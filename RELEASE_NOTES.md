@@ -1,3 +1,16 @@
+# PIET A.0.0 / CoBrA 1.0.0 — macOS build of 2026-11-06 (tag `A.0.0-public-20261106`)
+
+First downloadable build from the public tree: `PIET-A.0.0-20261106-macos-arm64.dmg`
+on the release page, built with `scripts/build-macos.sh` + `scripts/package-macos-dmg.sh`
+from the tagged commit on an Apple Silicon Mac (macOS 26.6, Xcode command-line
+tools), ad-hoc signed, not notarized (see README, "Download for macOS").
+The app reports PIET `A.0.0` and CoBrA `1.0.0`; the tree it was built from
+includes the fixes landed after those version stamps (BUG-1939 dev-tree path
+resolution, BUG-1940 `hausman` on a difference matrix that is not positive
+definite, demo tour corrections), so the tag and commit on the release page,
+not the version string alone, identify the build. Corresponding source: this
+repository at the tag.
+
 # PIET A.0.0 / CoBrA 1.0.0 — public source cut of 2026-11-06
 
 This cut replaces the experimental 2026-10 source beta with the full current

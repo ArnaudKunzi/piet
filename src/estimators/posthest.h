@@ -19,9 +19,11 @@
 namespace cecon {
 
 struct HausmanResult {
-    int dof = 0;             // # parameters used in the test
-    double chi2 = 0;
-    double pvalue = 0;       // approximate (chi² right-tail)
+    int dof = 0;             // r(df): the rank of V_FE - V_RE (= k when nonsingular)
+    double chi2 = 0;         // may be NEGATIVE when V_FE - V_RE is not positive definite
+    double pvalue = 0;       // chi² right-tail; NaN when chi2 < 0
+    bool not_pd = false;     // V_FE - V_RE has a non-positive eigenvalue (Stata's note)
+    std::vector<double> se_diff;  // sqrt(diag(V_FE - V_RE)); NaN where the diagonal is negative
     bool ok = true;
     std::string error;
 };

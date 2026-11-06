@@ -250,6 +250,7 @@ regress frate beertax spirits, vce(robust)    // HC1
 regress frate beertax spirits, vce(cluster state)
 regress frate beertax spirits in 1/200        // in-range qualifier
 regress frate beertax spirits if year>=1985, vce(cluster state)   // if + cluster
+regress frate beertax spirits                 // classical SE again: hettest/ovtest refuse a robust/cluster fit (as in Stata)
 estat hettest                                 // Breusch-Pagan (heteroskedasticity is why we cluster)
 estat ovtest                                  // Ramsey RESET
 regress frate beertax spirits unemp lincome
@@ -429,7 +430,7 @@ else {
 * S12 Cleanup & exit                                                           *
 *------------------------------------------------------------------------------*
 erase "pangram_fat.dta"                       // remove scratch artifacts
-rm "pangram_post"                             // rm = built-in synonym of erase
+rm "pangram_post.dta"                         // rm = built-in synonym of erase (the extension is required, as in Stata)
 erase "pangram_fig.svg"
 rm "pangram_session.log"
 timer off 1

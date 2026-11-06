@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -226,31 +227,63 @@ HausmanResult hausman_test(const double* b_FE, const double* V_FE,
         for (int r = 0; r < k; ++r)
             dV[static_cast<size_t>(c) * k + r] = V_FE[c * k + r] - V_RE[c * k + r];
 
-    // Try Cholesky-invert. If not PD, PSD-project (clip negative eigenvalues).
+    R.se_diff.assign(static_cast<size_t>(k), std::numeric_limits<double>::quiet_NaN());
+    for (int c = 0; c < k; ++c) {
+        double d = dV[static_cast<size_t>(c) * k + c];
+        if (d >= 0) R.se_diff[static_cast<size_t>(c)] = std::sqrt(d);
+    }
+
+    // Stata's rule (identified from its documentation and output): the
+    // difference matrix is inverted with a generalized inverse whether or
+    // not it is positive definite; the statistic may then be negative, the
+    // output carries the note "(V_b-V_B is not positive definite)", and
+    // r(df) is the rank of the difference. BUG-1940: the previous fallback
+    // (project onto the PSD cone, then Cholesky) answered a near-singular
+    // clipped matrix with chi2 ~ 1e16, or refused outright, where Stata
+    // reports 1.15 with the note.
     std::vector<double> dV_inv(dV);
-    int info = la::spd_inverse(dV_inv.data(), k);
+    int info = la::spd_inverse(dV_inv.data(), k);   // positive definite: plain inverse, as before
+    int rank = k;
     if (info != 0) {
-        // PSD project ΔV (symmetric eigendecomp, clip negatives, rebuild),
-        // then re-attempt the inverse on the result.
-        std::vector<double> dV_psd(dV);
-        int clipped = la::psd_clip(dV_psd.data(), k);
-        (void)clipped;
-        dV_inv = dV_psd;
-        info = la::spd_inverse(dV_inv.data(), k);
-        if (info != 0) {
+        std::vector<double> Q(dV);
+        std::vector<double> w(static_cast<size_t>(k));
+        if (la::sym_eig(Q.data(), k, w.data()) != 0) {
             R.ok = false;
-            R.error = "V_FE - V_RE not invertible even after PSD projection";
+            R.error = "V_FE - V_RE: symmetric eigendecomposition failed";
+            return R;
+        }
+        double wmax = 0;
+        for (int c = 0; c < k; ++c) wmax = std::max(wmax, std::fabs(w[static_cast<size_t>(c)]));
+        const double tol = wmax * 1e-13;
+        rank = 0;
+        R.not_pd = true;
+        // dV^- = Q diag(1/w_j for |w_j| > tol, else 0) Q'
+        std::fill(dV_inv.begin(), dV_inv.end(), 0.0);
+        for (int j = 0; j < k; ++j) {
+            double wj = w[static_cast<size_t>(j)];
+            if (std::fabs(wj) <= tol) continue;
+            ++rank;
+            const double* q = Q.data() + static_cast<size_t>(j) * k;
+            for (int c = 0; c < k; ++c)
+                for (int r = 0; r < k; ++r)
+                    dV_inv[static_cast<size_t>(c) * k + r] += q[r] * q[c] / wj;
+        }
+        if (rank == 0) {
+            R.ok = false;
+            R.error = "V_FE - V_RE is the zero matrix; no test is defined";
             return R;
         }
     }
 
-    // chi2 = db' · dV^-1 · db
+    // chi2 = db' · dV^- · db
     std::vector<double> tmp(static_cast<size_t>(k));
     la::matvec(dV_inv.data(), k, db.data(), tmp.data());
     double chi2 = 0;
     for (int c = 0; c < k; ++c) chi2 += db[static_cast<size_t>(c)] * tmp[static_cast<size_t>(c)];
     R.chi2 = chi2;
-    R.pvalue = gammq(static_cast<double>(k) / 2.0, chi2 / 2.0);
+    R.dof = rank;
+    R.pvalue = chi2 >= 0 ? gammq(static_cast<double>(rank) / 2.0, chi2 / 2.0)
+                         : std::numeric_limits<double>::quiet_NaN();
     return R;
 }
 

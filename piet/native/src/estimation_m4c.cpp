@@ -8207,10 +8207,18 @@ ojson runHausman(const std::string& name1, const std::string& name2,
   block["estimator"] = "hausman";
   block["depvar"] = feSnap->value("depvar", std::string());
   block["n_obs"] = raw.value("n_obs", 0);
-  static const char* kHausmanFields[] = {"chi2", "p", "dof", "coefs"};
+  static const char* kHausmanFields[] = {"chi2", "p", "dof", "coefs", "not_pd"};
   for (const char* k : kHausmanFields) {
     if (raw.contains(k)) block[k] = raw[k];
   }
+  // BUG-1940: Stata's two notes under the statistic, in its words.
+  std::vector<std::string> notes;
+  if (raw.value("not_pd", false)) notes.push_back("(V_b-V_B is not positive definite)");
+  if (raw.contains("chi2") && raw["chi2"].is_number() && raw["chi2"].get<double>() < 0) {
+    notes.push_back("chi2<0 ==> model fitted on these data fails to meet the asymptotic "
+                    "assumptions of the Hausman test; see suest for a generalized test");
+  }
+  if (!notes.empty()) block["notes"] = notes;
   return block;
 }
 

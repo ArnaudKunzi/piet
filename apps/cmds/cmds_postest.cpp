@@ -3,6 +3,8 @@
 #include "common.h"
 #include "commands.h"
 
+#include <cmath>
+#include <limits>
 #include <set>
 
 #include "estimators/feols.h"
@@ -2771,11 +2773,19 @@ int cmd_hausman(const std::vector<std::string>& a) {
     HausmanResult h = hausman_test(bFE.data(), VFE.data(), bRE.data(), VRE.data(), kc);
     if (!h.ok) { std::fprintf(stderr, "hausman: %s\n", h.error.c_str()); return 1; }
     json diffs = json::array();
-    for (int i = 0; i < kc; ++i)
-        diffs.push_back({{"name", common[static_cast<size_t>(i)]}, {"b_fe", bFE[static_cast<size_t>(i)]},
-                         {"b_re", bRE[static_cast<size_t>(i)]}, {"diff", bFE[static_cast<size_t>(i)] - bRE[static_cast<size_t>(i)]}});
+    for (int i = 0; i < kc; ++i) {
+        json row = {{"name", common[static_cast<size_t>(i)]}, {"b_fe", bFE[static_cast<size_t>(i)]},
+                    {"b_re", bRE[static_cast<size_t>(i)]}, {"diff", bFE[static_cast<size_t>(i)] - bRE[static_cast<size_t>(i)]}};
+        double sd = i < static_cast<int>(h.se_diff.size()) ? h.se_diff[static_cast<size_t>(i)]
+                                                           : std::numeric_limits<double>::quiet_NaN();
+        if (std::isnan(sd)) row["se_diff"] = nullptr; else row["se_diff"] = sd;  // Stata prints "." here
+        diffs.push_back(row);
+    }
+    // BUG-1940: dof = rank of the difference, p missing when chi2 < 0, and
+    // the not-positive-definite flag Stata reports as a note.
     json out = {{"estimator", "hausman"}, {"chi2", h.chi2}, {"dof", h.dof},
-                {"p", chi2_pvalue(h.chi2, h.dof)}, {"coefs", diffs}};
+                {"not_pd", h.not_pd}, {"coefs", diffs}};
+    if (std::isnan(h.pvalue)) out["p"] = nullptr; else out["p"] = h.pvalue;
     emit(out, opt(a, "--out"));
     return 0;
 }

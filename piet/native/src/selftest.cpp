@@ -22558,6 +22558,68 @@ void testBS097OptionNetAndBS018DoNostop() {
           "implement) is named as such, not lumped with a bogus typo");
   }
 
+  // BUG-1940: hausman when V_b-V_B is not positive definite. Stata inverts
+  // the difference with a generalized inverse and reports the statistic with
+  // the note "(V_b-V_B is not positive definite)"; PIET's PSD-clip fallback
+  // answered chi2 ~ 2.6e16 (near-singular clipped matrix) or refused with an
+  // engine_error. Oracle: StataBE 19.5, 2026-11-06, the bundled fatalities
+  // sample imported asdouble, frate = fatal/pop*10000, encode state, xtset:
+  //   beertax unemp         -> r(chi2) 1.15382326678694  r(df) 2  r(p) .5616302108923181  (not PD)
+  //   beertax spirits unemp -> r(chi2) 70.30558871723755 r(df) 3  r(p) 3.67130877062e-15  (not PD)
+  //   beertax spirits       -> r(chi2) 30.02004414363056 r(df) 2  r(p) 3.02851856992e-07  (PD, no note)
+  {
+    piet::SessionState hs(workdir + "/bug1940");
+    std::filesystem::create_directories(workdir + "/bug1940");
+    (void)piet::dispatch("sysuse fatalities, clear", hs);
+    if (!hs.hasData()) {
+      skip("BUG-1940 (all legs)", "`sysuse fatalities` setup returned no data");
+    } else {
+      (void)piet::dispatch("generate double frate = fatal/pop*10000", hs);
+      (void)piet::dispatch("encode state, gen(snum)", hs);
+      (void)piet::dispatch("xtset snum year", hs);
+      struct Arm { const char* xs; double chi2; int df; double p; bool notpd; };
+      const Arm arms[] = {
+          {"beertax unemp", 1.15382326678694, 2, 0.5616302108923181, true},
+          {"beertax spirits unemp", 70.30558871723755, 3, 3.67130877062e-15, true},
+          {"beertax spirits", 30.02004414363056, 2, 3.02851856992e-07, false},
+      };
+      int armNo = 0;
+      for (const Arm& a : arms) {
+        ++armNo;
+        std::string tag = "h1940_" + std::to_string(armNo);
+        (void)piet::dispatch(std::string("xtreg frate ") + a.xs + ", fe", hs);
+        (void)piet::dispatch("estimates store " + tag + "f", hs);
+        (void)piet::dispatch(std::string("xtreg frate ") + a.xs + ", re", hs);
+        (void)piet::dispatch("estimates store " + tag + "r", hs);
+        auto blocks = piet::dispatch("hausman " + tag + "f " + tag + "r", hs);
+        auto err = firstBlockOfType(blocks, "error");
+        nlohmann::ordered_json hb;
+        for (const auto& b : blocks)
+          if (b.is_object() && b.value("estimator", std::string()) == "hausman") { hb = b; break; }
+        std::string label = std::string("BUG-1940 hausman `") + a.xs + "`";
+        check(err.is_null() && hb.is_object(),
+              label + ": answers with a hausman block, no engine_error (was: refused or chi2 ~ 1e16)");
+        if (!hb.is_object()) continue;
+        double chi2 = hb.value("chi2", 0.0);
+        double p = hb.contains("p") && hb["p"].is_number() ? hb["p"].get<double>() : -1.0;
+        check(std::fabs(chi2 - a.chi2) <= 1e-9 * std::fabs(a.chi2),
+              label + ": chi2 matches StataBE r(chi2) " + std::to_string(a.chi2) + " at rtol 1e-9, got " +
+                  std::to_string(chi2));
+        check(hb.value("dof", -1) == a.df,
+              label + ": dof is Stata's r(df) " + std::to_string(a.df) + " (the rank of V_b-V_B)");
+        check(std::fabs(p - a.p) <= 1e-9 * std::fabs(a.p) + 1e-300,
+              label + ": p matches StataBE r(p) at rtol 1e-9, got " + std::to_string(p));
+        bool noted = false;
+        if (hb.contains("notes"))
+          for (const auto& n : hb["notes"])
+            if (n.is_string() && n.get<std::string>() == "(V_b-V_B is not positive definite)") noted = true;
+        check(hb.value("not_pd", !a.notpd) == a.notpd && noted == a.notpd,
+              label + (a.notpd ? ": carries Stata's note \"(V_b-V_B is not positive definite)\""
+                               : ": positive definite, so no note"));
+      }
+    }
+  }
+
   // tabstat (BUG-105 remainder) — `stat`/`stats`/`statistics` are the only
   // options this arm reads; the singular `stat(...)` spelling had to be
   // recognized in the SAME change as the reject net (freeze corpus proof:
