@@ -132,6 +132,27 @@ FileReadResult readDoFileForBridge(const SessionState& session, const std::strin
   return r;
 }
 
+// Opening a do-file in the app makes its folder the working directory, so a
+// relative `use "data.dta"` in it finds the data beside it instead of looking in
+// the seeded Documents folder. Goes through `cd`'s own handler so every consumer
+// of the working directory (the business-calendar search path included) moves
+// with it. Returns the new directory, or "" when nothing moved. Only the app's
+// open gestures call this: a typed `do FILE` keeps the working directory, as
+// Stata's does and as scripts that chain do-files by relative path rely on.
+std::string followDoFileDirectory(SessionState& session, const std::string& resolvedDoFile) {
+  namespace fs = std::filesystem;
+  const fs::path dir = cecon::to_native_path(resolvedDoFile).parent_path();
+  if (dir.empty()) return std::string();
+  std::error_code ec;
+  if (session.cwd.has_value() && !session.cwd->empty() &&
+      fs::equivalent(cecon::to_native_path(*session.cwd), dir, ec) && !ec) {
+    return std::string();
+  }
+  const nlohmann::ordered_json block = handlers::runCd(cecon::from_native_path(dir), session);
+  if (block.value("type", std::string()) != "echo") return std::string();
+  return block.value("text", std::string());
+}
+
 // ── BUG-133: orphan-scratch reaping ─────────────────────────────────────────
 // makeWorkdir() mkdtemp's a per-process `piet_native_XXXXXX` scratch dir that a
 // RAII ScratchDirGuard (below) removes at NORMAL process exit. But the fleet

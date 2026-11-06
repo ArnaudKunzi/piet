@@ -311,9 +311,12 @@ export class HTTPClient {
   // {source, resolved_path}. Rejects with bridge error code "bad_request" for
   // a missing/non-.do/>2MB file — the caller surfaces that via the normal
   // ApiError.message path (see _nativeRequest()'s catch below).
-  async readDoFile(path) {
+  // {followCwd:true} is the app's "the user opened this do-file" gesture: the
+  // kernel moves the working directory to the file's folder, and the reply names
+  // it in cwd_changed if that moved anything.
+  async readDoFile(path, { followCwd = false } = {}) {
     if (this.mock) return { source: '* mock: file reading not available without a running kernel.\n', resolved_path: path };
-    return this._post('/api/file/read', { path });
+    return this._post('/api/file/read', followCwd ? { path, follow_cwd: true } : { path });
   }
 
   // ── GET /api/varlist ────────────────────────────────────────────────────────
