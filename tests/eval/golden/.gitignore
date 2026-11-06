@@ -1,0 +1,4 @@
+# Golden oracle capture logs ARE provenance (Eval §10): they carry the
+# full-precision Stata truth the *.csv cells were transcribed from, plus the
+# no-gaming cross-check blocks. Re-include them against the repo-root *.log rule.
+!*.log

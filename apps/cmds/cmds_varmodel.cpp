@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 
@@ -13,7 +15,7 @@
 // release-118 `.dta` — from the `irf.cells[]` array, whose keys are EXACTLY the
 // `.irf` column names so no translation table is needed on either side.
 //
-// Oracle for every number: Stata 19.5, tests/kitchensink/pangram/waves/_oracle/
+// Oracle for every number: Stata 19.5, internal capture
 // p7_stata.log (the `preserve / keep if id==1 / tsset t` block of p7.do) plus the
 // `_runs/p7_irf.irf` artifact it writes. Assertions — and an explicit statement
 // of what that fixture CANNOT pin — in tests/unit/test_varmodel.cpp.

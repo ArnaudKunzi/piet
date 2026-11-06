@@ -1,0 +1,5 @@
+{
+  "type": "error",
+  "code": "engine_error",
+  "message": "Failed to open file: format not recognised or file not found."
+}

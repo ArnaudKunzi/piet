@@ -1,0 +1,23 @@
+{
+ "xtlogit_big": {
+  "a_median_s": 5.07,
+  "rc_a": 0,
+  "b_median_s": 5.025,
+  "rc_b": 0,
+  "ratio_b_over_a": 0.9911
+ },
+ "xtpois_big": {
+  "a_median_s": 0.435,
+  "rc_a": 0,
+  "b_median_s": 0.434,
+  "rc_b": 0,
+  "ratio_b_over_a": 0.9968
+ },
+ "nbreg": {
+  "a_median_s": 2.213,
+  "rc_a": 0,
+  "b_median_s": 2.194,
+  "rc_b": 0,
+  "ratio_b_over_a": 0.9912
+ }
+}

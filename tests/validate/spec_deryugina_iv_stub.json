@@ -1,0 +1,10 @@
+{
+  "data": { "path": "tests/validate/deryugina.hbin" },
+  "model": {
+    "type": "feols",
+    "depvar": "y_all",
+    "exog": ["pm25", "tmaxb", "tminb", "precd", "wsd"],
+    "fixed_effects": ["sigungu5", "year"]
+  },
+  "vcov": { "type": "cluster", "cluster": ["sigungu5"] }
+}

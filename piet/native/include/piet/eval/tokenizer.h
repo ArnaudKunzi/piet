@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Stata-subset tokenizer — C++ port of piet/backend/piet/router/tokenizer.py.
 //
 // Order of operations (per BACKEND.md Tokenizer, mirrored verbatim):
@@ -63,10 +65,20 @@ struct ParsedCommand {
   std::optional<std::string> inRange;
   std::optional<std::string> weightType;
   std::optional<std::string> weightVar;
+  // The weight expression as Stata keeps it for e(wexp): the text after `=` with
+  // its leading blanks removed and its trailing ones kept (`[aw=  wf ]` -> "wf ",
+  // w2aj_qualifiers qf_rw_aw_wide). weightVar is the same text stripped. Not part
+  // of toJson().
+  std::optional<std::string> weightExp;
   // Preserves insertion order like Python dict does (tests may rely on it
   // for display, though equality checks are order-independent by key).
   std::vector<std::pair<std::string, OptValue>> opts;
   std::string raw;
+  // The pre-comma text after the command word, qualifiers removed, as typed:
+  // `varlist` is this text split on blanks, which collapses a run of blanks
+  // inside a string literal (`generate b = "x  y"`). generate/replace read
+  // their expression from here (FU-639/FU-652). Not part of toJson().
+  std::string argText;
 
   nlohmann::json toJson() const;
 };
@@ -98,6 +110,14 @@ long long findUnquotedComma(const std::string& s);
 // mis-split because the qualifier regexes ran quote-blind).
 std::vector<bool> quotedSpanMask(const std::string& s);
 
+// Stata's storage rule for the lines of a loop body (foreach/forvalues/while)
+// and of a program body: every run of blanks (spaces and tabs) outside double
+// quotes and compound quotes becomes ONE blank, before any macro is expanded
+// (StataBE 19.5 probes, w2at_table_writers wt_x01: `tex `lab' &  ...` inside a
+// foreach writes `x1 & .125`; top-level lines and a top-level `if {}` body keep
+// their blanks). Leading indentation is left as it is. Idempotent.
+std::string collapseUnquotedBlanks(const std::string& s);
+
 // std::regex_search, but skips any match whose span overlaps a quoted
 // string (per quotedSpanMask) — a drop-in replacement at if/in/weight
 // qualifier call sites so a qualifier-shaped substring inside a quoted
@@ -113,6 +133,12 @@ bool searchUnquoted(const std::string& s, const std::regex& re, std::smatch& out
 // the SAME quote/paren-aware option grammar rather than re-deriving it
 // (mirrors twoway_parse.py's own "reuse, don't reinvent" docstring note).
 std::vector<std::pair<std::string, OptValue>> parseOpts(const std::string& optStr);
+
+// `text` with its first unquoted weight clause removed -- the one weight grammar
+// tokenize() reads (`[aw = x]`, `[ w= x ]`, `[cell=x]`, ...), for a handler that
+// re-reads its own raw command text (collapse's stat list). Unchanged when there
+// is no clause.
+std::string removeWeightClause(const std::string& text);
 
 // Parse one Stata command line into a ParsedCommand. Throws TokenizerError
 // on rejection (matches Python's raise semantics exactly).

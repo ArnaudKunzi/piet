@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // --evalcase driver — the native half of the M1 differential-parity harness.
 //
 // Reads JSONL cases from stdin (one JSON object per line), runs each through

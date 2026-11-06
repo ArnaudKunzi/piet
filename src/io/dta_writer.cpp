@@ -1,6 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "io/dta_writer.h"
 #include "io/win_compat.h"  // to_native_path: wide open on Windows for non-ASCII paths (BUG-050)
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -107,7 +110,7 @@ struct Out {
         if (s.size() >= n) {
             throw EngineError("data_io", "dta: " + std::string(what) + " for '" + who + "' is " +
                                              std::to_string(s.size()) + " bytes, exceeds the " +
-                                             std::to_string(n - 1) + "-byte format-118 field");
+                                             std::to_string(n - 1) + "-byte .dta field");
         }
         raw(s.data(), s.size());
         b.insert(b.end(), n - s.size(), 0);
@@ -141,6 +144,8 @@ struct Plan {
     // width for every str# (1..2045; dta_reader.cpp:129 decodes it the same way), so
     // the two tables stay one table read in two directions.
     bool is_str = false;
+    bool is_strl = false;
+    uint32_t var_index = 0;
     int str_width = 0;
     // Missing string cells written as "" (Stata's only spelling for "nothing here").
     // Tallied rather than rejected so write_dta can name the cost once per column;
@@ -150,25 +155,17 @@ struct Plan {
     std::string vlabel;  // <variable_labels>
     std::string vlname;  // <value_label_names>
 
-    uint16_t typecode() const { return is_str ? static_cast<uint16_t>(str_width) : t.code; }
-    int cell_width() const { return is_str ? str_width : t.width; }
+    uint16_t typecode() const { return is_strl ? 32768 : is_str ? static_cast<uint16_t>(str_width) : t.code; }
+    int cell_width() const { return is_strl ? 8 : is_str ? str_width : t.width; }
 };
 
-// Stata's str# cap (spec §8 Q4). Above it Stata needs strL, which this arc does not
-// write — so the level is an honest reject, never a truncation.
+// Above the fixed-width cap, use a real strL reference and GSO payload.
 constexpr std::size_t kStrMax = 2045;
 
-// %tc / %tC — the ONE surviving date rescale (brief §3): the reader multiplies these
-// by 1/86 400 000 to reach epoch-days (dta_reader.cpp:629-630) and leaves every other
-// %t* family as its raw Stata index, so every other inverse is the identity.
-//
-// Exactness: Stata's %tc domain is INTEGER milliseconds, and for an integer ms the
-// round trip is exact — `round(ms/86 400 000 × 86 400 000)` recovers ms bit-for-bit
-// because the error of the two divisions is ~4e-4 ms for the largest realistic
-// datetime (~2e12 ms), four orders below the 0.5 rounding margin. The `round` is what
-// makes it exact rather than 1-ULP-lucky, and it is also what Stata itself stores. A
-// sub-millisecond value is OUT of Stata's domain (spec §8 Q6's "flag any fractional-
-// date fixture as out-of-domain") and lands on its nearest ms.
+// %tc / %tC were the one date rescale (ms <-> epoch-days). BUG-1091 retired it: the
+// reader keeps milliseconds like every other %t* index, so tc_inverse is always
+// false and every value is written as is -- fractional ms included, which StataBE
+// stores too (import excel's 1872914339399.999756).
 inline double emit_value(const Plan& p, double v) {
     if (std::isnan(v)) return v;
     if (!p.tc_inverse) return v;
@@ -257,8 +254,8 @@ const WType* type_by_label(const std::string& l) {
     return nullptr;  // strNN / strL / unknown: no numeric meaning, fall back to the scan
 }
 
-// A declared `strNN` width, or 0 for anything else (including "strL": this arc cannot
-// write strL, so the declaration simply loses to the measured str# — the values still
+// A declared `strNN` width, or 0 for anything else (strL is handled separately).
+// Fixed-width declarations widen the measured str#; the values still
 // round-trip exactly, only the declared TYPE does not, which is Q4's cost, not a new
 // silent narrowing).
 int str_width_by_label(const std::string& l) {
@@ -284,18 +281,14 @@ void plan_factor(Plan& p, int64_t nrows, bool strict) {
     const LevelCol& lv = p.col->levels;
     std::size_t w = 0;
     for (std::size_t k = 0; k < lv.size(); ++k) {
-        if (lv[k].size() > kStrMax) {
-            throw EngineError("data_io",
-                              "dta: column '" + p.name + "' has a string value of " +
-                                  std::to_string(lv[k].size()) +
-                                  " bytes; format 118 caps a str# at " + std::to_string(kStrMax) +
-                                  " and this release does not write strL (the value would have to "
-                                  "be truncated, which this writer never does)");
-        }
+        if (lv[k].size() >= std::numeric_limits<uint32_t>::max())
+            throw EngineError("data_io", "dta: strL value exceeds the GSO length limit");
+        if (lv[k].size() > kStrMax || lv[k].find('\0') != std::string::npos)
+            p.is_strl = true;
         if (lv[k].size() > w) w = lv[k].size();
     }
     p.is_str = true;
-    p.str_width = static_cast<int>(w > 0 ? w : 1);
+    p.str_width = static_cast<int>(std::min(w > 0 ? w : 1, kStrMax));
 
     // Count genuinely missing string cells. Stata spells "nothing here" in a string
     // variable exactly one way — `""` — so that is what we emit, matching what Stata
@@ -362,14 +355,140 @@ void emit_cell(Out& o, const WType& t, double v) {
     }
 }
 
+// Format 115 (Stata 12; `saveold, version(11|12)`): the pre-XML binary layout.
+// Header 109 bytes -- ds_format 115, byte order 2 (LOHI), filetype 1, a pad byte,
+// nvar u16, nobs u32, data_label[81], time_stamp[18]; then typlist (one byte
+// per variable: str1..str244 = the width, byte/int/long/float/double =
+// 251/252/253/254/255), varlist[33], srtlist (u16 x nvar+1), fmtlist[49],
+// lbllist[33], variable labels[81], the expansion fields (type 1, u32 length,
+// varname[33], charname[33], value NUL; ended by type 0 length 0), the data,
+// and the value labels (u32 table length, name[33], 3 pad bytes, table). The
+// cell encodings, missing codes included, are 117's.
+void write_dta_115(const Frame& fr, const std::string& path, const DtaWriteOptions& wo,
+                   const std::vector<Plan>& plans, int64_t nrows, std::size_t kName,
+                   std::size_t kFmt, std::size_t kVlab) {
+    const int ncols = static_cast<int>(plans.size());
+    Out o;
+    o.u8v(115);
+    o.u8v(2);  // LOHI
+    o.u8v(1);
+    o.u8v(0);
+    o.u16(static_cast<uint16_t>(ncols));
+    o.u32(static_cast<uint32_t>(nrows));
+    if (wo.data_label.size() > 80)
+        throw EngineError("data_io", "dta: dataset label exceeds 80 bytes (format 115)");
+    o.field(wo.data_label, 81, "dataset label", "_dta");
+    if (wo.timestamp.size() > 17)
+        throw EngineError("data_io", "dta: timestamp exceeds 17 bytes (format 115)");
+    o.field(wo.timestamp, 18, "timestamp", "_dta");
+    for (const auto& p : plans) {
+        if (p.is_str) {
+            o.u8v(static_cast<uint8_t>(p.str_width));
+            continue;
+        }
+        uint8_t code = 255;
+        switch (p.t.kind) {
+            case WKind::Byte: code = 251; break;
+            case WKind::Int16: code = 252; break;
+            case WKind::Int32: code = 253; break;
+            case WKind::Float32: code = 254; break;
+            case WKind::Float64: code = 255; break;
+        }
+        o.u8v(code);
+    }
+    for (const auto& p : plans) o.field(p.name, kName, "variable name", p.name);
+    {
+        std::vector<uint16_t> sl;
+        bool claim_ok = !fr.sorted_by().empty();
+        for (const std::string& k : fr.sorted_by()) {
+            int pos = -1;
+            for (int i = 0; i < ncols; ++i)
+                if (plans[static_cast<size_t>(i)].name == k) { pos = i; break; }
+            if (pos < 0) { claim_ok = false; break; }
+            sl.push_back(static_cast<uint16_t>(pos + 1));
+        }
+        int emitted = 0;
+        if (claim_ok)
+            for (uint16_t v : sl) { o.u16(v); ++emitted; }
+        for (int i = emitted; i < ncols + 1; ++i) o.u16(0);
+    }
+    for (const auto& p : plans) o.field(p.format, kFmt, "display format", p.name);
+    for (const auto& p : plans) o.field(p.vlname, kName, "value-label name", p.name);
+    for (const auto& p : plans) o.field(p.vlabel, kVlab, "variable label", p.name);
+    for (const auto& ch : wo.characteristics) {
+        const uint64_t len = 2ull * kName + static_cast<uint64_t>(ch.value.size()) + 1ull;
+        if (len > 0x7FFFFFFFull)
+            throw EngineError("data_io", "dta: characteristic '" + ch.charname + "' is too large");
+        o.u8v(1);
+        o.u32(static_cast<uint32_t>(len));
+        o.field(ch.varname, kName, "characteristic variable name", ch.charname);
+        o.field(ch.charname, kName, "characteristic name", ch.varname);
+        o.bytes(ch.value);
+        o.u8v(0);
+    }
+    o.u8v(0);
+    o.u32(0);
+    for (int64_t i = 0; i < nrows; ++i) {
+        for (const auto& p : plans) {
+            if (p.is_str) {
+                emit_str_cell(o, p, i);
+                continue;
+            }
+            const F64Col& f = p.col->f64;
+            const double raw = (static_cast<std::size_t>(i) < f.size())
+                                   ? f[static_cast<std::size_t>(i)]
+                                   : std::numeric_limits<double>::quiet_NaN();
+            emit_cell(o, p.t, emit_value(p, raw));
+        }
+    }
+    for (const auto& vl : wo.value_labels) {
+        const uint32_t n = static_cast<uint32_t>(vl.map.size());
+        uint64_t txtlen = 0;
+        for (const auto& kv : vl.map) txtlen += kv.second.size() + 1;
+        if (txtlen > 0x7FFFFFFFull)
+            throw EngineError("data_io", "dta: value label '" + vl.name + "' text is too large");
+        o.u32(static_cast<uint32_t>(8ull + 8ull * n + txtlen));
+        o.field(vl.name, kName, "value-label set name", vl.name);
+        o.u8v(0); o.u8v(0); o.u8v(0);
+        o.u32(n);
+        o.u32(static_cast<uint32_t>(txtlen));
+        uint32_t off = 0;
+        for (const auto& kv : vl.map) {
+            o.u32(off);
+            off += static_cast<uint32_t>(kv.second.size() + 1);
+        }
+        for (const auto& kv : vl.map) {
+            if (kv.first < -2147483648LL || kv.first > 2147483647LL)
+                throw EngineError("data_io", "dta: value label '" + vl.name + "' has code " +
+                                                 std::to_string(kv.first) +
+                                                 " outside Stata's 4-byte label code range");
+            o.i32(static_cast<int32_t>(kv.first));
+        }
+        for (const auto& kv : vl.map) { o.bytes(kv.second); o.u8v(0); }
+    }
+    std::ofstream f(to_native_path(path), std::ios::binary | std::ios::trunc);
+    if (!f) throw EngineError("data_io", "dta: cannot open " + path + " for writing");
+    f.write(reinterpret_cast<const char*>(o.b.data()), static_cast<std::streamsize>(o.b.size()));
+    f.flush();
+    if (!f) throw EngineError("data_io", "dta: write failed for " + path);
+}
+
 }  // namespace
 
 void write_dta(const Frame& fr, const std::string& path, const DtaWriteOptions& wo) {
     const int ncols = fr.n_cols();
     const int64_t nrows = fr.n_rows();
+    const int release = wo.release;
+    if (release != 118 && release != 117 && release != 115)
+        throw EngineError("bad_input", "dta: release " + std::to_string(release) +
+                                           " is not written (115, 117 or 118)");
     if (ncols > 65535)
-        throw EngineError("data_io", "dta: format 118 holds at most 65535 variables, got " +
+        throw EngineError("data_io", "dta: format " + std::to_string(release) +
+                                         " holds at most 65535 variables, got " +
                                          std::to_string(ncols));
+    if (release != 118 && nrows > 2147483647LL)
+        throw EngineError("data_io", "dta: format " + std::to_string(release) +
+                                         " holds at most 2147483647 observations");
 
     // ---- plan every column (types + formats) before a byte is emitted ----
     std::vector<Plan> plans;
@@ -378,6 +497,7 @@ void write_dta(const Frame& fr, const std::string& path, const DtaWriteOptions& 
         Plan p;
         p.col = &c;
         p.name = c.name;
+        p.var_index = static_cast<uint32_t>(plans.size() + 1);
 
         // Resolve the format string FIRST, because the %tc inverse must key on the
         // string this file will actually CARRY — the reader re-derives the rescale
@@ -388,7 +508,10 @@ void write_dta(const Frame& fr, const std::string& path, const DtaWriteOptions& 
         for (const auto& m : wo.var_meta)
             if (m.name == c.name) { hint = &m; break; }
         p.format = (hint && !hint->format.empty()) ? hint->format : c.format;
-        p.tc_inverse = starts_with(p.format, "%tc") || starts_with(p.format, "%tC");
+        // BUG-1091: a %tc column is milliseconds in memory (the reader keeps
+        // them), so it is written as is; the old x86 400 000 put 1.677e20 in
+        // the file for 007's EndDate2 (1941192180000 in StataBE's).
+        p.tc_inverse = false;
         p.vlabel = hint ? hint->label : std::string();
         p.vlname = hint ? hint->value_label_name : std::string();
 
@@ -403,6 +526,7 @@ void write_dta(const Frame& fr, const std::string& path, const DtaWriteOptions& 
                                                  "variables only");
             }
             plan_factor(p, nrows, wo.strict_string_missing);
+            p.is_strl = p.is_strl || (hint && hint->stata_type == "strL");
             // Symmetry with the numeric ladder (and what makes a `describe` type
             // round-trip real): a declared width WIDER than the dictionary needs is
             // honoured as-is — same bytes per value, a bigger fixed field, and
@@ -412,7 +536,8 @@ void write_dta(const Frame& fr, const std::string& path, const DtaWriteOptions& 
             const int declared_w = hint ? str_width_by_label(hint->stata_type) : 0;
             if (declared_w > p.str_width) p.str_width = declared_w;
             // Stata's own default display format for a str#: right-aligned %<w>s.
-            if (p.format.empty()) p.format = "%" + std::to_string(p.str_width) + "s";
+            if (p.format.empty())
+                p.format = p.is_strl ? "%9s" : "%" + std::to_string(p.str_width) + "s";
             p.tc_inverse = false;  // a date format on a string column means nothing
             plans.push_back(p);
             continue;
@@ -446,34 +571,46 @@ void write_dta(const Frame& fr, const std::string& path, const DtaWriteOptions& 
                      static_cast<long long>(p.str_missing_first_row));
     }
 
-    // A <value_label_names> entry naming a table that <value_labels> will not contain
-    // is the one malformation that survives our own round trip (the reader tolerates a
-    // dangling name) and fails only in Stata. Reject before emitting.
-    for (const auto& p : plans) {
-        if (p.vlname.empty()) continue;
-        bool defined = false;
-        for (const auto& vl : wo.value_labels)
-            if (vl.name == p.vlname) { defined = true; break; }
-        if (!defined) {
-            throw EngineError("data_io", "dta: column '" + p.name + "' names value label '" +
-                                             p.vlname +
-                                             "' but no such label set was supplied (--in-meta's "
-                                             "value_labels has no entry for it)");
-        }
+    // A <value_label_names> entry may name a table <value_labels> does not contain:
+    // Stata attaches an undefined set (`label values x notdefined`) and StataBE
+    // writes and reads such a file (AER 007's Wave1.dta, not_in_LF_BL -> notlf).
+
+    // Field widths of the release (118: 129/57/321; 117 and 115: 33/49/81).
+    const std::size_t kName = release == 118 ? 129 : 33;
+    const std::size_t kFmt = release == 118 ? 57 : 49;
+    const std::size_t kVlab = release == 118 ? 321 : 81;
+    if (release == 115) {
+        for (const auto& p : plans)
+            if (p.is_str && (p.is_strl || p.str_width > 244))
+                throw EngineError("data_io", "dta: column '" + p.name + "' is str" +
+                                                 std::to_string(p.str_width) +
+                                                 "; format 115 caps a str# at 244");
+        write_dta_115(fr, path, wo, plans, nrows, kName, kFmt, kVlab);
+        return;
     }
 
     // ---- container: the section order dta_reader.cpp parses, tag for tag ----
     Out o;
     o.lit("<stata_dta>");
     o.lit("<header>");
-    o.lit("<release>"); o.lit("118"); o.lit("</release>");
+    o.lit("<release>"); o.lit(release == 118 ? "118" : "117"); o.lit("</release>");
     o.lit("<byteorder>"); o.lit("LSF"); o.lit("</byteorder>");
     o.lit("<K>"); o.u16(static_cast<uint16_t>(ncols)); o.lit("</K>");
-    o.lit("<N>"); o.u64(static_cast<uint64_t>(nrows)); o.lit("</N>");
+    if (release == 118) {
+        o.lit("<N>"); o.u64(static_cast<uint64_t>(nrows)); o.lit("</N>");
+    } else {
+        o.lit("<N>"); o.u32(static_cast<uint32_t>(nrows)); o.lit("</N>");
+    }
     o.lit("<label>");
-    if (wo.data_label.size() > 320)
-        throw EngineError("data_io", "dta: dataset label exceeds 320 bytes");
-    o.u16(static_cast<uint16_t>(wo.data_label.size()));
+    if (release == 118) {
+        if (wo.data_label.size() > 320)
+            throw EngineError("data_io", "dta: dataset label exceeds 320 bytes");
+        o.u16(static_cast<uint16_t>(wo.data_label.size()));
+    } else {
+        if (wo.data_label.size() > 80)
+            throw EngineError("data_io", "dta: dataset label exceeds 80 bytes (format 117)");
+        o.u8v(static_cast<uint8_t>(wo.data_label.size()));
+    }
     o.bytes(wo.data_label);
     o.lit("</label>");
     o.lit("<timestamp>");
@@ -505,7 +642,7 @@ void write_dta(const Frame& fr, const std::string& path, const DtaWriteOptions& 
 
     map[3] = o.pos();
     o.lit("<varnames>");
-    for (const auto& p : plans) o.field(p.name, 129, "variable name", p.name);
+    for (const auto& p : plans) o.field(p.name, kName, "variable name", p.name);
     o.lit("</varnames>");
 
     map[4] = o.pos();
@@ -542,17 +679,17 @@ void write_dta(const Frame& fr, const std::string& path, const DtaWriteOptions& 
 
     map[5] = o.pos();
     o.lit("<formats>");
-    for (const auto& p : plans) o.field(p.format, 57, "display format", p.name);
+    for (const auto& p : plans) o.field(p.format, kFmt, "display format", p.name);
     o.lit("</formats>");
 
     map[6] = o.pos();
     o.lit("<value_label_names>");
-    for (const auto& p : plans) o.field(p.vlname, 129, "value-label name", p.name);
+    for (const auto& p : plans) o.field(p.vlname, kName, "value-label name", p.name);
     o.lit("</value_label_names>");
 
     map[7] = o.pos();
     o.lit("<variable_labels>");
-    for (const auto& p : plans) o.field(p.vlabel, 321, "variable label", p.name);
+    for (const auto& p : plans) o.field(p.vlabel, kVlab, "variable label", p.name);
     o.lit("</variable_labels>");
 
     // <characteristics> — layout MEASURED, see dta_writer.h. Each entry's length
@@ -560,13 +697,13 @@ void write_dta(const Frame& fr, const std::string& path, const DtaWriteOptions& 
     map[8] = o.pos();
     o.lit("<characteristics>");
     for (const auto& ch : wo.characteristics) {
-        const uint64_t len = 258ull + static_cast<uint64_t>(ch.value.size()) + 1ull;
+        const uint64_t len = 2ull * kName + static_cast<uint64_t>(ch.value.size()) + 1ull;
         if (len > 0xFFFFFFFFull)
             throw EngineError("data_io", "dta: characteristic '" + ch.charname + "' is too large");
         o.lit("<ch>");
         o.u32(static_cast<uint32_t>(len));
-        o.field(ch.varname, 129, "characteristic variable name", ch.charname);
-        o.field(ch.charname, 129, "characteristic name", ch.varname);
+        o.field(ch.varname, kName, "characteristic variable name", ch.charname);
+        o.field(ch.charname, kName, "characteristic name", ch.varname);
         o.bytes(ch.value);
         o.u8v(0);
         o.lit("</ch>");
@@ -582,6 +719,15 @@ void write_dta(const Frame& fr, const std::string& path, const DtaWriteOptions& 
         o.b.reserve(o.b.size() + rowbytes * static_cast<std::size_t>(nrows > 0 ? nrows : 0) + 4096);
         for (int64_t i = 0; i < nrows; ++i) {
             for (const auto& p : plans) {
+                if (p.is_strl) {
+                    const int32_t code = p.col->codes[static_cast<size_t>(i)];
+                    const bool present = code >= 0 && static_cast<size_t>(code) < p.col->levels.size() &&
+                                         !p.col->levels[static_cast<size_t>(code)].empty();
+                    if (!present) o.u64(0);
+                    else if (release == 117) { o.u32(p.var_index); o.u32(static_cast<uint32_t>(i + 1)); }
+                    else o.u64(p.var_index | (static_cast<uint64_t>(i + 1) << 16));
+                    continue;
+                }
                 if (p.is_str) {
                     emit_str_cell(o, p, i);
                     continue;
@@ -598,7 +744,28 @@ void write_dta(const Frame& fr, const std::string& path, const DtaWriteOptions& 
 
     map[10] = o.pos();
     o.lit("<strls>");
-    o.lit("</strls>");  // strL write is out of scope by DOSSIER directive (Q4)
+    // [P] dta, section 5.11: one GSO per nonempty strL cell, in row-major
+    // order. Crosslinking duplicates is optional. Embedded NULs require binary
+    // type 129; text type 130 includes its terminating NUL in the length.
+    for (int64_t row = 0; row < nrows; ++row) {
+        for (const auto& p : plans) {
+            if (!p.is_strl) continue;
+            const int32_t code = p.col->codes[static_cast<size_t>(row)];
+            if (code < 0 || static_cast<size_t>(code) >= p.col->levels.size()) continue;
+            const std::string& value = p.col->levels[static_cast<size_t>(code)];
+            if (value.empty()) continue;
+            const bool binary = value.find('\0') != std::string::npos;
+            o.lit("GSO");
+            o.u32(p.var_index);
+            if (release == 117) o.u32(static_cast<uint32_t>(row + 1));
+            else o.u64(static_cast<uint64_t>(row + 1));
+            o.u8v(binary ? 129 : 130);
+            o.u32(static_cast<uint32_t>(value.size() + (binary ? 0 : 1)));
+            o.bytes(value);
+            if (!binary) o.u8v(0);
+        }
+    }
+    o.lit("</strls>");
 
     // <value_labels> — one <lbl> per set, in the Stata packed layout (off/val/txt).
     // `slength` spans n/txtlen/off/val/txt ONLY: 8 + 8n + txtlen. That span is
@@ -614,7 +781,7 @@ void write_dta(const Frame& fr, const std::string& path, const DtaWriteOptions& 
             throw EngineError("data_io", "dta: value label '" + vl.name + "' text exceeds 4 GB");
         o.lit("<lbl>");
         o.u32(static_cast<uint32_t>(8ull + 8ull * n + txtlen));
-        o.field(vl.name, 129, "value-label set name", vl.name);
+        o.field(vl.name, kName, "value-label set name", vl.name);
         o.u8v(0); o.u8v(0); o.u8v(0);  // 3-byte padding the reader skips (dta_reader.cpp:419)
         o.u32(n);
         o.u32(static_cast<uint32_t>(txtlen));

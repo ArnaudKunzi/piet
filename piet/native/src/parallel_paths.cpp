@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // P9 automode · call-site path substitution. See parallel_paths.h for the
 // measured shapes this models and the one-sidedness argument.
 #include "piet/parallel_paths.h"

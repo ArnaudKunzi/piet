@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Group-level parallel execution — arc ① skeleton. See include/piet/parallel.h
 // for the design authority, the User rulings, and the arc boundary (what this
 // arc deliberately does NOT do).
@@ -12,11 +14,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -50,6 +55,29 @@ namespace {
 std::string trimCopy(const std::string& s) { return strutil::trim(s); }
 
 ojson errBlock(const std::string& msg) { return eval::engineError(msg); }
+
+// The parent<->worker protocol (spec in, result out) travels as CBOR, not JSON
+// text: a local read raw from a Latin-1 file, or a block that `type`s one,
+// holds bytes that are not UTF-8. A JSON dump throws on them (BUG-1131: the
+// whole run ended in type_error.316), and replacing them would hand the task
+// other bytes than the serial run sees (strlen 9 for "caf<E9> 12", not 7).
+// CBOR carries a string's bytes as they are, both ways.
+void writeProtocol(std::ostream& os, const ojson& doc) {
+  const std::vector<std::uint8_t> bytes = ojson::to_cbor(doc);
+  os.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+}
+
+void writeProtocol(std::FILE* f, const ojson& doc) {
+  const std::vector<std::uint8_t> bytes = ojson::to_cbor(doc);
+  std::fwrite(bytes.data(), 1, bytes.size(), f);
+}
+
+// The bytes of `path`, or nullopt when it cannot be opened.
+std::optional<std::string> readProtocolBytes(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return std::nullopt;
+  return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
 
 // Brace delta of one already-flattened body line, ignoring braces inside
 // double-quoted strings (a `display "a { b"` must not open a block). Stata has
@@ -410,11 +438,16 @@ ojson buildTaskSpec(const std::vector<std::string>& tasks, const SessionState& s
   // type float|double (c(type), BUG-471 T2 — without it a worker's untyped
   // gen/egen stores float after the parent's `set type double`). They are
   // one-way like every other §2.4 input — a child never returns them.
+  // BUG-1432: `set extcompat` lives in a process-global rather than on the
+  // session (settings.cpp), and a worker that is not told re-reads the durable
+  // setting: after `set extcompat off` a task ran the community names the
+  // serial run refuses r(199). It travels as the parent's live value.
   ojson sets = ojson::object();
   sets["graphics_off"] = session.graphicsOff;
   sets["level"] = session.level;
   if (session.seed.has_value()) sets["seed"] = *session.seed;
   sets["type"] = session.defaultStorageType;
+  sets["extcompat"] = settings::extcompatEnabled();
   spec["set_state"] = sets;
 
   // Programs: without these a child cannot run a task that calls one, and the
@@ -432,6 +465,26 @@ ojson buildTaskSpec(const std::vector<std::string>& tasks, const SessionState& s
     progs.push_back(pd);
   }
   spec["programs"] = progs;
+
+  // BUG-1430 (FU-223): per-variable metadata. A worker's session.load of the
+  // parent head reads only what the head file states (format, label), so the
+  // storage type a declaration, gen's implicit float or a widening replace
+  // recorded was lost there: a task's `replace x = x/3` into the parent's
+  // undeclared gen stored the double where the serial run rounds it to float
+  // (`count if x == float(1/3)`: 0 in the worker, 3 serially). One-way like the
+  // rest; the worker applies it to the head it loads.
+  ojson varMeta = ojson::object();
+  for (const auto& [name, m] : session.varMeta) {
+    ojson e = ojson::object();
+    if (m.label.has_value()) e["label"] = *m.label;
+    if (m.format.has_value()) e["format"] = *m.format;
+    if (m.stataType.has_value()) e["stata_type"] = *m.stataType;
+    varMeta[name] = e;
+  }
+  spec["var_meta"] = varMeta;
+  ojson implicitFloat = ojson::array();
+  for (const auto& name : session.implicitFloatVars) implicitFloat.push_back(name);
+  spec["implicit_float"] = implicitFloat;
 
   ojson globals = ojson::object();
   for (const auto& [k, v] : session.eval.globals.items()) globals[k] = v;
@@ -459,7 +512,8 @@ std::string dumpTaskSpecIfRequested(const ojson& spec) {
   std::filesystem::path p = std::filesystem::path(dir) / "task_spec.json";
   std::ofstream f(p);
   if (!f) return "";
-  f << spec.dump(2) << "\n";
+  // A human-readable copy: a byte that is not UTF-8 shows as U+FFFD (BUG-1131).
+  f << spec.dump(2, ' ', false, ojson::error_handler_t::replace) << "\n";
   f.close();
   return p.u8string();
 }
@@ -468,23 +522,19 @@ int runParallelWorker(const std::string& specPath) {
   ojson out = ojson::object();
   ojson spec;
   {
-    std::ifstream f(specPath);
-    if (!f) {
+    const std::optional<std::string> bytes = readProtocolBytes(specPath);
+    if (!bytes) {
       out["ok"] = false;
       out["driver_error"] = "cannot open task spec: " + specPath;
-      std::fputs(out.dump().c_str(), stdout);
-      std::fputc('\n', stdout);
+      writeProtocol(stdout, out);
       return 1;
     }
-    std::ostringstream ss;
-    ss << f.rdbuf();
     try {
-      spec = ojson::parse(ss.str());
+      spec = ojson::from_cbor(*bytes);
     } catch (const std::exception& e) {
       out["ok"] = false;
-      out["driver_error"] = std::string("bad task spec JSON: ") + e.what();
-      std::fputs(out.dump().c_str(), stdout);
-      std::fputc('\n', stdout);
+      out["driver_error"] = std::string("bad task spec: ") + e.what();
+      writeProtocol(stdout, out);
       return 1;
     }
   }
@@ -549,6 +599,8 @@ int runParallelWorker(const std::string& specPath) {
       session.seed = st["seed"].get<long long>();
     if (st.contains("type") && st["type"].is_string())
       session.defaultStorageType = st["type"].get<std::string>();
+    if (st.contains("extcompat") && st["extcompat"].is_boolean())
+      settings::setExtcompatEnabled(st["extcompat"].get<bool>());
   }
   if (spec.contains("programs") && spec["programs"].is_array()) {
     for (const auto& pd : spec["programs"]) {
@@ -568,15 +620,34 @@ int runParallelWorker(const std::string& specPath) {
   // read-only is what makes N children share one set of file pages (§2.4).
   std::string parentHead = spec.value("parent_head", std::string(""));
   if (!parentHead.empty()) {
+    Datastore* headDs = nullptr;
     try {
       session.load(parentHead);
-      session.datastore();  // fail loudly here, not on the first task's first verb
+      headDs = session.datastore();  // fail loudly here, not on the first task's first verb
     } catch (const std::exception& e) {
       out["ok"] = false;
       out["driver_error"] = std::string("parent_head load failed: ") + e.what();
-      std::fputs(out.dump().c_str(), stdout);
-      std::fputc('\n', stdout);
+      writeProtocol(stdout, out);
       return 1;
+    }
+    // BUG-1430: the parent's per-variable metadata, for the columns the head
+    // holds (a claim on a non-column is the BUG-190 family).
+    if (headDs != nullptr && spec.contains("var_meta") && spec["var_meta"].is_object()) {
+      for (auto it = spec["var_meta"].begin(); it != spec["var_meta"].end(); ++it) {
+        if (!headDs->has(it.key()) || !it.value().is_object()) continue;
+        const ojson& e = it.value();
+        VarMeta& m = session.varMeta[it.key()];
+        if (e.contains("label") && e["label"].is_string()) m.label = e["label"].get<std::string>();
+        if (e.contains("format") && e["format"].is_string())
+          m.format = e["format"].get<std::string>();
+        if (e.contains("stata_type") && e["stata_type"].is_string())
+          m.stataType = e["stata_type"].get<std::string>();
+      }
+    }
+    if (headDs != nullptr && spec.contains("implicit_float") && spec["implicit_float"].is_array()) {
+      for (const auto& name : spec["implicit_float"])
+        if (name.is_string() && headDs->has(name.get<std::string>()))
+          session.implicitFloatVars.insert(name.get<std::string>());
     }
   }
 
@@ -629,8 +700,7 @@ int runParallelWorker(const std::string& specPath) {
   }
   out["ok"] = true;
   out["tasks"] = results;
-  std::fputs(out.dump().c_str(), stdout);
-  std::fputc('\n', stdout);
+  writeProtocol(stdout, out);
   return 0;
 }
 
@@ -693,18 +763,16 @@ pid_t spawnWorker(const std::string& exe, const std::string& specPath,
 // Read one worker's protocol object and fold its single task row into `out`.
 void collectWorker(const std::string& outPath, int taskIndex, int childStatus,
                    TaskOutcome& out) {
-  std::ifstream f(outPath);
-  if (!f) {
+  const std::optional<std::string> bytes = readProtocolBytes(outPath);
+  if (!bytes) {
     out.driverError = "worker produced no output file";
     return;
   }
-  std::ostringstream ss;
-  ss << f.rdbuf();
   ojson doc;
   try {
-    doc = ojson::parse(ss.str());
+    doc = ojson::from_cbor(*bytes);
   } catch (const std::exception& e) {
-    out.driverError = std::string("worker output was not JSON: ") + e.what();
+    out.driverError = std::string("worker output was unreadable: ") + e.what();
     return;
   }
   if (!doc.value("ok", false)) {
@@ -770,7 +838,7 @@ std::vector<TaskOutcome> runTasksInWorkers(const std::vector<std::string>& tasks
   const int perWorkerThreads = budget.engineThreads;  // see resolveWorkers (§3.5)
   const std::string cobraBin = piet::resolveCobraBin();
 
-  struct Running { int taskIndex; std::string outPath; };
+  struct Running { int taskIndex; std::string specPath; std::string outPath; };
   std::map<pid_t, Running> running;
   size_t next = 0;
   const size_t slots = budget.n < 1 ? 1 : static_cast<size_t>(budget.n);
@@ -778,8 +846,8 @@ std::vector<TaskOutcome> runTasksInWorkers(const std::vector<std::string>& tasks
   auto launch = [&]() -> bool {
     if (next >= tasks.size()) return false;
     const size_t i = next++;
-    const std::string specPath = scratchDir + "/spec_" + std::to_string(i) + ".json";
-    const std::string outPath = scratchDir + "/out_" + std::to_string(i) + ".json";
+    const std::string specPath = scratchDir + "/spec_" + std::to_string(i) + ".cbor";
+    const std::string outPath = scratchDir + "/out_" + std::to_string(i) + ".cbor";
     registerScratchMint(specPath);  // BUG-389: protocol files die with the block
     registerScratchMint(outPath);
     // One task per spec — the unit the pull queue hands out. buildTaskSpec is
@@ -789,12 +857,12 @@ std::vector<TaskOutcome> runTasksInWorkers(const std::vector<std::string>& tasks
     spec["tasks"][0]["index"] = static_cast<int>(i);
     spec["workdir"] = scratchDir + "/w_" + std::to_string(i);
     {
-      std::ofstream sf(specPath);
+      std::ofstream sf(specPath, std::ios::binary);
       if (!sf) {
         outcomes[i].driverError = "could not write task spec";
         return true;  // consumed the task; report it rather than losing it
       }
-      sf << spec.dump() << "\n";
+      writeProtocol(sf, spec);
     }
     pid_t pid = spawnWorker(*exe, specPath, outPath, perWorkerThreads, budget.engineMemoryMb,
                             cobraBin);
@@ -802,7 +870,7 @@ std::vector<TaskOutcome> runTasksInWorkers(const std::vector<std::string>& tasks
       outcomes[i].driverError = "fork failed";
       return true;
     }
-    running.emplace(pid, Running{static_cast<int>(i), outPath});
+    running.emplace(pid, Running{static_cast<int>(i), specPath, outPath});
     return true;
   };
 
@@ -831,13 +899,23 @@ std::vector<TaskOutcome> runTasksInWorkers(const std::vector<std::string>& tasks
     // collectWorker has already read its protocol file, so nothing else will ever
     // look at this directory. Best-effort — a failed remove is not a reason to fail
     // the task whose results are already in hand.
+    // BUG-481: the task's spec and protocol files go with it. They used to stay
+    // until process exit (the exit scratch census read ORPHAN 2 per task).
     {
       std::error_code rmEc;
       std::filesystem::remove_all(scratchDir + "/w_" + std::to_string(it->second.taskIndex),
                                   rmEc);
+      std::filesystem::remove(it->second.specPath, rmEc);
+      std::filesystem::remove(it->second.outPath, rmEc);
     }
     running.erase(it);
     launch();  // the freed slot pulls the next unassigned task
+  }
+  // The block's own directory, empty once every task is reaped (a non-empty one
+  // -- waitpid failed with workers still out -- is left for the process teardown).
+  {
+    std::error_code rmEc;
+    std::filesystem::remove(scratchDir, rmEc);
   }
   return outcomes;
 #endif

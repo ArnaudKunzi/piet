@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Synthetic difference-in-differences, implemented from the published
 // methodology paper:
 //
@@ -5,11 +7,8 @@
 //             S. Wager (2021), "Synthetic Difference-in-Differences",
 //             American Economic Review 111(12), 4088-4118.
 //
-// Clean-room provenance: implemented from the paper cited above only. No
-// existing sdid (Stata or R) package source was read or consulted; conventions
-// the paper leaves open are pinned by this project's own committed goldens and
-// unit tests, per the clean-room precedent set for csdid
-// (docs/legal/CSDID_CLEANROOM_WALL.md).
+// Method source: the paper cited above. Conventions the paper leaves open are
+// pinned by this project's own committed goldens and unit tests.
 //
 // sdid_run implements AAHIW21's estimator (Algorithm 1): unit weights omega and
 // time weights lambda are each chosen by a separate regularized minimum-distance

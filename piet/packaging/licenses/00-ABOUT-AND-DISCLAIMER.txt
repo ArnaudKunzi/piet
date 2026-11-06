@@ -16,8 +16,12 @@ file formats.
 
 PIET also accepts command names introduced by independent community-authored
 Stata packages (reghdfe, csdid, rdrobust, esttab, and others — the full list is
-in NOTICE.txt section 2). These compatibility names do not install the original packages.
-See THIRD_PARTY_NOTICES.txt for included third-party components. Those names are accepted only while the
+in NOTICE.txt section 2). PIET contains no code from those packages
+except the declared adoptions listed in this file's "Adopted code" register and
+notices: estout/esttab/estadd/eststo, coefplot and texsave (MIT); outreg2,
+mat2txt, acreg, qreg2, ritest, lassopack and swindex (GPL v3). Every other
+estimator behind those names is an independent implementation written for
+this project from published methods. Those names are accepted only while the
 "external-library compatibility names" setting is enabled.
 
 Statistical output carries no warranty of accuracy or fitness for any purpose;

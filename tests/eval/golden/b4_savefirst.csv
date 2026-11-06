@@ -1,0 +1,10 @@
+key,value
+first_stage[mpg].n_obs,7.400000000000000e+01
+first_stage[mpg].df_r,6.900000000000000e+01
+first_stage[mpg].df_m,4.000000000000000e+00
+first_stage[mpg].k_eq,2.000000000000000e+00
+first_stage[mpg].rmse,3.461416162665537e+00
+first_stage[mpg].coef[headroom],1.612961072758275e-02
+first_stage[turn].k_eq,2.000000000000000e+00
+first_stage[turn].rmse,2.202473406240474e+00
+first_stage[turn].coef[headroom],-6.494452002516976e-02

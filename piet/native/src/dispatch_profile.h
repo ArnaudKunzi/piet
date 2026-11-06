@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #ifndef PIET_DISPATCH_PROFILE_H
 #define PIET_DISPATCH_PROFILE_H
 

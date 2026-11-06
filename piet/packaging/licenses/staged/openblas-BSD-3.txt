@@ -1,0 +1,8 @@
+STAGED PLACEHOLDER — NOT SHIPPED IN CURRENT (macOS) BUILDS
+Component : OpenBLAS (https://github.com/OpenMathLib/OpenBLAS)
+License   : BSD-3-Clause
+Activates : with static Linux/Windows builds that link OpenBLAS
+            (macOS builds use Apple Accelerate — no OpenBLAS is bundled).
+Action    : at the first such build, copy the verbatim LICENSE file from the
+            exact OpenBLAS version linked into a top-level NN-openblas-BSD-3.txt
+            in piet/packaging/licenses/ so it enters THIRD_PARTY_NOTICES.txt.

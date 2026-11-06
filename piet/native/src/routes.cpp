@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Bridge route handlers — M0 shipped echo/cobra.version; M4b (ROADMAP
 // §2.0.0 "M4b") wires the full CONTRACT.md Boundary-B surface onto the
 // dispatcher/doexec/SessionState/Datastore machinery M2/M3/M4a already
@@ -84,7 +86,14 @@ namespace {
 // **rejected** promise to CommandErrorResult at the JS seam; a **resolved**
 // promise carrying a `{type:"error",...}` block is already the shape the
 // console renderer expects, unchanged from the fetch-transport era.
-BridgeResult ok(const ojson& j) { return BridgeResult::success(j.dump()); }
+//
+// BUG-1372: a string function works on bytes, as Stata's do, so a block may
+// carry a split UTF-8 sequence; it is sent as U+FFFD, as the do paths send it
+// (main.cpp), instead of throwing the whole response away. So is a byte that is
+// not UTF-8 (BUG-1131).
+BridgeResult ok(const ojson& j) {
+  return BridgeResult::success(j.dump(-1, ' ', false, ojson::error_handler_t::replace));
+}
 
 BridgeResult harnessError(const std::string& code, const std::string& message) {
   ojson err;
@@ -263,7 +272,11 @@ BridgeResult browse(SessionState& session, const std::string& body) {
     vars = v;
   }
   Datastore* ds = session.datastore();
-  ojson result = ds->browse(offset, limit, vars, session.valueLabelMapForBrowse());
+  // format-display-default-lifecycle: the Data Editor grid renders each column
+  // in the format `list` and describe report (SessionState::displayFormat); this
+  // route used to pass no format map, so a `format x %td` never reached it.
+  ojson result = ds->browse(offset, limit, vars, session.valueLabelMapForBrowse(),
+                            session.displayFormatMap(ds->formatCard(vars)));
   return ok(result);
 }
 
@@ -692,9 +705,9 @@ BridgeResult varDetail(SessionState& session, const std::string& body) {
     return ok(engineErrorRest("Variable '" + name + "' not found."));
   }
 
-  // Metadata (dtype/label/n_missing) from the enriched varlist; format from
-  // the session format map (a .dta native format or a user `format VAR %fmt`),
-  // else VarInfo's %9.0g default — same source browse() uses.
+  // Metadata (dtype/label/n_missing/format) from the enriched varlist, whose
+  // format is the one resolver's answer (SessionState::displayFormat) -- the
+  // same one list, describe and `: format` report.
   VarInfo meta;
   for (const auto& v : session.varlistWithMeta(ds)) {
     if (v.name == name) {
@@ -702,13 +715,7 @@ BridgeResult varDetail(SessionState& session, const std::string& body) {
       break;
     }
   }
-  std::string fmt = meta.format;
-  for (const auto& [vn, f] : session.formatMapForBrowse()) {
-    if (vn == name) {
-      fmt = f;
-      break;
-    }
-  }
+  const std::string fmt = meta.format;
 
   ojson out;
   out["name"] = name;
@@ -804,8 +811,10 @@ BridgeResult legalNotices(const std::string& /*body*/) {
 
   // Dev run: concatenate the checked-in manifest (same NN-*.txt glob +
   // lexical order the packager uses).
-  if (auto root = devTreeRoot()) {
-    std::string licensesDir = *root + "/piet/packaging/licenses";
+  std::string root = std::string(__FILE__);
+  auto pos = root.rfind("/piet/native/src/routes.cpp");
+  if (pos != std::string::npos) {
+    std::string licensesDir = root.substr(0, pos) + "/piet/packaging/licenses";
     std::vector<std::string> parts;
     if (DIR* d = opendir(licensesDir.c_str())) {
       while (dirent* e = readdir(d)) {

@@ -1,0 +1,27 @@
+{
+  "kind": "marginsplot",
+  "model": "logit",
+  "n": 74,
+  "points": [
+    {
+      "b": -0.0197186624337883,
+      "ci_hi": -0.0007096408061415503,
+      "ci_lo": -0.03872768406143505,
+      "name": "mpg",
+      "se": 0.00969865863739716
+    },
+    {
+      "b": -0.0004569448233944694,
+      "ci_hi": -0.0003451081975920686,
+      "ci_lo": -0.0005687814491968702,
+      "name": "weight",
+      "se": 5.706055146143188e-05
+    }
+  ],
+  "title": "Average Marginal Effects (logit)",
+  "type": "graph",
+  "x_label": "",
+  "y_label": "Average marginal effect (dydx)",
+  "y_max": 0.0034931493887922294,
+  "y_min": -0.04256594164781935
+}

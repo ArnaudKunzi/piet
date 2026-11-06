@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "estimators/iv2sls.h"
 #include "core/error.h"
 
@@ -284,11 +286,16 @@ struct IvShared {
     std::vector<std::vector<double>> gammas;
     DofInfo dof;
     int k_full = 0;
+    // ivreg2 dofminus (xtivreg2: the absorbed groups, IvModelData::dofminus_fe); 0 otherwise.
+    int dofminus = 0;
     int dm_iters = 0;
     double dm_resid = 0;
     bool dm_conv = true;
     std::vector<std::string> names, endog_names;
     std::vector<std::string> omitted;  // excluded IVs annihilated by the FE absorption
+    // BUG-1225: included regressors annihilated by the FE absorption, and the
+    // pre-omission [exog, endog] names (both empty when nothing was dropped).
+    std::vector<std::string> omitted_exog, full_names;
     int64_t n_dropped = 0;
     // shared first-stage / weak-id stats
     std::vector<double> first_stage_F;
@@ -305,29 +312,58 @@ struct IvShared {
 
 IvShared iv_build_shared(IvModelData& md, Vcov vt, int cluster_index) {
     const int64_t n = md.n;
-    const int kexog = md.kexog, kendog = md.kendog;
-    // kinst/kw are NOT const: a collinear excluded instrument is dropped below
-    // (after the FE absorption reveals it), which shrinks both.
+    const int kendog = md.kendog;
+    // kexog/kx and kinst/kw are NOT const: a collinear included regressor (BUG-1225)
+    // and a collinear excluded instrument are dropped below (after the FE absorption
+    // reveals them), which shrinks them.
+    int kexog = md.kexog;
     int kinst = md.kinst;
-    const int kx = kexog + kendog;       // regressors
+    int kx = kexog + kendog;             // regressors
     int kw = kexog + kinst;              // instruments W = [exog, excluded IVs]
+    // The sample first: with no row every instrument is collinear, and Stata's
+    // `ivregress 2sls y (x = w) if 0` is "no observations" r(2000).
+    require_sample(n);
     if (kinst < kendog) throw EngineError("under_identified", "under-identified: fewer instruments than endogenous regressors");
     if (n <= kx) throw EngineError("no_obs", "not enough observations");
 
     IvShared S;
-    S.n = n; S.kexog = kexog; S.kendog = kendog; S.kx = kx;
+    S.n = n; S.kendog = kendog;
     S.n_dropped = md.n_dropped;
-    S.names = md.exog_names;
-    for (auto& s : md.endog_names) S.names.push_back(s);
     S.endog_names = md.endog_names;
 
     // --- demean exog, endog, instruments by the FE set (y demeaned by caller) ---
-    DemeanReport d1 = demean(md.Xexog.data(), n, kexog, md.fe);
-    DemeanReport d2 = demean(md.Xendog.data(), n, kendog, md.fe);
-    DemeanReport d3 = demean(md.Zinst.data(), n, kinst, md.fe);
+    // (already done, weighted, when iv_apply_weights met absorbed effects)
+    const std::vector<Factor> no_fe;
+    const std::vector<Factor>& dm_fe = md.fe_absorbed ? no_fe : md.fe;
+    DemeanReport d1 = demean(md.Xexog.data(), n, kexog, dm_fe);
+    DemeanReport d2 = demean(md.Xendog.data(), n, kendog, dm_fe);
+    DemeanReport d3 = demean(md.Zinst.data(), n, kinst, dm_fe);
     S.dm_iters = std::max(d1.iters, std::max(d2.iters, d3.iters));
     S.dm_resid = std::max(d1.resid, std::max(d2.resid, d3.resid));
     S.dm_conv = d1.converged && d2.converged && d3.converged;
+
+    // --- omit included regressors annihilated by the FE absorption (BUG-1225) -----
+    // A regressor constant within an absorbed level demeans to zero (or into the span
+    // of the earlier regressors). ivreghdfe's ivreg2_rmcollright2 sweeps the partialled
+    // [included exog, excluded IVs, endog] in that order and drops the later member of
+    // a collinear set, so such a regressor is omitted -- posted as b 0, se 0 -- and the
+    // rest is fitted with it out of K (StataBE: `ivreghdfe y x2 x3 (x1 = z1), absorb(id)`
+    // with x2 constant within id: x2 "(omitted)", F(2, 98), _b[x1] 2.0200764942375309,
+    // _se[x1] .065431301337589967). Earlier columns win, as in the instrument pass below.
+    if (kexog > 0 && !md.fe.empty() && static_cast<int>(md.exog_names.size()) == kexog) {
+        const std::vector<char> keep_x = collinear_keep_mask(md.Xexog.data(), n, kexog);
+        if (std::find(keep_x.begin(), keep_x.end(), 0) != keep_x.end()) {
+            S.full_names = md.exog_names;
+            for (const auto& s : md.endog_names) S.full_names.push_back(s);
+            S.omitted_exog = compact_columns(md.Xexog, n, md.kexog, md.exog_names, keep_x);
+            kexog = md.kexog;
+            kx = kexog + kendog;
+            kw = kexog + kinst;
+        }
+    }
+    S.kexog = kexog; S.kx = kx;
+    S.names = md.exog_names;
+    for (auto& s : md.endog_names) S.names.push_back(s);
 
     // --- omit excluded instruments annihilated by the FE absorption (§35) --------
     // An instrument that is constant within an absorbed FE level (the textbook case
@@ -338,8 +374,9 @@ IvShared iv_build_shared(IvModelData& md, Vcov vt, int cluster_index) {
     //
     // Scope is deliberately narrow — only the EXCLUDED-IV block may be dropped:
     //   * a rank-deficient EXOG block is a collinear-REGRESSOR problem whose remedy
-    //     is to change the reported coefficient set, not the instrument set, so it
-    //     still raises (the existing hard error stays reachable and correct);
+    //     is to change the reported coefficient set, not the instrument set; the
+    //     pass above already omitted such a regressor (BUG-1225), so the exog block
+    //     reaching here is full rank;
     //   * dropping below kendog surviving instruments is genuine under-identification
     //     and also still raises.
     // The engine has no warning channel on the success path (stderr is discarded
@@ -431,6 +468,7 @@ IvShared iv_build_shared(IvModelData& md, Vcov vt, int cluster_index) {
     S.dof = compute_dof(n, kx, md.fe);
     if (S.dof.dof_resid <= 0) throw EngineError("no_obs", "non-positive residual dof");
     S.k_full = kx + S.dof.k_fe;
+    S.dofminus = md.dofminus_fe ? S.dof.k_fe : 0;
 
     // --- first-stage F per endogenous regressor (homoskedastic) ---
     // F = gamma_inst' (W'W)_inst,inst^-1 gamma_inst / (kinst * sigma_u^2)
@@ -472,19 +510,14 @@ IvShared iv_build_shared(IvModelData& md, Vcov vt, int cluster_index) {
         // intercept column of the exog), so the base is 0; when FE are absorbed the
         // intercept is NOT in kw, so the base is 1 and each non-cluster-nested FE
         // adds (levels-1) — giving the absorbed-FE dof (e.g. one G-level FE => G).
-        int sdofminus = md.has_intercept ? 0 : 1;
-        for (const Factor& f : md.fe) {
-            bool nested = false;
-            if (cl) {
-                std::vector<int32_t> map(static_cast<size_t>(f.n_levels), -1);
-                nested = true;
-                for (int64_t i = 0; i < n && nested; ++i) {
-                    int32_t fc = f.codes[i], cc = cl->codes[i];
-                    if (map[static_cast<size_t>(fc)] == -1) map[static_cast<size_t>(fc)] = cc;
-                    else if (map[static_cast<size_t>(fc)] != cc) nested = false;
-                }
-            }
-            if (!nested) sdofminus += (f.n_levels - 1);
+        // With FE that count is ivreghdfe's absorb_ct: reghdfe's df_a under this
+        // vce's cluster nesting, floored at 1 (as ivreghdfe does, identified from its ado).
+        int sdofminus = (md.has_intercept || md.no_constant) ? 0 : 1;
+        if (!md.fe.empty()) {
+            std::vector<char> nested(md.fe.size(), 0);
+            if (cl)
+                for (size_t g = 0; g < md.fe.size(); ++g) nested[g] = fe_nested_in_cluster(md.fe[g], *cl);
+            sdofminus = std::max(absorbed_dof(md.fe, nested).df_a, 1);
         }
 
         // KP rk Wald F (1 endogenous: = robust first-stage F of the excluded IVs).
@@ -632,7 +665,7 @@ IvShared iv_build_shared(IvModelData& md, Vcov vt, int cluster_index) {
 // V = (X'Z Omega^-1 Z'X)^-1 (robust GMM SEs). Just-identified GMM == 2SLS.
 IvResult iv_solve_outcome(const IvShared& S, IvModelData& md, Vcov vt, int cluster_index,
                           int y_dm_iters, double y_dm_resid, bool y_dm_conv, bool gmm,
-                          bool small) {
+                          bool small, bool multiway_subset_factors = false) {
     const int64_t n = S.n;
     const int kendog = S.kendog, kinst = S.kinst, kx = S.kx, kw = S.kw;
     const double* W = S.W.data();
@@ -647,6 +680,8 @@ IvResult iv_solve_outcome(const IvShared& S, IvModelData& md, Vcov vt, int clust
     r.names = S.names;
     r.endog_names = S.endog_names;
     r.omitted = S.omitted;  // §35: excluded IVs the FE absorption annihilated
+    r.omitted_exog = S.omitted_exog;  // BUG-1225: regressors it annihilated
+    r.full_names = S.full_names;
     r.dof = S.dof;
     r.demean_iters = std::max(S.dm_iters, y_dm_iters);
     r.demean_resid = std::max(S.dm_resid, y_dm_resid);
@@ -672,11 +707,31 @@ IvResult iv_solve_outcome(const IvShared& S, IvModelData& md, Vcov vt, int clust
     // sigma2 (IID branch only): Stata `ivregress` defaults to ASYMPTOTIC (RSS/N);
     // `small` restores the N-K small-sample convention. dof.dof_resid (=N-K, a
     // structural count) is untouched either way.
-    r.sigma2 = small ? ssr / static_cast<double>(r.dof.dof_resid) : ssr / static_cast<double>(n);
+    // ivreg2 dofminus (xtivreg2's absorbed groups, S.dofminus): the large-sample
+    // sigma2 is rss/(N-dofminus) (livreg2 s_iegmm `sigmasq=ee/(N-dofminus)`); the small
+    // one, rss/(N-K-dofminus), is dof_resid already (k_fe = dofminus).
+    const int dm = S.dofminus;
+    r.sigma2 = small ? ssr / static_cast<double>(r.dof.dof_resid)
+                     : ssr / static_cast<double>(n - dm);
 
     // --- vcov: meat from instrumented Xhat, residuals from actual X ---
+    // FU-387: ivregress's `small` multiway variance is the built-in convention
+    // (per-combination factors, minus = rank); without `small` there is no factor at all,
+    // which the undo below reproduces from the Gmin sum (the clip is scale-free).
+    // w2s_multiway_class.log:880 mw_iv_c2s_se .0585934519606149, :816 .0503059336995026.
+    const bool subset_multiway = multiway_subset_factors && small && !gmm && vt == Vcov::Multiway;
     VcovResult vc = compute_vcov(vt, Xhat, n, kx, e.data(), bread, S.k_full,
-                                 r.sigma2, md.fe, md.cluster, cluster_index);
+                                 r.sigma2, md.fe, md.cluster, cluster_index, -1.0, false,
+                                 false, subset_multiway, nullptr, md.multiway_no_psd_fix);
+    // compute_vcov's nested-FE K is reghdfe's, rank + df_a + 1. ivreghdfe passes
+    // absorb_ct = max(df_a, 1) to ivreg2 as sdofminus and adds nothing for the
+    // nesting (as ivreghdfe does, identified from its ado), so its K is one lower whenever df_a > 0.
+    if (!vc.nested_fe.empty() && vc.cluster_dof_k > kx + 1) {
+        const double adj = static_cast<double>(n - vc.cluster_dof_k) /
+                           static_cast<double>(n - vc.cluster_dof_k + 1);
+        for (auto& v : vc.V) v *= adj;
+        vc.cluster_dof_k -= 1;
+    }
     // compute_vcov (shared with OLS/feols) always applies Stata's SMALL-sample
     // HC1/cluster factors. ivregress's default is asymptotic (HC0 / no
     // G/(G-1)*(N-1)/(N-K) factor) — undo the factor here unless --small was
@@ -692,6 +747,20 @@ IvResult iv_solve_outcome(const IvShared& S, IvModelData& md, Vcov vt, int clust
                           (static_cast<double>(n - vc.cluster_dof_k) / static_cast<double>(n - 1));
             for (auto& v : vc.V) v *= undo;
         }
+        // dofminus: m_omega's large-sample correction of the robust (not the cluster)
+        // meat, N/(N-dofminus); ivreg2's own note "No dofminus adjustment
+        // needed for cluster-robust" states the same rule. StataBE xtivreg2 1.0.17 probe
+        // (impl_F2/stata_probe): fe robust and fe [pw] reproduce to <=4e-16.
+        if (dm > 0 && vt == Vcov::HC1) {
+            const double adj = static_cast<double>(n) / static_cast<double>(n - dm);
+            for (auto& v : vc.V) v *= adj;
+        }
+    } else if (!gmm && dm > 0 && vt == Vcov::Cluster) {
+        // ivreg2's small cluster factor is (N-1)/(N-K)*M/(M-1) with K the regressors
+        // alone (ivreg2's rankxx; xtivreg2 calls it nocons, dofminus never
+        // enters it), where compute_vcov's K is the nested-FE-exempt cluster_dof_k.
+        const double adj = static_cast<double>(n - vc.cluster_dof_k) / static_cast<double>(n - kx);
+        for (auto& v : vc.V) v *= adj;
     }
     r.vcov_type = vc.type;
     r.n_clusters = vc.n_clusters;
@@ -867,11 +936,184 @@ IvResult iv_solve_outcome(const IvShared& S, IvModelData& md, Vcov vt, int clust
             }
         }
         r.rmse = std::sqrt(r.ssr / static_cast<double>(n));
+        // ivreg2's e(rmse) = sqrt(sigmasq): rss/(N-dofminus), or rss/(N-K-dofminus)
+        // under small (identified from ivreg2's ado).
+        if (S.dofminus > 0 && !gmm)
+            r.rmse = std::sqrt(r.ssr / static_cast<double>(small ? r.dof.dof_resid : n - S.dofminus));
     }
     return r;
 }
 
 }  // namespace
+
+// ---- ivreg2 e(first): the first-stage summary statistics (s_ffirst) ------------
+// ivreg2 4.1.12's s_ffirst (identified from its ado), for each endogenous regressor i:
+//  * rmse = sqrt(rss_i/(N-L)); sheapr2 = diag(X'X)^-1 / diag(X'PzX)^-1 at i;
+//  * the Wald test of the excluded instruments in the first stage, classical with
+//    sigma2 = rss_i/N, giving pr2 = (W/N)/(1+W/N); under robust or cluster the
+//    Wald is recomputed from the raw sandwich (Z'Z)^-1 S (Z'Z)^-1 (m_omega has no
+//    small-sample factor; the F carries it);
+//  * F = W/N*(N-L)/L1 with df_r = N-L, or under cluster W/(N-1)*(N-L)*(G-1)/G/L1
+//    with df_r = G-1; pvalue = Ftail(L1, df_r, F);
+//  * one endogenous regressor: the Sanderson-Windmeijer and Angrist-Pischke rows
+//    repeat F, its Wald (chi2) and pr2; with several, each is the excluded-
+//    instrument test in the regression of the partialled residual of X1_i on Z,
+//    where AP partials the OTHER fitted endogenous regressors (and the exogenous
+//    ones) out of X1_i and SW uses the actual ones with the same coefficients,
+//    on L1-K1+1 numerator degrees of freedom.
+// dofminus is 0 for the plain ivreg2 fit, and S.dofminus (the absorbed groups) for
+// xtivreg2's (s_ffirst with dofminus d, sdofminus 0): the classical sigma2 is rss/(N-d)
+// and the robust (not cluster) meat carries N/(N-d), so pr2 = (W/(N-d))/(1+W/(N-d));
+// F = W/(N-d)*(N-d-L)/L1 with df_r = N-d-L (cluster: unchanged, df_r = G-1); rmse =
+// sqrt(rss/(N-L-d)) (identified from ivreg2's ado). Other absorbed effects (ivreghdfe's
+// sdofminus) are not captured, and a multiway m_omega is not implemented here, so
+// both leave ffirst empty (the caller then posts no e(first)).
+static void iv_fill_ffirst(const IvShared& S, IvModelData& md, Vcov vt, int cluster_index,
+                           std::vector<IvFirstStage>& out) {
+    if (!md.fe.empty() && S.dofminus == 0) return;
+    if (vt != Vcov::IID && vt != Vcov::HC1 && vt != Vcov::Cluster) return;
+    const int64_t n = S.n;
+    const int kw = S.kw, kexog = S.kexog, L1 = S.kinst, K1 = S.kendog, kx = S.kx;
+    if (L1 <= 0 || static_cast<int>(out.size()) != K1) return;
+    const double N = static_cast<double>(n), L = static_cast<double>(kw);
+    const double d = static_cast<double>(S.dofminus);
+    const bool robust = vt != Vcov::IID;
+    const bool clust = vt == Vcov::Cluster;
+    const Factor* cl = nullptr;
+    if (clust) {
+        if (cluster_index < 0 || cluster_index >= static_cast<int>(md.cluster.size())) return;
+        cl = &md.cluster[static_cast<size_t>(cluster_index)];
+    }
+    const int G = cl ? cl->n_levels : 0;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double* W = S.W.data();
+    const double* breadW = S.breadW.data();
+
+    auto exclBlock = [&](const double* V) {
+        std::vector<double> B(static_cast<size_t>(L1) * L1);
+        for (int b = 0; b < L1; ++b)
+            for (int a = 0; a < L1; ++a)
+                B[static_cast<size_t>(a) + static_cast<size_t>(b) * L1] =
+                    V[static_cast<size_t>(kexog + a) + static_cast<size_t>(kexog + b) * kw];
+        return B;
+    };
+    auto quad = [&](std::vector<double> B, const double* rb) -> double {
+        if (la::spd_inverse(B.data(), L1) != 0) return nan;
+        std::vector<double> t(static_cast<size_t>(L1));
+        la::matvec(B.data(), L1, rb, t.data());
+        double q = 0;
+        for (int a = 0; a < L1; ++a) q += rb[a] * t[static_cast<size_t>(a)];
+        return q;
+    };
+    // The Wald statistic of the excluded-instrument coefficients of a regression on
+    // W with coefficients c and residual r: classical, and robust/cluster when asked.
+    auto waldPair = [&](const std::vector<double>& c, const std::vector<double>& r, double& classical,
+                        double& active) {
+        const double* rb = c.data() + kexog;
+        const double s2 = la::sumsq(r.data(), n) / (N - d);  // COBRA-DD-ACCUM (T1)
+        std::vector<double> Vc = exclBlock(breadW);
+        for (auto& v : Vc) v *= s2;
+        classical = quad(Vc, rb);
+        active = classical;
+        if (robust) {
+            std::vector<double> M = iv_robust_meat(W, n, kw, r.data(), cl, G, clust);
+            std::vector<double> tmp(static_cast<size_t>(kw) * kw, 0.0), Vg(static_cast<size_t>(kw) * kw, 0.0);
+            la::sandwich(breadW, M.data(), kw, (!clust && d > 0) ? N / (N - d) : 1.0, Vg.data(),
+                         tmp.data());
+            active = quad(exclBlock(Vg.data()), rb);
+        }
+    };
+    auto fOf = [&](double wald, double df1) {
+        return clust ? wald / (N - 1.0) * (N - L) * (G - 1.0) / G / df1
+                     : wald / (N - d) * (N - d - L) / df1;
+    };
+    auto r2Of = [&](double wald) { return (wald / (N - d)) / (1.0 + wald / (N - d)); };
+    const double dfr = clust ? G - 1.0 : N - d - L;
+    auto ftail = [&](double x, double d1, double d2) { return std::isfinite(x) ? f_pvalue(x, d1, d2) : nan; };
+    auto chi2tail = [&](double x, double d) { return std::isfinite(x) ? chi2_pvalue(x, d) : nan; };
+
+    // sheapr2's numerator: diag (X'X)^-1, X = [exog, endog] as fitted.
+    std::vector<double> XXinv(static_cast<size_t>(kx) * kx);
+    la::xtx(S.X.data(), n, kx, XXinv.data());
+    const bool haveXX = la::spd_inverse(XXinv.data(), kx) == 0;
+
+    for (int i = 0; i < K1; ++i) {
+        IvFirstStage& f = out[static_cast<size_t>(i)];
+        const int col = kexog + i;
+        std::vector<double> u(static_cast<size_t>(n));
+        la::residual(W, n, kw, S.gammas[static_cast<size_t>(i)].data(), md.endog(i), u.data());
+        double wc = nan, wr = nan;
+        waldPair(S.gammas[static_cast<size_t>(i)], u, wc, wr);
+        const double rmse = (N - L - d > 0) ? std::sqrt(la::sumsq(u.data(), n) / (N - L - d)) : nan;
+        const double shea =
+            haveXX ? XXinv[static_cast<size_t>(col) * (kx + 1)] / S.bread[static_cast<size_t>(col) * (kx + 1)]
+                   : nan;
+        const double pr2 = r2Of(wc);
+        const double F = fOf(wr, L1);
+        const double p = ftail(F, L1, dfr);
+        double Fdf1 = L1, swF = F, swChi2 = wr, swR2 = pr2, apF = F, apChi2 = wr, apR2 = pr2;
+        if (K1 > 1) {
+            Fdf1 = L1 - K1 + 1;
+            // Every regressor but X1_i, fitted (AP) and actual (SW).
+            const int km = kx - 1;
+            std::vector<double> Xh(static_cast<size_t>(n) * km), Xa(static_cast<size_t>(n) * km);
+            for (int j = 0, c = 0; j < kx; ++j) {
+                if (j == col) continue;
+                std::copy(S.Xhat.data() + static_cast<int64_t>(j) * n,
+                          S.Xhat.data() + static_cast<int64_t>(j + 1) * n, Xh.data() + static_cast<int64_t>(c) * n);
+                std::copy(S.X.data() + static_cast<int64_t>(j) * n, S.X.data() + static_cast<int64_t>(j + 1) * n,
+                          Xa.data() + static_cast<int64_t>(c) * n);
+                ++c;
+            }
+            std::vector<double> XhXh(static_cast<size_t>(km) * km), b1(static_cast<size_t>(km)),
+                Xhx(static_cast<size_t>(km));
+            la::xtx(Xh.data(), n, km, XhXh.data());
+            la::xtv(Xh.data(), n, km, md.endog(i), Xhx.data());
+            if (la::spd_inverse(XhXh.data(), km) == 0) {
+                la::matvec(XhXh.data(), km, Xhx.data(), b1.data());
+                auto partialStat = [&](const std::vector<double>& Xs, double& Fo, double& chi2o, double& r2o) {
+                    std::vector<double> e1(static_cast<size_t>(n));
+                    la::residual(Xs.data(), n, km, b1.data(), md.endog(i), e1.data());
+                    std::vector<double> We(static_cast<size_t>(kw)), c2(static_cast<size_t>(kw));
+                    la::xtv(W, n, kw, e1.data(), We.data());
+                    la::matvec(breadW, kw, We.data(), c2.data());
+                    std::vector<double> e2(static_cast<size_t>(n));
+                    la::residual(W, n, kw, c2.data(), e1.data(), e2.data());
+                    double c = nan, a = nan;
+                    waldPair(c2, e2, c, a);
+                    r2o = r2Of(c);
+                    chi2o = a;
+                    Fo = fOf(a, Fdf1);
+                };
+                partialStat(Xh, apF, apChi2, apR2);
+                partialStat(Xa, swF, swChi2, swR2);
+            } else {
+                swF = swChi2 = swR2 = apF = apChi2 = apR2 = nan;
+            }
+        }
+        f.ffirst = {rmse,
+                    shea,
+                    pr2,
+                    F,
+                    static_cast<double>(L1),
+                    dfr,
+                    p,
+                    swF,
+                    Fdf1,
+                    dfr,
+                    ftail(swF, Fdf1, dfr),
+                    swChi2,
+                    chi2tail(swChi2, Fdf1),
+                    swR2,
+                    apF,
+                    Fdf1,
+                    dfr,
+                    ftail(apF, Fdf1, dfr),
+                    apChi2,
+                    chi2tail(apChi2, Fdf1),
+                    apR2};
+    }
+}
 
 // ---- ivreg2 `savefirst`: the stored first-stage estimate, one per endogenous ----
 // The design, the coefficients and the bread all already exist in IvShared: W is
@@ -896,7 +1138,7 @@ static std::vector<IvFirstStage> iv_build_first_stages(const IvShared& S, IvMode
     // from all 106 corpus packages, so nothing here extrapolates to xtivreg2's naming
     // rule either. Reopen with an `ivreghdfe … absorb() savefirst` capture.
     const int k_full = kw + S.dof.k_fe;
-    // ivreg2.ado:648-655 posts cnZ1 = exexog1 inexog1 _cons. cobra's W is the other
+    // ivreg2 posts cnZ1 = exexog1 inexog1 _cons. cobra's W is the other
     // way round (constant first, then included exog, then the excluded IVs), so build
     // the permutation once and apply it to names, beta, se and V together.
     std::vector<int> perm;
@@ -921,17 +1163,26 @@ static std::vector<IvFirstStage> iv_build_first_stages(const IvShared& S, IvMode
         IvFirstStage f;
         f.depvar = S.endog_names[static_cast<size_t>(j)];
         f.n = n;
-        f.df_r = n - k_full;      // :3143 — unconditional on cluster (arm E: 70, not M-1=8)
+        f.df_r = n - k_full;      // ivreg2 posts this unconditionally on cluster (arm E: 70, not M-1=8)
         f.df_m = kw - (md.has_intercept ? 1 : 0);
-        f.k_eq = S.kendog;        // :3153 posts the ENDOGENOUS COUNT (arm A: 2 on both eqs)
+        f.k_eq = S.kendog;        // ivreg2 posts the ENDOGENOUS COUNT (arm A: 2 on both eqs)
         la::residual(S.W.data(), n, kw, S.gammas[static_cast<size_t>(j)].data(), md.endog(j),
                      u.data());
         f.rss = la::sumsq(u.data(), n);  // COBRA-DD-ACCUM (T1)
         const double dfr = static_cast<double>(f.df_r);
         const double sigma2 = (dfr > 0) ? f.rss / dfr : 0.0;
-        f.rmse = std::sqrt(sigma2);      // :6151
+        f.rmse = std::sqrt(sigma2);      // ivreg2's rmse
         VcovResult vc = compute_vcov(vt, S.W.data(), n, kw, u.data(), S.breadW.data(), k_full,
                                      sigma2, md.fe, md.cluster, cluster_index);
+        // xtivreg2 (dofminus): the stage's cluster factor is (N-1)/(N-iv1_ct)*M/(M-1),
+        // iv1_ct the instruments alone (as in ivreg2); compute_vcov's K is the
+        // nested-FE-exempt cluster_dof_k. iid and robust already match: their factors
+        // (N-dofminus)/(N-iv1_ct-dofminus) on top of m_omega's N/(N-dofminus) are
+        // k_full = iv1_ct + dofminus.
+        if (S.dofminus > 0 && vt == Vcov::Cluster) {
+            const double adj = static_cast<double>(n - vc.cluster_dof_k) / static_cast<double>(n - kw);
+            for (auto& v : vc.V) v *= adj;
+        }
         f.vcov_type = vc.type;
         f.n_clusters = vc.n_clusters;
         f.names.reserve(static_cast<size_t>(kw));
@@ -949,19 +1200,89 @@ static std::vector<IvFirstStage> iv_build_first_stages(const IvShared& S, IvMode
         }
         out.push_back(std::move(f));
     }
+    iv_fill_ffirst(S, md, vt, cluster_index, out);
     return out;
 }
 
+// [aw=]/[pw=] observation weights, as ivreg2 handles them: pweight is aweight plus
+// robust, and every weighted moment carries wf*w with wf = N/sum(w), so the weights
+// are normalized to sum to the row count and e(N) stays the row count. Multiplying
+// y and every column of X and Z (the constant included) by sqrt(wf*w) turns each
+// cross-product the fit forms into that weighted one: b is weighted 2SLS, the iid
+// variance's sigma2 is sum(wf*w*e^2)/N, and a robust or cluster score z*e becomes
+// wf*w*z*e. With absorbed effects the within transform comes FIRST and is weighted:
+// each variable minus its group mean sum(w*v)/sum(w) (as xtivreg2 does, `sum(var*
+// wvar)/sum(wvar)` with the raw weight, [pw] included), and only then the sqrt(wf*w)
+// scaling; md.fe_absorbed then tells the later demeaning passes it is done.
+// sqrt(wf*w) per row, after checking the weights; empty when md carries none.
+static std::vector<double> iv_weight_scale(const IvModelData& md) {
+    if (md.weights.empty()) return {};
+    if (md.weight_kind != WeightKind::Analytic && md.weight_kind != WeightKind::Probability)
+        throw EngineError("bad_input", "iv: only [aweight=] and [pweight=] are implemented");
+    const int64_t n = md.n;
+    if (static_cast<int64_t>(md.weights.size()) != n)
+        throw EngineError("internal", "iv: weight vector does not match the estimation sample");
+    double sw = 0;
+    for (double w : md.weights) sw += w;
+    if (!(sw > 0)) throw EngineError("bad_input", "iv: the weights sum to zero");
+    const double wf = static_cast<double>(n) / sw;
+    std::vector<double> s(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) s[static_cast<size_t>(i)] = std::sqrt(wf * md.weights[static_cast<size_t>(i)]);
+    return s;
+}
+
+static void iv_scale_rows(std::vector<double>& M, int k, int64_t n, const std::vector<double>& s) {
+    for (int j = 0; j < k; ++j)
+        for (int64_t i = 0; i < n; ++i) M[static_cast<size_t>(j) * n + i] *= s[static_cast<size_t>(i)];
+}
+
+// The X side (exog, endog, instruments): weighted within transform, then scaling.
+static void iv_apply_weights_x(IvModelData& md, const std::vector<double>& s) {
+    const int64_t n = md.n;
+    if (!md.fe.empty()) {
+        const double* wv = md.weights.data();
+        DemeanReport b = demean(md.Xexog.data(), n, md.kexog, md.fe, wv);
+        DemeanReport c = demean(md.Xendog.data(), n, md.kendog, md.fe, wv);
+        DemeanReport e = demean(md.Zinst.data(), n, md.kinst, md.fe, wv);
+        if (!(b.converged && c.converged && e.converged))
+            throw EngineError("no_convergence", "iv: the weighted within transformation did not converge");
+        md.fe_absorbed = true;
+    }
+    iv_scale_rows(md.Xexog, md.kexog, n, s);
+    iv_scale_rows(md.Xendog, md.kendog, n, s);
+    iv_scale_rows(md.Zinst, md.kinst, n, s);
+}
+
+// One outcome: the same weighted within transform and scaling.
+static DemeanReport iv_apply_weights_y(IvModelData& md, const std::vector<double>& s) {
+    DemeanReport a;
+    if (!md.fe.empty()) {
+        a = demean(md.y.data(), md.n, 1, md.fe, md.weights.data());
+        if (!a.converged)
+            throw EngineError("no_convergence", "iv: the weighted within transformation did not converge");
+    }
+    iv_scale_rows(md.y, 1, md.n, s);
+    return a;
+}
+
+static void iv_apply_weights(IvModelData& md) {
+    const std::vector<double> s = iv_weight_scale(md);
+    if (s.empty()) return;
+    iv_apply_weights_y(md, s);
+    iv_apply_weights_x(md, s);
+}
+
 IvResult iv2sls_fit(IvModelData& md, Vcov vt, int cluster_index, bool gmm, bool small,
-                    bool savefirst) {
-    DemeanReport d0 = demean(md.y.data(), md.n, 1, md.fe);
+                    bool savefirst, bool multiway_subset_factors) {
+    iv_apply_weights(md);
+    DemeanReport d0 = md.fe_absorbed ? DemeanReport{} : demean(md.y.data(), md.n, 1, md.fe);
     // GMM needs the efficient (robust) weight matrix → force the weak-id/meat plumbing
     // on so S.cl/S.G/S.weakid_on are populated even under a nominally-iid vcov request.
     IvShared S = iv_build_shared(md, gmm ? (vt == Vcov::Cluster ? vt : Vcov::HC1) : vt,
                                  cluster_index);  // demeans the X side
     if (gmm) S.weakid_on = true;
     IvResult r = iv_solve_outcome(S, md, vt, cluster_index, d0.iters, d0.resid, d0.converged,
-                                  gmm, small);
+                                  gmm, small, multiway_subset_factors);
     // The first stage does not involve y, so it is built off the shared X-side algebra
     // and is identical for every outcome in the multi batch below.
     if (savefirst) r.first_stage = iv_build_first_stages(S, md, vt, cluster_index);
@@ -972,6 +1293,9 @@ IvResult iv2sls_fit(IvModelData& md, Vcov vt, int cluster_index, bool gmm, bool 
 std::vector<IvResult> iv2sls_fit_multi(IvModelData& md, std::vector<std::vector<double>>& ys,
                                        Vcov vt, int cluster_index, bool gmm, bool small,
                                        bool savefirst) {
+    // Weighted: the X side is transformed once here, each outcome in the loop.
+    const std::vector<double> ws = iv_weight_scale(md);
+    if (!ws.empty()) iv_apply_weights_x(md, ws);
     IvShared S = iv_build_shared(md, gmm ? (vt == Vcov::Cluster ? vt : Vcov::HC1) : vt,
                                  cluster_index);  // demean X side + algebra ONCE
     if (gmm) S.weakid_on = true;
@@ -983,7 +1307,7 @@ std::vector<IvResult> iv2sls_fit_multi(IvModelData& md, std::vector<std::vector<
     out.reserve(ys.size());
     for (auto& yraw : ys) {
         md.y = yraw;  // copy (demean mutates in place)
-        DemeanReport d0 = demean(md.y.data(), md.n, 1, md.fe);
+        DemeanReport d0 = ws.empty() ? demean(md.y.data(), md.n, 1, md.fe) : iv_apply_weights_y(md, ws);
         out.push_back(iv_solve_outcome(S, md, vt, cluster_index, d0.iters, d0.resid, d0.converged, gmm, small));
         if (savefirst) out.back().first_stage = fs;
     }

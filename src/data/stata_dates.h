@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — Stata daily-date arithmetic (%td), single-sourced.
 //
 // BUG-371. Stata's daily date is a signed DAY COUNT with 1960-01-01 == 0, so
@@ -15,6 +17,8 @@
 // a fractional or negative %td cell. Same calendar, different contract; they are
 // cross-checked by test rather than by sharing code.
 #pragma once
+#include "core/ident.h"  // non-ASCII bytes are identifier bytes (Unicode names)
+
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -51,21 +55,35 @@ inline void civil_from_days(int64_t z, int64_t& y, int64_t& m, int64_t& d) {
 
 enum DatePart { DP_year, DP_month, DP_day, DP_dow, DP_doy, DP_quarter, DP_half };
 
+// Stata's %td calendar is 01jan0100 .. 31dec9999 (fn.pdf: "Domain e_d: e_d dates
+// 01jan0100 to 31dec9999 (integers -679,350 to 2,936,549)"). Captured, StataNow
+// 19.5 (internal notes w2y_fn_datetime_probe): mdy(1,1,100) is
+// -679350, mdy(12,31,99) is missing, year(-679351) and year(2936550) are missing.
+inline constexpr int64_t kStataDayMin = -679350;
+inline constexpr int64_t kStataDayMax = 2936549;
+
 // mdy(M,D,Y) -> Stata daily date, or NaN (missing).
 //
 // The round-trip at the end is not belt-and-braces: days_from_civil happily
 // NORMALISES a date that does not exist (Feb 30 becomes Mar 1), and returning
 // that would be a wrong number rather than an error. Stata returns missing for
 // an impossible date, so the only safe test is "does it come back as what went
-// in". Non-integer or out-of-range arguments are missing too.
+// in".
+//
+// Each argument is TRUNCATED first, as Stata does (w2y_fn_datetime fd_mdy_edges2:
+// mdy(1.5,1,2000) = mdy(1,1.9,2000) = mdy(1,1,2000.5) = 14610; probe p_mdy_d299:
+// mdy(2,29.5,2000) = 14669), and the year must lie in 100..9999 (p_mdy_99,
+// p_mdy_10000). This is the builder the mdy() FUNCTION uses; the literal and
+// string-mask paths call it only with whole numbers.
 inline double stata_mdy(double mm, double dd, double yy) {
     const double NA = std::numeric_limits<double>::quiet_NaN();
     if (std::isnan(mm) || std::isnan(dd) || std::isnan(yy)) return NA;
-    if (mm != std::floor(mm) || dd != std::floor(dd) || yy != std::floor(yy)) return NA;
+    if (!std::isfinite(mm) || !std::isfinite(dd) || !std::isfinite(yy)) return NA;
+    mm = std::trunc(mm); dd = std::trunc(dd); yy = std::trunc(yy);
+    if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return NA;
+    if (yy < 100 || yy > 9999) return NA;
     const int64_t m = static_cast<int64_t>(mm), d = static_cast<int64_t>(dd),
                   y = static_cast<int64_t>(yy);
-    if (m < 1 || m > 12 || d < 1 || d > 31) return NA;
-    if (y < -9999 || y > 9999) return NA;
     const int64_t z = days_from_civil(y, m, d);
     int64_t ry = 0, rm = 0, rd = 0;
     civil_from_days(z, ry, rm, rd);
@@ -74,12 +92,17 @@ inline double stata_mdy(double mm, double dd, double yy) {
 }
 
 // The inverse family. A fractional %td value floors (Stata renders 42.9 as the
-// same day as 42), and missing in means missing out.
+// same day as 42), and missing in means missing out. A floored day outside the
+// calendar is missing (probe p_year_-679350.5, p_year_2936550, p_doy_2936550),
+// except dow(), which Stata answers past the upper end (p_dow_2936550 = 6) but not
+// below the lower one (p_dow_-679351).
 inline double stata_date_part(double t, DatePart part) {
     const double NA = std::numeric_limits<double>::quiet_NaN();
     if (std::isnan(t)) return NA;
     const double ft = std::floor(t);
     if (!std::isfinite(ft) || std::fabs(ft) > 4.0e6) return NA;  // far outside any real calendar
+    if (ft < static_cast<double>(kStataDayMin)) return NA;
+    if (part != DP_dow && ft > static_cast<double>(kStataDayMax)) return NA;
     const int64_t td = static_cast<int64_t>(ft);
     const int64_t z = td - kStataEpochShift;
     int64_t y = 0, m = 0, d = 0;
@@ -110,7 +133,7 @@ inline double stata_date_part(double t, DatePart part) {
 // Every constant below was MEASURED against StataNow 19.5 BE rather than
 // recalled -- tests/validate/b3_funcs_oracle.{do,json} is the capture, and
 // the five prose prescriptions it overturned are written up in
-// private-notes/plans/ONESHOT-AER-SCOPE2-PLAN-20260907.md section 7.7.
+// internal note ONESHOT-AER-SCOPE2-PLAN-20260907.md section 7.7.
 //
 // The scales, with the oracle key that pins each:
 //   %tm  months  since 1960m1  == 0   (ym.2020.3   -> 722)
@@ -153,7 +176,31 @@ inline bool period_arg(double v, int64_t& out, double limit = 4.0e8) {
 // ---- builders: (year, period) -> scale value ----------------------
 // Out-of-range periods are MISSING, not wrapped: ym(2020,13) and ym(2020,0)
 // both answer `.` (oracle ym.ovf / ym.zero).
+//
+// Two builders, because Stata has two. The ym()/yq()/yh()/yw() FUNCTIONS are
+// linear in their arguments and take years 1000..9999 only (fn.pdf "Domain Y:
+// integers 1000 to 9999"; captured: ym(2000,2.5) = 481.5, ym(2000.5,2) = 487,
+// yq(2020.5,3) = 244, ym(1960,0.99) and ym(1960,12.5) missing, ym(100,1),
+// ym(101,1) and ym(9999.5,1) missing, ym(9999,12) = 96479 -- w2y_fn_datetime
+// fd_ym_edges/fd_yq_real and the probe's p_ym_* rows). The bound is checked on
+// the arguments as given, so a fractional year or period is not floored first.
 inline double stata_y_period(double yy, double pp, int64_t per_year) {
+    const double NA = std::numeric_limits<double>::quiet_NaN();
+    if (std::isnan(yy) || std::isnan(pp) || !std::isfinite(yy) || !std::isfinite(pp)) return NA;
+    if (pp < 1.0 || pp > static_cast<double>(per_year)) return NA;
+    if (yy < 1000.0 || yy > 9999.0) return NA;
+    return (yy - 1960.0) * static_cast<double>(per_year) + (pp - 1.0);
+}
+inline double stata_ym(double y, double m) { return stata_y_period(y, m, 12); }
+inline double stata_yq(double y, double q) { return stata_y_period(y, q, 4); }
+inline double stata_yh(double y, double h) { return stata_y_period(y, h, 2); }
+inline double stata_yw(double y, double w) { return stata_y_period(y, w, 52); }
+
+// The literal tm()/tq()/th()/tw() pseudo-functions and the monthly()/quarterly()
+// string translators build from whole numbers parsed out of text, and they are
+// NOT held to the function's 1000 floor: tm(0100m1) is -22320 and tq(0100q1) is
+// -7440 (probe p_lit_2, p_lit_4). This keeps the builder those paths always had.
+inline double stata_y_period_exact(double yy, double pp, int64_t per_year) {
     const double NA = std::numeric_limits<double>::quiet_NaN();
     int64_t y = 0, p = 0;
     if (!period_arg(yy, y, 9999.0) || !period_arg(pp, p)) return NA;
@@ -162,18 +209,36 @@ inline double stata_y_period(double yy, double pp, int64_t per_year) {
     if (y < -9999 || y > 9999) return NA;
     return static_cast<double>((y - 1960) * per_year + (p - 1));
 }
-inline double stata_ym(double y, double m) { return stata_y_period(y, m, 12); }
-inline double stata_yq(double y, double q) { return stata_y_period(y, q, 4); }
-inline double stata_yh(double y, double h) { return stata_y_period(y, h, 2); }
-inline double stata_yw(double y, double w) { return stata_y_period(y, w, 52); }
 
 // ---- %td -> coarser scale ----------------------------------------
 enum DateScale { DS_month, DS_quarter, DS_half, DS_year, DS_week };
 
+// BUG-1374: wofd() of a floored day outside the calendar is not missing in
+// StataBE 19.5 (mofd/qofd/hofd/yofd are). It answers a week of year 1 whose
+// index is the day's distance from 2147483643, wrapped to a signed 32-bit
+// value, floored by 7 and clamped at 51 like any week -- and missing once the
+// day itself leaves the 32-bit range. No calendar gives these numbers; the
+// model is fitted to the capture and reproduces every captured day (lane
+// expr-sem x1b/a14-a16.do): wofd(-679351), wofd(-2000000) and wofd(-1e9)
+// -101817, wofd(-2147483648) -101868, wofd(2936550..2936552) -306465739,
+// wofd(2936553) -306465738, wofd(5000000) -306170960, wofd(1e9) -164028103,
+// wofd(2e9) -21170960, wofd(2147483647) -101868, wofd(2147483648) and
+// wofd(-1e10) missing.
+inline double stata_week_outside_calendar(int64_t td) {
+    if (td < INT32_MIN || td > INT32_MAX) return std::numeric_limits<double>::quiet_NaN();
+    const int64_t off = floor_mod(td - 2147483643LL + 2147483648LL, 4294967296LL) - 2147483648LL;
+    const int64_t w = floor_div(off, 7);
+    return static_cast<double>((1 - 1960) * 52 + (w < 51 ? w : 51));
+}
+
 inline double stata_scale_of_day(double t, DateScale scale) {
     const double NA = std::numeric_limits<double>::quiet_NaN();
     int64_t td = 0;
-    if (!period_arg(t, td, 4.0e6)) return NA;
+    if (!period_arg(t, td, scale == DS_week ? 2147483648.0 : 4.0e6)) return NA;
+    // mofd/qofd/hofd/yofd of a floored day outside the calendar are missing
+    // (probe p_mofd_-679351, p_yofd_2936550, p_hofd_-1000000).
+    if (td < kStataDayMin || td > kStataDayMax)
+        return scale == DS_week ? stata_week_outside_calendar(td) : NA;
     int64_t y = 0, m = 0, d = 0;
     civil_from_days(td - kStataEpochShift, y, m, d);
     switch (scale) {
@@ -196,6 +261,7 @@ inline double stata_week_of_day(double t) {
     const double NA = std::numeric_limits<double>::quiet_NaN();
     int64_t td = 0;
     if (!period_arg(t, td, 4.0e6)) return NA;
+    if (td < kStataDayMin || td > kStataDayMax) return NA;  // p_week_-679351, p_week_2936550
     int64_t y = 0, m = 0, d = 0;
     civil_from_days(td - kStataEpochShift, y, m, d);
     const int64_t doy = td - kStataEpochShift - days_from_civil(y, 1, 1);
@@ -259,15 +325,28 @@ inline int64_t leap_seconds_on_day(int64_t td) {
 }
 
 // ---- %td <-> %tc <-> %tC -----------------------------------------
+// The %tc line covers the same calendar: 01jan0100 00:00:00.000 ..
+// 31dec9999 23:59:59.999 (probe: dofc(-58695840000000) = -679350 and
+// dofc(-58695840000001) missing; hh(253717919999999) = 23 and
+// hh(253717920000000) missing).
+inline constexpr double kStataClockMin = -58695840000000.0;
+inline constexpr double kStataClockMax = 253717919999999.0;
+inline bool stata_clock_in_range(double c) {
+    return !std::isnan(c) && c >= kStataClockMin && c <= kStataClockMax;
+}
+
+// cofd() checks its argument against the calendar AS GIVEN, before flooring:
+// cofd(-679350.5) and cofd(2936549.9) are missing (probe p_cofd_*).
 inline double stata_cofd(double t) {
     const double NA = std::numeric_limits<double>::quiet_NaN();
     int64_t td = 0;
     if (!period_arg(t, td, 4.0e6)) return NA;
+    if (t < static_cast<double>(kStataDayMin) || t > static_cast<double>(kStataDayMax)) return NA;
     return static_cast<double>(td) * static_cast<double>(kMsPerDay);
 }
 inline double stata_dofc(double c) {
     const double NA = std::numeric_limits<double>::quiet_NaN();
-    if (std::isnan(c) || !std::isfinite(c)) return NA;
+    if (!stata_clock_in_range(c)) return NA;
     return std::floor(c / static_cast<double>(kMsPerDay));
 }
 inline double stata_Cofd(double t) {
@@ -300,9 +379,14 @@ enum ClockPart { CLK_hour, CLK_minute, CLK_second };
 // same way. A timestamp landing INSIDE an inserted second reads as :59 here,
 // where Stata renders :60 -- documented rather than faked, since no corpus line
 // asks for it.
+//
+// A %tc value outside the calendar is missing (probe p_hh_-58695840000001,
+// p_mm_1e16), and ss() keeps the milliseconds: ss(253717919999999) is 59.999
+// (fn.pdf "Range: 0.000 to 59.999").
 inline double stata_clock_part(double c, ClockPart part, bool leap) {
     const double NA = std::numeric_limits<double>::quiet_NaN();
     if (std::isnan(c) || !std::isfinite(c)) return NA;
+    if (!leap && !stata_clock_in_range(c)) return NA;
     double ms = c;
     if (leap) {
         const double d = stata_dofC(c);
@@ -315,7 +399,7 @@ inline double stata_clock_part(double c, ClockPart part, bool leap) {
     switch (part) {
         case CLK_hour:   return static_cast<double>(within / 3600000);
         case CLK_minute: return static_cast<double>((within / 60000) % 60);
-        case CLK_second: return static_cast<double>((within / 1000) % 60);
+        case CLK_second: return static_cast<double>(within % 60000) / 1000.0;
     }
     return NA;
 }
@@ -425,7 +509,22 @@ inline std::vector<LiteralTok> literal_tokens(const std::string& s) {
 
 inline double stata_datetime_literal(const std::string& text, LiteralScale scale) {
     const double NA = std::numeric_limits<double>::quiet_NaN();
-    const std::vector<LiteralTok> t = literal_tokens(text);
+    // Stata reads a literal with its blanks taken out, as it reads every bracketed
+    // expression (core/expr_blanks.h): tc(01jan2010 12:00:00) is the text
+    // 01jan201012:00:00. The year after a month name is at most four digits and
+    // the rest of a longer run is the hour: tc(1jan20101:00) is 1jan2010 1:00,
+    // tc(1jan10000 1:00) is 1jan1000 1:00, tc(1jan999 1:00) and td(1jan20101)
+    // are invalid (StataBE 19.5).
+    std::string squeezed;
+    for (char c : text)
+        if (!std::isspace(static_cast<unsigned char>(c))) squeezed.push_back(c);
+    std::vector<LiteralTok> t = literal_tokens(squeezed);
+    if (t.size() >= 3 && t[0].numeric && !t[1].numeric && t[2].numeric &&
+        t[2].text.size() > 4 && literal_month_name(t[1].text) > 0) {
+        const LiteralTok hour{t[2].text.substr(4), true, ' '};
+        t[2].text.resize(4);
+        t.insert(t.begin() + 3, hour);
+    }
     if (t.empty()) return NA;
     auto num = [](const std::string& d) {
         double v = 0; for (char c : d) v = v * 10 + (c - '0'); return v;
@@ -445,10 +544,10 @@ inline double stata_datetime_literal(const std::string& text, LiteralScale scale
         }
         if (nums.size() != 2) return NA;
         switch (scale) {
-            case LiteralScale::Month:   return stata_ym(nums[0], nums[1]);
-            case LiteralScale::Quarter: return stata_yq(nums[0], nums[1]);
-            case LiteralScale::Week:    return stata_yw(nums[0], nums[1]);
-            default:                    return stata_yh(nums[0], nums[1]);
+            case LiteralScale::Month:   return stata_y_period_exact(nums[0], nums[1], 12);
+            case LiteralScale::Quarter: return stata_y_period_exact(nums[0], nums[1], 4);
+            case LiteralScale::Week:    return stata_y_period_exact(nums[0], nums[1], 52);
+            default:                    return stata_y_period_exact(nums[0], nums[1], 2);
         }
     }
 
@@ -465,24 +564,35 @@ inline double stata_datetime_literal(const std::string& text, LiteralScale scale
     }
     if (scale == LiteralScale::Day) return have_day && i == t.size() ? day : NA;
 
-    // Clock: hh:mm[:ss[.fff]]. A bare time means 1960-01-01, which is what
-    // tc(12:00) == 43200000 pins.
+    // Clock: hh:mm[:ss[.fff]] [am|pm]. A bare time means 1960-01-01, which is
+    // what tc(12:00) == 43200000 pins. A trailing meridian is honoured the way
+    // clock() honours it: tc(10:30am) = 37800000, tc(10:30 pm) = 81000000 (probe
+    // p_lit_16, p_lit_17).
     double h = 0, m = 0, sec = 0;
-    if (i < t.size()) {
+    int meridian = 0;  // 0 none, 1 am, 2 pm
+    if (!t.empty() && !t.back().numeric && i < t.size() - 1) {
+        std::string w = t.back().text;
+        for (char& c : w) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (w == "am" || w == "pm") meridian = (w == "pm") ? 2 : 1;
+    }
+    const size_t tend = t.size() - (meridian ? 1 : 0);
+    if (i < tend) {
         if (!t[i].numeric) return NA;
         h = num(t[i].text); ++i;
-        if (i >= t.size() || !t[i].numeric || t[i].lead != ':') return NA;
+        if (i >= tend || !t[i].numeric || t[i].lead != ':') return NA;
         m = num(t[i].text); ++i;
-        if (i < t.size() && t[i].numeric && t[i].lead == ':') {
+        if (i < tend && t[i].numeric && t[i].lead == ':') {
             sec = num(t[i].text); ++i;
-            if (i < t.size() && t[i].numeric && t[i].lead == '.') {
+            if (i < tend && t[i].numeric && t[i].lead == '.') {
                 double f = num(t[i].text);
                 for (size_t k = 0; k < t[i].text.size(); ++k) f /= 10.0;
                 sec += f; ++i;
             }
         }
     }
-    if (i != t.size()) return NA;
+    if (i != tend) return NA;
+    if (meridian == 2 && h < 12) h += 12;
+    if (meridian == 1 && h == 12) h = 0;
     const double within = stata_hms(h, m, sec);
     if (std::isnan(within)) return NA;
     const double base = (scale == LiteralScale::ClockLeap) ? stata_Cofd(day) : stata_cofd(day);
@@ -504,6 +614,57 @@ inline bool literal_scale_for(const std::string& name, LiteralScale& out) {
     // would be us answering a name Stata refuses.
     if (name == "y")                 { out = LiteralScale::Year; return true; }
     return false;
+}
+
+// Every literal pseudo-function call in an expression's TEXT, for the PIET
+// surfaces that must see one before an expression parser does (the macro/arith
+// whitelist refuses the ':' of tc(10:30); generate must refuse tq(2010q5) with
+// Stata's r(198) before the engine reports it as an internal error). Matches
+// what both lexers lift: a name from literal_scale_for, not part of a longer
+// identifier or a `.member`, then optional blanks and a balanced (...).
+// Double-quoted strings are skipped. visit(name, raw, begin, end) gets the
+// argument text and the byte span [begin, end) of the whole call; returning
+// false stops the scan.
+template <typename Visit>
+inline void for_each_datetime_literal(const std::string& s, Visit visit) {
+    auto word = [](char c) {
+        return cecon::ident::isIdentByte(c);
+    };
+    size_t i = 0;
+    while (i < s.size()) {
+        const char c = s[i];
+        if (c == '"') {
+            const size_t close = s.find('"', i + 1);
+            if (close == std::string::npos) return;
+            i = close + 1;
+            continue;
+        }
+        if (!cecon::ident::isIdentStartByte(c) ||
+            (i > 0 && (word(s[i - 1]) || s[i - 1] == '.'))) {
+            ++i;
+            continue;
+        }
+        size_t j = i;
+        while (j < s.size() && word(s[j])) ++j;
+        const std::string name = s.substr(i, j - i);
+        LiteralScale ls;
+        size_t k = j;
+        while (k < s.size() && (s[k] == ' ' || s[k] == '\t')) ++k;
+        if (!literal_scale_for(name, ls) || k >= s.size() || s[k] != '(') {
+            i = j;
+            continue;
+        }
+        size_t q = k + 1;
+        int depth = 1;
+        while (q < s.size() && depth) {
+            if (s[q] == '(') ++depth;
+            else if (s[q] == ')') --depth;
+            if (depth) ++q;
+        }
+        if (depth) return;  // unbalanced: the expression parser reports it
+        if (!visit(name, s.substr(k + 1, q - k - 1), i, q + 1)) return;
+        i = q + 1;
+    }
 }
 
 }  // namespace cecon

@@ -1,0 +1,37 @@
+{
+ "zip": {
+  "a_median_s": 7.664,
+  "rc_a": 0,
+  "b_median_s": 1.871,
+  "rc_b": 0,
+  "ratio_b_over_a": 0.2441
+ },
+ "ivprobit": {
+  "a_median_s": 13.079,
+  "rc_a": 0,
+  "b_median_s": 3.68,
+  "rc_b": 0,
+  "ratio_b_over_a": 0.2814
+ },
+ "ivtobit": {
+  "a_median_s": 18.224,
+  "rc_a": 0,
+  "b_median_s": 9.318,
+  "rc_b": 0,
+  "ratio_b_over_a": 0.5113
+ },
+ "nbreg": {
+  "a_median_s": 1.889,
+  "rc_a": 0,
+  "b_median_s": 1.896,
+  "rc_b": 0,
+  "ratio_b_over_a": 1.0037
+ },
+ "qreg": {
+  "a_median_s": 6.702,
+  "rc_a": 0,
+  "b_median_s": 6.754,
+  "rc_b": 0,
+  "ratio_b_over_a": 1.0077
+ }
+}

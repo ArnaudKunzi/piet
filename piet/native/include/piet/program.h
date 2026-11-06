@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // User-defined program support — C++ port of piet/backend/piet/program.py
 // (S6 + S7). Provides:
 //   captureProgams      — consume `program define…end` blocks from a line
@@ -156,6 +158,40 @@ std::map<std::string, std::string> buildArgs(const std::string& argstr);
 //     flushed into session.eval.rValues / session.eval.rStrings.
 ojson runProgram(const ProgramDef& progDef, const std::string& argstr, SessionState& session,
                   const DispatchFn& dispatchFn);
+
+// BUG-922: restore every preserved copy taken deeper than `callerLevel`
+// (SessionState::preserveLevel() before the program or nested do/run file
+// started) -- what Stata does when that program or do-file concludes, on
+// success and on error alike. Only a failed restore leaves a block, appended
+// to `blocks`; it stops the unwinding there. The one unwinder (session_state.h
+// PreserveFrame I3); defined in handlers_m3.cpp beside runRestore.
+void restorePreservesDeeperThan(int callerLevel, SessionState& session, ojson& blocks);
+
+// BUG-922: everything Stata undoes when a program returns or a nested do/run
+// file or `parallel` child concludes, on success and on error alike: the
+// preserved copies deeper than `callerLevel` (restorePreservesDeeperThan),
+// then the tempfiles, tempname scalars/matrices and tempvars minted deeper
+// than it (oracles w2_prog_controlflow pc_pr_in_program*, pc_tv_gone;
+// w2ad_prog_preserve_nest pn_d_leave*, pn_tv_do_gone).
+void concludeLevel(int callerLevel, SessionState& session, ojson& blocks);
+// The same on a C++ exception path: never throws, drops any block.
+void concludeLevelAfterThrow(int callerLevel, SessionState& session) noexcept;
+
+// BUG-920: a program or nested do/run file starts outside any loop. While one
+// lives, SessionState::loopBodyFloor is the loop depth it started at, so a
+// `continue` in it outside its own loops is r(119) "statement out of context"
+// (oracle w2ad_prog_preserve_nest pn_lm_cb_prog, pn_lm_cb_do).
+class LoopFloorGuard {
+ public:
+  explicit LoopFloorGuard(SessionState& session);
+  ~LoopFloorGuard();
+  LoopFloorGuard(const LoopFloorGuard&) = delete;
+  LoopFloorGuard& operator=(const LoopFloorGuard&) = delete;
+
+ private:
+  SessionState& session_;
+  int saved_;
+};
 
 // Native handler for `program drop NAME` / `program dir`. Returns a single
 // result block. sub is "drop" or "dir"; names is the list of names for

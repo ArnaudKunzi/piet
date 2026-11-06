@@ -1,9 +1,14 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Restricted Python-expression evaluator — see pyeval.h. The grammar and
 // semantics mirror CPython for the whitelisted-character subset that
 // macros._eval_arith / postfile.eval_macro_expr can ever feed to eval().
 #include "piet/eval/pyeval.h"
+#include "piet/eval/exprfns.h"  // kStataMissingSentinel: arithmetic on missing is `.`
 
 #include "data/stata_dates.h"  // B3(b): the literal pseudo-function table + parser
+#include "core/stata_arith.h"  // `^`/`**` with StataBE's bits
+#include "core/ident.h"  // Unicode names: the shared identifier byte tests
 
 #include "../dispatch_profile.h"  // EXPRLAYER: expression-zone attribution (opt-in, stderr)
 
@@ -205,13 +210,40 @@ struct Lexer {
       return lexNumber();
     }
     if (c == '"' || c == '\'') return lexString(c);
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
-      size_t start = i;
-      while (i < src.size() &&
-             ((src[i] >= 'a' && src[i] <= 'z') || (src[i] >= 'A' && src[i] <= 'Z') ||
-              (src[i] >= '0' && src[i] <= '9') || src[i] == '_')) {
-        ++i;
+    // EM3b: Stata's compound-quoted literal `"..."' -- the delimiter that can carry
+    // a '"' -- nests (a `" opens a level, a "' closes one) and keeps its body
+    // verbatim, inner quotes and nested spans included (w2af_macro_text_file.log
+    // :1077 mt_fn_strlen `<7>` for `a "b" c`; :1197 mt_fn_stritrim).
+    if (c == '`' && i + 1 < src.size() && src[i + 1] == '"') {
+      int depth = 0;
+      size_t j = i;
+      while (j < src.size()) {
+        if (j + 1 < src.size() && src[j] == '`' && src[j + 1] == '"') {
+          ++depth;
+          j += 2;
+        } else if (j + 1 < src.size() && src[j] == '"' && src[j + 1] == '\'') {
+          j += 2;
+          if (--depth == 0) break;
+        } else {
+          ++j;
+        }
       }
+      if (depth != 0) fail("unterminated string literal");
+      Token t;
+      t.kind = Tok::Str;
+      t.text = src.substr(i + 2, j - i - 4);
+      i = j;
+      return t;
+    }
+    // Unicode names (lane M): the shared rule's permissive byte tests
+    // (src/core/ident.h). A byte >= 0x80 is an identifier byte, so `قيمة`,
+    // `ملاحظات` and the mixed-script `دخل_2020` lex as ONE Name -- before, the
+    // first Arabic byte fell to the `default:` "unexpected character" arm and
+    // evalArith, evalBoolExpr and the string row evaluator all refused the
+    // expression. A name is looked up byte-exactly, so no decoding is needed.
+    if (cecon::ident::isIdentStartByte(c)) {
+      size_t start = i;
+      while (i < src.size() && cecon::ident::isIdentByte(src[i])) ++i;
       std::string name = src.substr(start, i - start);
       if (name == "and") return {Tok::And, name, 0, 0.0};
       if (name == "or") return {Tok::Or, name, 0, 0.0};
@@ -241,7 +273,12 @@ struct Lexer {
             if (depth) fail("expected ')' after " + name + "(");
             const std::string raw = src.substr(j + 1, q - j - 1);
             const double lit = cecon::stata_datetime_literal(raw, ls);
-            if (std::isnan(lit)) fail(name + "(" + raw + ") invalid");
+            // Stata refuses an impossible literal with r(198) (tq(2010q5),
+            // tm(2010m13), td(31feb2010): w2y_fn_datetime fd_tq_bad/fd_tm_bad/
+            // fd_td_bad). The `r(198):` prefix is the channel evalArith forwards as
+            // the exact code; a plain SyntaxError left `scalar s = tq(2010q5)` at
+            // rc 0 holding the expression text.
+            if (std::isnan(lit)) throw PyExc("r(198): " + name + "(" + raw + ") invalid");
             i = q + 1;
             Token lt;
             lt.kind = Tok::Float;
@@ -309,6 +346,15 @@ struct Lexer {
         // that sharing one token caused.
         ++i;
         return {Tok::Bang, "!", 0, 0.0};
+      case '~':
+        // Stata spells `!` and `!=` also as `~` and `~=` (operator.sthlp;
+        // w2ac_expr_relational gen_tilde_pow0 / gen_tilde_ne_gt).
+        if (i + 1 < src.size() && src[i + 1] == '=') {
+          i += 2;
+          return {Tok::Ne, "~=", 0, 0.0};
+        }
+        ++i;
+        return {Tok::Bang, "~", 0, 0.0};
       case '&':
         // BUG-660 fix round: Stata's `&` (logical AND). Distinct token from
         // the "and" keyword's Tok::And — see parseStataAnd/Node::T::Bool.
@@ -440,54 +486,49 @@ struct Parser {
     return parseComparison();
   }
 
-  static bool isCmp(Tok k) {
-    return k == Tok::Lt || k == Tok::Gt || k == Tok::Le || k == Tok::Ge || k == Tok::Eq ||
-           k == Tok::Ne;
-  }
-
-  NodePtr parseComparison() {
-    NodePtr n = parseArith();
-    if (!isCmp(cur.kind)) return n;
-    auto out = std::make_unique<Node>();
-    out->t = Node::T::Compare;
-    out->a = std::move(n);
-    while (isCmp(cur.kind)) {
+  // FU-844: Stata, not Python, comparisons. Each operator is its own
+  // left-associative level, tightest first != > < <= >= == (operator.sthlp;
+  // oracle w2ac_expr_relational disp_/local_/scalar_/ifcmd_<o1>_<o2>), so
+  // `0==0<0` is 0==(0<0) = 1 where Python's chain `0==0 and 0<0` is 0. Every
+  // Compare node holds exactly one operator.
+  static constexpr Tok kCmpLevel[6] = {Tok::Eq, Tok::Ge, Tok::Le, Tok::Lt, Tok::Gt, Tok::Ne};
+  NodePtr parseComparison(int lvl = 0) {
+    if (lvl == 6) return parseArith();
+    NodePtr n = parseComparison(lvl + 1);
+    while (cur.kind == kCmpLevel[lvl]) {
+      auto out = std::make_unique<Node>();
+      out->t = Node::T::Compare;
+      out->a = std::move(n);
       out->cmpOps.push_back(cur.kind);
       advance();
-      out->cmpOperands.push_back(parseArith());
+      out->cmpOperands.push_back(parseComparison(lvl + 1));
+      n = std::move(out);
     }
-    return out;
+    return n;
   }
 
-  NodePtr parseArith() {
-    NodePtr n = parseTerm();
-    while (cur.kind == Tok::Plus || cur.kind == Tok::Minus) {
+  // EM0: [U] 13.2.5 orders the binary operators ^, -(negation), /, *, -(subtraction), +,
+  // each level left-associative: a+b-c is a+(b-c) and a*b/c is a*(b/c) (oracle
+  // w2am_expr_binary_order eo_disp_pm: 0.1+0.2-0.3 is 2^-55; eo_disp_md). `//` stays
+  // at the `/` level.
+  NodePtr binLevel(NodePtr (Parser::*next)(), Tok t1, Tok t2) {
+    NodePtr n = (this->*next)();
+    while (cur.kind == t1 || cur.kind == t2) {
       Tok op = cur.kind;
       advance();
       auto out = std::make_unique<Node>();
       out->t = Node::T::Bin;
       out->op = op;
       out->a = std::move(n);
-      out->b = parseTerm();
+      out->b = (this->*next)();
       n = std::move(out);
     }
     return n;
   }
-
-  NodePtr parseTerm() {
-    NodePtr n = parseFactor();
-    while (cur.kind == Tok::Star || cur.kind == Tok::Slash || cur.kind == Tok::DblSlash) {
-      Tok op = cur.kind;
-      advance();
-      auto out = std::make_unique<Node>();
-      out->t = Node::T::Bin;
-      out->op = op;
-      out->a = std::move(n);
-      out->b = parseFactor();
-      n = std::move(out);
-    }
-    return n;
-  }
+  NodePtr parseArith() { return binLevel(&Parser::parseSub, Tok::Plus, Tok::Plus); }
+  NodePtr parseSub() { return binLevel(&Parser::parseTerm, Tok::Minus, Tok::Minus); }
+  NodePtr parseTerm() { return binLevel(&Parser::parseDiv, Tok::Star, Tok::Star); }
+  NodePtr parseDiv() { return binLevel(&Parser::parseFactor, Tok::Slash, Tok::DblSlash); }
 
   NodePtr parseFactor() {
     if (cur.kind == Tok::Plus || cur.kind == Tok::Minus) {
@@ -504,28 +545,55 @@ struct Parser {
     // `+`/`-`/comparisons/`&`/`|` -- see the Tok::Bang enum comment for the
     // StataBE measurements this rests on), NOT Python's low-precedence `not`
     // keyword (that one stays in parseNot()).
-    if (cur.kind == Tok::Bang) {
-      advance();
-      auto out = std::make_unique<Node>();
-      out->t = Node::T::Not;
-      out->op = Tok::Bang;  // Stata's `!`: a string operand is r(109) (eval())
-      out->a = parseFactor();
-      return out;
-    }
+    if (cur.kind == Tok::Bang) return parseBang(&Parser::parseFactor);
     return parsePower();
   }
 
+  // Stata's `!` (or `~`) over the operand `next` parses. A sign after it,
+  // spaces or not, is invalid syntax in StataBE (w2ac_expr_relational
+  // disp_not_gt `!-1>0`, gen_not_neg `!-t` r(198); w2ac_expr_valueref
+  // disp/local/scalar_not_neg(_sp) `! -1`, _not_plus `!+1`, _tilde_neg). The
+  // r(198) prefix is the exact-code channel, so `scalar s = !-1` is r(198) with
+  // s unset (scalar_not_neg) instead of storing the expression text.
+  NodePtr parseBang(NodePtr (Parser::*next)()) {
+    advance();
+    if (cur.kind == Tok::Minus || cur.kind == Tok::Plus) throw PyExc("r(198): invalid syntax");
+    auto out = std::make_unique<Node>();
+    out->t = Node::T::Not;
+    out->op = Tok::Bang;  // Stata's `!`: a string operand is r(109) (eval())
+    out->a = (this->*next)();
+    return out;
+  }
+
+  // FU-843: Stata's `^` (here `**`) is LEFT-associative and its right operand
+  // is the next atom with any leading signs / `!` (oracle w2ac_expr_precedence
+  // disp_chain_const `2^3^2` = 64, disp_pow_neg_pow `2^-3^2` = (2^-3)^2), not
+  // Python's right-associative `2**3**2` = 512 with a whole-factor rhs.
   NodePtr parsePower() {
-    NodePtr base = parseAtomTrailer();
-    if (accept(Tok::DblStar)) {
+    NodePtr n = parseAtomTrailer();
+    while (accept(Tok::DblStar)) {
       auto out = std::make_unique<Node>();
       out->t = Node::T::Bin;
       out->op = Tok::DblStar;
-      out->a = std::move(base);
-      out->b = parseFactor();  // right-assoc; allows unary rhs (2**-1)
+      out->a = std::move(n);
+      out->b = parsePowRhs();
+      n = std::move(out);
+    }
+    return n;
+  }
+
+  NodePtr parsePowRhs() {
+    if (cur.kind == Tok::Plus || cur.kind == Tok::Minus) {
+      Tok op = cur.kind;
+      advance();
+      auto out = std::make_unique<Node>();
+      out->t = Node::T::Unary;
+      out->op = op;
+      out->a = parsePowRhs();
       return out;
     }
-    return base;
+    if (cur.kind == Tok::Bang) return parseBang(&Parser::parsePowRhs);
+    return parseAtomTrailer();
   }
 
   NodePtr parseAtomTrailer() {
@@ -642,8 +710,63 @@ PyValue intMul(long long x, long long y) {
 
 long long asIntOperand(const PyValue& v) { return v.isFloat() ? 0 : v.intVal(); }
 
+// Is this operand one of the expression layer's missing values (`.` is 2^1023,
+// `.a`..`.z` sit just above it, the negative band is `.` too; exprfns.h)?
+// Sign-blind, and only finite values count, so the inf/nan that postfile's
+// Python namespace binds keep their IEEE arithmetic. c(maxdouble), one ulp
+// under 2^1023, is a real number (missing_range_oracle.log sentinel-negated).
+bool isStataMissingOperand(const PyValue& v) {
+  if (!v.isFloat()) return false;
+  const double d = v.floatVal();
+  return std::isfinite(d) && std::fabs(d) >= kStataMissingSentinel;
+}
+
+PyValue evalBinNumericRaw(Tok op, const PyValue& a, const PyValue& b, bool floats);
+
+// name-binding-display-literals: see StataDivisionScope (pyeval.h).
+thread_local bool tl_stataDivision = false;
+
+// On the Stata expression surfaces (StataDivisionScope) an operand that is not a
+// finite number -- the +/-inf an overflowing + - * leaves -- reads as `.` to the
+// operator that consumes it. A function argument is not read this way: Stata
+// hands the infinity itself to the function (StataBE 19.5: `(1e300*1e10 == .)`
+// is 1 and `(-1e300*1e10 < 0)` is 0, while `inlist(1e300*1e10, .)` is 0 and
+// `missing(-1e300*1e10)` is 0).
+bool isStataOverflowOperand(const PyValue& v) {
+  return tl_stataDivision && v.isFloat() && !std::isfinite(v.floatVal());
+}
+EvalVal stataOperand(EvalVal v) {
+  if (!v.isFn && isStataOverflowOperand(v.v)) return EvalVal::of(PyValue::floating(kStataMissingSentinel));
+  return v;
+}
+
 PyValue evalBinNumeric(Tok op, const PyValue& a, const PyValue& b) {
   bool floats = a.isFloat() || b.isFloat();
+  // Arithmetic on any missing is plain `.` in Stata: the kind is lost
+  // ((.a + 1) == . is 1, src/data/missing.h), and `./2`, `.*0`, `.^2` are `.`,
+  // not 2^1022, 0 or an overflow. Comparisons and direct reads keep the kind;
+  // they never reach this function.
+  if (floats && (isStataMissingOperand(a) || isStataMissingOperand(b) ||
+                 isStataOverflowOperand(a) || isStataOverflowOperand(b))) {
+    return PyValue::floating(kStataMissingSentinel);
+  }
+  // A finite result that lands in the band is plain `.` as well, never a kind
+  // (`c(maxdouble)*1.5` would otherwise decode as `.a`..`.z`). Non-finite
+  // results keep IEEE semantics: an overflow to +/-inf stays one, as in Stata,
+  // until an operator reads it (isStataOverflowOperand). On the Stata expression
+  // surfaces a NaN is never such a result -- it is `.` (BUG-1363).
+  PyValue r = evalBinNumericRaw(op, a, b, floats);
+  if (tl_stataDivision && r.isFloat() && std::isnan(r.floatVal())) {
+    return PyValue::floating(kStataMissingSentinel);
+  }
+  if (r.isFloat() && std::isfinite(r.floatVal()) &&
+      std::fabs(r.floatVal()) >= kStataMissingSentinel) {
+    return PyValue::floating(kStataMissingSentinel);
+  }
+  return r;
+}
+
+PyValue evalBinNumericRaw(Tok op, const PyValue& a, const PyValue& b, bool floats) {
   switch (op) {
     case Tok::Plus:
       if (!floats) return intAdd(asIntOperand(a), asIntOperand(b));
@@ -656,6 +779,9 @@ PyValue evalBinNumeric(Tok op, const PyValue& a, const PyValue& b) {
       return PyValue::floating(a.numAsDouble() * b.numAsDouble());
     case Tok::Slash: {
       double db = b.numAsDouble();
+      // name-binding-display-literals: under a StataDivisionScope (the Stata
+      // expression surfaces) x/0 is missing, as in Stata, never an error.
+      if (db == 0.0 && tl_stataDivision) return PyValue::floating(kStataMissingSentinel);
       if (db == 0.0) throw PyExc("ZeroDivisionError");
       return PyValue::floating(a.numAsDouble() / db);
     }
@@ -692,26 +818,48 @@ PyValue evalBinNumeric(Tok op, const PyValue& a, const PyValue& b) {
               if (__builtin_mul_overflow(bb, bb, &bb)) overflow = true;
             }
           }
-          if (!overflow) return PyValue::integer(result);
-          return PyValue::floating(std::pow(static_cast<double>(base), static_cast<double>(exp)));
+          // Exact while |result| <= 2^53, where Stata's left-to-right double
+          // product is exact too; beyond that the double Stata computes
+          // (core/stata_arith.h), which is not the rounded exact integer.
+          if (!overflow && result <= (1LL << 53) && result >= -(1LL << 53)) return PyValue::integer(result);
+          return PyValue::floating(cecon::stata_pow_value(static_cast<double>(base), static_cast<double>(exp)));
         }
-        // int ** negative int -> float; 0 ** -n -> ZeroDivisionError.
-        if (base == 0) throw PyExc("ZeroDivisionError: 0 to a negative power");
-        return PyValue::floating(std::pow(static_cast<double>(base), static_cast<double>(exp)));
+        // int ** negative int -> float; 0 ** -n -> ZeroDivisionError (Stata: `.`,
+        // BUG-1065).
+        if (base == 0) {
+          if (tl_stataDivision) return PyValue::floating(kStataMissingSentinel);
+          throw PyExc("ZeroDivisionError: 0 to a negative power");
+        }
+        return PyValue::floating(cecon::stata_pow_value(static_cast<double>(base), static_cast<double>(exp)));
       }
       double da = a.numAsDouble();
       double db = b.numAsDouble();
-      if (da == 0.0 && db < 0.0) throw PyExc("ZeroDivisionError: 0.0 to a negative power");
+      // BUG-1065: Stata's `^` has no error. 0^-n, a negative base with a
+      // fractional power and an overflowing power are all `.` (core/
+      // stata_arith.h), so on the Stata expression surfaces (StataDivisionScope)
+      // each of the three Python raises below is the missing sentinel instead.
+      if (da == 0.0 && db < 0.0) {
+        if (tl_stataDivision) return PyValue::floating(kStataMissingSentinel);
+        throw PyExc("ZeroDivisionError: 0.0 to a negative power");
+      }
       if (da < 0.0 && db != std::trunc(db) && std::isfinite(db)) {
         // Python returns a complex number here; every M1-scope consumer
         // then fails isinstance(int/float) EXCEPT postfile.eval_macro_expr
         // (documented divergence). Raise -> whole-expression failure.
+        if (tl_stataDivision) return PyValue::floating(kStataMissingSentinel);
         throw PyExc("complex result from negative base ** fractional exponent");
       }
-      double r = std::pow(da, db);
+      // Stata's `^`: x^2 is x*x, x^-2 is (1/x)*(1/x), a non-integer power is
+      // exp(y*ln(x)) (core/stata_arith.h); libm pow is off in the last bit.
+      double r = cecon::stata_pow_value(da, db);
       // CPython 3.13: only ** raises OverflowError on float overflow
       // (verified against the venv; + - * / silently produce inf).
-      if (std::isinf(r) && std::isfinite(da) && std::isfinite(db)) {
+      // (CPython decides by libm pow: the clamp of Stata's own overflow edge in
+      // stata_pow_value makes r a NaN where pow() overflowed.)
+      if ((std::isinf(r) || (std::isnan(r) && std::isinf(std::pow(da, db)))) && std::isfinite(da) && std::isfinite(db)) {
+        // Stata's `^` makes a positive overflow `.` but leaves a negative one
+        // -inf: inlist(1e200^2, .) is 1, inlist((-1e200)^3, .) is 0.
+        if (tl_stataDivision) return PyValue::floating(r < 0 ? r : kStataMissingSentinel);
         throw PyExc("OverflowError: (34, 'Result too large')");
       }
       return PyValue::floating(r);
@@ -741,7 +889,8 @@ bool pyEquals(const EvalVal& a, const EvalVal& b) {
   return dx == dy;  // NaN != NaN naturally
 }
 
-// Python ordering (raises TypeError across str/num or with fn objects).
+// Python ordering (raises TypeError with fn objects; a string ordered against a
+// number is Stata's r(109), below).
 bool pyOrder(Tok op, const EvalVal& a, const EvalVal& b) {
   if (a.isFn || b.isFn) throw PyExc("TypeError: ordering not supported on function objects");
   const PyValue& x = a.v;
@@ -757,9 +906,12 @@ bool pyOrder(Tok op, const EvalVal& a, const EvalVal& b) {
     }
     throw PyExc("bad cmp op");
   }
-  if (x.isStr() || y.isStr()) {
-    throw PyExc("TypeError: '<' not supported between str and number");
-  }
+  // A string against a number is Stata's type mismatch, as for == above:
+  // `display 3 > "a"`, `local m = 3 > "a"` and `scalar m = "a" < 3` are r(109)
+  // in StataBE 19.5. The Python TypeError left display to echo `3 > "a"`.
+  // BUG-1122: so are `generate z = (s > 1)`, `count if s >= 1` and `generate z
+  // = x >= s` (StataBE 19.5, 2026-11-03); the TypeError gave them rc 1.
+  if (x.isStr() || y.isStr()) throw PyExc("r(109): type mismatch");
   double dx = x.numAsDouble(), dy = y.numAsDouble();
   switch (op) {
     case Tok::Lt: return dx < dy;
@@ -879,9 +1031,9 @@ struct Evaluator {
         return last;
       }
       case Node::T::Compare: {
-        EvalVal left = eval(*n.a);
+        EvalVal left = stataOperand(eval(*n.a));
         for (size_t k = 0; k < n.cmpOps.size(); ++k) {
-          EvalVal right = eval(*n.cmpOperands[k]);
+          EvalVal right = stataOperand(eval(*n.cmpOperands[k]));
           if (!pyCompareOne(n.cmpOps[k], left, right)) {
             return EvalVal::of(PyValue::boolean(false));
           }
@@ -892,8 +1044,17 @@ struct Evaluator {
       case Node::T::Unary: {
         EvalVal a = eval(*n.a);
         if (a.isFn) throw PyExc("TypeError: bad operand for unary op");
-        if (a.v.isStr()) throw PyExc("TypeError: bad operand type for unary -: 'str'");
+        // BUG-1122: Stata's unary minus on a string is r(109) type mismatch
+        // (`generate z = -s`, `display -"a"`: StataBE 19.5, measured
+        // 2026-11-03); its unary plus on one is r(198), left to the generic
+        // failure.
+        if (a.v.isStr() && n.op == Tok::Minus) throw PyExc("r(109): type mismatch");
+        if (a.v.isStr()) throw PyExc("TypeError: bad operand type for unary +: 'str'");
         if (n.op == Tok::Minus) {
+          // `-.a` is `.`: negating a missing stand-in must not produce a huge
+          // negative real number (see evalBinNumeric).
+          if (isStataMissingOperand(a.v) || isStataOverflowOperand(a.v))
+            return EvalVal::of(PyValue::floating(kStataMissingSentinel));
           if (a.v.isFloat()) return EvalVal::of(PyValue::floating(-a.v.floatVal()));
           // -bool -> int in Python (-True == -1)
           long long iv = a.v.intVal();
@@ -916,11 +1077,21 @@ struct Evaluator {
             return EvalVal::of(PyValue::str(x.strVal() + y.strVal()));
           }
           if (n.op == Tok::Star && (x.isStr() != y.isStr())) {
-            // str * int (or int * str); bool counts as int; float -> TypeError.
+            // str * n (or n * str) repeats the string; bool counts as int. A
+            // non-integer n counts its whole part and a missing one none:
+            // StataBE 19.5 has 2.5*"ab" and 2.9999*"ab" abab, x[1]*"ab" with
+            // x[1] = 1.5 ab, and .*"ab" "". A float past 2^31 (longer than any
+            // Stata string) keeps the TypeError.
             const PyValue& s = x.isStr() ? x : y;
             const PyValue& m = x.isStr() ? y : x;
-            if (m.isFloat()) throw PyExc("TypeError: can't multiply sequence by float");
             long long times = m.intVal();
+            if (m.isFloat()) {
+              const double t = m.floatVal();
+              const bool missing = !std::isfinite(t) || std::fabs(t) >= kStataMissingSentinel;
+              if (!missing && t >= 2147483648.0)
+                throw PyExc("TypeError: can't multiply sequence by float");
+              times = !missing && t >= 1 ? static_cast<long long>(t) : 0;
+            }
             std::string out;
             for (long long k = 0; k < times; ++k) out += s.strVal();
             return EvalVal::of(PyValue::str(out));
@@ -936,14 +1107,28 @@ struct Evaluator {
       case Node::T::Call: {
         EvalVal callee = eval(*n.a);
         if (!callee.isFn) throw PyExc("TypeError: object is not callable");
-        std::vector<PyValue> args;
-        args.reserve(n.parts.size());
-        for (const auto& p : n.parts) {
-          EvalVal a = eval(*p);
+        // Stata evaluates a function's arguments right to left, every one of them
+        // (StataBE 19.5, 2026-11-03): after `set seed 1`, `display
+        // min(runiform(), runiform()+10)` and `cond(1, runiform(), runiform()+10)`
+        // both show the SECOND draw, and `display max(foo, bar)` says "bar not
+        // found". Binary operators stay left to right (Bin above).
+        std::vector<PyValue> args(n.parts.size());
+        for (size_t k = n.parts.size(); k-- > 0;) {
+          EvalVal a = eval(*n.parts[k]);
           if (a.isFn) throw PyExc("TypeError: function object as argument");
-          args.push_back(a.v);
+          args[k] = a.v;
         }
-        return EvalVal::of((*callee.fn)(args));
+        PyValue result = (*callee.fn)(args);
+        // BUG-1358: on the Stata expression surfaces (StataDivisionScope) a
+        // function's NaN -- the out-of-domain answer of invttail(5,2), mod(5,0),
+        // max(.a,.b), year(.a) -- is the missing sentinel. A NaN prints `.` but
+        // compares false, so `invttail(5,2) == .` was 0 and `invttail(5,2) > 5`
+        // was 0 where Stata answers 1 and 1. An infinity a function passes
+        // through stays one, as in Stata (missing(min(1,-1e300*1e10)) is 0); the
+        // operator that reads it sees `.` (isStataOverflowOperand).
+        if (tl_stataDivision && result.isFloat() && std::isnan(result.floatVal()))
+          return EvalVal::of(PyValue::floating(kStataMissingSentinel));
+        return EvalVal::of(std::move(result));
       }
     }
     throw PyExc("internal: bad node");
@@ -1307,8 +1492,11 @@ PyNamespace mathNamespace(bool withInfNan) {
   ns.fns["round"] = mRound;
   ns.fns["floor"] = mFloor;
   ns.fns["ceil"] = mCeil;
-  ns.consts["pi"] = PyValue::floating(M_PI);
-  ns.consts["e"] = PyValue::floating(M_E);
+  // BUG-1388: no bare `pi` or `e`. They were Python's math constants, so
+  // `` `=e + 1' `` expanded to 3.718281828459045 and `display pi` printed
+  // 3.1415927. Stata's constant is `_pi` (normalizeStataLiterals substitutes
+  // it as text), and StataBE 19.5 answers `e not found` / `pi not found`
+  // r(111) for the bare names on every surface.
   if (withInfNan) {
     ns.consts["inf"] = PyValue::floating(HUGE_VAL);
     ns.consts["nan"] = PyValue::floating(kNaN);
@@ -1323,5 +1511,8 @@ const PyNamespace& postfileMathNamespace() {
   static const PyNamespace kNs = mathNamespace(/*withInfNan=*/true);
   return kNs;
 }
+
+StataDivisionScope::StataDivisionScope() : prev_(tl_stataDivision) { tl_stataDivision = true; }
+StataDivisionScope::~StataDivisionScope() { tl_stataDivision = prev_; }
 
 }  // namespace piet::eval

@@ -1,4 +1,6 @@
-// See rdlocal.h for method sources and clean-room provenance.
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
+// See rdlocal.h for method sources.
 //
 // Layout: (1) tiny dense linear algebra, (2) the shared local-polynomial core
 // (kernel, Gamma/vartheta/Psi, weighted fits, the mass-point nearest-neighbor

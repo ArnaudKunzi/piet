@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // M4a estimation + diagnostic surface — C++ port of
 // piet/backend/piet/router/translate.py's build_estimation_argv/
 // build_csdid_argv/build_corr_argv/build_ttest_argv routing plus
@@ -28,12 +30,14 @@
 #include "piet/cobra_runner.h"
 #include "piet/cobra_session.h"
 #include "piet/eval/errors.h"
+#include "piet/eval/exprfns.h"  // kStataMissingSentinel
 #include "piet/inrange_filter.h"
 #include "piet/settings.h"
 #include "piet/strutil.h"
 #include "io/win_compat.h"  // cecon::native_unlink (BUG-050 wide unlink)
 #include "piet/translate.h"
 #include "piet/scratch_seq.h"
+#include "lapack_dsyevr.h"  // BUG-1482: the clustered V's rank (clusteredVRankM4)
 
 // ---------------------------------------------------------------------------
 // BUG-233 / FIX:OPTNET-ABBREV-SWEEP — this file's option vocabularies.
@@ -59,7 +63,7 @@ const piet::eval::OptVocab& kVocabReg3 = piet::eval::registerOptVocab(
     {"reg3"}, {{"sure", "3sls"},
      {}});
 const piet::eval::OptVocab& kVocabBoottest = piet::eval::registerOptVocab(
-    {"boottest"}, {{"reps", "seed", "weights", "null",
+    {"boottest"}, {{"reps", "seed", "weighttype", "null",
                                                           "cluster"},
      {}});
 const piet::eval::OptVocab& kVocabTobit = piet::eval::registerOptVocab(
@@ -98,7 +102,7 @@ const piet::eval::OptVocab& kVocabDrdid = piet::eval::registerOptVocab(
 // estimation_m4c.cpp's copy (the one actually READ by runMargins) for the
 // full rationale. Three byte-identical copies must move together.
 const piet::eval::OptVocab& kVocabMargins = piet::eval::registerOptVocab(
-    {"margins"}, {{"at", "dydx", "post"},
+    {"margins"}, {{"at", "dydx", "post", "atmeans"},
      {}});
 const piet::eval::OptVocab& kVocabEstatDurbinalt = piet::eval::registerOptVocab(
     {"estat"}, {{"small", "lags"},
@@ -107,7 +111,7 @@ const piet::eval::OptVocab& kVocabEstatEvent = piet::eval::registerOptVocab(
     {"estat"}, {{"window", "post"},
      {}});
 const piet::eval::OptVocab& kVocabNewey = piet::eval::registerOptVocab(
-    {"newey"}, {{"lag"},
+    {"newey"}, {{"lag", "force"},
      {}});
 const piet::eval::OptVocab& kVocabPrais = piet::eval::registerOptVocab(
     {"prais"}, {{"corc", "twostep", "rhotype"},
@@ -198,8 +202,20 @@ ojson engineErrorBlockM4(const std::string& message, const std::string& code) {
 // model ran iid at rc 0. Measured on the branch binary 2026-09-29:
 // `xtreg y x1, fe cluster`, `logit yb x1, cluster`, `probit yb x1, robust(id)`
 // and `poisson cnt x1, cluster` each returned rc 0 with e(vce) iid.
+//
+// ppmlhdfe and ivreghdfe ignore an EMPTY `cluster()` and fit their default VCE
+// at rc 0 (w2l_vce_shape_det.log ppmlhdfe_empty_cluster `0|ppmlhdfe|robust|
+// Robust|.|180`, :3508 ivreghdfe_empty_cluster `0|ivreghdfe|||.|180`); the
+// official ML commands (logit, probit, ivprobit, ivtobit, ...) keep r(198).
+static bool emptyClusterIgnoredM4(const std::string& cmd) {
+  return cmd == "ppmlhdfe" || cmd == "ivreghdfe";
+}
+
 static std::optional<std::string> vceOptionShapeErrorM4(const eval::ParsedCommand& parsed) {
   for (const auto& [k, v] : parsed.opts) {
+    if (k == "cluster" && !v.isBool && trimM4(v.strValue).empty() &&
+        emptyClusterIgnoredM4(parsed.cmd))
+      continue;
     if (k == "cluster" && (v.isBool || trimM4(v.strValue).empty())) {
       return std::string("option `cluster` requires a variable: cluster(varname)");
     }
@@ -500,16 +516,16 @@ ojson cobraToEstimationM4(const ojson& raw, const std::string& cobraCmd,
 // `reghdfe income beertax, absorb(state) vce(cluster state year)` ->
 // beertax se=1867.524 matches byte-for-byte through this exact
 // --vcov twoway --cluster state,year shape). One var -> the pre-existing
-// single-cluster path (unchanged). Three+ vars -> named refusal: multiway
-// clustering with three or more variables is implemented for reghdfe only
-// (handlers.cpp splitClusterVars), so every M4 command refuses it.
+// single-cluster path (unchanged). Three+ vars -> `--vcov multiway --cluster
+// A,B,C` where `allowMultiway` (the callers whose k-way fit is measured, see
+// vcovFromOpts), else a named refusal.
 struct ClusterSplitM4 {
   std::vector<std::string> argv;  // {"--vcov", TYPE, "--cluster", VARS}
   bool errored = false;
   std::string errorMsg;
 };
 
-ClusterSplitM4 splitClusterVarsM4(const std::string& raw) {
+ClusterSplitM4 splitClusterVarsM4(const std::string& raw, bool allowMultiway = false) {
   ClusterSplitM4 r;
   std::vector<std::string> toks;
   std::istringstream iss(raw);
@@ -524,18 +540,155 @@ ClusterSplitM4 splitClusterVarsM4(const std::string& raw) {
     r.argv = {"--vcov", "cluster", "--cluster", toks[0]};
   } else if (toks.size() == 2) {
     r.argv = {"--vcov", "twoway", "--cluster", toks[0] + "," + toks[1]};
+  } else if (allowMultiway) {
+    std::string joined = toks[0];
+    for (size_t i = 1; i < toks.size(); ++i) joined += "," + toks[i];
+    r.argv = {"--vcov", "multiway", "--cluster", joined};
   } else {
     r.errored = true;
     r.errorMsg =
         "three or more cluster variables are not supported for this command in this "
         "version of PIET; multiway clustering with three or more cluster variables is "
-        "implemented for reghdfe only";
+        "implemented for reghdfe, xtreg, fe and ppmlhdfe only";
   }
   return r;
 }
 
+// The M4 commands whose k-way (k >= 3) cluster VCE is measured against StataBE 19.5:
+// xtreg, fe under the built-in multiway convention (BUG-1290: vce(cluster cg1 cg2
+// cg3) _se[x1] .019191881847891872, e(df_r) 2, e(N_clust) .) and ppmlhdfe under
+// reghdfe's (BUG-1189: vce(cluster id id2 id3) e(N_clust) 5, _se[x1]
+// .018284790750361792). The engine's two-way and multiway modes are one
+// (apps/cmds/common.cpp Vcov::Multiway), over every listed variable.
+static bool multiwayClusterMeasuredM4(const std::string& cmd) {
+  return cmd == "xtreg" || cmd == "ppmlhdfe";
+}
+
+static bool vceTrailingTokenAcceptedM4(const std::string& cmd) {
+  return cmd == "reghdfe" || cmd == "ppmlhdfe" || cmd == "fepois" || cmd == "feols" ||
+         cmd == "csdid" || cmd == "ivreg2" || cmd == "xtivreg2";
+}
+
+// Stata's own refusals, carried with Stata's rc (coarseRc reads the `r(NNN)`
+// reason first, so the rc is never the generic 1).
+static ojson stataRefusalBlockM4(const std::string& message, int rc) {
+  return ojson(eval::errorBlock("syntax_error", message, std::nullopt, std::nullopt, std::nullopt,
+                                "r(" + std::to_string(rc) + ")"));
+}
+
+// FU-147 / FU-160, twin of handlers.cpp clusterSpecRefusal for the callers of
+// buildEstimationArgvM4 (xtreg, logit, probit, ...) and, BUG-1278, of the m4b
+// fits that read vce() themselves (ivregress, poisson/ppmlhdfe, nbreg): what
+// the fit's own option parser refuses about its cluster variables, before any
+// engine call, in that parser's order. Both options are read, whichever one
+// vcovFromOpts would pick (BUG-1278: `poisson y x, vce(cluster k) cluster(nosuch)`
+// fitted at rc 0). StataBE 19.5, 2026-11-03, over logit/probit/xtreg/poisson/
+// nbreg/ivregress/ppmlhdfe with vce(cluster), cluster() and both:
+//  - kVceParse (_vce_parse): with `multiwayVceRefused`, vce(cluster a b) is
+//    "multiway cluster VCE not allowed" r(198) before anything is looked up;
+//    then cluster()'s names, "variable V not found" + "(error in option
+//    cluster())" r(111); with `legacyOneVar`, a second cluster() name "cluster():
+//    too many variables specified" r(103); then vce(cluster)'s names, r(111)
+//    without the tail; then the pairing: vce(robust) with cluster() "only one of
+//    options cluster() or vce(robust) is allowed" r(198), vce(cluster a) with
+//    cluster(b) "options cluster(clustvar) and vce(cluster clustvar) are in
+//    conflict" r(100) (the same variable in both is accepted).
+//  - kIvregress: cluster()'s names and r(103) as above, then any vce() with
+//    cluster() "cannot specify options robust or cluster() with option vce()"
+//    r(198), then vce(cluster)'s names, which its vce() parser turns into
+//    "option vce() incorrectly specified" r(198).
+//  - kPpmlhdfe: vce() with cluster() "only one of cluster() and vce() can be
+//    specified" r(198) first; a name is r(111) with no cluster() tail.
+std::optional<ojson> clusterSpecRefusalM4(const eval::ParsedCommand& parsed, SessionState& session,
+                                          ClusterOptParserM4 parser, bool multiwayVceRefused,
+                                          bool legacyOneVar) {
+  std::optional<std::string> vceVal;
+  std::optional<std::string> clusterOpt;
+  for (const auto& [k, v] : parsed.opts) {
+    if ((k == "vce" || k == "vcov") && !vceVal.has_value()) {
+      vceVal = v.isBool ? std::string() : v.strValue;
+    } else if (k == "cluster" && !v.isBool) {
+      clusterOpt = v.strValue;
+    }
+  }
+  auto tokens = [](const std::string& raw) {
+    std::vector<std::string> toks;
+    std::istringstream iss(raw);
+    std::string t;
+    while (iss >> t) toks.push_back(t);
+    return toks;
+  };
+  std::string vceType;
+  std::string vceRest;
+  if (vceVal.has_value() && !vceVal->empty()) vceType = canonicalVceType(*vceVal, &vceRest);
+  const bool both = !vceType.empty() && clusterOpt.has_value();
+  const std::vector<std::string> legacyToks = tokens(clusterOpt.value_or(""));
+  // vce(cluster) with no variable of its own takes cluster()'s (vcovFromOpts).
+  const std::vector<std::string> vceToks =
+      vceType == "cluster" && !vceRest.empty() ? tokens(vceRest) : std::vector<std::string>();
+  if (parser == ClusterOptParserM4::kPpmlhdfe && both)
+    return stataRefusalBlockM4("only one of cluster() and vce() can be specified", 198);
+  if (multiwayVceRefused && vceToks.size() >= 2)
+    return stataRefusalBlockM4("multiway cluster VCE not allowed", 198);
+  Datastore* ds = session.datastore();
+  if (ds == nullptr) return std::nullopt;
+  // BUG-1437: the dispatcher has already put a unique abbreviation's full name
+  // in; a name that begins several variables is "NAME ambiguous abbreviation"
+  // where one that begins none is "variable NAME not found", with the same rc and
+  // tail (StataBE 19.5, 2026-11-03, over the seven fits above).
+  auto notFound = [ds](const std::string& n) {
+    int hits = 0;
+    for (const auto& v : ds->names())
+      if (v.size() > n.size() && v.compare(0, n.size(), n) == 0) ++hits;
+    return hits > 1 ? n + " ambiguous abbreviation" : "variable " + n + " not found";
+  };
+  for (const auto& n : legacyToks) {
+    if (ds->has(n)) continue;
+    return stataRefusalBlockM4(
+        notFound(n) +
+            (parser == ClusterOptParserM4::kPpmlhdfe ? "" : "\n(error in option cluster())"),
+        111);
+  }
+  if (legacyOneVar && legacyToks.size() >= 2)
+    return stataRefusalBlockM4("cluster():  too many variables specified", 103);
+  if (parser == ClusterOptParserM4::kIvregress && both)
+    return stataRefusalBlockM4("cannot specify options robust or cluster() with option vce()", 198);
+  for (const auto& n : vceToks) {
+    if (ds->has(n)) continue;
+    if (parser == ClusterOptParserM4::kIvregress)
+      return stataRefusalBlockM4(notFound(n) + "\noption vce() incorrectly specified", 198);
+    return stataRefusalBlockM4(notFound(n), 111);
+  }
+  if (parser == ClusterOptParserM4::kVceParse && both) {
+    if (vceType == "robust")
+      return stataRefusalBlockM4("only one of options cluster() or vce(robust) is allowed", 198);
+    if (vceType == "cluster" && !vceToks.empty() && vceToks != legacyToks)
+      return stataRefusalBlockM4(
+          "options cluster(clustvar) and vce(cluster clustvar) are in conflict", 100);
+  }
+  return std::nullopt;
+}
+
+ojson vcovErrorBlockM4(const VcovResult& vr) {
+  if (vr.rc != 0) return stataRefusalBlockM4(vr.errorMsg, vr.rc);
+  return engineErrorBlockM4(vr.errorMsg, "unsupported_option");
+}
+
 VcovResult vcovFromOpts(const eval::ParsedCommand& parsed, bool* sawRobustFlag) {
   VcovResult out;
+  // ppmlhdfe's own option parser (ppmlhdfe.ado's parse_vce through
+  // _assert_abort) refuses a bare `cluster` with r(3498) "Invalid options:
+  // cluster" (w2l_vce_shape_det.log:2819 ppmlhdfe_bare_cluster).
+  if (parsed.cmd == "ppmlhdfe") {
+    for (const auto& [k, v] : parsed.opts) {
+      if (k == "cluster" && v.isBool) {
+        out.errored = true;
+        out.errorMsg = "Invalid options: cluster";
+        out.rc = 3498;
+        return out;
+      }
+    }
+  }
   if (auto shapeErr = vceOptionShapeErrorM4(parsed)) {
     out.errored = true;
     out.errorMsg = *shapeErr;
@@ -550,7 +703,7 @@ VcovResult vcovFromOpts(const eval::ParsedCommand& parsed, bool* sawRobustFlag) 
     } else if (k == "robust" && v.isBool && v.boolValue) {
       robustFlag = true;
     } else if (k == "cluster" && !v.isBool) {
-      clusterOpt = v.strValue;
+      clusterOpt = trimM4(v.strValue);
     }
   }
   if (sawRobustFlag) *sawRobustFlag = robustFlag;
@@ -559,18 +712,38 @@ VcovResult vcovFromOpts(const eval::ParsedCommand& parsed, bool* sawRobustFlag) 
     // sites (piet/handlers.h `canonicalVceType`), measured floors.
     std::string vceRest;
     const std::string lv = canonicalVceType(*vceVal, &vceRest);
+    // FU-117: the token after a non-cluster vce type was dropped (HC1 at rc 0).
+    // Official commands refuse it as Stata's _vce_parse does
+    // (w2l_vce_shape.log:407 regress, :764 areg, :3580 ivreghdfe: r(198)); the
+    // community commands that reach this helper accept it (:2972 ppmlhdfe,
+    // :4034 reghdfe, csdid :2471), so they are exempt by command word.
+    if (!vceRest.empty() && (lv == "robust" || lv == "hc1" || lv == "iid") &&
+        !vceTrailingTokenAcceptedM4(parsed.cmd)) {
+      out.errored = true;
+      out.errorMsg = "option vce() incorrectly specified: `" + vceRest + "` cannot follow vce(" +
+                     lv + ")";
+      return out;
+    }
     if (lv == "robust" || lv == "hc1") {
       out.argv = {"--vcov", "hc1"};
     } else if (lv == "cluster") {
       std::string cvar = clusterOpt.value_or("");
       if (!vceRest.empty()) cvar = vceRest;
+      if (cvar.empty() && parsed.cmd == "ppmlhdfe") {
+        // reghdfe's parse_vce, which ppmlhdfe shares: r(9)
+        // (w2l_vce_shape_det.log:2893 ppmlhdfe_vce_cluster_novar).
+        out.errored = true;
+        out.errorMsg = "Can't specify cluster without clustervars (and viceversa)";
+        out.rc = 9;
+        return out;
+      }
       if (cvar.empty()) {
         out.errored = true;
         out.errorMsg = "Option `vce(cluster)` is not supported in this version of PIET. "
                         "Cluster variable required: vce(cluster varname)";
         return out;
       }
-      ClusterSplitM4 cs = splitClusterVarsM4(cvar);
+      ClusterSplitM4 cs = splitClusterVarsM4(cvar, multiwayClusterMeasuredM4(parsed.cmd));
       if (cs.errored) {
         out.errored = true;
         out.errorMsg = cs.errorMsg;
@@ -603,7 +776,7 @@ VcovResult vcovFromOpts(const eval::ParsedCommand& parsed, bool* sawRobustFlag) 
     // typed -- `xtreg ..., robust fe cluster(firmID)` x12 in one corpus
     // file. Stata's cluster wins: w2_pweight.log R5_pw_robust_AND_cluster_
     // equals_R4 is byte-identical to R4. Twin ordering in runRegress.
-    ClusterSplitM4 cs = splitClusterVarsM4(*clusterOpt);
+    ClusterSplitM4 cs = splitClusterVarsM4(*clusterOpt, multiwayClusterMeasuredM4(parsed.cmd));
     if (cs.errored) {
       out.errored = true;
       out.errorMsg = cs.errorMsg;
@@ -692,10 +865,17 @@ EstimationArgvResult buildEstimationArgvM4(const std::string& cobraCmd,
     }
   }
 
+  // xtreg's _vce_parse takes vce(cluster a b) on to its own panel checks.
+  if (auto bad = clusterSpecRefusalM4(parsed, session, ClusterOptParserM4::kVceParse,
+                                      /*multiwayVceRefused=*/parsed.cmd != "xtreg")) {
+    res.errored = true;
+    res.errorBlock = *bad;
+    return res;
+  }
   VcovResult vr = vcovFromOpts(parsed);
   if (vr.errored) {
     res.errored = true;
-    res.errorBlock = engineErrorBlockM4(vr.errorMsg, "unsupported_option");
+    res.errorBlock = vcovErrorBlockM4(vr);
     return res;
   }
   // P3 / BUG-056: cobra's logit/probit estimator does not implement
@@ -717,7 +897,9 @@ EstimationArgvResult buildEstimationArgvM4(const std::string& cobraCmd,
   // two-way clustering, which no MLE path in this engine computes. Keeping
   // the reject for "twoway" is the honest half — a silent fallback to
   // one-way would answer a different question.
-  if ((cobraCmd == "logit" || cobraCmd == "probit") && vr.argv.size() >= 2 &&
+  // cloglog (BUG-1169/1170) is the third binary ML verb and shares their CLI.
+  const bool binaryMl = cobraCmd == "logit" || cobraCmd == "probit" || cobraCmd == "cloglog";
+  if (binaryMl && vr.argv.size() >= 2 &&
       vr.argv[0] == "--vcov" && vr.argv[1] == "twoway") {
     res.errored = true;
     res.errorBlock = engineErrorBlockM4(
@@ -818,23 +1000,52 @@ EstimationArgvResult buildEstimationArgvM4(const std::string& cobraCmd,
       "absorb", "vce", "vcov", "robust", "cluster", "noconstant", "nocons",
       "level",  "fe",  "re",   "be",     "gls",     "mle",        "ec1",  "pa",
   };
-  // BUG-333: `or` (odds-ratio display) and `iterate(#)` are logit-ONLY. They are
-  // gated on cobraCmd rather than added to the shared set above, because this
-  // builder also serves probit/xtreg/etc., where Stata offers neither — widening
-  // the shared set would manufacture an over-acceptance on four other commands.
-  // `or` is consumed in the dispatcher (display metric, never reaches the engine);
-  // `iterate` is forwarded below.
+  // BUG-333: `or` (odds-ratio display) is logit-ONLY. It is gated on cobraCmd
+  // rather than added to the shared set above, because this builder also serves
+  // probit/xtreg/etc. — widening the shared set would manufacture an
+  // over-acceptance on the other commands. `or` is consumed in the dispatcher
+  // (display metric, never reaches the engine).
   const bool logitOnlyOk = (cobraCmd == "logit");
+  // FU-425: Stata's maximize options, on logit AND probit: both pass them
+  // to the shared ML-options parser, whose syntax line
+  // is ITERate(int) TOLerance(real) LTOLerance(real) NRTOLerance(real)
+  // DIFficult; the capitalised stem is the minimum abbreviation. BUG-333 had
+  // gated `iterate` on logit alone, so `probit ..., iterate(300)` was r(198)
+  // where Stata runs it (w2e_probes.log:412 lp_probit_tight_ctl, rc 0). Gated on
+  // the two commands, not the shared set, for the reason `or` is: xtreg and the
+  // other callers of this builder must not start accepting them. Forwarded below
+  // under the engine's spellings (cmds_mle.cpp parse_ml_max_options).
+  const bool mlMaxOk = binaryMl;
+  struct MlMaxOpt { const char* name; size_t minLen; bool valued; };
+  static const MlMaxOpt kMlMaxOpts[] = {{"iterate", 4, true},     {"tolerance", 3, true},
+                                        {"ltolerance", 4, true},  {"nrtolerance", 5, true},
+                                        {"difficult", 3, false}};
+  // The canonical maximize option `k` spells (nullptr when none), and only in
+  // its own shape: a valued one with a value, `difficult` bare.
+  auto mlMaxOptOf = [&](const std::string& k, const eval::OptValue& v) -> const MlMaxOpt* {
+    if (!mlMaxOk) return nullptr;
+    for (const MlMaxOpt& o : kMlMaxOpts) {
+      const std::string name = o.name;
+      if (k.size() >= o.minLen && k.size() <= name.size() && name.compare(0, k.size(), k) == 0)
+        return (o.valued ? !v.isBool : (v.isBool && v.boolValue)) ? &o : nullptr;
+    }
+    return nullptr;
+  };
   // BUG-331: `offset()` is a logit/probit option in Stata (StataBE 19.5 oracle,
   // 2026-08-17) and the engine implements it as of cobra 0.42.0. Gated on the two
   // commands that have it rather than widened into the shared set, for the same
   // reason `or`/`iterate` are: this builder also serves xtreg and friends.
   const bool offsetOk = (cobraCmd == "logit" || cobraCmd == "probit");
+  // FU-468: `asis` keeps perfect predictors and their rows (logit's help,
+  // probit's help); a flag, forwarded as the engine's --asis below.
+  const bool asisOk = offsetOk || cobraCmd == "cloglog";  // cobra cloglog has no --offset
   for (const auto& [k, v] : parsed.opts) {
     (void)v;
     if (kEstimationKnownOpts.count(k)) continue;
-    if (logitOnlyOk && (k == "or" || k == "iterate")) continue;
+    if (logitOnlyOk && k == "or") continue;
+    if (mlMaxOptOf(k, v) != nullptr) continue;
     if (offsetOk && k == "offset") continue;
+    if (asisOk && k == "asis" && v.isBool) continue;
     res.errored = true;
     res.errorBlock = engineErrorBlockM4("option `" + k + "` not allowed", "unsupported_option");
     return res;
@@ -847,7 +1058,7 @@ EstimationArgvResult buildEstimationArgvM4(const std::string& cobraCmd,
   // leaving `--vcov cluster` unmapped made a supported combination fail as an
   // unrecognized flag. `--cluster VAR` rides along unchanged (same spelling
   // on both CLIs).
-  if (cobraCmd == "logit" || cobraCmd == "probit") {
+  if (binaryMl) {
     for (size_t i = 0; i < argv.size(); ++i) {
       if (argv[i] != "--vcov" || i + 1 >= argv.size()) continue;
       if (argv[i + 1] == "hc1") {
@@ -866,17 +1077,60 @@ EstimationArgvResult buildEstimationArgvM4(const std::string& cobraCmd,
     argv = translate::injectTsContext(argv, session);
   }
 
-  // BUG-333: forward logit's --iterate. This MUST push onto the local `argv`,
-  // not onto res.argv — the assignment on the next line overwrites res.argv
-  // wholesale, which silently swallowed the first version of this forward
-  // (measured: `logit ..., iterate(2)` returned the un-truncated default fit).
-  if (logitOnlyOk) {
-    for (const auto& [k, v] : parsed.opts)
-      if (k == "iterate" && !v.isBool) {
-        argv.push_back("--iterate");
-        argv.push_back(v.strValue);
-        break;
+  // BUG-333 / FU-425: forward the maximize options (logit and probit) as
+  // --iterate/--tolerance/--ltolerance/--nrtolerance/--difficult. This MUST push
+  // onto the local `argv`, not onto res.argv — the assignment below overwrites
+  // res.argv wholesale, which silently swallowed the first version of this
+  // forward (measured: `logit ..., iterate(2)` returned the un-truncated default
+  // fit). The first spelling of each option wins, as the --iterate forward did.
+  // The engine echoes them (`ml_max_argv`) and every post-estimation refit
+  // carries them (estimation_m4c.cpp pushFitAsisM4), so lincom/test/margins
+  // answer from the posted iterate (FU-426).
+  // A value the engine's parse_ml_max_options would refuse (exit 2, which this
+  // layer reports as rc 1) is refused here by name at r(198) instead: a
+  // tolerance that is not a nonnegative number, an iterate() outside the
+  // engine's [1, 16000]. No captured record covers these values (Stata's
+  // mlopts takes iterate(0) and any real tolerance), so this is a refusal of a
+  // shape this build does not run, not a claim about Stata's answer.
+  // BUG-872: the value is a decimal literal parsed whole (no hex, inf or nan),
+  // and iterate() is forwarded as the integer it parsed to, never as typed: the
+  // engine reads --iterate as a plain integer, so `iterate(1e3)` forwarded
+  // verbatim used to run ONE iteration at rc 0 (e(ic) 1, e(converged) 0).
+  if (mlMaxOk) {
+    std::set<std::string> sent;
+    for (const auto& [k, v] : parsed.opts) {
+      const MlMaxOpt* o = mlMaxOptOf(k, v);
+      if (o == nullptr || !sent.insert(o->name).second) continue;
+      if (o->valued) {
+        const std::string val = strutil::trim(v.strValue);
+        char* end = nullptr;
+        const double d = std::strtod(val.c_str(), &end);
+        const bool decimal = val.find_first_not_of("0123456789.eE+-") == std::string::npos;
+        const bool parsed_all =
+            !val.empty() && decimal && end != nullptr && *end == '\0' && std::isfinite(d);
+        const bool isIterate = std::string(o->name) == "iterate";
+        // iterate(0) reports the starting values (BUG-1244: StataBE e(converged) 0,
+        // e(ic) 0, the constant-only start; the engine takes --iterate 0).
+        const bool ok = parsed_all && (isIterate ? (d == std::floor(d) && d >= 0 && d <= 16000) : d >= 0);
+        if (!ok) {
+          res.errored = true;
+          res.errorBlock = engineErrorBlockM4(
+              std::string("option ") + o->name + "() " +
+                  (isIterate ? "must be an integer from 0 to 16000 in this build"
+                             : "must be a nonnegative number in this build") +
+                  " (got `" + v.strValue + "`)",
+              "unsupported_option");
+          return res;
+        }
       }
+      argv.push_back(std::string("--") + o->name);
+      if (o->valued) {
+        const std::string val = strutil::trim(v.strValue);
+        argv.push_back(std::string(o->name) == "iterate"
+                           ? std::to_string(static_cast<int>(std::strtod(val.c_str(), nullptr)))
+                           : val);
+      }
+    }
   }
 
   // BUG-331: forward `offset(VAR)`. Same local-`argv` rule as --iterate above —
@@ -887,6 +1141,13 @@ EstimationArgvResult buildEstimationArgvM4(const std::string& cobraCmd,
       if (k == "offset" && !v.isBool) {
         argv.push_back("--offset");
         argv.push_back(v.strValue);
+        break;
+      }
+  }
+  if (asisOk) {
+    for (const auto& [k, v] : parsed.opts)
+      if (k == "asis" && v.isBool && v.boolValue) {
+        argv.push_back("--asis");
         break;
       }
   }
@@ -1010,8 +1271,556 @@ bool computeYMinMaxM4(SessionState& session, const std::string& yName,
   return true;
 }
 
+std::optional<std::vector<int64_t>> esampleRowsM4(SessionState& session, const LastModel& lm) {
+  if (lm.esample != LastModel::EsampleState::kColumn || lm.esampleSerial == 0) return std::nullopt;
+  try {
+    Datastore* ds = session.datastore();
+    if (ds == nullptr || !ds->has(kEsampleColumn) || ds->dtype(kEsampleColumn) != "f64")
+      return std::nullopt;
+    const double* mk = ds->col(kEsampleColumn).f64();
+    const double serial = static_cast<double>(lm.esampleSerial);
+    std::vector<int64_t> rows;
+    for (int64_t i = 0; i < ds->nRows(); ++i)
+      if (mk[i] == serial) rows.push_back(i);
+    return rows;
+  } catch (const std::exception&) {
+    return std::nullopt;  // an unreadable frame: the caller posts nothing that needs the rows
+  }
+}
+
+const double* f64ColumnM4(SessionState& session, const std::string& name) {
+  try {
+    Datastore* ds = session.datastore();
+    if (ds == nullptr || name.empty() || !ds->has(name) || ds->dtype(name) != "f64") return nullptr;
+    return ds->col(name).f64();
+  } catch (const std::exception&) {
+    return nullptr;
+  }
+}
+
 }  // namespace est_detail
 using namespace est_detail;
+
+// ===========================================================================
+// Stata's built-in multiway cluster e() (FU-388 / FU-402 / FU-406). regress
+// (Stata's multiway-cluster step), areg and xtreg,fe (Stata's absorb step)
+// post, after a VCE with two or more cluster variables: no e(N_clust),
+// e(rank) = the rank of the clipped variance (r(rankc)), the e(kcluster) matrix
+// (1 x every cluster combination, row "#Groups", columns cluster1..) and the macros
+// e(cluster1..) naming each combination (`id#id2`). The engine's feols reply under
+// --multiway-subset-factors carries `vcov_rank` and `kcluster` (apps/cmds/common.cpp
+// run_feols). w2s_multiway_class.log:116 regress `.|6|2|180`, :133
+// `30|7|180|id|id2|id#id2`, :691 xtreg `.|4|30|180|cg1 cg2|2`, :1115/:1126 three-way.
+// Shared with handlers.cpp (runRegress), which declares both itself.
+//
+// The cached reply's half: run on the reply that becomes LastModel::result, BEFORE
+// setLastModel (which mirrors it into the resolver), like BUG-570's n_clusters erase.
+// The emitted block keeps the engine's fields.
+void applyBuiltinMultiwayReplyM4(ojson& result) {
+  if (!result.is_object()) return;
+  result.erase("n_clusters");
+  if (result.contains("vcov_rank") && result["vcov_rank"].is_number())
+    result["k_vars"] = result["vcov_rank"];
+}
+
+// The e() stores' half, AFTER setLastModel: e(kcluster) and e(cluster#). Recorded
+// with noteEOnFit so the next install drops them (SessionState::dropEOnFit), as it
+// does any name written on top of a fit.
+void postBuiltinMultiwayEM4(SessionState& session, const ojson& raw) {
+  if (!raw.is_object() || !raw.contains("kcluster") || !raw["kcluster"].is_array() ||
+      raw["kcluster"].empty())
+    return;
+  eval::EvalMatrix m;
+  m.rownames = {"#Groups"};
+  m.data.emplace_back();
+  size_t i = 0;
+  for (const auto& c : raw["kcluster"]) {
+    if (!c.is_object() || !c.contains("levels") || !c["levels"].is_number()) return;
+    ++i;
+    m.colnames.push_back("cluster" + std::to_string(i));
+    m.data[0].push_back(c["levels"].get<double>());
+  }
+  auto& store = session.eval.eMatrices;
+  store.erase(std::remove_if(store.begin(), store.end(),
+                             [](const auto& p) { return p.first == "kcluster"; }),
+              store.end());
+  store.emplace_back("kcluster", std::move(m));
+  session.noteEOnFit("kcluster");
+  i = 0;
+  for (const auto& c : raw["kcluster"]) {
+    const std::string name = "cluster" + std::to_string(++i);
+    session.eval.setEString(name, c.value("name", std::string()));
+    session.noteEOnFit(name);
+  }
+}
+
+// ===========================================================================
+// Stata's ordered e() name lists (`: e(scalars)`, `: e(macros)`, `: e(matrices)`)
+// for the fits whose whole Stata namespace PIET posts (w2s_multiway_class mw_*_scalars
+// /_macros/_lists, w2v_estpost_ematrix ep15d_ematrices). Each path below posts every
+// name Stata lists that PIET's lazily resolved e() did not carry, with Stata's value,
+// then installs the list (SessionState::ENameContract; eNameOrderFor re-checks it
+// against the live stores on every read). A kind whose names cannot all be posted
+// with Stata's value is left unclaimed, so `: e(kind)' keeps its r(111) refusal.
+//
+// The orders are Stata's e() store order (StataBE 19.5 on the oracle machine):
+// e(macros) is newest-first and a re-set name moves to the front, e(matrices) is
+// `b V` then newest-first (both reproduce from the ado posting sequences, e.g.
+// regress's own posts then Stata's multiway-cluster step for the multiway regress
+// lists); e(scalars) follows the store's own order, which the ado sequence alone does
+// not determine (areg's list, w2s_multiway_class.log mw_areg_c2_scalars, has
+// `ar2 p F r2_a` after the hidden/historical posts), so each scalar list is the one
+// measured for that path. Names that depend on the specification are generated:
+// e(cluster1..C) for the C cluster combinations.
+namespace {
+
+void putEScalarNL(SessionState& s, const std::string& n, double v) {
+  s.eval.setEScalar(n, v);
+  s.noteEOnFit(n);
+}
+void putEStringNL(SessionState& s, const std::string& n, const std::string& v) {
+  s.eval.setEString(n, v);
+  s.noteEOnFit(n);
+}
+void putEMatrixNL(SessionState& s, const std::string& n, eval::EvalMatrix m) {
+  auto& store = s.eval.eMatrices;
+  store.erase(std::remove_if(store.begin(), store.end(),
+                             [&n](const auto& p) { return p.first == n; }),
+              store.end());
+  store.emplace_back(n, std::move(m));
+  s.noteEOnFit(n);
+}
+std::optional<double> rawNumNL(const ojson& raw, const char* key) {
+  if (!raw.is_object() || !raw.contains(key) || !raw[key].is_number()) return std::nullopt;
+  return raw[key].get<double>();
+}
+// The regress-family log likelihood of a Gaussian fit with residual (or, for ll_0,
+// total) sum of squares `ss` over N observations: regress's e(ll)/e(ll_0)
+// (-N/2 (1 + ln 2pi + ln(ss/N)); StataBE regress c2 e(ll) -429.7924086070367 with
+// rss 1249.565, e(ll_0) -590.9762832476949 with tss 7491.19; areg/xtreg,fe post
+// r(ll0) over the within sum of squares, e(ll_0) -577.19 with tss_w 6427.50).
+double gaussLogLikNL(double N, double ss) {
+  return -0.5 * N * (1.0 + std::log(2.0 * 3.14159265358979323846) + std::log(ss / N));
+}
+// e(cmdline): the ado's `"<cmd> `0'"' -- the command word as Stata names it, then
+// the arguments as typed (StataBE `reg y x1 x2 , vce(cluster id   id2)` posts
+// "regress y x1 x2 , vce(cluster id   id2)").
+std::string stataCmdlineNL(const std::string& word, const eval::ParsedCommand& parsed,
+                           const std::string& expanded = std::string()) {
+  // the dispatched line before tokenize, which keeps the trailing blanks parsed.raw drops
+  const std::string& s = expanded.empty() ? parsed.raw : expanded;
+  size_t i = s.find_first_not_of(" \t");
+  if (i == std::string::npos) return word;
+  size_t j = s.find_first_of(" \t,", i);
+  if (j == std::string::npos) return word;
+  size_t k = s.find_first_not_of(" \t", j);
+  if (k == std::string::npos) return word;
+  // Trailing blanks stay: Stata's `0` keeps those a macro or xi's substitution
+  // leaves (`regress y x1 ` after `xi: regress y x1 i.one`, BUG-1048); a typed
+  // line arrives here already trimmed, as Stata trims it.
+  return word + " " + s.substr(k);
+}
+// Record the engine's e(beta) coefficients (`beta_std`) or e(V_modelbased)
+// (`e_Vmb`) on the live session block, IN PLACE: the session block is mutated,
+// never reassigned or swapped, so its identity (liveEstimationIdentity, the
+// address r(table) and the e(b) stripe annotation key on) is the fit's own. The
+// matrices are built at the moment of need by EvalSession::resolveEMatrixFor
+// from a copy of this block through the e(b)/e(V) reader, after
+// annotateEbStripe has recorded the base-level columns. Session block only,
+// like e_V and `noconstant`: the console block (freeze-pinned) is unchanged.
+bool recordOnBlockNL(SessionState& session, const ojson& raw, const char* key) {
+  if (!session.lastEstBlock.has_value() || !session.lastEstBlock->is_object() ||
+      !raw.is_object() || !raw.contains(key) || !raw[key].is_object() || raw[key].empty())
+    return false;
+  (*session.lastEstBlock)[key] = raw[key];
+  return true;
+}
+std::vector<std::string> clusterMacrosNL(size_t combos) {
+  std::vector<std::string> v;
+  for (size_t i = 1; i <= combos; ++i) v.push_back("cluster" + std::to_string(i));
+  return v;
+}
+void installENameContractNL(SessionState& session, const std::string& cmd,
+                            std::optional<std::vector<std::string>> scalars,
+                            std::optional<std::vector<std::string>> macros,
+                            std::optional<std::vector<std::string>> matrices,
+                            std::vector<std::string> missingScalars = {}) {
+  if (!session.lastModel().has_value()) return;
+  SessionState::ENameContract c;
+  c.fitSerial = session.lastModel()->fitSerial;
+  c.cmd = cmd;
+  c.scalars = std::move(scalars);
+  c.macros = std::move(macros);
+  c.matrices = std::move(matrices);
+  c.missingScalars = std::move(missingScalars);
+  session.eNameContract = std::move(c);
+}
+// The options whose presence leaves the e() namespace of a regress/areg/xtreg fit as
+// measured (vce/robust/cluster pick the measured VCE path; level is display-only).
+// Anything else (beta, hascons, tsscons, notable, noheader, absorb options...) is
+// not measured, and the fit keeps the refusal.
+bool onlyOptionsNL(const eval::ParsedCommand& parsed, std::initializer_list<const char*> allowed) {
+  for (const auto& [k, v] : parsed.opts) {
+    (void)v;
+    bool ok = false;
+    for (const char* a : allowed) ok = ok || k == a;
+    if (!ok) return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+// regress (one-way: OLS, vce(robust), vce(cluster v); built-in multiway) and areg
+// (built-in multiway), unweighted, with the constant; and a weighted or noconstant
+// one-way regress (BUG-1542), whose values are posted without the ordered name lists.
+// Called by runRegress right after the multiway e() hook. `raw` is the engine reply as
+// the fit received it.
+void postENameListsRegressM4(SessionState& session, const ojson& raw,
+                             const eval::ParsedCommand& parsed, const std::string& stataCmdIn,
+                             bool builtinMultiway, bool noConstant) {
+  session.eNameContract.reset();
+  const std::string stataCmd = stataCmdIn == "reg" ? std::string("regress") : stataCmdIn;
+  const auto& lmo = session.lastModel();
+  if (!lmo.has_value() || !raw.is_object()) return;
+  const bool weighted = !lmo->fitWeight.empty();
+  if ((weighted || noConstant) && stataCmd != "regress") return;
+  const LastModel& lm = *lmo;
+  const bool multiway = builtinMultiway && (lm.vcov == "twoway" || lm.vcov == "multiway") &&
+                        raw.contains("kcluster") && raw["kcluster"].is_array() &&
+                        !raw["kcluster"].empty();
+  const auto N = rawNumNL(raw, "n_obs");
+  const auto rss = rawNumNL(raw, "rss");
+  const auto mss = rawNumNL(raw, "mss");
+  if (!N || !rss || !mss || *N <= 0 || *rss <= 0) return;
+  const std::string cmdline = stataCmdlineNL(stataCmd, parsed, session.leafCmdExpanded);
+
+  if (stataCmd == "regress") {
+    if (!lm.fe.empty() ||
+        !onlyOptionsNL(parsed, {"vce", "robust", "cluster", "level", "noconstant", "nocons"}))
+      return;
+    enum class Path { kOls, kRobust, kCluster1, kMultiway } path;
+    if (multiway) path = Path::kMultiway;
+    else if (lm.vcov == "iid") path = Path::kOls;
+    else if (lm.vcov == "hc1") path = Path::kRobust;
+    else if (lm.vcov == "cluster" && lm.cluster.size() == 1 &&
+             lm.cluster[0].find(',') == std::string::npos)
+      path = Path::kCluster1;
+    else return;
+    // [R] regress Stored results and regress's posting: e(sum_w) is N unweighted,
+    // e(ll)/e(ll_0) the Gaussian log likelihoods of the fit and of the constant-only fit.
+    // Weighted (BUG-1542, StataBE 19.5, 12 rows, sum(wf) 28.5): e(sum_w) is the weight
+    // total and e(ll)/e(ll_0) the same Gaussian over e(N) and e(rss)/e(mss) -- [fw=] N 30,
+    // ll -17.670289377592514; [iw=] N 28, -21.142846032770578, or N 12 on the normalized
+    // weights under vce(robust)/vce(cluster) (-8.9550222657338434, the [pw=] value) --
+    // plus, for [aw=] only, 0.5 * sum(ln(w_i * N / sum w)) over e(sample), each weight
+    // read as a precision (-10.210580476229087 under every VCE). noconstant posts no
+    // e(ll_0) and the same e(ll) over its own e(rss) (StataBE `regress y x, noconstant`
+    // -25.243130074332818 under every VCE, [aw=] -27.799597115109073, [fw=]
+    // -65.078391062216852, [iw=] -62.18388485682388). Not measured weighted or
+    // noconstant: the built-in multiway path.
+    if ((weighted || noConstant) && path == Path::kMultiway) return;
+    double sumW = *N, llShift = 0.0;
+    if (weighted) {
+      if (!raw.contains("weight") || !raw["weight"].is_object()) return;
+      const auto w = rawNumNL(raw["weight"], "sum_w");
+      if (!w || !(*w > 0)) return;
+      sumW = *w;
+      if (lm.fitWtype == "aw") {
+        llShift = std::numeric_limits<double>::quiet_NaN();
+        const auto rows = esampleRowsM4(session, lm);
+        const double* wv = f64ColumnM4(session, lm.fitWeight);
+        if (rows.has_value() && wv != nullptr && static_cast<double>(rows->size()) == *N) {
+          double s = 0.0;
+          for (const int64_t i : *rows) s += std::log(wv[i] * *N / sumW);
+          if (std::isfinite(s)) llShift = 0.5 * s;
+        }
+      }
+    }
+    putEScalarNL(session, "sum_w", sumW);
+    if (!std::isnan(llShift)) {
+      putEScalarNL(session, "ll", gaussLogLikNL(*N, *rss) + llShift);
+      if (!noConstant) putEScalarNL(session, "ll_0", gaussLogLikNL(*N, *mss + *rss) + llShift);
+    }
+    // regress's own macros; the coefficient-table step posts the hidden
+    // e(_r_z__CL)/e(_r_z_abs__CL) when the table is shown (StataBE `ereturn list, all`).
+    putEStringNL(session, "cmdline", cmdline);
+    putEStringNL(session, "title", "Linear regression");
+    putEStringNL(session, "marginsprop", "minus");
+    putEStringNL(session, "marginsok", "XB default");
+    putEStringNL(session, "properties", "b V");
+    putEStringNL(session, "predict", "regres_p");
+    putEStringNL(session, "model", "ols");
+    putEStringNL(session, "estat_cmd", "regress_estat");
+    putEStringNL(session, "_r_z__CL", "t");
+    putEStringNL(session, "_r_z_abs__CL", "|t|");
+    // A weighted or noconstant fit's e(beta), e(V_modelbased) and ordered name lists
+    // are not measured.
+    if (weighted || noConstant) return;
+    // e(beta) is posted by regress for every fit except a one-way cluster VCE
+    // (StataBE `: e(matrices)`: OLS/robust/hc3/aw/fv `b V beta...`, vce(cluster id)
+    // `b V V_modelbased`); the multiway path's inner regress runs without the cluster.
+    // Both are recorded on the block and resolved when read (recordOnBlockNL);
+    // the matrix list below names them only when recorded, and eNameOrderFor
+    // re-checks on every read that each one resolves.
+    const bool beta = path != Path::kCluster1 && recordOnBlockNL(session, raw, "beta_std");
+    // e(V_modelbased) is (X'X)^-1 = V/rmse^2 under every VCE the engine sends it for
+    // (BUG-1043: one-way robust/cluster too, unweighted or fweighted).
+    const bool vmb = path != Path::kOls && recordOnBlockNL(session, raw, "e_Vmb");
+    const std::vector<std::string> base = {"cmdline", "title", "marginsprop", "marginsok",
+                                           "vce", "_r_z_abs__CL", "_r_z__CL", "depvar", "cmd",
+                                           "properties", "predict", "model", "estat_cmd"};
+    const std::vector<std::string> olsScalars = {"N",   "sum_w", "df_m", "df_r", "F",
+                                                 "r2",  "rmse",  "mss",  "rss",  "r2_a",
+                                                 "ll",  "ll_0",  "rank"};
+    std::optional<std::vector<std::string>> S, M, X;
+    switch (path) {
+      case Path::kOls:
+        S = olsScalars;
+        M = base;
+        if (beta) X = std::vector<std::string>{"b", "V", "beta"};
+        break;
+      case Path::kRobust:
+        // StataBE `: e(matrices)` after vce(robust): `b V beta V_modelbased`.
+        S = olsScalars;
+        M = base;
+        M->push_back("vcetype");
+        if (beta && vmb) X = std::vector<std::string>{"b", "V", "beta", "V_modelbased"};
+        break;
+      case Path::kCluster1: {
+        S = std::vector<std::string>{"N_clust"};
+        S->insert(S->end(), olsScalars.begin(), olsScalars.end());
+        M = base;
+        M->push_back("vcetype");
+        M->push_back("clustvar");
+        if (vmb) X = std::vector<std::string>{"b", "V", "V_modelbased"};  // StataBE `b V V_modelbased`
+        break;
+      }
+      case Path::kMultiway: {
+        // Stata's multiway-cluster step: df_r and rank re-set, then
+        // the model test's df_m, F, p.
+        S = std::vector<std::string>{"N",   "sum_w", "r2",   "rmse", "mss",  "rss", "r2_a",
+                                     "ll",  "ll_0",  "df_r", "rank", "df_m", "F",   "p"};
+        M = std::vector<std::string>{"_r_z_abs__CL", "_r_z__CL", "clustvar", "vce", "vcetype"};
+        for (const auto& c : clusterMacrosNL(raw["kcluster"].size())) M->push_back(c);
+        for (const char* n : {"cmdline", "title", "marginsprop", "marginsok", "depvar", "cmd",
+                              "properties", "predict", "model", "estat_cmd"})
+          M->push_back(n);
+        if (beta && vmb)
+          X = std::vector<std::string>{"b", "V", "kcluster", "V_modelbased", "beta"};
+        break;
+      }
+    }
+    installENameContractNL(session, session.eval.eStrings.get("cmd"), std::move(S), std::move(M), std::move(X));
+    return;
+  }
+
+  if (stataCmd == "areg") {
+    // The MAP path with one absorbed variable and the built-in multiway VCE
+    // (Stata's absorb step, areg's ado).
+    if (!multiway || lm.fe.size() != 1 || !onlyOptionsNL(parsed, {"absorb", "vce", "cluster", "level"}))
+      return;
+    const auto tss = rawNumNL(raw, "tss_total");
+    const auto tssW = rawNumNL(raw, "tss_within");
+    const auto r2a = rawNumNL(raw, "adj_r2");
+    if (!tss || !tssW || !r2a || !raw.contains("e_V") || !raw["e_V"].is_object() ||
+        !raw["e_V"].contains("names") || !raw["e_V"]["names"].is_array() ||
+        !raw.contains("absorbed") || !raw["absorbed"].is_object() ||
+        !raw["absorbed"].contains(lm.fe[0]) || !raw["absorbed"][lm.fe[0]].is_number())
+      return;
+    const double levels = raw["absorbed"][lm.fe[0]].get<double>();
+    const double rankMb = static_cast<double>(raw["e_V"]["names"].size());
+    putEScalarNL(session, "rc", 0.0);
+    // r(dfe), the model-based residual dof (areg charges the absorbed levels).
+    putEScalarNL(session, "df_r_mb", *N - (levels - 1.0) - rankMb);
+    putEScalarNL(session, "rank_mb", rankMb);
+    putEScalarNL(session, "ll", gaussLogLikNL(*N, *rss));
+    putEScalarNL(session, "ll_0", gaussLogLikNL(*N, *tssW));
+    putEScalarNL(session, "tss", *tss);
+    putEScalarNL(session, "adjdf", 0.0);
+    putEScalarNL(session, "mss_w", *tssW - *rss);
+    putEScalarNL(session, "tss_w", *tssW);
+    putEScalarNL(session, "k_absorb", levels);
+    putEScalarNL(session, "ar2", *r2a);  // areg's ado historical(9.2) ar2 = e(r2_a)
+    std::optional<std::vector<std::string>> M, X;
+    // Macros (Stata's absorb step, areg, the estimation-sample signature)
+    // and matrices. Only a plain varlist (no factor or
+    // time-series operators, which unopvarlist would rewrite) is claimed.
+    const auto plain = [](const std::string& v) {
+      return !v.empty() && v.find_first_of(".#()") == std::string::npos;
+    };
+    bool plainVars = plain(lm.y);
+    for (const auto& x : lm.x) plainVars = plainVars && plain(x);
+    const std::string absvar = lm.fe[0];
+    const std::string clustvar = session.eval.eStrings.get("clustvar");
+    std::vector<std::string> sigVars;
+    if (plainVars && !clustvar.empty()) {
+      sigVars.push_back(lm.y);
+      for (const auto& x : lm.x) sigVars.push_back(x);
+      sigVars.push_back(absvar);
+      std::istringstream cs(clustvar);
+      for (std::string c; cs >> c;) sigVars.push_back(c);
+    }
+    std::string signature;
+    if (!sigVars.empty() && lm.esample == LastModel::EsampleState::kColumn &&
+        session.currentHbin().has_value()) {
+      // e(datasignature): `_datasignature <vars>, esample nonames` over e(sample).
+      // Stata's checksum algorithm is unpublished, so this is the engine's own
+      // signature in Stata's nonames shape (src/data/datasignature.h Q9 ruling,
+      // the same divergence `datasignature` itself carries).
+      std::string csv;
+      for (const auto& v : sigVars) csv += (csv.empty() ? "" : ",") + v;
+      CobraRunResult cr = runCobra({"datasignature", "--data", *session.currentHbin(), "--vars",
+                                    csv, "--keepif",
+                                    std::string(kEsampleColumn) + "==" +
+                                        std::to_string(lm.esampleSerial)});
+      if (cr.ok) {
+        signature = cr.stdout_text;
+        while (!signature.empty() && (signature.back() == '\n' || signature.back() == '\r' ||
+                                      signature.back() == ' '))
+          signature.pop_back();
+      }
+    }
+    if (!signature.empty()) {
+      std::string sv;
+      for (const auto& v : sigVars) sv += (sv.empty() ? "" : " ") + v;
+      putEStringNL(session, "cmdline", cmdline);
+      putEStringNL(session, "_r_z__CL", "t");
+      putEStringNL(session, "_r_z_abs__CL", "|t|");
+      putEStringNL(session, "estmethod", "MAP");
+      putEStringNL(session, "footnote", "areg_footnote");
+      putEStringNL(session, "title2", "Absorbed variable: " + absvar);
+      putEStringNL(session, "title", "Linear regression, absorbing indicators");
+      putEStringNL(session, "predict", "areg_p");
+      putEStringNL(session, "marginsprop", "nolinearize");
+      putEStringNL(session, "marginsnotok", "Residuals SCore D XBD");
+      putEStringNL(session, "datasignaturevars", sv);
+      putEStringNL(session, "datasignature", signature);
+      putEStringNL(session, "absvar", absvar);
+      putEStringNL(session, "apm", "projection");
+      putEStringNL(session, "map_method", "projection");
+      putEStringNL(session, "properties", "b V");
+      M = std::vector<std::string>{"cmdline", "_r_z_abs__CL", "_r_z__CL", "estmethod", "cmd",
+                                   "footnote", "title2", "title", "predict", "marginsprop",
+                                   "marginsnotok", "datasignaturevars", "datasignature", "vce"};
+      for (const auto& c : clusterMacrosNL(raw["kcluster"].size())) M->push_back(c);
+      for (const char* n : {"absvar", "depvar", "vcetype", "clustvar", "apm", "map_method",
+                            "properties"})
+        M->push_back(n);
+    }
+    // e(ksingle) counts the absorbed singletons; claimed only when there are none.
+    const bool noSingletons = raw.contains("fe_group_sizes") && raw["fe_group_sizes"].is_object() &&
+                              raw["fe_group_sizes"].contains("min") &&
+                              raw["fe_group_sizes"]["min"].is_number() &&
+                              raw["fe_group_sizes"]["min"].get<double>() > 1.0;
+    const bool vmb = recordOnBlockNL(session, raw, "e_Vmb");  // resolved when read
+    if (noSingletons && vmb) {
+      const auto one = [&absvar](const char* row, double v) {
+        eval::EvalMatrix m;
+        m.rownames = {row};
+        m.colnames = {absvar};
+        m.data = {{v}};
+        return m;
+      };
+      putEMatrixNL(session, "ksingle", one("singletons", 0.0));
+      putEMatrixNL(session, "dfabsorb", one("df", levels - 1.0));
+      putEMatrixNL(session, "kabsorb", one("absvar", levels));
+      X = std::vector<std::string>{"b",       "V",       "kcluster",    "ksingle",
+                                   "dfabsorb", "kabsorb", "V_modelbased"};
+    }
+    installENameContractNL(
+        session, session.eval.eStrings.get("cmd"),
+        std::vector<std::string>{"rc",   "N",      "df_a",     "df_r", "df_r_mb", "rank",
+                                 "rank_mb", "ll",  "ll_0",     "rss",  "tss",     "adjdf",
+                                 "rmse", "mss",    "r2_w",     "r2",   "mss_w",   "tss_w",
+                                 "k_absorb", "df_m", "ar2",    "p",    "F",       "r2_a"},
+        std::move(M), std::move(X));
+  }
+}
+
+// xtreg, fe under the built-in multiway VCE, unweighted (Stata's absorb step with
+// cmd xtreg,fe). Called after postBuiltinMultiwayEM4.
+void postENameListsXtregFeM4(SessionState& session, const ojson& raw,
+                             const eval::ParsedCommand& parsed) {
+  session.eNameContract.reset();
+  const auto& lmo = session.lastModel();
+  if (!lmo.has_value() || !lmo->fitWeight.empty() || !raw.is_object() ||
+      !onlyOptionsNL(parsed, {"fe", "vce", "cluster", "level"}))
+    return;
+  const auto N = rawNumNL(raw, "n_obs");
+  const auto rss = rawNumNL(raw, "rss");
+  const auto tss = rawNumNL(raw, "tss_total");
+  const auto tssW = rawNumNL(raw, "tss_within");
+  const auto su = rawNumNL(raw, "sigma_u");
+  const auto se = rawNumNL(raw, "sigma_e");
+  const auto ng = rawNumNL(raw, "N_g");
+  if (!N || !rss || !tss || !tssW || !su || !se || !ng || !raw.contains("fe_group_sizes") ||
+      !raw["fe_group_sizes"].is_object() || !raw.contains("e_V") || !raw["e_V"].is_object() ||
+      !raw["e_V"].contains("names") || !raw["e_V"]["names"].is_array() ||
+      !raw.contains("kcluster") || !raw["kcluster"].is_array() || raw["kcluster"].empty())
+    return;
+  const auto& gs = raw["fe_group_sizes"];
+  if (!gs.contains("min") || !gs.contains("max") || !gs.contains("avg")) return;
+  const double gmin = gs["min"].get<double>(), gmax = gs["max"].get<double>(),
+               gavg = gs["avg"].get<double>();
+  const double rankMb = static_cast<double>(raw["e_V"]["names"].size());
+  putEScalarNL(session, "rc", 0.0);
+  putEScalarNL(session, "df_ax", 0.0);  // Stata's absorb step (xtreg,fe)
+  // r(dfe): the panels nest in every cluster (xtreg requires it, _xtreg_chk_cl2), so
+  // the absorbed panel means are not charged (StataBE e(df_r_mb) 177 = 180 - 3).
+  putEScalarNL(session, "df_r_mb", *N - rankMb);
+  putEScalarNL(session, "rank_mb", rankMb);
+  putEScalarNL(session, "ll", gaussLogLikNL(*N, *rss));
+  putEScalarNL(session, "ll_0", gaussLogLikNL(*N, *tssW));
+  putEScalarNL(session, "tss", *tss);
+  putEScalarNL(session, "adjdf", 0.0);
+  putEScalarNL(session, "k_absorb", *ng);
+  // e(df_b): the dof of the model test of the slopes
+  // (Stata's absorb step), the reply's df_b (runXtreg: the slope count,
+  // bounded by the clipped V's rank).
+  putEScalarNL(session, "df_b", rawNumNL(raw, "df_b").value_or(rankMb - 1.0));
+  putEScalarNL(session, "sigma", std::sqrt(*su * *su + *se * *se));  // xtreg,fe
+  putEScalarNL(session, "ui", *su);
+  putEScalarNL(session, "g_max", gmax);
+  putEScalarNL(session, "g_avg", gavg);
+  putEScalarNL(session, "g_min", gmin);
+  putEScalarNL(session, "Tcon", gmin == gmax ? 1.0 : 0.0);
+  putEScalarNL(session, "Tbar", gavg);
+  putEScalarNL(session, "tss_w", *tssW);
+  putEScalarNL(session, "mss_w", *tssW - *rss);
+  putEScalarNL(session, "tss_xt", *tssW);
+  installENameContractNL(
+      session, "xtreg",
+      std::vector<std::string>{"rc",      "N",     "df_a",  "df_ax",  "df_r",  "df_r_mb", "rank",
+                               "rank_mb", "ll",    "ll_0",  "rss",    "tss",   "adjdf",   "rmse",
+                               "mss",     "r2",    "k_absorb", "df_b", "df_m", "r2_w",    "p",
+                               "rho",     "sigma", "sigma_e", "r2_b", "r2_o",  "corr",    "sigma_u",
+                               "ui",      "N_g",   "g_max", "g_avg",  "g_min", "Tcon",    "Tbar",
+                               "F",       "r2_a",  "tss_w", "mss_w",  "tss_xt"},
+      std::nullopt, std::nullopt);
+}
+
+// ivregress 2sls under the built-in multiway VCE, asymptotic (no `small`),
+// unweighted, with the constant (ivregress.ado / ivregress 2sls). Called after
+// runIvRegress has posted e(mss)/e(tss)/e(rss)/e(r2)/e(r2_a)/e(df_m).
+void postENameListsIvregressM4(SessionState& session, const ojson& raw, size_t kEndog) {
+  session.eNameContract.reset();
+  if (!session.lastModel().has_value() || !raw.is_object()) return;
+  const auto p = rawNumNL(raw, "chi2_p");
+  if (!p || kEndog == 0) return;
+  for (const char* n : {"mss", "tss", "rss", "r2", "r2_a", "df_m"})
+    if (session.eval.eScalars.find(n) == nullptr) return;
+  putEScalarNL(session, "kappa", 1.0);
+  putEScalarNL(session, "p", *p);
+  putEScalarNL(session, "k_endog", static_cast<double>(kEndog));
+  putEScalarNL(session, "iterations", 0.0);
+  installENameContractNL(
+      session, "ivregress",
+      std::vector<std::string>{"N",    "kappa",   "mss",  "tss",  "rss",  "rmse",
+                               "r2",   "r2_a",    "df_m", "p",    "rank_mb", "rank",
+                               "chi2", "df_r",    "k_endog", "iterations"},
+      std::nullopt, std::nullopt, {"rank_mb", "df_r"});
+}
 
 // ===========================================================================
 // tabstat / correlate / pwcorr / ttest — all route through cobraToEstimationM4
@@ -1030,12 +1839,19 @@ namespace {
 ojson runTabstatCore(const std::vector<std::string>& varlist,
                       const std::optional<std::string>& byVal,
                       const std::optional<std::string>& statsVal, const std::string& dataPath,
-                      bool wantGroups, bool noTotal) {
+                      bool wantGroups, bool noTotal, const std::string& weightFlag = "",
+                      const std::string& weightVar = "") {
   const std::string* dataPathOpt = &dataPath;
   std::vector<std::string> args = {"tabstat", "--vars", joinCommaM4(varlist)};
   if (byVal.has_value() && !byVal->empty()) {
     args.push_back("--by");
     args.push_back(*byVal);
+  }
+  // BUG-1014: [aw=]/[fw=] reach the engine, whose tabstat is summarize per group
+  // with the same weight conventions (w2as sx_tabstat_aw, sx_tabstat_fw).
+  if (!weightFlag.empty() && !weightVar.empty()) {
+    args.push_back(weightFlag);
+    args.push_back(weightVar);
   }
   if (statsVal.has_value() && !statsVal->empty()) {
     // space/comma -> comma-joined.
@@ -1105,6 +1921,23 @@ ojson runTabstat(const std::vector<std::string>& varlist, const std::optional<st
   return runTabstatCore(varlist, byVal, statsVal, *dataPathOpt, wantGroups, noTotal);
 }
 
+// BUG-1014: the weighted form of runTabstat. Not in piet/handlers.h (outside
+// this lane's manifest); forward-declared in dispatcher.cpp like
+// runSummarizeAweight. `weightFlag` is "--aweight" or "--fweight".
+ojson runTabstatWeighted(const std::vector<std::string>& varlist,
+                         const std::optional<std::string>& byVal,
+                         const std::optional<std::string>& statsVal, SessionState& session,
+                         const std::optional<std::string>& ifExpr, bool wantGroups, bool noTotal,
+                         const std::string& weightFlag, const std::string& weightVar) {
+  if (!session.currentHbin().has_value()) return eval::noDataLoaded();
+  if (varlist.empty()) return engineErrorBlockM4("tabstat requires at least one variable");
+  ojson ifErr;
+  auto dataPathOpt = applyIfFilterM4(session, *session.currentHbin(), ifExpr, ifErr);
+  if (!dataPathOpt.has_value()) return ifErr;
+  return runTabstatCore(varlist, byVal, statsVal, *dataPathOpt, wantGroups, noTotal, weightFlag,
+                        weightVar);
+}
+
 ojson runTabstatOnData(const std::vector<std::string>& varlist,
                         const std::optional<std::string>& statsVal, SessionState& session,
                         const std::string& dataPath) {
@@ -1114,12 +1947,43 @@ ojson runTabstatOnData(const std::vector<std::string>& varlist,
                         /*noTotal=*/false);
 }
 
-ojson runCorr(const std::vector<std::string>& varlist, bool pairwise, bool sig,
-              SessionState& session, const std::optional<std::string>& ifExpr,
-              const std::optional<std::string>& inRange) {
+// BUG-1520: `by g: tabstat x [aw=w]` / `[fw=w]` -- one group's slice with the
+// weight. Forward-declared in dispatcher.cpp like runTabstatWeighted.
+ojson runTabstatOnDataWeighted(const std::vector<std::string>& varlist,
+                               const std::optional<std::string>& statsVal,
+                               const std::string& dataPath, const std::string& weightFlag,
+                               const std::string& weightVar) {
+  if (varlist.empty()) return engineErrorBlockM4("tabstat requires at least one variable");
+  return runTabstatCore(varlist, std::nullopt, statsVal, dataPath, /*wantGroups=*/false,
+                        /*noTotal=*/false, weightFlag, weightVar);
+}
+
+// BUG-1014: correlate / pwcorr as StataBE 19.5 posts them (w2as_summary_stats_family
+// sx_corr_*, sx_correlate_*, sx_pwcorr_*; w2o_rnames N18 N19). Not in
+// piet/handlers.h (outside this lane's manifest); forward-declared in
+// dispatcher.cpp. `weightFlag` is "--aweight", "--fweight" or "".
+//  correlate: r(N) (Σw under fw), r(rho) = r(C)[1,2] (0 for one variable; not
+//    posted with covariance), r(C) the correlation -- or covariance -- matrix,
+//    r(cov_12) r(Var_1) r(Var_2) with covariance, r(sum_w) with aweights;
+//  pwcorr (pwcorr.ado): r(N) = r(Nobs)[1,2], r(rho) = r(C)[1,2], r(C), r(Nobs),
+//    and r(sig) with sig.
+// A string variable is dropped from the varlist first ("(s ignored because
+// string variable)", sx_corr_str); fewer than two left is r(102) for pwcorr.
+ojson runCorrStata(const std::vector<std::string>& varlistIn, bool pairwise, bool sig, bool covar,
+                   const std::string& weightFlag, const std::string& weightVar,
+                   SessionState& session, const std::optional<std::string>& ifExpr,
+                   const std::optional<std::string>& inRange) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
-  if (varlist.empty()) {
-    return engineErrorBlockM4("syntax_error: corr requires at least two variables", "syntax_error");
+  std::vector<std::string> varlist;
+  if (Datastore* ds = session.datastore()) {
+    for (const auto& v : varlistIn)
+      if (!(ds->has(v) && ds->dtype(v) == "factor")) varlist.push_back(v);
+  } else {
+    varlist = varlistIn;
+  }
+  if (varlist.empty() || (pairwise && varlist.size() < 2)) {
+    return ojson(eval::errorBlock("syntax_error", "too few variables specified", std::nullopt,
+                                  std::nullopt, std::nullopt, std::string("r(102)")));
   }
   ojson ifErr;
   auto dataPathOpt = applyIfFilterM4(session, *session.currentHbin(), ifExpr, ifErr, inRange);
@@ -1128,6 +1992,11 @@ ojson runCorr(const std::vector<std::string>& varlist, bool pairwise, bool sig,
   std::vector<std::string> args = {"corr", "--vars", joinCommaM4(varlist)};
   if (pairwise) args.push_back("--pairwise");
   if (sig) args.push_back("--sig");
+  if (covar) args.push_back("--cov");
+  if (!weightFlag.empty() && !weightVar.empty()) {
+    args.push_back(weightFlag);
+    args.push_back(weightVar);
+  }
   args.push_back("--data");
   args.push_back(*dataPathOpt);
   args.push_back("--tidy");
@@ -1138,25 +2007,117 @@ ojson runCorr(const std::vector<std::string>& varlist, bool pairwise, bool sig,
   } catch (const CobraError& ce) {
     return engineErrorBlockM4(cobraErrorStrM4(ce), ce.code);
   }
+  // correlate reads only the rows with every variable present: none is r(2000)
+  // "no observations", one r(2001) "insufficient observations", weighted or not
+  // and with covariance too (StataBE 19.5, 2026-11-03: `correlate x1 x2 if x1 >
+  // 100`, `... in 1`, `... [fw=w] in 1` with w = 5). r() then holds r(N) = 0 and,
+  // after an earlier correlate, that one's r(C) -- even past `return clear`.
+  // pwcorr is left as it was (`pwcorr x1 x2 in 1` is rc 0 in Stata).
+  // The count is of rows: under [fw=] the engine's n_obs is the weight sum, so
+  // the usable rows are counted here (a present, positive weight, as the engine
+  // reads them).
+  std::optional<double> usableRows;
+  if (!pairwise && raw.contains("n_obs") && raw["n_obs"].is_number())
+    usableRows = raw["n_obs"].get<double>();
+  if (usableRows.has_value() && weightFlag == "--fweight" && !weightVar.empty()) {
+    try {
+      Datastore wds(*dataPathOpt);
+      std::vector<const double*> cols;
+      for (const auto& v : varlist) cols.push_back(wds.col(v).f64());
+      const double* w = wds.col(weightVar).f64();
+      int64_t rows = 0;
+      for (int64_t r = 0; r < wds.nRows() && rows < 2; ++r) {
+        bool ok = !std::isnan(w[r]) && w[r] > 0;
+        for (const double* c : cols) ok = ok && !std::isnan(c[r]);
+        if (ok) ++rows;
+      }
+      usableRows = static_cast<double>(rows);
+    } catch (const std::exception&) {
+      usableRows.reset();
+    }
+  }
+  if (usableRows.has_value() && *usableRows <= 1.0) {
+    const bool none = *usableRows <= 0.0;
+    eval::replaceRClass(session.eval);
+    std::vector<std::string> posted = {"N"};
+    session.eval.rValues.set("N", 0.0);
+    if (session.lastCorrelateC.has_value()) {
+      eval::EvalMatrix c = *session.lastCorrelateC;
+      c.gen = eval::nextStoreGeneration();  // a write of this command's
+      session.eval.rMatrices.emplace_back("C", std::move(c));
+      posted.push_back("C");
+    }
+    eval::declareRPosted(session.eval, "correlate", std::move(posted));
+    return ojson(eval::errorBlock("engine_error",
+                                  none ? "no observations" : "insufficient observations",
+                                  std::nullopt, std::nullopt, std::nullopt,
+                                  std::string(none ? "r(2000)" : "r(2001)")));
+  }
   ojson corrBlock = cobraToEstimationM4(raw, "corr");
-  // BUG-353 (W1 lens L3): `correlate` is an r-class command and PIET published
-  // NOTHING — `di r(rho)` after a correlate answered "r(rho) is not set", which
-  // is the honest-but-wrong answer to a question Stata answers. Measured on
-  // StataBE 19.5 (`sysuse auto`): `correlate mpg weight` sets r(N)=74 and
-  // r(rho)=-.80717486, and with THREE variables r(rho) stays the FIRST PAIR's
-  // correlation (-.80717486 again), i.e. it is always the [1,2] element rather
-  // than something only defined for two variables.
-  //
-  // The engine already reports both — `r` (the matrix) and `n_obs` — so this is
-  // pure carriage, at the one seam that has them.
-  if (raw.contains("n_obs") && raw["n_obs"].is_number()) {
-    session.eval.rValues.set("N", raw["n_obs"].get<double>());
+  auto cell = [](const ojson& m, size_t i, size_t j) {
+    if (m.is_array() && i < m.size() && m[i].is_array() && j < m[i].size() && m[i][j].is_number())
+      return m[i][j].get<double>();
+    return eval::kStataMissingSentinel;
+  };
+  auto toMatrix = [&](const ojson& m) {
+    eval::EvalMatrix out;
+    out.rownames = varlist;
+    out.colnames = varlist;
+    for (size_t i = 0; i < varlist.size(); ++i) {
+      std::vector<double> row;
+      for (size_t j = 0; j < varlist.size(); ++j) {
+        const double v = cell(m, i, j);
+        row.push_back(v >= eval::kStataMissingSentinel ? std::numeric_limits<double>::quiet_NaN() : v);
+      }
+      out.data.push_back(std::move(row));
+    }
+    return out;
+  };
+  // r() is this command's from here on (an r-class command replaces all of it).
+  eval::replaceRClass(session.eval);
+  std::vector<std::string> posted;
+  auto post = [&](const char* name, double v) {
+    session.eval.rValues.set(name, v);
+    posted.push_back(name);
+  };
+  auto postMatrix = [&](const char* name, const ojson& m) {
+    session.eval.rMatrices.emplace_back(name, toMatrix(m));
+    posted.push_back(name);
+  };
+  const ojson& R = raw.contains("r") ? raw["r"] : ojson();
+  if (pairwise) {
+    const ojson& NB = raw.contains("nobs") ? raw["nobs"] : ojson();
+    post("N", cell(NB, 0, 1));
+    post("rho", cell(R, 0, 1));
+    postMatrix("C", R);
+    postMatrix("Nobs", NB);
+    if (sig && raw.contains("p")) postMatrix("sig", raw["p"]);
+  } else {
+    if (raw.contains("n_obs") && raw["n_obs"].is_number()) post("N", raw["n_obs"].get<double>());
+    if (covar) {
+      const ojson& CV = raw.contains("cov") ? raw["cov"] : ojson();
+      postMatrix("C", CV);
+      post("Var_1", cell(CV, 0, 0));
+      if (varlist.size() >= 2) {
+        post("cov_12", cell(CV, 0, 1));
+        post("Var_2", cell(CV, 1, 1));
+      }
+    } else {
+      postMatrix("C", R);
+      post("rho", varlist.size() >= 2 ? cell(R, 0, 1) : 0.0);
+    }
+    session.lastCorrelateC = session.eval.rMatrices.back().second;
+    if (weightFlag == "--aweight" && raw.contains("sum_w") && raw["sum_w"].is_number())
+      post("sum_w", raw["sum_w"].get<double>());
   }
-  if (raw.contains("r") && raw["r"].is_array() && raw["r"].size() >= 2 &&
-      raw["r"][0].is_array() && raw["r"][0].size() >= 2 && raw["r"][0][1].is_number()) {
-    session.eval.rValues.set("rho", raw["r"][0][1].get<double>());
-  }
+  eval::declareRPosted(session.eval, pairwise ? "pwcorr" : "correlate", std::move(posted));
   return corrBlock;
+}
+
+ojson runCorr(const std::vector<std::string>& varlist, bool pairwise, bool sig,
+              SessionState& session, const std::optional<std::string>& ifExpr,
+              const std::optional<std::string>& inRange) {
+  return runCorrStata(varlist, pairwise, sig, /*covar=*/false, "", "", session, ifExpr, inRange);
 }
 
 ojson runTtest(const eval::ParsedCommand& parsed, SessionState& session) {
@@ -1216,6 +2177,30 @@ ojson runTtest(const eval::ParsedCommand& parsed, SessionState& session) {
     return *err;
   }
 
+  // A string variable has no observations: _ttest's summarize finds none,
+  // r(2000) (w2as sx_ttest_ref_str; it was a factor_misuse engine error, rc 1).
+  if (Datastore* tds = session.datastore()) {
+    if (tds->has(varlist[0]) && tds->dtype(varlist[0]) == "factor")
+      return ojson(eval::errorBlock("engine_error", "no observations", std::nullopt, std::nullopt,
+                                    std::nullopt, std::string("r(2000)")));
+  }
+  // `ttest x = y` is `ttest x == y` (ttest.ado turns "==" into "=" before
+  // syntax). The right-hand side is read from the varlist tokens, never from the
+  // raw text: a regex over the raw line found the `==` of an `if` clause, so
+  // `ttest pre = post if d == 1` ran a one-sample test of pre against 1 and
+  // posted its names (sx_ttest_paired_eq).
+  std::optional<std::string> eqRhs;
+  {
+    std::string joined;
+    for (const auto& t : varlist) joined += t + " ";
+    const size_t eq = joined.find('=');
+    if (eq != std::string::npos) {
+      std::string r = joined.substr(eq + 1);
+      while (!r.empty() && (r.front() == '=' || std::isspace(static_cast<unsigned char>(r.front()))))
+        r.erase(r.begin());
+      eqRhs = trimM4(r);
+    }
+  }
   std::vector<std::string> args;
   if (byVal.has_value() && !byVal->empty()) {
     args = {"ttest", "--var", varlist[0], "--by", *byVal};
@@ -1223,10 +2208,8 @@ ojson runTtest(const eval::ParsedCommand& parsed, SessionState& session) {
     if (reverse) args.push_back("--reverse");
     for (const auto& a : levelArgs) args.push_back(a);
   } else {
-    std::smatch m;
-    std::regex eqRe(R"(==\s*(\S+))");
-    if (std::regex_search(raw, m, eqRe)) {
-      std::string rhs = trimM4(m[1].str());
+    if (eqRhs.has_value() && !eqRhs->empty()) {
+      std::string rhs = *eqRhs;
       try {
         size_t pos;
         std::stod(rhs, &pos);  // Python's float(rhs) — value unused, only validity matters
@@ -1277,7 +2260,23 @@ ojson runTtest(const eval::ParsedCommand& parsed, SessionState& session) {
   try {
     raw2 = runCobraJsonM4(args);
   } catch (const CobraError& ce) {
-    return engineErrorBlockM4(cobraErrorStrM4(ce), ce.code);
+    // by() must name exactly two groups: Stata's r(420) (sx_ttest_ref_by3). The
+    // engine's two_groups() says how many it found.
+    const std::string msg = cobraErrorStrM4(ce);
+    static const std::regex kGroups(R"(must define exactly 2 groups \(found (\d+)\))");
+    std::smatch gm;
+    if (std::regex_search(msg, gm, kGroups)) {
+      const int found = std::stoi(gm[1].str());
+      return ojson(eval::errorBlock(
+          "engine_error",
+          found > 2 ? "more than 2 groups found, only 2 allowed"
+                    : std::to_string(found) + " group" + (found == 1 ? "" : "s") + " found, 2 required",
+          std::nullopt, std::nullopt, std::nullopt, std::string("r(420)")));
+    }
+    if (msg.find("no observations") != std::string::npos)
+      return ojson(eval::errorBlock("engine_error", "no observations", std::nullopt, std::nullopt,
+                                    std::nullopt, std::string("r(2000)")));
+    return engineErrorBlockM4(msg, ce.code);
   }
   ojson ttBlock = cobraToEstimationM4(raw2, "ttest");
   // BUG-165 (W:P5): the per-group dispersions Stata prints in the group rows
@@ -1289,26 +2288,21 @@ ojson runTtest(const eval::ParsedCommand& parsed, SessionState& session) {
   for (const char* k : {"sd_1", "sd_2"}) {
     if (raw2.contains(k)) ttBlock[k] = raw2[k];
   }
-  // BUG-354 (W1 lens L3): `ttest` is r-class and published nothing, so
-  // `di r(t)` after one answered "r(t) is not set". Stata's one-sample return
-  // list, measured on StataBE 19.5 (`ttest mpg == 20` on auto): mu_1 21.297297,
-  // N_1 74, t 1.9289201, p .05762867, se .67255109, df_t 73. NOTE r(sd) is
-  // MISSING there — Stata leaves it unset for the one-sample form — so this
-  // publishes sd only when the engine actually reports one, rather than
-  // inventing a value Stata does not have.
-  {
-    auto put = [&](const char* rname, const char* jkey) {
-      if (raw2.contains(jkey) && raw2[jkey].is_number())
-        session.eval.rValues.set(rname, raw2[jkey].get<double>());
-    };
-    put("N_1", "n_obs");
-    put("mu_1", "mean");
-    put("t", "t");
-    put("p", "p");
-    put("se", "se");
-    put("df_t", "df");
-    put("sd", "sd");
+  // BUG-1015: r() is the engine's `r` object -- every name Stata posts for the
+  // form that ran (one-sample 12, two-sample 28, paired 23; ttest.sthlp Stored
+  // results) and no other: r(sd) after a one-sample test reads `.` (FU-269,
+  // w2o_rnames N07), the two-sample and paired names are posted (FU-270, N09 N10).
+  eval::replaceRClass(session.eval);
+  std::vector<std::string> posted;
+  if (raw2.contains("r") && raw2["r"].is_object()) {
+    for (auto it = raw2["r"].begin(); it != raw2["r"].end(); ++it) {
+      if (!it.value().is_number()) continue;
+      session.eval.rValues.set(it.key(), it.value().get<double>());
+      posted.push_back(it.key());
+    }
   }
+  eval::declareRPosted(session.eval, "ttest", std::move(posted));
+  ttBlock.erase("r");  // r() carriage, not part of the displayed block
   return ttBlock;
 }
 
@@ -1320,10 +2314,20 @@ namespace {
 // commands reconstruct the SAME call. Mirrors handlers.cpp::runRegress's
 // identical inline logic (M2), duplicated here per this file's
 // established one-copy-per-milestone-file convention.
+//
+// e(sample) T2: `esampleValues` is the fit's `--esample-out` file (esampleFitArgs,
+// NOT in `argv`) for a route wired for the mask; empty (every other caller)
+// leaves the model's e(sample) a named r(198) and the call byte-identical.
+//
+// `stataCmd`: the Stata command word e(cmd) publishes (LastModel::stataCmd), or
+// empty to publish cobraCmd as before.
 void cacheLastModelM4(SessionState& session, const std::string& cobraCmd,
-                       const std::vector<std::string>& argv, const ojson& block, const ojson& raw) {
+                       const std::vector<std::string>& argv, const ojson& block, const ojson& raw,
+                       const std::string& esampleValues = std::string(),
+                       const std::string& stataCmd = std::string()) {
   LastModel lm;
   lm.cobraCmd = cobraCmd;
+  lm.stataCmd = stataCmd;
   for (size_t i = 0; i < argv.size(); ++i) {
     if (argv[i] == "--y" && i + 1 < argv.size()) lm.y = argv[i + 1];
     if (argv[i] == "--x" && i + 1 < argv.size()) {
@@ -1353,6 +2357,8 @@ void cacheLastModelM4(SessionState& session, const std::string& cobraCmd,
       if (!cur.empty()) lm.fe.push_back(cur);
     }
     if (argv[i] == "--vcov" && i + 1 < argv.size()) lm.vcov = argv[i + 1];
+    if (argv[i] == "--keep-singletons") lm.keepSingletons = true;  // e(sample) T2
+    if (argv[i] == "--collinear-forward") lm.collinearForward = true;  // BUG-1067
     // W:P5: logit/probit spell the same selector `--vce` (buildEstimationArgvM4
     // remaps `--vcov hc1|cluster` onto it), so scanning only `--vcov` left
     // lm.vcov at its "iid" default for exactly the models that DID have a
@@ -1363,6 +2369,9 @@ void cacheLastModelM4(SessionState& session, const std::string& cobraCmd,
       lm.vcov = (argv[i + 1] == "robust") ? std::string("hc1") : argv[i + 1];
     }
     if (argv[i] == "--cluster" && i + 1 < argv.size()) lm.cluster.push_back(argv[i + 1]);
+    // runSvyPrefix: a `svy:` fit's e(vce) is linearized (StataBE 19.5, BUG-1513);
+    // lm.vcov keeps the engine spelling the replays key on.
+    if (argv[i] == "--svy") lm.eVce = "linearized";
   }
   lm.depvar = block.value("depvar", "");
   captureFitFilterM4(lm, argv);
@@ -1381,11 +2390,25 @@ void cacheLastModelM4(SessionState& session, const std::string& cobraCmd,
       (*lm.result)["n_clusters"].get<double>() == 0.0) {
     lm.result->erase("n_clusters");
   }
+  // BUG-1041: xtreg, fe posts e(tss), the total sum of squares about the overall
+  // mean (StataBE 9544.62 where its within e(mss) is 8389.45). Cached reply only.
+  if (lm.stataCmd == "xtreg" && lm.result.has_value() && lm.result->is_object() &&
+      lm.result->contains("tss_total") && (*lm.result)["tss_total"].is_number())
+    (*lm.result)["tss"] = (*lm.result)["tss_total"];
+  // BUG-518 order: the mask column first, then setLastModel.
+  if (!esampleValues.empty()) (void)esampleInstallOnHead(session, esampleValues, *lm.result, lm);
   session.setLastModel(lm);
   session.lastEstBlock = block;
+  session.attachFitCovariance(raw);  // eb-order T-P1: e(V) when the fit sent one
+  // A noconstant fit (`--no-intercept`) records it, as runRegress does, so the
+  // e(b) readers know the missing `_cons` is Stata's too (w2p_estim_ev.log:1585
+  // G_pnc_fit `probit d x1 x2, noconstant`: colsof(e(b)) = 2).
+  if (std::find(argv.begin(), argv.end(), "--no-intercept") != argv.end() &&
+      session.lastEstBlock.has_value() && session.lastEstBlock->is_object())
+    (*session.lastEstBlock)["noconstant"] = true;
 }
 
-// FU-29: xtreg_fe.ado's weight rule. After `mark touse [weight] if in` and
+// FU-29: xtreg,fe's weight rule. After `mark touse [weight] if in` and
 // `markout touse ivar tvar varlist` it runs `by ivar touse: assert w == w[_N]
 // if touse` and stops with "weight must be constant within <ivar>" r(199)
 // (w2_pweight.log X10_pw_varies_within_id; aer_b4 predict-e-xbd.log
@@ -1492,6 +2515,37 @@ void aliasPanelR2M4(ojson& raw) {
   if (raw.contains("r2_overall") && raw["r2_overall"].is_number()) raw["r2_o"] = raw["r2_overall"];
 }
 
+// BUG-1482: the rank of a one-way clustered V (e_V, slopes and _cons), Stata's
+// r(rankc) (Stata's robust-VCE step: the pivoted QR of the clustered V, tolerance 1e-9):
+// the eigenvalues of the symmetric V above 1e-9 of the largest. Under xtreg, fe
+// the clusters nest the panels, so the _cons scores sum to zero in every cluster
+// and the rank is min(slopes, G - 1) on ordinary data (StataBE 19.5, 2 clusters
+// and 2 slopes: e(rank) 1). nullopt when e_V is absent or not square.
+std::optional<double> clusteredVRankM4(const ojson& raw) {
+  if (!raw.contains("e_V") || !raw["e_V"].is_object() || !raw["e_V"].contains("matrix") ||
+      !raw["e_V"]["matrix"].is_array())
+    return std::nullopt;
+  const ojson& m = raw["e_V"]["matrix"];
+  const size_t k = m.size();
+  if (k == 0) return std::nullopt;
+  std::vector<double> a(k * k);
+  for (size_t r = 0; r < k; ++r) {
+    if (!m[r].is_array() || m[r].size() != k) return std::nullopt;
+    for (size_t c = 0; c < k; ++c) {
+      if (!m[r][c].is_number()) return std::nullopt;
+      a[r + c * k] = m[r][c].get<double>();
+    }
+  }
+  std::vector<double> w, z;
+  if (piet::lapack::dsyevrVAL(static_cast<int>(k), std::move(a), 0.0, w, z) != 0 || w.empty())
+    return std::nullopt;
+  const double top = *std::max_element(w.begin(), w.end());
+  double rank = 0.0;
+  for (double v : w)
+    if (v > 1e-9 * top) rank += 1.0;
+  return rank;
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -1501,14 +2555,115 @@ void aliasPanelR2M4(ojson& raw) {
 ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
 
+  bool isBe = false;
   for (const auto& [k, v] : parsed.opts) {
-    static const std::set<std::string> kBad = {"be", "gls", "mle", "ec1", "pa"};
+    static const std::set<std::string> kBad = {"gls", "mle", "ec1", "pa"};
     if (kBad.count(k) && v.isBool && v.boolValue) {
       return engineErrorBlockM4(
-          "This version of PIET supports only `xtreg ,fe` (-> feols within) and "
-          "`xtreg ,re` (Swamy-Arora GLS). `xtreg ," + k + "` is not available.",
+          "This version of PIET supports only `xtreg ,fe` (-> feols within), "
+          "`xtreg ,re` (Swamy-Arora GLS) and `xtreg ,be` (between). `xtreg ," + k +
+              "` is not available.",
           "unsupported_option");
     }
+    if (k == "be" && v.isBool && v.boolValue) isBe = true;
+  }
+  // BUG-1515: between effects, xtreg,be: the OLS of the panel means of y on the
+  // panel means of the regressors and a constant, one row per panel (cobra xtreg
+  // --be). StataBE 19.5 (i6.do, 20 panels of 6): _b[x] .7062577229568211, _se[x]
+  // .12404345599768729, e(df_r) 18, e(r2_b) .64298067688888827, e(model) "be".
+  // Its syntax has no weight and no vce other than conventional (m2.do, StataBE
+  // 19.5): [aw=] r(101) "weights not allowed", vce(robust) / vce(cluster id) r(198)
+  // "vcetype robust|cluster not allowed", and robust, cluster() and noconstant are
+  // r(198) "option ... not allowed". `wls` (weights by panel size) is not served.
+  if (isBe) {
+    for (const auto& [k, v] : parsed.opts) {
+      if ((k == "fe" || k == "re") && v.isBool && v.boolValue)  // xtreg.ado opts_exclusive
+        return ojson(eval::errorBlock("engine_error",
+                                      "only one of re, fe, be, pa, or cre is allowed",
+                                      std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+    }
+    if (!session.panelvar.has_value() || session.panelvar->empty()) {
+      return ojson(eval::errorBlock("engine_error", "must specify panelvar; use xtset",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(459)"));
+    }
+    if (parsed.weightType.has_value() && parsed.weightVar.has_value() &&
+        !parsed.weightVar->empty()) {
+      return ojson(eval::errorBlock("engine_error", "weights not allowed", std::nullopt,
+                                    std::nullopt, std::nullopt, "r(101)"));
+    }
+    for (const auto& [k, v] : parsed.opts) {
+      if (v.isBool && !v.boolValue) continue;
+      std::string refusal;
+      if (k == "vce" || k == "vcov") {
+        // The first word as typed: vce(r) is "vcetype r not allowed", and even
+        // vce(conv) is refused (StataBE 19.5 m3b.do); vce(bootstrap) and
+        // vce(jackknife) are prefix runs this build does not have.
+        const std::string vt = trimM4(v.isBool ? std::string() : v.strValue);
+        const std::string word = vt.substr(0, vt.find_first_of(" \t,"));
+        const std::string lw = lowerM4(word);
+        if (lw.size() >= 4 && (std::string("bootstrap").rfind(lw, 0) == 0 ||
+                               std::string("jackknife").rfind(lw, 0) == 0))
+          return engineErrorBlockM4("`xtreg ,be vce(" + word + ")` is not available in this version "
+                                    "of PIET.",
+                                    "unsupported_option");
+        if (!word.empty() && word != "conventional") refusal = "vcetype " + word + " not allowed";
+      } else if (k == "robust" || k == "noconstant" || k == "nocons") {
+        refusal = "option " + k + " not allowed";
+      } else if (k == "cluster") {
+        refusal = "option cluster() not allowed";
+      } else if (k == "absorb") {
+        refusal = "option absorb() not allowed";
+      } else if (k == "wls") {
+        return engineErrorBlockM4("`xtreg ,be wls` (weights by panel size) is not available in this "
+                                  "version of PIET.",
+                                  "unsupported_option");
+      }
+      if (!refusal.empty())
+        return ojson(eval::errorBlock("engine_error", refusal, std::nullopt, std::nullopt,
+                                      std::nullopt, "r(198)"));
+    }
+    if (auto refused = tsFitRestrictionRefusal(parsed, "xtreg")) return *refused;
+    // What is left of vce() is vce(conventional), the default (rc 0 in Stata),
+    // which the shared builder does not spell.
+    eval::ParsedCommand beParsed = parsed;
+    beParsed.opts.erase(std::remove_if(beParsed.opts.begin(), beParsed.opts.end(),
+                                       [](const auto& o) { return o.first == "vce" || o.first == "vcov"; }),
+                        beParsed.opts.end());
+    EstimationArgvResult built = buildEstimationArgvM4("xtreg", beParsed, session);
+    if (built.errored) return built.errorBlock;
+    std::vector<std::string> cobraArgs = built.argv;
+    cobraArgs.push_back("--ivar");
+    cobraArgs.push_back(*session.panelvar);
+    cobraArgs.push_back("--be");
+    cobraArgs.push_back("--emit-v");
+    cobraArgs.push_back("--data");
+    cobraArgs.push_back(*session.currentHbin());
+    cobraArgs.push_back("--tidy");
+    ojson raw;
+    try {
+      raw = runCobraJsonM4(cobraArgs);
+    } catch (const CobraError& ce) {
+      return engineErrorBlockM4(cobraErrorStrM4(ce), ce.code);
+    }
+    ojson block = cobraToEstimationM4(raw, "xtreg", &session);
+    aliasPanelR2M4(raw);
+    // e(N_g), e(Tbar) (the mean panel size), e(Tcon), e(rank) (cached reply only).
+    if (raw.is_object()) {
+      if (raw.contains("n_groups") && raw["n_groups"].is_number()) raw["N_g"] = raw["n_groups"];
+      if (raw.contains("g_avg") && raw["g_avg"].is_number()) raw["Tbar"] = raw["g_avg"];
+      if (raw.contains("g_min") && raw["g_min"].is_number() && raw.contains("g_max") &&
+          raw["g_max"].is_number())
+        raw["Tcon"] = raw["g_min"].get<double>() == raw["g_max"].get<double>() ? 1.0 : 0.0;
+      if (raw.contains("e_V") && raw["e_V"].is_object() && raw["e_V"].contains("names") &&
+          raw["e_V"]["names"].is_array())
+        raw["k_vars"] = raw["e_V"]["names"].size();
+    }
+    cacheLastModelM4(session, "xtreg_be", cobraArgs, block, raw, std::string(), "xtreg");
+    if (session.lastModel().has_value()) {
+      putEStringNL(session, "model", "be");
+      session.eval.setEString("vce", "conventional");
+    }
+    return block;
   }
   // model = str(opts.get("fe", opts.get("re", ""))).lower() — reads fe's
   // value if the key is present (bare flag -> "true"), else falls back to
@@ -1543,7 +2698,7 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
       return ojson(eval::errorBlock("engine_error", "must specify panelvar; use xtset",
                                     std::nullopt, std::nullopt, std::nullopt, "r(459)"));
     }
-    // FU-29: xtreg_fe.ado's `syntax ... [aw fw pw]` -- an iweight is Stata's
+    // FU-29: xtreg,fe's `syntax ... [aw fw pw]` -- an iweight is Stata's
     // r(101) "iweights not allowed" (w2_pweight.log X11_iw_fe). The registry
     // row is AllWeights because the RE arm below has a different rule.
     const bool weighted =
@@ -1555,6 +2710,9 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
                                       std::nullopt, std::nullopt, "r(101)"));
       }
     }
+    // FU-475: the engine applies --keepif after its time-series operators only
+    // for a restriction it can evaluate on the full frame.
+    if (auto refused = tsFitRestrictionRefusal(parsed, "xtreg")) return *refused;
     EstimationArgvResult built =
         buildEstimationArgvM4("feols", parsed, session, *session.panelvar);
     if (built.errored) return built.errorBlock;
@@ -1564,6 +2722,23 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
       }
     }
     std::vector<std::string> cobraArgs = built.argv;
+    // FU-386: xtreg,fe's multiway cluster VCE is Stata's built-in convention
+    // (xtreg,fe -> Stata's absorb step -> Stata's robust-VCE step), minus = rank + dfax:
+    // w2s_multiway_class.log:696 vce(cluster cg1 cg2) se(x1) .0532737214421747 where
+    // reghdfe's Gmin factor (the engine default) gave .0509313674247111.
+    // FU-401/FU-407: every cluster variable must nest the panels, else r(498)
+    // (Stata's absorb step -> Stata's xtreg cluster check; log:640
+    // vce(cluster id id2), vce(cluster id2)): the engine checks it on the
+    // estimation sample (--fe-nested-in-clusters) and the refusal is mapped below.
+    bool clusterVce = false;
+    bool multiwayVce = false;
+    for (size_t i = 0; i + 1 < cobraArgs.size(); ++i) {
+      if (cobraArgs[i] != "--vcov") continue;
+      clusterVce = cobraArgs[i + 1] == "cluster" || cobraArgs[i + 1] == "twoway" ||
+                   cobraArgs[i + 1] == "multiway";
+      multiwayVce = cobraArgs[i + 1] == "twoway" || cobraArgs[i + 1] == "multiway";
+    }
+    if (multiwayVce) cobraArgs.push_back("--multiway-subset-factors");
     // BUG-538 (W2 estimopts): under `xtreg, fe` Stata's vce(robust) / bare
     // `robust` IS vce(cluster panelvar) -- w2_pweight.log X1_fe_vcerobust
     // is byte-identical to X2_fe_clusterid (e(vce)=cluster, e(clustvar)=id,
@@ -1578,13 +2753,45 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
         break;
       }
     }
+    // e(sample) T2: xtreg, fe keeps a one-observation panel in the sample and in
+    // N_g (w2_esample.log:897 D3 `0|59|59|11|`; the engine's reghdfe default
+    // dropped id 11: 58 and 10). Read back into LastModel::keepSingletons by
+    // cacheLastModelM4, so the refits keep it too.
+    cobraArgs.push_back("--keep-singletons");
+    // BUG-1067: xtreg, fe keeps the earlier term of a collinear set, as reghdfe and
+    // areg do (StataBE scratch-r150/c1067/m1.do A_xtreg `x o.z`), not the engine's
+    // default pivoted basis (regress's `o.x z`). Read back into
+    // LastModel::collinearForward by cacheLastModelM4, so the refits keep it too.
+    cobraArgs.push_back("--collinear-forward");
     cobraArgs.push_back("--data");
     cobraArgs.push_back(*session.currentHbin());
     cobraArgs.push_back("--tidy");
+    // e(sample) T2: the engine writes the fit's admitted rows over the --data
+    // rows (its own --keepif included); cacheLastModelM4 installs them. Kept
+    // out of cobraArgs, which cacheLastModelM4 reads as the fit's flags.
+    std::vector<std::string> fitArgv = cobraArgs;
+    const std::string esampleValues = esampleFitArgs(session, fitArgv, std::string(), 0);
+    fitArgv.push_back("--emit-v");  // eb-order T-P1: the fit's full e(V) (feols row)
+    // FU-401: the nesting check is the fit's alone (not in cobraArgs, which the
+    // refits replay: a model that was fitted already passed it). vce(robust) was
+    // rewritten to cluster(panelvar) above, which nests trivially.
+    if (clusterVce || std::find(cobraArgs.begin(), cobraArgs.end(), "--cluster") != cobraArgs.end())
+      fitArgv.push_back("--fe-nested-in-clusters");
     ojson raw;
     try {
-      raw = runCobraJsonM4(cobraArgs);
+      raw = runCobraJsonM4(fitArgv);
     } catch (const CobraError& ce) {
+      cecon::native_unlink(esampleValues);
+      // Stata's r(498), with its message (one-way: the first line only); no e() is
+      // posted, so a following `_se[x1]` is r(111) (log:645-648).
+      if (ce.detail == "panels_not_nested")
+        return ojson(eval::errorBlock("engine_error", ce.what(), std::nullopt, std::nullopt,
+                                      std::nullopt, std::string("r(498)")));
+      // BUG-1269: `xtreg, fe` on an empty sample is r(2001) "insufficient
+      // observations", not regress's r(2000) (StataBE 19.5, `xtreg y x if x > 20, fe`).
+      if (ce.code == "no_obs" && std::string(ce.what()) == "no observations")
+        return ojson(eval::errorBlock("engine_error", "insufficient observations", std::nullopt,
+                                      std::nullopt, std::nullopt, std::string("r(2001)")));
       return engineErrorBlockM4(cobraErrorStrM4(ce), ce.code);
     }
     // FU-29: e(sigma_e) of a weighted fit. The engine's panel-scalar producer
@@ -1623,6 +2830,26 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
       raw["N_g"] = ng;
       raw["df_a"] = ng - 1.0;
     }
+    // FU-102: e(g_min)/e(g_avg)/e(g_max), the panel row counts over the
+    // estimation sample (xtreg,fe; w2p_estim_ev D_xtreg_fe_ctl
+    // `0|60|10|6|6|xtreg|`). Copied from the engine's fe_group_sizes into the
+    // cached reply only, like N_g above.
+    if (raw.is_object() && raw.contains("fe_group_sizes") && raw["fe_group_sizes"].is_object()) {
+      const ojson& gs = raw["fe_group_sizes"];
+      if (gs.contains("min") && gs.contains("avg") && gs.contains("max")) {
+        raw["g_min"] = gs["min"];
+        raw["g_avg"] = gs["avg"];
+        raw["g_max"] = gs["max"];
+        // BUG-1516: e(Tbar) is the mean group size and e(Tcon) whether every panel
+        // has the same size (xtreg,fe); e(k_absorb) is e(N_g), the
+        // absorbed panel count (also under a multiway VCE).
+        // StataBE 19.5 (30 panels of 6): e(Tbar) 6, e(Tcon) 1, e(k_absorb) 30.
+        raw["Tbar"] = gs["avg"];
+        if (gs["min"].is_number() && gs["max"].is_number())
+          raw["Tcon"] = gs["min"].get<double>() == gs["max"].get<double>() ? 1.0 : 0.0;
+        if (raw.contains("N_g")) raw["k_absorb"] = raw["N_g"];
+      }
+    }
     // BUG-383 #1 (off-pin sweep vs live Stata, 2026-09-01): the xtreg,fe route
     // published the underlying feols block untouched, and two of its members
     // are feols conventions, not xtreg ones. [XT] xtreg stores e(r2) as the
@@ -1633,27 +2860,55 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
     // slope count alone. Both raw ingredients are already in the engine reply
     // (r2_within, k_vars, k_absorbed); this route just has to pick the xtreg
     // spellings. The r2_w/r2_b/r2_o trio and the rendered header are untouched.
+    // The block's df_m now mirrors e(df_m), with the header's own numerator beside
+    // it (BUG-1291, below the model-based scalars).
     if (raw.contains("r2_within")) block["r2"] = raw["r2_within"];
-    if (raw.contains("k_vars") && raw.contains("k_absorbed") &&
-        raw["k_absorbed"].is_number() && raw["k_absorbed"].get<double>() >= 1.0) {
-      block["df_m"] = raw["k_vars"].get<double>() + raw["k_absorbed"].get<double>() - 1.0;
-    }
     // FU-76: the same two members, e() side. BUG-383 wrote them into the block
     // only, while e() resolves from the cached reply, so e(r2) read the LSDV fit
     // (0.7235263265398173) and e(df_m) the slope count 2 (w2_pweight.log X0_fe
     // PVAL e(r2) +1.132199730c722X-001 = r2_within 0.5373657181682785).
-    // e(df_m) follows xtreg_fe.ado's two arms: conventional VCE posts
+    // e(df_m) follows xtreg,fe's two arms: conventional VCE posts
     // `df_m = e(df_a) + dfb` (X0_fe and X3_aw_fe: 2 + 14 = 16), a cluster VCE
-    // posts _regress's own model df, which the oracle shows as one less than
+    // posts regress's own model df, which the oracle shows as one less than
     // the slope count: X1, X2, X4, X5, X7, X8, X9 (cluster id, 15 clusters)
     // and X6 (cluster cl2, 5 clusters) all 1 with k = 2, X13 2 with k = 3.
     // Other VCE shapes are not witnessed and keep the engine's value. The
-    // block's df_m is left as it was (freeze-pinned; see BUG-383 above).
+    // block mirrors it (BUG-1291, below).
+    // BUG-1291: e(df_b), the slope count the model F tests: r(dfr) under the
+    // conventional VCE, the model test's dof under a cluster VCE
+    // (Stata's absorb step); StataBE 2 for `xtreg y x1 x2, fe`
+    // and for vce(cluster id) (with e(df_m) 31 and 1). The test drops the
+    // constraints a clipped multiway V cannot carry, so its rank (the reply's
+    // vcov_rank) bounds it: StataBE [aw=w] vce(cluster cg1 cg2 cg3) e(rank) 1,
+    // e(df_b) 1.
     if (raw.contains("r2_within")) raw["r2"] = raw["r2_within"];
+    // BUG-1482: the clustered V's rank r(rankc) on the absorb route
+    // (xtreg,fe: a cluster variable other than the panel variable, or several):
+    // the multiway reply's vcov_rank, else the rank of the one-way e_V. Below the
+    // slope count it is e(rank), it bounds e(df_b) and e(df_m), and the model test
+    // drops a constraint, so e(F) is missing. StataBE 19.5,
+    // vce(cluster c2) with 2 clusters and 2 slopes: e(rank) 1, e(df_b) 1, e(df_m) 0,
+    // e(F) . (vce(cluster c2 c3), min G 2, alike).
+    std::optional<double> rankc;
+    if (multiwayVce) {
+      if (raw.contains("vcov_rank") && raw["vcov_rank"].is_number())
+        rankc = raw["vcov_rank"].get<double>();
+    } else if (clusterVce) {
+      for (size_t i = 0; i + 1 < cobraArgs.size(); ++i)
+        if (cobraArgs[i] == "--cluster" && cobraArgs[i + 1] != *session.panelvar)
+          rankc = clusteredVRankM4(raw);
+    }
     if (raw.contains("k_vars") && raw["k_vars"].is_number() && raw.contains("df_a") &&
         raw["df_a"].is_number()) {
       const double k = raw["k_vars"].get<double>();
       const std::string vt = raw.value("vcov_type", std::string());
+      raw["df_b"] = rankc.has_value() ? std::min(k, *rankc) : k;
+      if (rankc.has_value() && *rankc < k) {
+        raw["F"] = nullptr;
+        raw["p_F"] = nullptr;
+        block["F"] = nullptr;
+        block["p_F"] = nullptr;
+      }
       if (vt == "iid") {
         raw["df_m"] = k + raw["df_a"].get<double>();
       } else if (vt.rfind("cluster(", 0) == 0 && k >= 1.0) {
@@ -1690,7 +2945,92 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
                                     " not computed for weighted xtreg, fe in this engine (left missing)");
       }
     }
-    cacheLastModelM4(session, "feols", cobraArgs, block, raw);
+    // FU-402: the built-in multiway e() (no e(N_clust), e(rank) of the clipped V).
+    const ojson rawFit = raw;
+    if (multiwayVce) applyBuiltinMultiwayReplyM4(raw);
+    // The model-based scalars (Stata's absorb step with cmd xtreg_fe):
+    // e(rmse) = sqrt(r(mse)) and e(r2_a) = 1 - mse/(sst_xt/(N-1)), mse = rss / r(dfe). Under any cluster VCE (one-way, vce(robust) =
+    // cluster(panelvar) here, multiway; Stata's kclust > 0) the panels nest in
+    // every cluster (checked above), so r(dfe) = N - rank_mb charges no absorbed
+    // panel mean: StataBE (fixture w2s_multiway_class) vce(cluster cg1 cg2),
+    // vce(cluster id) and vce(cluster cg1) e(rmse) 1.4571896494673038 =
+    // sqrt(375.84/177) and e(r2_a) .9408651668053871, where the engine's within dof
+    // (148) gave 1.5936 and .93932 -- that dof is e(sigma_e)'s (xtreg,fe).
+    // Under the conventional VCE r(dfe) is that within dof, whose rmse the reply
+    // carries, and e(r2_a) .929277935976713 (BUG-1042; the reply's adj_r2 is the
+    // LSDV fit's .93932); e(rank) there is r(rank) = rank_mb, 3 (a cluster VCE's
+    // e(rank) is the clustered V's, the slope count k_vars or the multiway
+    // vcov_rank). Weighted fits follow the same rules on the reply's weighted sums
+    // (StataBE [aw=w] conventional e(r2_a) .93017655599106241, vce(cluster id)
+    // e(rmse) 1.4200006643786318 and .94161655529196175, [pw=w] alike; [fw=w] with
+    // N = 450 .93798739005530563, and 1.4128349298420197 / .94201057951480482;
+    // [aw=w] vce(cluster cg1 cg2) 1.4200006643786312 / .94161655529196187).
+    // e(df_m) under the robust/cluster VCE is r(dfr) + r(dfax)
+    // (Stata's absorb step, put back after the model test),
+    // with r(dfr) = min(rank, rankc) - cons (Stata's absorb solver): rank the
+    // model-based rank e(rank_mb) (the fitted columns, _cons included), rankc the
+    // clustered V's rank e(rank) (the engine's vcov_rank), cons 1 when _cons has a
+    // positive variance, and r(dfax) 0 because xtreg, fe absorbs only
+    // the panel. StataBE (fixture above): rank_mb 3, rank 2 ->
+    // e(df_m) 1, weighted ([aw=w] vce(cluster cg1 cg2)) too. e(df_b) is the
+    // model test's dof (postENameListsXtregFeM4).
+    const std::string vcovTypeFit = rawFit.value("vcov_type", std::string());
+    const bool clusterFit = multiwayVce || vcovTypeFit.rfind("cluster(", 0) == 0;
+    if ((clusterFit || vcovTypeFit == "iid") && raw.is_object() && raw.contains("tss_within") &&
+        raw["tss_within"].is_number() && raw.contains("rss") && raw["rss"].is_number() &&
+        raw.contains("n_obs") && raw["n_obs"].is_number() && raw.contains("dof_resid") &&
+        raw["dof_resid"].is_number() && raw.contains("e_V") && raw["e_V"].is_object() &&
+        raw["e_V"].contains("names") && raw["e_V"]["names"].is_array()) {
+      const double n = raw["n_obs"].get<double>();
+      const double rankMb = static_cast<double>(raw["e_V"]["names"].size());
+      const double dfe = clusterFit ? n - rankMb : raw["dof_resid"].get<double>();
+      const double rssV = raw["rss"].get<double>(), sstXt = raw["tss_within"].get<double>();
+      if (dfe > 0 && n > 1 && sstXt > 0) {
+        const double mse = rssV / dfe;
+        if (clusterFit) raw["rmse"] = std::sqrt(mse);
+        raw["adj_r2"] = 1.0 - mse / (sstXt / (n - 1.0));
+        if (!clusterFit) raw["k_vars"] = rankMb;  // e(rank) = r(rank)
+        // BUG-1482: a one-way cluster VCE's e(rank) is r(rankc) too (the multiway
+        // reply's k_vars already is, applyBuiltinMultiwayReplyM4).
+        if (rankc.has_value() && !multiwayVce) raw["k_vars"] = *rankc;
+        if (rankc.has_value()) {
+          // cons: the _cons column's variance is positive in the clustered V.
+          double cons = 0.0;
+          const auto& ev = raw["e_V"];
+          if (ev.contains("matrix") && ev["matrix"].is_array()) {
+            const auto& names = ev["names"];
+            for (size_t j = 0; j < names.size(); ++j) {
+              if (!names[j].is_string()) continue;
+              const std::string nm = names[j].get<std::string>();
+              if (nm != "_cons" && nm != "(intercept)") continue;
+              const auto& mat = ev["matrix"];
+              if (j < mat.size() && mat[j].is_array() && j < mat[j].size() &&
+                  mat[j][j].is_number() && mat[j][j].get<double>() > 0.0)
+                cons = 1.0;
+            }
+          }
+          const double dfax = 0.0;  // xtreg, fe: only the panel is absorbed
+          const double dfr = std::min(rankMb, *rankc) - cons;
+          if (dfr >= 0.0) raw["df_m"] = dfr + dfax;
+        }
+      }
+    }
+    // BUG-1291 / BUG-1042: the block carries the e() scalars eststo/esttab read off
+    // it (eststo_esttab.cpp escalarsFrom: e(df_m), e(r2_a), e(rmse)) as the cached
+    // reply resolves them, where it had k + N_g - 1, the LSDV adj_r2 and the
+    // within-dof rmse under every VCE; and e(df_b), the numerator of xtreg's header
+    // F(e(df_b), e(df_r)) (xtreg,fe's display), which the console prints:
+    // StataBE "F(2, 148) = 1191.52", under vce(cluster id) "F(2, 29) = 1142.39",
+    // where the block's df_m printed F(31, ...).
+    for (const char* key : {"df_m", "df_b", "adj_r2", "rmse"})
+      if (raw.contains(key) && raw[key].is_number()) block[key] = raw[key];
+    // e(cmd) is `xtreg` (w2v_margins_corpus F1_fit `cmd=xtreg|N=200`); the replay
+    // machinery keeps keying on cobraCmd "feols".
+    cacheLastModelM4(session, "feols", cobraArgs, block, raw, esampleValues, "xtreg");
+    if (multiwayVce) postBuiltinMultiwayEM4(session, rawFit);
+    // Stata's ordered `: e(scalars)' for this fit (w2s_multiway_class mw_xt_cg_scalars).
+    if (multiwayVce && !weighted) postENameListsXtregFeM4(session, raw, parsed);
+    else session.eNameContract.reset();
     // e(vce) after a default-VCE `xtreg, fe` is `conventional` (w2_pweight.log
     // X0_fe PSTR `120|103|.|conventional|||||`; X3_aw_fe alike). setLastModel()
     // published lm.vcov's engine spelling `iid`, which the replay machinery keys
@@ -1700,6 +3040,8 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
     if (session.lastModel().has_value() && session.lastModel()->vcov == "iid") {
       session.eval.setEString("vce", "conventional");
     }
+    // BUG-1516: e(model) "fe" (xtreg,fe; StataBE 19.5 i17.do).
+    if (session.lastModel().has_value()) putEStringNL(session, "model", "fe");
     return block;
   }
 
@@ -1710,7 +3052,7 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
     return ojson(eval::errorBlock("engine_error", "must specify panelvar; use xtset", std::nullopt,
                                   std::nullopt, std::nullopt, "r(459)"));
   }
-  // FU-29: xtreg_re.ado's `syntax` declares no weight, so any weight type is
+  // FU-29: xtreg,re's `syntax` declares no weight, so any weight type is
   // Stata's r(101) "weights not allowed" (w2_pweight.log X12_pw_re). Until the
   // registry row opened to AllWeights the tokenizer refused it as r(198).
   if (parsed.weightType.has_value() && parsed.weightVar.has_value() &&
@@ -1735,6 +3077,7 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
   std::vector<std::string> cobraArgs = built.argv;
   cobraArgs.push_back("--ivar");
   cobraArgs.push_back(*session.panelvar);
+  cobraArgs.push_back("--emit-v");  // BUG-1196: e(V), joined by cacheLastModelM4
   cobraArgs.push_back("--data");
   cobraArgs.push_back(*session.currentHbin());
   cobraArgs.push_back("--tidy");
@@ -1746,7 +3089,22 @@ ojson runXtreg(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   ojson block = cobraToEstimationM4(raw, "xtreg", &session);
   aliasPanelR2M4(raw);
+  // BUG-1516: xtreg,re posts e(Tbar), the harmonic mean of the panel sizes
+  // (the reply's T_h), e(Tcon) whether they are all equal, e(N_g), and e(rank)
+  // the rank of the full-rank V (every coefficient, _cons included). StataBE 19.5
+  // (30 panels of 6): e(Tbar) 6, e(Tcon) 1, e(rank) 3. Cached reply only.
+  if (raw.is_object()) {
+    if (raw.contains("T_h") && raw["T_h"].is_number()) raw["Tbar"] = raw["T_h"];
+    if (raw.contains("g_min") && raw["g_min"].is_number() && raw.contains("g_max") &&
+        raw["g_max"].is_number())
+      raw["Tcon"] = raw["g_min"].get<double>() == raw["g_max"].get<double>() ? 1.0 : 0.0;
+    if (raw.contains("n_groups") && raw["n_groups"].is_number()) raw["N_g"] = raw["n_groups"];
+    if (raw.contains("e_V") && raw["e_V"].is_object() && raw["e_V"].contains("names") &&
+        raw["e_V"]["names"].is_array())
+      raw["k_vars"] = raw["e_V"]["names"].size();
+  }
   cacheLastModelM4(session, "xtreg", cobraArgs, block, raw);
+  if (session.lastModel().has_value()) putEStringNL(session, "model", "re");
   return block;
 }
 
@@ -1892,8 +3250,10 @@ P7MleArgv buildP7MleArgv(const std::string& cobraCmd, const eval::ParsedCommand&
 // rawOut, when given, receives the engine payload BEFORE cobraToEstimationM4
 // narrows it to the known block keys — the ordered models need it because their
 // cutpoints ride in a key the mapper does not carry through.
-ojson runP7Mle(const std::string& cobraCmd, std::vector<std::string> cobraArgs,
-               SessionState& session, ojson* rawOut) {
+// `stataCmd` is the e(cmd) word LastModel records (cacheLastModelM4); empty
+// publishes cobraCmd, as every runP7Mle caller does.
+static ojson runP7MleAsM4(const std::string& cobraCmd, std::vector<std::string> cobraArgs,
+                          SessionState& session, ojson* rawOut, const std::string& stataCmd) {
   cobraArgs.push_back("--data");
   cobraArgs.push_back(*session.currentHbin());
   cobraArgs.push_back("--tidy");
@@ -1906,8 +3266,110 @@ ojson runP7Mle(const std::string& cobraCmd, std::vector<std::string> cobraArgs,
   if (rawOut) *rawOut = raw;
   ojson block = cobraToEstimationM4(raw, cobraCmd, &session);
   fillCoeftableStatsM4(block);
-  cacheLastModelM4(session, cobraCmd, cobraArgs, block, raw);
+  cacheLastModelM4(session, cobraCmd, cobraArgs, block, raw, std::string(), stataCmd);
   return block;
+}
+
+ojson runP7Mle(const std::string& cobraCmd, std::vector<std::string> cobraArgs,
+               SessionState& session, ojson* rawOut) {
+  return runP7MleAsM4(cobraCmd, std::move(cobraArgs), session, rawOut, std::string());
+}
+
+// BUG-1196: the depvar equation of an engine coefficient array as Stata names
+// it -- `depvar:name`, `(intercept)` spelled `_cons` and placed last. False when
+// a name is not a plain variable name (a factor level, an interaction, a
+// time-series operator): Stata's columns there (base levels, `o.` marks) are
+// not the engine's, and nothing is posted.
+bool depvarEqColsM4(const std::string& depvar, const ojson& coefs, const char* bKey,
+                    std::vector<AncillaryEbColM4>& out) {
+  static const std::regex rePlain(R"(^[A-Za-z_][A-Za-z0-9_]*$)");
+  if (!std::regex_match(depvar, rePlain) || !coefs.is_array() || coefs.empty()) return false;
+  std::vector<AncillaryEbColM4> cols;
+  std::optional<AncillaryEbColM4> cons;
+  for (const auto& c : coefs) {
+    if (!c.is_object() || !c.contains("name") || !c["name"].is_string() || !c.contains(bKey) ||
+        !c[bKey].is_number())
+      return false;
+    const std::string nm = c["name"].get<std::string>();
+    AncillaryEbColM4 col{std::string(), nm, c[bKey].get<double>()};
+    if (nm == "(intercept)" || nm == "_cons") {
+      col.stata = depvar + ":_cons";
+      cons = col;
+      continue;
+    }
+    if (!std::regex_match(nm, rePlain)) return false;
+    col.stata = depvar + ":" + nm;
+    cols.push_back(std::move(col));
+  }
+  if (cons.has_value()) cols.push_back(*cons);
+  out.insert(out.end(), cols.begin(), cols.end());
+  return true;
+}
+
+// BUG-1196: e(b)/e(V) of a fit whose Stata stripe has equations or ancillary
+// parameters that the coefficient table does not carry (tobit, ologit/oprobit,
+// nbreg, mlogit), posted as e() matrices, which every e(b)/e(V) reader answers
+// before the stripe table's refusal (EvalSession::resolveEMatrixFor). `cols`
+// are Stata's columns in order: its name, the engine's `e_V` name for it ("" for
+// a column Stata posts as a structural 0 -- mlogit's base outcome), and b. e(V)
+// is the engine's `--emit-v` covariance, made exactly symmetric as
+// canonicalEMatrix makes it. Posts nothing -- the refusal stands -- unless the
+// reply's `e_V` names every column with finite cells.
+bool postAncillaryEbM4(SessionState& session, const ojson& raw,
+                       const std::vector<AncillaryEbColM4>& cols) {
+  const auto it = raw.find("e_V");
+  if (cols.empty() || it == raw.end() || !it->is_object() || !it->contains("names") ||
+      !it->contains("matrix"))
+    return false;
+  const ojson& vn = (*it)["names"];
+  const ojson& vm = (*it)["matrix"];
+  if (!vn.is_array() || !vm.is_array() || vm.size() != vn.size()) return false;
+  const size_t k = cols.size();
+  std::vector<long> at(k, -1);
+  for (size_t a = 0; a < k; ++a) {
+    if (!std::isfinite(cols[a].b)) return false;
+    if (cols[a].engine.empty()) continue;
+    for (size_t j = 0; j < vn.size(); ++j)
+      if (vn[j].is_string() && vn[j].get<std::string>() == cols[a].engine) {
+        at[a] = static_cast<long>(j);
+        break;
+      }
+    if (at[a] < 0) return false;
+  }
+  const auto cell = [&vm, &vn](long r, long c, double* v) {
+    const ojson& row = vm[static_cast<size_t>(r)];
+    if (!row.is_array() || row.size() != vn.size() || !row[static_cast<size_t>(c)].is_number())
+      return false;
+    *v = row[static_cast<size_t>(c)].get<double>();
+    return std::isfinite(*v);
+  };
+  eval::EvalMatrix mb, mv;
+  mb.rownames = {"y1"};
+  mb.data.emplace_back();
+  mv.data.assign(k, std::vector<double>(k, 0.0));
+  for (size_t a = 0; a < k; ++a) {
+    mb.colnames.push_back(cols[a].stata);
+    mb.data[0].push_back(cols[a].b);
+    for (size_t c = 0; c < k; ++c) {
+      if (at[a] < 0 || at[c] < 0) continue;
+      double v1 = 0, v2 = 0;
+      if (!cell(at[a], at[c], &v1) || !cell(at[c], at[a], &v2)) return false;
+      mv.data[a][c] = 0.5 * (v1 + v2);
+    }
+  }
+  mv.rownames = mb.colnames;
+  mv.colnames = mb.colnames;
+  for (auto* m : {&mb, &mv}) {
+    const std::string nm = m == &mb ? "b" : "V";
+    bool put = false;
+    for (auto& kv : session.eval.eMatrices)
+      if (kv.first == nm) {
+        kv.second = *m;
+        put = true;
+      }
+    if (!put) session.eval.eMatrices.emplace_back(nm, *m);
+  }
+  return true;
 }
 
 }  // namespace est_detail
@@ -1918,8 +3380,26 @@ ojson runOrdered(const std::string& cobraCmd, const eval::ParsedCommand& parsed,
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   P7MleArgv b = buildP7MleArgv(cobraCmd, parsed, {"iid", "robust", "cluster"});
   if (b.errored) return b.errorBlock;
+  b.argv.push_back("--emit-v");  // BUG-1196: the fit's e(V), posted below
   ojson raw;
   ojson block = runP7Mle(cobraCmd, b.argv, session, &raw);
+  // BUG-1196: Stata's e(b) is the depvar's equation, then the cutpoints
+  // (StataBE 19.5 `yo:x1 yo:x2 /cut1 /cut2`); e(V) is the fit's, in that order.
+  if (raw.is_object() && raw.contains("e_V") && raw.contains("coefs") && raw.contains("cuts") &&
+      raw["cuts"].is_array()) {
+    std::vector<AncillaryEbColM4> cols;
+    bool ok = depvarEqColsM4(parsed.varlist[0], raw["coefs"], "b", cols);
+    for (const auto& c : raw["cuts"]) {
+      if (!ok || !c.is_object() || !c.contains("name") || !c["name"].is_string() ||
+          !c.contains("b") || !c["b"].is_number()) {
+        ok = false;
+        break;
+      }
+      const std::string nm = c["name"].get<std::string>();
+      cols.push_back({nm, nm, c["b"].get<double>()});
+    }
+    if (ok) (void)postAncillaryEbM4(session, raw, cols);
+  }
   // Stata prints the cutpoints in the SAME table as the coefficients, under a
   // /cut1, /cut2 … stanza. The engine emits them under their own `cuts` key
   // (they are not slopes and are excluded from the model Wald test), and
@@ -1957,7 +3437,56 @@ ojson runMlogit(const eval::ParsedCommand& parsed, SessionState& session) {
       b.argv.push_back(trimM4(v.strValue));
     }
   }
-  return runP7Mle("mlogit", b.argv, session);
+  b.argv.push_back("--emit-v");  // BUG-1196: the fit's e(V), posted below
+  ojson raw;
+  ojson block = runP7Mle("mlogit", b.argv, session, &raw);
+  // BUG-1196: Stata's e(b) has one equation per outcome, ascending, named by the
+  // outcome's value; the base outcome's columns are `o.` zeros, as are its rows
+  // and columns of e(V) (StataBE 19.5 `1:o.x1 1:o.x2 1:o._cons 2:x1 2:x2 2:_cons
+  // 3:x1 3:x2 3:_cons`). A labeled outcome, or one whose value is not a
+  // nonnegative integer, names its equation otherwise; nothing is posted then.
+  const std::string& y = parsed.varlist[0];
+  const auto lbl = session.varLblname.find(y);
+  if (raw.is_object() && raw.contains("e_V") && raw.contains("equations") &&
+      raw["equations"].is_array() && (lbl == session.varLblname.end() || lbl->second.empty())) {
+    std::vector<std::string> coefNames;  // a non-base equation's names, engine spelling
+    for (const auto& e : raw["equations"])
+      if (e.is_object() && !e.value("base", false) && e.contains("coefs") && e["coefs"].is_array()) {
+        for (const auto& c : e["coefs"])
+          if (c.is_object() && c.contains("name") && c["name"].is_string())
+            coefNames.push_back(c["name"].get<std::string>());
+        break;
+      }
+    std::vector<AncillaryEbColM4> cols;
+    bool ok = !coefNames.empty();
+    for (const auto& e : raw["equations"]) {
+      const double v = e.is_object() && e.contains("outcome") && e["outcome"].is_number()
+                           ? e["outcome"].get<double>()
+                           : -1.0;
+      if (!ok || !(v >= 0.0 && v < 1e9 && v == std::floor(v))) {
+        ok = false;
+        break;
+      }
+      char eq[64];
+      std::snprintf(eq, sizeof(eq), "%.17g", v);  // the engine's `e_V` spelling of the outcome
+      const bool isBase = e.value("base", false);
+      ojson coefs = isBase ? ojson::array() : e.value("coefs", ojson::array());
+      if (isBase)
+        for (const auto& n : coefNames) coefs.push_back({{"name", n}, {"b", 0.0}});
+      std::vector<AncillaryEbColM4> ec;  // `y:name`, re-keyed to the outcome's equation
+      if (!depvarEqColsM4(y, coefs, "b", ec)) {
+        ok = false;
+        break;
+      }
+      for (auto& c : ec) {
+        c.stata = std::string(eq) + (isBase ? ":o." : ":") + c.stata.substr(y.size() + 1);
+        c.engine = isBase ? std::string() : std::string(eq) + ":" + c.engine;
+        cols.push_back(std::move(c));
+      }
+    }
+    if (ok) (void)postAncillaryEbM4(session, raw, cols);
+  }
+  return block;
 }
 
 // `zip`/`zinb depvar indepvars [if], inflate(...) [vce(robust)]`.
@@ -2025,7 +3554,7 @@ ojson runFracreg(const eval::ParsedCommand& parsed, SessionState& session) {
 ojson runVar(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   // BUG-657: var.ado runs `tsset, noquery` -> `_ts`, whose refusal is "time
-  // variable not set, use tsset varname ..." r(111) (_ts.ado); was
+  // variable not set, use tsset varname ..." r(111) (the time-series helper); was
   // unsupported_option = r(198).
   if (!session.timevar.has_value() || session.timevar->empty())
     return ojson(eval::errorBlock("engine_error", "time variable not set, use tsset varname ...",
@@ -2480,8 +4009,36 @@ ojson runNlGmm(const std::string& cobraCmd, const std::string& rawLine,
           "`nl` (the small-sample factor is not fixed by any oracle available here).",
           "unsupported_option");
   }
+  // [aw=]/[pw=] (BUG-1283): the engine's weighted NLS -- aweights normalized to N
+  // with the model-based VCE, pweights the robust sandwich (StataBE 19.5 _se[/b1]
+  // .067819537723433465 / .071775268345285762). Stata notes the weight sum first.
+  const bool weighted = cobraCmd == "nl" && parsed.weightVar.has_value() &&
+                        !parsed.weightVar->empty();
+  if (weighted) {
+    const std::string wt = lowerM4(parsed.weightType.value_or("aw"));
+    argv.push_back("--weight");
+    argv.push_back(*parsed.weightVar);
+    const bool pw = wt == "pw" || wt == "pweight";
+    argv.push_back("--wtype");
+    argv.push_back(pw ? "pw" : "aw");
+    if (pw) {  // e(vce) robust, e(vcetype) Robust, as Stata posts under a pweight
+      argv.push_back("--vce");
+      argv.push_back("robust");
+    }
+  }
   pushLevelIfGivenM4(parsed, argv);
-  return runP7Mle(cobraCmd, argv, session);
+  ojson raw;
+  ojson block = runP7Mle(cobraCmd, argv, session, &raw);
+  if (!weighted || block.value("type", std::string()) == "error" || !raw.contains("weight") ||
+      !raw["weight"].is_object() || !raw["weight"].contains("sum_w") ||
+      !raw["weight"]["sum_w"].is_number())
+    return block;
+  char buf[64];
+  std::snprintf(buf, sizeof buf, "(sum of wgt is %.16g)", raw["weight"]["sum_w"].get<double>());
+  ojson note;
+  note["type"] = "display";
+  note["text"] = buf;
+  return ojson::array({note, block});
 }
 
 // ===========================================================================
@@ -2615,11 +4172,10 @@ ojson runSvyset(const eval::ParsedCommand& parsed, SessionState& session) {
             "implement for `svyset`.",
             "unsupported_option");
     }
-    if (strata.empty())
-      return engineErrorBlockM4(
-          "svyset: this version of PIET requires strata(), e.g. "
-          "`svyset PSU [pweight=W], strata(S)`.",
-          "unsupported_option");
+    // No strata() is ONE stratum, as in Stata (w2t_boottest_family.log:2455 H1:
+    // `svyset id [pweight=w]` prints "Strata 1: <one>" and `svy: regress` fits
+    // with "Number of strata = 1"). d.strata stays empty; runSvyPrefix then
+    // sends no --strata and the engine's feols uses the constant stratum.
     SessionState::SvySettings d;
     d.psu = parsed.varlist[0];
     d.pweight = *parsed.weightVar;
@@ -2631,7 +4187,7 @@ ojson runSvyset(const eval::ParsedCommand& parsed, SessionState& session) {
   b["type"] = "svyset";
   b["pweight"] = d.pweight;
   b["vce"] = "linearized";
-  b["strata1"] = d.strata;
+  b["strata1"] = d.strata.empty() ? std::string("<one>") : d.strata;
   b["su1"] = d.psu;
   b["fpc1"] = nullptr;
   return b;
@@ -2694,9 +4250,44 @@ ojson runSvyPrefix(const std::string& innerRaw, SessionState& session) {
   argv.push_back("--svy");
   argv.push_back("--psu");
   argv.push_back(d.psu);
-  argv.push_back("--strata");
-  argv.push_back(d.strata);
-  return runP7Mle(argv[0], argv, session);
+  // A design without strata() is one stratum for every svy verb the engine
+  // serves (BUG-1424: its mean and logit paths take it, as feols did).
+  if (!d.strata.empty()) {
+    argv.push_back("--strata");
+    argv.push_back(d.strata);
+  }
+  // e(cmd) after `svy: regress` is `regress` (w2t_boottest_family.log:2497
+  // H1_svy ecmd=regress); the engine's verb stays the cobraCmd every replay
+  // keys on. mean and logit keep publishing the engine's word as before.
+  ojson raw;
+  ojson block = runP7MleAsM4(argv[0], argv, session, &raw,
+                             argv[0] == "feols" ? std::string("regress") : std::string());
+  // FU-471: as in runLogitProbit, the logit reply's `df_m` stays on the cached
+  // reply (e(df_m)) and off the block, which never carried it.
+  if (argv[0] == "logit" && block.is_object()) block.erase("df_m");
+  // The design's counts from the reply's svy block (BUG-1424: StataBE e(N_psu) 20,
+  // e(N_strata) 1, e(df_r) 19 after `svy: mean` / `svy: logit` on a one-stratum design).
+  if (block.value("type", std::string()) != "error" && raw.is_object() && raw.contains("svy") &&
+      raw["svy"].is_object()) {
+    const ojson& sv = raw["svy"];
+    for (const auto& [key, name] : std::vector<std::pair<const char*, const char*>>{
+             {"n_psu", "N_psu"}, {"n_strata", "N_strata"}, {"design_df", "df_r"},
+             {"pop_size", "N_pop"}})
+      if (sv.contains(key) && sv[key].is_number())
+        putEScalarNL(session, name, sv[key].get<double>());
+    // BUG-1513 (StataBE 19.5, one stratum and strata(s)): `svy: regress` e(df_m) 1, the
+    // numerator dof of the design-adjusted F the reply sends; e(prefix) svy; e(title)
+    // "Survey: " + the command's own title ("Linear regression", "Mean estimation",
+    // "Logistic regression" after svy: logit and svy: logistic). e(vce)/e(vcetype)
+    // linearized/Linearized come with the model (cacheLastModelM4, setLastModel).
+    if (argv[0] == "feols" && sv.contains("f_df1") && sv["f_df1"].is_number())
+      putEScalarNL(session, "df_m", sv["f_df1"].get<double>());
+    putEStringNL(session, "prefix", "svy");
+    putEStringNL(session, "title", argv[0] == "feols"  ? "Survey: Linear regression"
+                                   : argv[0] == "mean" ? "Survey: Mean estimation"
+                                                       : "Survey: Logistic regression");
+  }
+  return block;
 }
 
 // ===========================================================================
@@ -2940,6 +4531,37 @@ ojson runStreg(const eval::ParsedCommand& parsed, SessionState& session) {
 ojson runLogitProbit(const std::string& cobraCmd, const eval::ParsedCommand& parsed,
                       SessionState& session) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
+  // FU-585 / BUG-1286: logit, logistic and probit let every weight through the
+  // registry gate. Stata takes fweights, iweights and pweights for them
+  // (logit.sthlp, probit.sthlp), so an aweight is its own r(101). The engine fits
+  // fw and iw under the default and robust VCEs, and logit's fw under
+  // vce(cluster) too (StataBE 19.5 `logit d x [fw=wi]` _se[x] .091571881918893761,
+  // e(N) 30; probit .056114942772508274); an iweight under vce(cluster), and
+  // probit's fweight there, are valid Stata the engine does not fit here.
+  if (parsed.weightType.has_value()) {
+    const std::string wt = lowerM4(*parsed.weightType);
+    if (wt == "aw" || wt == "aweight")
+      return ojson(eval::errorBlock("engine_error", "aweights not allowed", std::nullopt,
+                                    std::nullopt, std::nullopt, std::string("r(101)")));
+    bool clusterVce = false;
+    for (const auto& [k, v] : parsed.opts) {
+      if (k == "cluster" && !v.isBool) clusterVce = true;
+      if (k == "vce" && !v.isBool) {
+        const std::string t = lowerM4(trimM4(v.strValue));
+        clusterVce = clusterVce || t.rfind("cl", 0) == 0;
+      }
+    }
+    const bool iw = wt == "iw" || wt == "iweight";
+    const bool fw = wt == "fw" || wt == "fweight";
+    if (clusterVce && (iw || (fw && cobraCmd != "logit")))
+      return ojson(eval::errorBlock(
+          "unsupported_option",
+          "`" + cobraCmd + "` [" + *parsed.weightType + "=] with vce(cluster ...) is not supported "
+          "in this version of PIET (it fits fweights and iweights under the default and robust "
+          "VCEs" + std::string(cobraCmd == "logit" ? ", and fweights under vce(cluster ...)" : "") +
+              "); nothing was fitted.",
+          std::nullopt, std::nullopt, std::nullopt, std::string("r(198)")));
+  }
   EstimationArgvResult built = buildEstimationArgvM4(cobraCmd, parsed, session);
   if (built.errored) return built.errorBlock;
   std::vector<std::string> cobraArgs = built.argv;
@@ -2947,12 +4569,42 @@ ojson runLogitProbit(const std::string& cobraCmd, const eval::ParsedCommand& par
   cobraArgs.push_back(*session.currentHbin());
   cobraArgs.push_back("--tidy");
   ojson raw;
+  // ME07: the fit writes its own e(sample) (the engine's rows after listwise,
+  // weight, cluster AND perfect-prediction-screen losses; cmd_logit/cmd_probit
+  // --esample-out), installed by cacheLastModelM4 below -- so `count if
+  // e(sample)` is e(N) after a screened fit (w2u_binary_ml_edges.log:199
+  // bm_l_dz0_fit `esample=190`) and margins averages over those rows
+  // (w2v_margins_siblings.log:3574 F_pp_g `N=234`).
+  std::string esampleValues;
   try {
-    raw = runCobraJsonM4(cobraArgs);
+    // eb-order T-P1: the fit's full e(V) (the logit/probit options_table rows
+    // carry --emit-v, apps/cmds/cmds_mle.cpp add_e_v). Only the fit call gets
+    // the flag; the args the LastModel records (cacheLastModelM4) do not.
+    std::vector<std::string> fitArgs = cobraArgs;
+    fitArgs.push_back("--emit-v");
+    esampleValues = esampleFitArgs(session, fitArgs, std::string(), 0);
+    raw = runCobraJsonM4(fitArgs);
   } catch (const CobraError& ce) {
+    if (!esampleValues.empty()) cecon::native_unlink(esampleValues);
+    // FU-547: the engine's `no_obs` (a string variable in the varlist, or no
+    // row left) is Stata's "no observations" r(2000) (w2u_binary_ml_edges.log:
+    // 3686-3692 `probit ystr x1`), never the rc 1 of a bare engine_error. One
+    // row is r(2001) "insufficient observations" (BUG-1269, StataBE 19.5
+    // `logit d x if x == 1`).
+    if (ce.code == "no_obs" && std::string(ce.what()) == "insufficient observations")
+      return ojson(eval::errorBlock("engine_error", "insufficient observations", std::nullopt,
+                                    std::nullopt, std::nullopt, std::string("r(2001)")));
+    if (ce.code == "no_obs")
+      return ojson(eval::errorBlock("engine_error", "no observations", std::nullopt, std::nullopt,
+                                    std::nullopt, std::string("r(2000)")));
     return engineErrorBlockM4(cobraErrorStrM4(ce), ce.code);
   }
   ojson block = cobraToEstimationM4(raw, cobraCmd, &session);
+  // FU-471: the reply's `df_m` is e(df_m), read from the cached reply (macros.cpp
+  // eScalarKey). The block never carried it for logit/probit, and the shared
+  // kOls allowlist would copy it onto every logit/probit block (25 freeze
+  // fixtures), so it stays on the reply only -- the e(k) pattern below.
+  block.erase("df_m");
   // W:P8: cobra's logit/probit raw JSON carries no "depvar" field at all
   // (live-verified: poisson/tobit/feols all do, these two are the only
   // estimators PIET drives that omit it), so the block published an EMPTY
@@ -2975,7 +4627,15 @@ ojson runLogitProbit(const std::string& cobraCmd, const eval::ParsedCommand& par
   if (!raw.contains("k") && raw.contains("coefs") && raw["coefs"].is_array()) {
     raw["k"] = raw["coefs"].size();
   }
-  cacheLastModelM4(session, cobraCmd, cobraArgs, block, raw);
+  if (!raw.is_object() || !raw.contains("esample_n")) {
+    cecon::native_unlink(esampleValues);
+    esampleValues.clear();
+  }
+  // BUG-1192: e(cmd) after `logistic` is `logistic` (StataBE 19.5 `logistic yb x1 x2`,
+  // whose e() otherwise matches logit's but for e(predict) logistic_p), so it is the
+  // e(cmd) word LastModel records; the replays keep keying on cobraCmd "logit".
+  cacheLastModelM4(session, cobraCmd, cobraArgs, block, raw, esampleValues,
+                   lowerM4(parsed.cmd) == "logistic" ? std::string("logistic") : std::string());
   // FU-30: e(vce) after a default-VCE logit/probit is `oim` -- both are ML
   // estimators, and Stata's ML default VCE is the observed information matrix
   // (tests/eval/golden/aer_w2/w2c_ml_getmata.log:321 ml_pw_vceoim and :356
@@ -2987,6 +4647,38 @@ ojson runLogitProbit(const std::string& cobraCmd, const eval::ParsedCommand& par
   // `cluster` with e(vcetype) `Robust` (w2b_estim.log:619 logit_vce_robust).
   if (session.lastModel().has_value() && session.lastModel()->vcov == "iid") {
     session.eval.setEString("vce", "oim");
+  }
+  // FU-471 / FU-466: e(chi2type) and e(rules). The engine reply carries
+  // `chi2type` (LR, or Wald after robust/cluster/noconstant) and `rules`, one
+  // row (op, rhs, outcome, #dropped) per perfect predictor the screen dropped,
+  // J(1,4,0) when none (logit's ado). e(N_cds)/e(N_cdf)/e(df_m) resolve
+  // from the cached reply by name and e(rank) from its `k_vars` key. Both stores
+  // are recorded with noteEOnFit so the next model install drops them.
+  if (raw.contains("chi2type") && raw["chi2type"].is_string()) {
+    session.eval.setEString("chi2type", raw["chi2type"].get<std::string>());
+    session.noteEOnFit("chi2type");
+  }
+  if (raw.contains("rules") && raw["rules"].is_array() && !raw["rules"].empty()) {
+    eval::EvalMatrix m;
+    const ojson names = raw.value("rules_names", ojson::array());
+    size_t r = 0;
+    for (const auto& row : raw["rules"]) {
+      std::vector<double> cells;
+      if (row.is_array())
+        for (const auto& c : row) cells.push_back(c.is_number() ? c.get<double>() : 0.0);
+      cells.resize(4, 0.0);
+      m.data.push_back(std::move(cells));
+      m.rownames.push_back(r < names.size() && names[r].is_string()
+                               ? names[r].get<std::string>()
+                               : "r" + std::to_string(r + 1));
+      ++r;
+    }
+    m.colnames = {"c1", "c2", "c3", "c4"};
+    bool replaced = false;
+    for (auto& kv : session.eval.eMatrices)
+      if (kv.first == "rules") { kv.second = m; replaced = true; }
+    if (!replaced) session.eval.eMatrices.emplace_back("rules", std::move(m));
+    session.noteEOnFit("rules");
   }
   return block;
 }

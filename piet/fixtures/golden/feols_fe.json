@@ -1,0 +1,107 @@
+{
+  "absorbed": {
+    "rep78": 5
+  },
+  "ci_hi": {
+    "mpg": 108.16835304371224,
+    "weight": 5.436236984602894
+  },
+  "ci_lo": {
+    "mpg": -234.36254570596628,
+    "weight": -1.250104387720197
+  },
+  "cluster_dof_k": 3,
+  "coef": {
+    "mpg": -63.09709633112703,
+    "weight": 2.093066298441349
+  },
+  "coeftable": [
+    {
+      "b": -63.09709633112703,
+      "ci_hi": 108.16835304371224,
+      "ci_lo": -234.36254570596628,
+      "name": "mpg",
+      "p": 0.36418606088472305,
+      "se": 61.685155976688506,
+      "t": -1.022889467199728
+    },
+    {
+      "b": 2.093066298441349,
+      "ci_hi": 5.436236984602894,
+      "ci_lo": -1.250104387720197,
+      "name": "weight",
+      "p": 0.15715823841446186,
+      "se": 1.204119137779019,
+      "t": 1.7382551549691174
+    }
+  ],
+  "depvar": "price",
+  "diagnostics": {
+    "demean_converged": true,
+    "demean_iters": 1,
+    "demean_resid": 1.2397433802615414
+  },
+  "dof_resid": 62,
+  "estimator": "feols",
+  "fe_exact": true,
+  "fe_redundant": 0,
+  "k_absorbed": 5,
+  "k_vars": 2,
+  "n_clusters": 5,
+  "n_dropped": 5,
+  "n_dropped_singletons": 0,
+  "n_obs": 69,
+  "nested_fe": [
+    "rep78"
+  ],
+  "provenance": {
+    "argv": [
+      "cobra",
+      "feols",
+      "--data",
+      "tests/validate/auto.hbin",
+      "--y",
+      "price",
+      "--x",
+      "mpg,weight",
+      "--fe",
+      "rep78",
+      "--vcov",
+      "cluster",
+      "--cluster",
+      "rep78",
+      "--tidy"
+    ],
+    "cobra_version": "0.12.0",
+    "data": {
+      "fnv1a64": "e34d22f817b27833",
+      "path": "tests/validate/auto.hbin"
+    },
+    "demean_converged": true,
+    "n_dropped": 5,
+    "n_dropped_singletons": 0,
+    "n_obs": 69
+  },
+  "pvalue": {
+    "mpg": 0.36418606088472305,
+    "weight": 0.15715823841446186
+  },
+  "r2_within": 0.3590923713848627,
+  "se": {
+    "mpg": 61.685155976688506,
+    "weight": 1.204119137779019
+  },
+  "sigma2": 5876052.186321513,
+  "t_dof": 4.0,
+  "timing_ms": {
+    "build": 0.02325,
+    "fit": 0.500625,
+    "load": 0.159125
+  },
+  "tstat": {
+    "mpg": -1.022889467199728,
+    "weight": 1.7382551549691174
+  },
+  "vcov_npd_fix": false,
+  "vcov_type": "cluster(rep78)"
+}

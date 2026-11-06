@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 
@@ -13,7 +15,7 @@
 // were refusing by name: `tsfilter hp`, `lpoly`, `lowess` and `pca`.
 //
 // Every statistical decision here was verified against StataNow 19.5 BEFORE it
-// was written (plans/ERRATA-AER-H-SPECS-20260904.md), because bundle H's tests
+// was written (internal note ERRATA-AER-H-SPECS-20260904.md), because bundle H's tests
 // would otherwise have been written from the same transcription as its code.
 // The mathematics lives in src/estimators/aer_smooth.* and src/estimators/pca.*;
 // this file is argument handling, the sample, and the JSON.
@@ -170,6 +172,48 @@ int cmd_hpfilter(const std::vector<std::string>& a) {
 }
 
 // ---------------------------------------------------------------------------
+// The smoothing sample of lpoly and lowess: `marksample touse` over the FULL
+// frame, never a physically filtered copy. Both commands write their results
+// back by ROW (lowess generate() leaves the rows outside the sample missing,
+// lpoly at() evaluates at every row whose at value is nonmissing whatever
+// if/in say -- lpl_at_self_if: r(ngrid) 114 under an if with r(N) 75), so the
+// row positions must survive. `--keepif` is therefore evaluated into a mask
+// (eval_keepif_mask, the same evaluator maybe_keepif uses) and `--inrange A/B`
+// is a literal 1-based row range the caller has already resolved.
+
+namespace {
+
+std::vector<char> smoothing_sample(const std::vector<std::string>& a, const std::string& data,
+                                   const Dataset& ds, const char* cmd,
+                                   const std::vector<const double*>& cols) {
+    std::vector<char> keep = keep_mask(ds, cols);
+    const std::string keepif = opt(a, "--keepif");
+    if (!keepif.empty()) {
+        const std::vector<char> m = eval_keepif_mask(data, keepif);
+        for (std::size_t i = 0; i < keep.size() && i < m.size(); ++i)
+            if (!m[i]) keep[i] = 0;
+    }
+    const std::string inr = opt(a, "--inrange");
+    if (!inr.empty()) {
+        const std::size_t slash = inr.find('/');
+        long long lo = 0, hi = 0;
+        try {
+            lo = std::stoll(inr.substr(0, slash));
+            hi = (slash == std::string::npos) ? lo : std::stoll(inr.substr(slash + 1));
+        } catch (const std::exception&) {
+            throw EngineError("bad_input", std::string(cmd) + ": --inrange must be A/B");
+        }
+        for (std::size_t i = 0; i < keep.size(); ++i) {
+            const long long row = static_cast<long long>(i) + 1;
+            if (row < lo || row > hi) keep[i] = 0;
+        }
+    }
+    return keep;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
 // lowess
 
 int cmd_lowess(const std::vector<std::string>& a) {
@@ -177,16 +221,17 @@ int cmd_lowess(const std::vector<std::string>& a) {
     if (data_missing(data) || yname.empty() || xname.empty()) {
         std::fprintf(stderr,
             "usage: cobra lowess --data f.hbin --y Y --x X [--bw B] [--mean] [--noweight]\n"
-            "                    [--keepif EXPR] [--out f.json]\n"
-            "  Tricube LOWESS with NO robustness iterations ([R] lowess p.1604).\n"
+            "                    [--keepif EXPR] [--inrange A/B] [--emit-touse] [--out f.json]\n"
+            "  Tricube LOWESS with NO robustness iterations (as documented for lowess).\n"
             "  A --bw outside the OPEN interval (0,1) is silently replaced by 0.8,\n"
-            "  which is what lowess.ado does; the emitted `bwidth` is the EFFECTIVE one.\n");
+            "  which is what Stata's lowess does; the emitted `bwidth` is the EFFECTIVE one.\n"
+            "  `smooth` is frame-length: rows outside the if/in sample stay missing.\n");
         return 2;
     }
-    data = maybe_keepif(data, opt(a, "--keepif"));
     const Dataset& ds = acquire_data(data);
     const double* y = require_num(ds, "lowess", yname);
     const double* x = require_num(ds, "lowess", xname);
+    const std::vector<char> keep = smoothing_sample(a, data, ds, "lowess", {y, x});
 
     LowessOpts o;
     const std::string bwOpt = opt(a, "--bw");
@@ -198,7 +243,7 @@ int cmd_lowess(const std::vector<std::string>& a) {
     // (Stata's own sort is not stable and the goldens carry a tolnote for it).
     std::vector<int64_t> idx;
     for (int64_t i = 0; i < ds.n_rows(); ++i)
-        if (!std::isnan(x[i]) && !std::isnan(y[i])) idx.push_back(i);
+        if (keep[static_cast<std::size_t>(i)]) idx.push_back(i);
     std::stable_sort(idx.begin(), idx.end(),
                      [&](int64_t p, int64_t q) { return x[p] < x[q]; });
 
@@ -223,6 +268,10 @@ int cmd_lowess(const std::vector<std::string>& a) {
         {"n_obs", static_cast<int64_t>(idx.size())},
         {"smooth", out_col},
     };
+    if (has(a, "--emit-touse")) {
+        std::vector<int> t(keep.begin(), keep.end());
+        out["touse"] = t;
+    }
     emit(out, opt(a, "--out"));
     return 0;
 }
@@ -235,16 +284,42 @@ int cmd_lpoly(const std::vector<std::string>& a) {
     if (data_missing(data) || yname.empty() || xname.empty()) {
         std::fprintf(stderr,
             "usage: cobra lpoly --data f.hbin --y Y --x X [--degree D] [--kernel K]\n"
-            "                   [--bw H] [--n G] [--pwidth P] [--keepif EXPR] [--out f.json]\n"
+            "                   [--bw H] [--n G] [--pwidth P] [--se] [--at V]\n"
+            "                   [--weight W --wtype aweight] [--keepif EXPR] [--inrange A/B]\n"
+            "                   [--emit-touse]\n"
+            "                   [--out f.json]\n"
             "  Local polynomial smoothing with the Fan-Gijbels rule-of-thumb bandwidth.\n"
             "  Kernels: epanechnikov (default) epan2 biweight cosine gaussian parzen\n"
-            "  rectangle triangle.\n");
+            "  rectangle triangle. With --at the smooth is evaluated at V's values and\n"
+            "  `grid`/`smooth`/`se` are frame-length, row for row.\n");
         return 2;
     }
-    data = maybe_keepif(data, opt(a, "--keepif"));
     const Dataset& ds = acquire_data(data);
     const double* y = require_num(ds, "lpoly", yname);
     const double* x = require_num(ds, "lpoly", xname);
+    const std::string wname = opt(a, "--weight");
+    const double* wcol = nullptr;
+    if (!wname.empty()) {
+        const std::string wtype = opt(a, "--wtype");
+        // Stata's lpoly takes [fw aw]. Only aweight is implemented here: how Stata's
+        // Mata counts r(N) and the ROT's n under fweights is unmeasured, so an
+        // fweight is refused by name rather than guessed.
+        if (wtype != "aweight")
+            throw EngineError("unsupported", "lpoly: --wtype " + (wtype.empty() ? std::string("(none)") : wtype) +
+                                                 " is not implemented (aweight only)");
+        wcol = require_num(ds, "lpoly", wname);
+    }
+    std::vector<const double*> cols = {y, x};
+    if (wcol) cols.push_back(wcol);
+    std::vector<char> keep = smoothing_sample(a, data, ds, "lpoly", cols);
+    if (wcol) {
+        // marksample: a zero weight leaves the sample; a negative one is r(402).
+        for (int64_t i = 0; i < ds.n_rows(); ++i) {
+            if (!keep[static_cast<std::size_t>(i)]) continue;
+            if (wcol[i] < 0) throw EngineError("bad_input", "lpoly: negative weights encountered");
+            if (wcol[i] == 0) keep[static_cast<std::size_t>(i)] = 0;
+        }
+    }
 
     LpolyOpts o;
     const std::string kname = opt(a, "--kernel");
@@ -259,32 +334,45 @@ int cmd_lpoly(const std::vector<std::string>& a) {
     if (!pwOpt.empty()) o.pwidth = std::stod(pwOpt);
     const std::string nOpt = opt(a, "--n");
     if (!nOpt.empty()) o.n = std::stoi(nOpt);
+    o.n_cap = static_cast<int>(ds.n_rows());
+    o.want_se = has(a, "--se");
 
-    std::vector<double> xs, ys;
-    for (int64_t i = 0; i < ds.n_rows(); ++i) {
-        if (std::isnan(x[i]) || std::isnan(y[i])) continue;
+    // Sorting is not required by the local fit, but it makes the ROT's global
+    // polynomial and the grid deterministic in the same order every run.
+    std::vector<int64_t> idx;
+    for (int64_t i = 0; i < ds.n_rows(); ++i)
+        if (keep[static_cast<std::size_t>(i)]) idx.push_back(i);
+    // Stata's lpoly: r(2000) for no observations, r(2001) for a single one.
+    if (idx.empty()) throw EngineError("bad_input", "lpoly: no observations");
+    if (idx.size() < 2) throw EngineError("bad_input", "lpoly: insufficient observations");
+    std::stable_sort(idx.begin(), idx.end(), [&](int64_t p, int64_t q) { return x[p] < x[q]; });
+    std::vector<double> xs, ys, ws;
+    for (int64_t i : idx) {
         xs.push_back(x[i]);
         ys.push_back(y[i]);
     }
-    if (xs.size() < 2) throw EngineError("bad_input", "lpoly: too few observations");
-    // Sorting is not required by the local fit, but it makes the ROT's global
-    // polynomial and the grid deterministic in the same order every run.
-    {
-        std::vector<std::size_t> ord(xs.size());
-        std::iota(ord.begin(), ord.end(), 0);
-        std::stable_sort(ord.begin(), ord.end(), [&](std::size_t p, std::size_t q) { return xs[p] < xs[q]; });
-        std::vector<double> xt(xs.size()), yt(ys.size());
-        for (std::size_t t = 0; t < ord.size(); ++t) { xt[t] = xs[ord[t]]; yt[t] = ys[ord[t]]; }
-        xs.swap(xt);
-        ys.swap(yt);
+    if (wcol) {
+        // Stata's lpoly: an aweight is rescaled to w*N/sum(w) over the sample.
+        double sw = 0;
+        for (int64_t i : idx) sw += wcol[i];
+        for (int64_t i : idx) ws.push_back(wcol[i] * static_cast<double>(idx.size()) / sw);
+        o.weights = &ws;
+    }
+
+    // at(): every row with the at variable nonmissing, regardless of if/in.
+    const std::string atname = opt(a, "--at");
+    std::vector<double> atv;
+    if (!atname.empty()) {
+        const double* at = require_num(ds, "lpoly", atname);
+        atv.assign(at, at + ds.n_rows());
+        o.at = &atv;
     }
 
     LpolyResult r = lpoly_fit(xs, ys, o);
     if (r.grid.empty()) {
         // The only way here is an unpinned rule-of-thumb constant. Refuse BY
-        // NAME rather than inventing one: the constants are Stata-effective
-        // values backed out of live runs, and only p=1 and p=3 (plus rectangle
-        // at p=5) have been measured.
+        // NAME rather than inventing one: the constants are Stata's trapezoid
+        // values for p=1 and p=3 (plus rectangle at p=5), nothing else.
         throw EngineError("unsupported",
             std::string("lpoly: no rule-of-thumb bandwidth constant is pinned for kernel '") +
             lpoly_kernel_name(o.kernel) + "' at degree " + std::to_string(o.degree) +
@@ -299,12 +387,20 @@ int cmd_lpoly(const std::vector<std::string>& a) {
         {"degree", o.degree},
         {"bwidth", r.bwidth},
         {"pwidth", r.pwidth},
+        {"at", !atname.empty()},
         {"grid", r.grid},
         {"smooth", r.smooth},
-        {"se", nullptr},
+        {"se", o.want_se ? json(r.se) : json(nullptr)},
         {"n_obs", static_cast<int64_t>(xs.size())},
         {"ngrid", r.ngrid},  // SUCCESSFUL fits, which can be < grid.size()
+        {"n_capped", r.n_capped},
     };
+    // --emit-touse: the sample as a frame-length 0/1 column, for the caller
+    // that draws the scatter of exactly the rows the smooth used.
+    if (has(a, "--emit-touse")) {
+        std::vector<int> t(keep.begin(), keep.end());
+        out["touse"] = t;
+    }
     emit(out, opt(a, "--out"));
     return 0;
 }
@@ -337,9 +433,9 @@ int cmd_pca(const std::vector<std::string>& a) {
     const std::string cOpt = opt(a, "--comp");
     if (!cOpt.empty()) {
         o.components = std::stoi(cOpt);
-        // pcamat.ado errors 125 here; the manual's contrary sentence ("larger
-        // than the number of variables is equivalent to the number of
-        // variables") is wrong and the code is what ships.
+        // StataBE errors r(125) here ("components() should be between 1 and
+        // p"); the manual's contrary sentence ("larger than the number of
+        // variables is equivalent to the number of variables") does not hold.
         if (o.components < 1 || o.components > static_cast<int>(names.size()))
             throw EngineError("bad_input",
                               "pca: comp() should be between 1 and " +

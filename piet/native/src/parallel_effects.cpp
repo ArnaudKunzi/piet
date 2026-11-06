@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // P9 automode · L2 — see parallel_effects.h for the safety axiom this file exists to serve.
 #include "piet/parallel_effects.h"
 
@@ -91,11 +93,13 @@ const std::map<std::string, Effects>& table() {
       {"reghdfe", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"logit", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"probit", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      {"cloglog", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"poisson", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"nbreg", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"xtreg", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"xtset", mk(0, 1, 0, 1, 1, 0, 0, 0)},
       {"ivregress", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      {"sureg", mk(0, 1, 0, 1, 0, 0, 0, 0)},  // reg3 ..., sure: an e() writer like ivregress
       {"areg", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"lincom", mk(0, 1, 1, 1, 0, 0, 0, 0)},
       {"test", mk(0, 1, 1, 1, 0, 0, 0, 0)},
@@ -191,9 +195,16 @@ const std::map<std::string, Effects>& table() {
       {"tab1", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"tab2", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"histogram", mk(0, 0, 0, 1, 0, 0, 0, 0)},
+      // kdensity is rclass (r(kernel bwidth n scale)) and generate() adds
+      // variables (w2aq_histogram_family hk_kd_*_r, hk_kd_*_g).
+      {"kdensity", mk(0, 1, 0, 1, 1, 0, 0, 0)},
       {"scatter", mk(0, 0, 0, 1, 0, 0, 0, 0)},
       {"line", mk(0, 0, 0, 1, 0, 0, 0, 0)},
       {"twoway", mk(0, 0, 0, 1, 0, 0, 0, 0)},
+      // serset-twoway SS: `serset` reads the session's graph-owned serset store
+      // (the graphs drawn before it, in this process), posts r(), and `serset
+      // use` replaces the data: session control, never moved to a worker.
+      {"serset", mk(0, 1, 0, 0, 1, 1, 0, 0)},
       {"estat", mk(0, 1, 1, 1, 0, 0, 0, 0)},
       {"fepois", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"ppmlhdfe", mk(0, 1, 0, 1, 0, 0, 0, 0)},
@@ -362,6 +373,36 @@ const std::map<std::string, Effects>& table() {
       // what they would do if implemented.
       {"unzipfile", mk(0, 0, 0, 0, 0, 0, 0, 1)},
       {"zipfile", mk(0, 0, 0, 0, 0, 0, 0, 1)},
+      // AER tier-1 (2026-10-28). Each row copies the neighbour it is wired over:
+      // macro/matsort/matselrc write session-global stores like `matrix`; fvunab
+      // writes a local like `unab`; xtdescribe/findname/cf publish r() off the
+      // data like `xtsum`; lrtest reads stored estimates and publishes r();
+      // integ publishes r() and may generate; the data writers copy `xtile`/
+      // `rename`/`label`; zipuse replaces the data like `use` (without its
+      // self-seed claim) and zipsave writes a file like `save`; postutil copies
+      // `postclose`; require/_dots touch nothing a later statement reads.
+      {"macro", mk(2, 0, 0, 0, 0, 0, 0, 0)},
+      {"xtdescribe", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      {"mvdecode", mk(0, 0, 0, 1, 1, 0, 0, 0)},
+      {"lrtest", mk(0, 1, 1, 0, 0, 0, 0, 0)},
+      {"fvunab", mk(1, 0, 0, 1, 0, 0, 0, 0)},
+      {"integ", mk(0, 1, 0, 1, 1, 0, 0, 0)},
+      {"numlabel", mk(0, 0, 0, 1, 1, 0, 0, 0)},
+      {"_dots", mk(0, 0, 0, 0, 0, 0, 0, 0)},
+      {"cf", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      {"renpfix", mk(0, 0, 0, 1, 1, 0, 0, 0)},
+      {"markout", mk(0, 0, 0, 1, 1, 0, 0, 0)},
+      {"postutil", mk(0, 0, 0, 0, 0, 0, 0, 0)},
+      {"require", mk(0, 0, 0, 0, 0, 0, 0, 0)},
+      {"labvars", mk(0, 0, 0, 1, 1, 0, 0, 0)},
+      {"astile", mk(0, 0, 0, 1, 1, 0, 0, 0)},
+      {"matsort", mk(2, 0, 1, 0, 0, 0, 0, 0)},
+      {"matselrc", mk(2, 0, 1, 0, 0, 0, 0, 0)},
+      {"fillmissing", mk(0, 0, 0, 1, 1, 0, 0, 0)},
+      {"findname", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      {"sencode", mk(0, 0, 0, 1, 1, 0, 0, 0)},
+      {"zipuse", mk(0, 0, 0, 0, 1, 0, 0, 0)},
+      {"zipsave", mk(0, 0, 0, 1, 0, 0, 0, 1)},
       {"odbc", mk(0, 0, 0, 0, 0, 0, 0, 1)},
       {"spshape2dta", mk(0, 0, 0, 0, 0, 0, 0, 1)},
 
@@ -376,6 +417,9 @@ const std::map<std::string, Effects>& table() {
       {"missings", mk(0, 1, 0, 1, 1, 0, 0, 0)},
       // Column writers.
       {"carryforward", mk(0, 0, 0, 1, 1, 0, 0, 0)},
+      {"lookfor", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      {"ihstrans", mk(0, 1, 0, 1, 1, 0, 0, 0)},
+      {"sctorezone", mk(0, 1, 0, 1, 1, 0, 0, 0)},
       {"rangestat", mk(0, 0, 0, 1, 1, 0, 0, 0)},
       {"tsspell", mk(0, 0, 0, 1, 1, 0, 0, 0)},
       // Metadata writers: the label store and variable names are session-global
@@ -435,6 +479,9 @@ const std::map<std::string, Effects>& table() {
       {"areg", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"ivreg2", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       {"xtivreg2", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      // sureg = reg3 ..., sure (sureg): reads the frame, posts e()
+      // and a LastModel, writes no column and no file -- the estimation shape.
+      {"sureg", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       // E2 computed here: read the frame, publish r(), touch nothing else --
       // the shape pwcorr (:183) already has.
       {"spearman", mk(0, 1, 0, 1, 0, 0, 0, 0)},
@@ -445,6 +492,14 @@ const std::map<std::string, Effects>& table() {
       // oaxaca (AER scope-2 B2): reads the frame, posts e() and a LastModel,
       // writes no column and no file. Same shape as pca.
       {"oaxaca", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      // glm left the refusal list below with X2-GLM (2026-10-12): the native
+      // fitter reads the frame and posts e() and a LastModel, writes no column
+      // and no file. Same shape as pca.
+      {"glm", mk(0, 1, 0, 1, 0, 0, 0, 0)},
+      // qreg2 left E3 (handlers_e3_qreg2.cpp): it reads the frame and posts e(),
+      // and without cluster() an if/in fit leaves the sample rows first
+      // (qreg2.ado's `sort _gv`), so it also writes the dataset's order.
+      {"qreg2", mk(0, 1, 0, 1, 1, 0, 0, 0)},
       // teffects left the refusal list below 2026-09-09 (AER scope-2 B2-4).
       // `teffects nnmatch` reads the frame and posts e()/a LastModel like
       // oaxaca, and under gen(stub) it WRITES stub1..stubK -- so it carries
@@ -469,16 +524,22 @@ const std::map<std::string, Effects>& table() {
       // to the frozen exempt list, because "this command does nothing" is a
       // fact about them and not an exception to the rule.
       {"suest", mk(0, 0, 0, 0, 0, 0, 0, 0)},
-      {"glm", mk(0, 0, 0, 0, 0, 0, 0, 0)},
-      {"lasso", mk(0, 0, 0, 0, 0, 0, 0, 0)},
-      {"rlasso", mk(0, 0, 0, 0, 0, 0, 0, 0)},
+      // A fitted lasso reads the data, posts e(), and may select a random CV path.
+      {"lasso", mk(0, 1, 0, 1, 0, 0, 1, 0)},
+      // ml model/init/search/maximize carry a persistent model specification.
+      // Keep the whole lifecycle serial rather than split it between workers.
+      {"ml", mk(2, 1, 1, 1, 0, 1, 1, 0)},
+      {"lassocoef", mk(0, 0, 1, 0, 0, 0, 0, 0)},
+      {"rlasso", mk(0, 1, 0, 1, 0, 0, 0, 0)},
       // oaxaca left this list 2026-09-08 (AER scope-2 B2): its row now sits
       // with pca above, because it reads the frame and posts e().
       {"honestdid", mk(0, 0, 0, 0, 0, 0, 0, 0)},
       {"ritest", mk(0, 0, 0, 0, 0, 0, 0, 0)},
       {"acreg", mk(0, 0, 0, 0, 0, 0, 0, 0)},
       {"swindex", mk(0, 0, 0, 0, 0, 0, 0, 0)},
-      {"qreg2", mk(0, 0, 0, 0, 0, 0, 0, 0)},
+      // leebounds reads the frame and posts e() (replay reads it back); with
+      // if/in it adds and drops a temporary qualifier column, so it writes too.
+      {"leebounds", mk(0, 1, 1, 1, 1, 0, 0, 0)},
 
       // grstyle is genuinely effect-free: it is an accept-note, and nothing a
       // later statement can read changes.
@@ -494,7 +555,9 @@ const std::map<std::string, Effects>& table() {
       // so "no effects" is the honest classification -- not an oversight the
       // campaign ratchet should have to shelter behind an exemption.
       {"winexec", mk(0, 0, 0, 0, 0, 0, 0, 0)},
-      {"twoway__histogram_gen", mk(0, 0, 0, 0, 0, 0, 0, 0)},
+      // Served since gfx-histogram-kdensity-family: rclass (r(bin start width
+      // min max N area n_x type)) and generate() adds two variables.
+      {"twoway__histogram_gen", mk(0, 1, 0, 1, 1, 0, 0, 0)},
   };
   return t;
 }

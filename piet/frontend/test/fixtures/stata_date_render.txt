@@ -1,0 +1,86 @@
+# Stata date-family render oracle — truth source for the P1-A2 browse-grid %t*
+# renderer (UX-052 back half).
+#
+# Provenance: StataNow 19.5 BE (/Applications/StataNow/StataBE.app), batch run
+# 2026-07-30 by an automated session. Each case was emitted by
+#     di "RENDER|<fmt>|<raw>|" <fmt> <raw>
+# so the third field is Stata's OWN display string for that raw family index —
+# nothing here is hand-typed. The raw indices were computed by Stata's own
+# constructors (td()/tw()/tm()/tq()/th()), which is why e.g. tw(2020w1) reads
+# 3120 (matching tests/eval/golden/f16_tw_oracle.log's `tw2020w1_raw=3120`).
+#
+# Leading spaces in the third field are `display`'s right-alignment padding to
+# the format's fixed width (%tw/%tm = 7, %tq/%th = 6, %td = 9). They are NOT
+# part of the value's text: a browse cell is right-aligned by piet.css, so the
+# renderer emits the trimmed string and dom_runner compares trimmed.
+#
+# Format:  RENDER|<fmt>|<raw index>|<Stata display string>
+
+RENDER|%td|0|01jan1960
+RENDER|%td|-1|31dec1959
+RENDER|%td|21974|29feb2020
+RENDER|%td|21989|15mar2020
+RENDER|%td|22280|31dec2020
+RENDER|%tw|0| 1960w1
+RENDER|%tw|-1|1959w52
+RENDER|%tw|3119|2019w52
+RENDER|%tw|3120| 2020w1
+RENDER|%tw|3121| 2020w2
+RENDER|%tw|3171|2020w52
+RENDER|%tm|0| 1960m1
+RENDER|%tm|-1|1959m12
+RENDER|%tm|722| 2020m3
+RENDER|%tm|731|2020m12
+RENDER|%tq|0|1960q1
+RENDER|%tq|-1|1959q4
+RENDER|%tq|240|2020q1
+RENDER|%tq|243|2020q4
+RENDER|%th|0|1960h1
+RENDER|%th|-1|1959h2
+RENDER|%th|120|2020h1
+RENDER|%th|121|2020h2
+RENDER|%ty|1960|1960
+RENDER|%ty|2020|2020
+
+# FIX:GRID-TFMT-DETAIL addition (automated session,
+# 2026-07-30): %td detail-string token-map cases, same provenance discipline as
+# above (StataNow 19.5 BE, `stata_date_render.do` re-run, new lines appended —
+# nothing above this block was rewritten). jan5/2020 is deliberate for the
+# DD-vs-dd pair: a single-digit day is the only value where zero-padded (DD)
+# and not (dd) actually differ in text.
+RENDER|%tdCCYY-NN-DD|21989|2020-03-15
+RENDER|%tdNN/DD/CCYY|21974|02/29/2020
+RENDER|%tdMon_dd,_CCYY|21919| Jan 5, 2020
+RENDER|%tdDD_Month_CCYY|21919|  05 January 2020
+RENDER|%tdYY/NN/DD|21989|20/03/15
+RENDER|%tdCCYY-NN-DD|-1|1959-12-31
+
+# P1-A2B addition (automated session, 2026-07-30):
+# %tc clock cases + the `c` thousands-comma suffix — UX-052 named residuals ②
+# and ①. Same provenance discipline as every block above (StataNow 19.5 BE,
+# `stata_date_render.do` re-run, new lines appended — nothing above this block
+# was rewritten). The six %tc raw indices are the writer Q6 measurement's own
+# datetime boundaries (tests/eval/golden/tc_datetime_fixture.dta), so the render
+# oracle and the write oracle share one set of hard cases; `…930123`/`…400999`
+# are that measurement's full-precision forms and are what prove the default
+# %tc layout TRUNCATES the sub-second remainder (both render identically to
+# their whole-second floor) rather than rounding it up.
+RENDER|%tc|0|01jan1960 00:00:00
+RENDER|%tc|500|01jan1960 00:00:00
+RENDER|%tc|1000|01jan1960 00:00:01
+RENDER|%tc|-86400000|31dec1959 00:00:00
+RENDER|%tc|1893456930000|01jan2020 00:15:30
+RENDER|%tc|2082326400000|26dec2025 00:00:00
+RENDER|%tc|1893456930123|01jan2020 00:15:30
+RENDER|%tc|2082326400999|26dec2025 00:00:00
+RENDER|%tc|1899899107000|15mar2020 13:45:07
+
+# The `c` suffix on a numeric format is Stata's thousands separator. 999 (no
+# separator) and the two negatives pin that grouping is by magnitude and never
+# chunks the sign; both the g and f branches are exercised.
+RENDER|%12.0gc|1234567|   1,234,567
+RENDER|%12.0gc|-1234567|  -1,234,567
+RENDER|%12.0gc|999|         999
+RENDER|%12.0gc|1000|       1,000
+RENDER|%12.2fc|1234567.891|1,234,567.89
+RENDER|%12.2fc|-9876.5|   -9,876.50

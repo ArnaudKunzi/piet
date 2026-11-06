@@ -1,0 +1,11 @@
+key,value
+nw2:coeftable[weight].b,4.699064878412990e+00
+nw2:coeftable[weight].se,1.990432788682840e+00
+nw2:coeftable[length].b,-9.796031181815820e+01
+nw2:coeftable[length].se,6.217002830541340e+01
+nw2:coeftable[(intercept)].b,1.038654054084500e+04
+nw2:coeftable[(intercept)].se,5.997333744449350e+03
+prais:coeftable[weight].b,3.983061818446055e+00
+prais:coeftable[length].b,-4.637693154478969e+01
+prais:coeftable[(intercept)].b,2.900989191556635e+03
+prais:rho,4.917003503005703e-01

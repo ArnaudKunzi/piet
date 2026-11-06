@@ -1,0 +1,35 @@
+R Mathlib (nmath), src/nmath/pnorm.c — GPL-2.0-or-later
+Adopted at: src/core/distributions.h (stata_normal(): W. J. Cody's rational
+Chebyshev approximation of the standard normal CDF, ACM TOMS Algorithm 715
+ANORM, in the form of R's pnorm_both(); the coefficient tables a/b/c/d/p/q, the
+three-interval structure, and the two-exp() tail evaluation are derived from
+that routine. R 2024 revision of pnorm.c, whose copyright line reads 2000-2024.
+The surrounding Stata-bit-identity edge cases — |x| >= 40, the subnormal-to-0
+rule, no-FMA evaluation — are this project's own.)
+
+Upstream notice (from the head of pnorm.c):
+
+  Mathlib : A C Library of Special Functions
+  Copyright (C) 2000-2024 The R Core Team
+  Copyright (C) 2003 The R Foundation
+  Copyright (C) 1998 Ross Ihaka
+
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; either version 2 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program; if not, a copy is available at
+  https://www.R-project.org/Licenses/
+
+The GNU GPL version 2 text is available at the URL above. Because the upstream
+grant is "version 2 of the License, or (at your option) any later version",
+this project exercises the later-version option: it distributes the adapted code
+under the GNU General Public License version 3 or later, the full text of which
+ships beside this application as LICENSE.txt.

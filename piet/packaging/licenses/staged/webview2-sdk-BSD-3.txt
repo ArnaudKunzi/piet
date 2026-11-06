@@ -1,0 +1,23 @@
+STAGED PLACEHOLDER — NOT SHIPPED / NOT LINKED IN CURRENT BUILDS
+Component : Microsoft WebView2 SDK header (Microsoft.Web.WebView2)
+Version   : 1.0.2957.106 (NuGet package)
+Header    : build/native/include/WebView2.h
+            → vendored verbatim at piet/native/vendor/webview2/WebView2.h
+            sha256 cbcdc6a5135b7b09cc82cafac983505aa36fb61c1af12a1020b7605cf1da3829
+License   : BSD-3-Clause (© Microsoft Corporation) — the SDK's own LICENSE.txt,
+            vendored beside the header at piet/native/vendor/webview2/LICENSE.txt.
+Nature    : BUILD-TIME COMPILER INPUT ONLY. WebView2.h supplies the ICoreWebView2*
+            COM interface *type* declarations the WEBVIEW_EDGE backend compiles
+            against. Nothing from it is linked into or shipped with the binary:
+            WEBVIEW_MSWEBVIEW2_BUILTIN_IMPL=1 resolves the WebView2 loader at
+            runtime via LoadLibrary/GetProcAddress (no import .lib), and the
+            actual WebView2 Runtime is a separate Microsoft-distributed component
+            the end user installs — it is not redistributed by PIET.
+Activates : with the Windows (WEBVIEW_EDGE) build of piet_native.
+Action    : at the first shipped Windows build, promote a top-level
+            NN-webview2-sdk-BSD-3.txt into piet/packaging/licenses/ (verbatim
+            LICENSE.txt) so it enters THIRD_PARTY_NOTICES.txt. Note this covers
+            only the SDK HEADER; the WebView2 Runtime itself is not bundled.
+Provenance: https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2957.106
+            (the .nupkg is a plain zip; WebView2.h extracted from
+            build/native/include/, unmodified). See piet/native/vendor/VENDOR.md.

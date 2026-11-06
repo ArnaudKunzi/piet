@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Session-state macro / r() expansion layer — C++ port of
 // piet/backend/piet/router/macros.py plus its two out-of-module helpers:
 //   - postfile.eval_macro_expr        (the `=expr' arithmetic-macro form)
@@ -10,9 +12,8 @@
 //     (deliberate deviation from Stata's silent empty expansion).
 //   - MULTI-PASS EXPANSION: bounded 16-pass loop, clean engine_error on
 //     non-convergence (self-referential macros), never an infinite loop.
-//   - Definition-side RHS expansion is ONE _expand_pass, not a full
-//     expand_macros loop (nested refs may legally survive into the stored
-//     value — bug-for-bug with the oracle).
+//   - Definition-side RHS expansion runs expandPass to a fixed point
+//     (expandDefinitionText; EM3a, Stata's own rule), not one pass.
 //
 // NOT ported (dead code in the oracle): macros.handle_display /
 // _resolve_scalars / _apply_stata_fmt — superseded by
@@ -41,6 +42,10 @@ struct ExpandResult {
   bool isError = false;
   std::string line;            // when !isError
   nlohmann::ordered_json error;  // when isError
+  // BUG-1527: expandMacros' line before its compound-quote fold, when the fold
+  // changed it ("" otherwise) -- the command as typed, which graph describe
+  // reports.
+  std::string typed;
 };
 
 // macros.has_macro_refs
@@ -59,13 +64,50 @@ bool hasMacroRefs(const std::string& rawLine);
 // unresolved `scalar(NAME)` already becomes the missing sentinel in
 // evalBoolExpr. The default (false) keeps the honest-error behaviour for the
 // command-line path (`gen z = r(mean)` etc.), which goldens pin.
+//
+// `verbatim` (EM3a, macval): when true, the text a `` `macval(NAME)' `` reference
+// splices is ENCODED (each '`' -> kVerbatimTick, each '$' -> kVerbatimDollar) so
+// a later pass over the same line cannot re-expand it; the caller decodes
+// (decodeVerbatim) once its loop is done. When false the value is spliced as is,
+// which is right for a caller that runs exactly one pass.
 ExpandResult expandPass(const std::string& line, EvalSession& session,
-                        bool unsetRAsMissing = false);
+                        bool unsetRAsMissing = false, bool verbatim = false);
 
-// macros.expand_macros — bounded multi-pass loop + compound-quote strip +
+// macros.expand_macros — bounded multi-pass loop + compound-quote normalization +
 // convergence guard. See expandPass for `unsetRAsMissing`.
+// `keepVerbatim` (EM3a): leave the macval() sentinels in the returned line. Only
+// the dispatcher's step 0b asks for it: tokenize() runs its unexpanded-macro net
+// on the encoded line (a macval value's own ` and $ are text, not references)
+// and decodes right after it. Every other caller gets real characters back.
 ExpandResult expandMacros(const std::string& rawLine, EvalSession& session,
-                          bool unsetRAsMissing = false);
+                          bool unsetRAsMissing = false, bool keepVerbatim = false);
+
+// EM3a: the right-hand side of a macro DEFINITION (`local x `"..."'`, `local x
+// text`, `return local x ...`). Stata expands the text completely: a reference
+// whose value holds another reference is expanded again (`local cp2 `"`xb'"'`
+// with xb = p`mtl'q stores pLVALq, w2af_macro_text_file.log:1021 mt_mv_copy),
+// while `macval(NAME)' inserts the value verbatim. Loops expandPass to a fixed
+// point (bounded like expandMacros) and returns decoded text; no convergence
+// error and no compound-quote rewrite -- the stored value keeps its quotes.
+ExpandResult expandDefinitionText(const std::string& text, EvalSession& session);
+
+// EM3a sentinels: a '`' or '$' that is TEXT (a macval() value, or Stata's `\``
+// / `\$` escapes) travels through the expansion passes as one of these bytes.
+inline constexpr char kVerbatimTick = '\x11';
+inline constexpr char kVerbatimDollar = '\x12';
+bool hasVerbatim(const std::string& s);
+std::string encodeVerbatim(const std::string& s);
+std::string decodeVerbatim(std::string s);
+
+// EM3b: a compound-quoted span `"..."' starting at `i` (s[i] is '`' or
+// kVerbatimTick, s[i+1] is '"'): the index one past its closing "' with Stata's
+// nesting (a `" opens a level, a "' closes one), or npos when it never closes.
+size_t compoundSpanEnd(const std::string& s, size_t i);
+bool startsCompound(const std::string& s, size_t i);
+// EM3b: every top-level compound span whose body holds no '"' (and so no nested
+// span) becomes a plain "body"; one that holds a quote stays `"body"', the only
+// spelling that can carry it. Plain "..." literals are copied through.
+std::string normalizeCompoundQuotes(const std::string& s);
 
 // BUG-216/217: the extended-macro-function ERROR channel.
 //
@@ -101,8 +143,28 @@ struct MacroFnError {
 // failure into a Stata rc (err filled); false means the shape is one it
 // deliberately leaves unclaimed — a string-literal RHS, or a bare-identifier
 // NameError (the dataset-variable read this layer cannot do) — and the caller
-// keeps its legacy fallback.
-bool classifyFailedExpr(const std::string& expr, const std::string& raised, MacroFnError* err);
+// keeps its legacy fallback. A `session` whose variable reader is installed
+// decides that bare name as the `local NAME =` arm does: `NAME not found`
+// r(111) (`file write h (nosuchvar)`, StataBE 19.5).
+bool classifyFailedExpr(const std::string& expr, const std::string& raised, MacroFnError* err,
+                        const EvalSession* session = nullptr);
+
+// BUG-1420: Stata's message for the first `c(NAME)` in `expr` (outside a string
+// literal) whose NAME is no c() key of StataBE 19.5 at all -- "c(NAME)
+// undefined", r(133) -- or nullopt. A key Stata has and PIET does not serve is
+// not "undefined" and is not claimed.
+std::optional<std::string> undefinedCRef(const std::string& expr);
+// BUG-1330: true for a name StataBE's c() answers (`creturn list`), whether or
+// not this build serves it (piet::resolveCValue).
+bool isStataCClassName(const std::string& name);
+// Its r(133) refusal of a bare c(name) nothing answered: StataBE's `c(name)
+// undefined`, or, for a real name this build does not serve, a named refusal.
+std::string cClassRefusalMessage(const std::string& name);
+// The code that refusal carries: 133 for a name StataBE has no value for, as
+// Stata codes `c(name) undefined`; 198, PIET's unsupported-feature code, for a
+// real name this build does not serve. Stata answers that one at rc 0
+// (c(framesmax) is 100), so 133 would claim an error Stata never raises.
+std::string cClassRefusalRc(const std::string& name);
 
 // macros.try_capture_definition — returns true when the line was captured
 // as a definition (local/global/scalar/increment forms); false = not a
@@ -176,6 +238,32 @@ std::string substituteMatrixRefs(const std::string& expr, const EvalSession& ses
 std::string substituteBareName(const std::string& in, const std::string& name,
                                const std::string& value);
 
+// name-binding-display-literals: the one string-literal guard (BUG-501's
+// protectStringLiterals) for a substitution pass outside this file. Each "..."
+// literal becomes a `"0L<k>L0"` placeholder no name can match, its text kept
+// in `spans` (a pass may append its own literals there); restoreLiterals puts
+// every placeholder back. Text inside a literal is data, never a name: the row
+// plane's stored-scalar pass ran over raw text, so `count if arm == "control"`
+// with a scalar `control` compared with "5" (w2av_name_binding bd_row_cntlit).
+std::string protectLiterals(const std::string& s, std::vector<std::string>* spans);
+std::string restoreLiterals(const std::string& s, const std::vector<std::string>& spans);
+
+// name-binding-display-literals: the messages of the inline `=exp' references
+// that failed as Stata's evaluator fails (r(111), r(133), r(109)) and so
+// expanded to nothing at rc 0 since the last call, oldest first; the queue is
+// emptied. StataBE prints each (`foo not found`) and goes on (w2av_name_binding
+// bd_dy_ilunb); the dispatcher prints them ahead of the command's own output.
+std::vector<std::string> takeInlineExpansionNotes();
+
+// FU-842: the text a VALUE reference (a scalar by name or scalar(), _b[]/_se[],
+// bare e()/r(), a matrix element) is pasted as. A value is ONE operand in Stata,
+// so a negative number goes in parenthesised: with zneg = -2, `zneg^2` is 4 and
+// `-zneg^2` is -4, where the bare text `-2^2` / `--2^2` reads -4 / 4. Anything
+// that is not a negative number (a positive value, a missing token, a quoted
+// string) comes back unchanged. A MACRO (`local', `r(x)', `e(x)') stays raw
+// text: that is Stata's own rule, and why this is applied per value site.
+std::string valueRefText(const std::string& text);
+
 // BUG-512: bare `_N` -> the observation count, bare `_n` -> 1, for an expression
 // evaluated in a MACRO context (w2_smalls.log section A). Quote-aware; the count
 // comes through EvalSession::obsCount and is asked for only when a bare `_N` is
@@ -228,6 +316,15 @@ std::string stringSlotMismatchError(const std::string& call);
 // the trigger is how the two layers start disagreeing.
 bool hasBareRParen(const std::string& s);
 bool hasBareEParen(const std::string& s);
+
+// e(sample) T2 (internal note esample/SPEC.md §5.1): the token
+// `e(sample)` (`\be\(\s*sample\s*\)`) OUTSIDE double-quoted string literals --
+// `display "e(sample)"` is text (w2_esample.log B21b). hasEsampleToken is the
+// pre-test; replaceEsampleToken swaps every occurrence for `with`. The row layer
+// (dispatcher.cpp rewriteEsampleToken) uses both; the macro layer reaches the
+// same token through resolveEstScalarRefs' e() arm, whose regex shares the shape.
+bool hasEsampleToken(const std::string& s);
+std::string replaceEsampleToken(const std::string& s, const std::string& with);
 
 // display_hardening.py's _E_SCALAR_KEY: Stata's e() scalar spellings -> the
 // keys cobra actually emits (`e(N)` -> n_obs, `e(r2_a)` -> adj_r2, ...). A name

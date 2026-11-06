@@ -1,0 +1,31 @@
+# Build cecon for Linux. Used to produce a portable binary for Cowork.
+# Run via: docker buildx build --platform linux/amd64,linux/arm64 ...
+ARG BASE=debian:12-slim
+FROM $BASE AS build
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential cmake pkg-config \
+      libopenblas-dev liblapacke-dev liblapack-dev \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . /src
+
+# Use a portable march flag so the binary runs on most x86_64 / aarch64 hosts.
+# (Apple Silicon native build used -march=native; cloud Linux is unknown CPU.)
+RUN cmake -S . -B /build -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CXX_FLAGS="-O3 -Wall -Wextra -Wno-deprecated-declarations" \
+    && cmake --build /build -j$(nproc) --target cobra
+
+# Stage 2: minimal runtime image with just the binary + its dynamic deps.
+FROM $BASE AS runtime
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      libopenblas0 liblapacke liblapack3 \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /build/cobra /usr/local/bin/cobra
+COPY --from=build /build /build
+COPY --from=build /src /src
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/cobra"]

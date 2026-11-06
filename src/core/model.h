@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — assemble a model's data (design matrix + fixed-effect/cluster factors)
 // from a Dataset, with a single listwise deletion across every involved column.
 #pragma once
@@ -35,6 +37,21 @@ struct ModelData {
     bool has_intercept = false;
     std::vector<int64_t> keep;     // original-dataset row indices kept (length n)
     int64_t n_singletons_dropped = 0;  // rows removed by singleton-FE dropping
+    // BUG-1067: which member of a collinear set feols_fit omits. false (the
+    // default) keeps a norm-pivoted basis, Stata `regress`'s choice (z = 2*x:
+    // `o.x z`). true keeps the EARLIER term in design order and omits the later
+    // one (collinear_keep_mask), which implements reghdfe, areg and xtreg,fe per
+    // StataBE probes (`x o.z` for all three). Set by the caller after build_model
+    // (cmd_feols and the post-estimation refits' `--collinear-forward`).
+    bool collinear_forward = false;
+    // Under collinear_forward, the design columns scanned LAST: the cells of a
+    // standalone `a#b` that hold a factor's base level. StataBE (AER 007
+    // TA17: `treatment##i.husb ... treatment#i.edu_nohs_BL`) keeps
+    // 0b.treatment#1.edu_nohs_BL and 1.treatment#1.edu_nohs_BL and omits
+    // 1o.treatment#0b.edu_nohs_BL, which duplicates the 1.treatment main effect;
+    // a plain forward scan kept that cell and omitted 1.treatment#1.edu_nohs_BL,
+    // reporting 1.treatment .0942 for Stata's .1851. Filled by build_model.
+    std::vector<std::string> late_cells;
     // BUG-112(8): non-fatal model-spec notes raised while resolving the design
     // (today: `ib#.` naming a base level absent from the data). Empty on every
     // clean run — callers surface it as the response's optional "warnings" array,
@@ -103,8 +120,26 @@ struct IvModelData {
     std::vector<std::string> exog_names, endog_names, inst_names;
     std::vector<Factor> fe, cluster;
     bool has_intercept = false;
+    // `ivregress ..., noconstant`: no intercept column AND no absorbed effect
+    // standing in for it (the small-sample dof base is then 0, not 1).
+    bool no_constant = false;
     std::vector<int64_t> keep;  // original-dataset row indices kept (length n)
     std::vector<std::string> warnings;  // BUG-112(8), see ModelData::warnings
+    // [aw=]/[pw=] observation weights (raw, length n; empty = unweighted). Set by the
+    // caller after build_iv_model, aligned to `keep`. iv2sls_fit applies them (see
+    // there); only Analytic and Probability are accepted.
+    std::vector<double> weights;
+    WeightKind weight_kind = WeightKind::None;
+    // ivreg2's two-way cluster variance: left unrepaired (compute_vcov no_psd_fix).
+    bool multiway_no_psd_fix = false;
+    // xtivreg2's ivreg2 call (identified from its ado): within-transformed data fitted
+    // with dofminus(N_g) — the absorbed parameters are a LARGE-sample adjustment
+    // (sigma2 = rss/(N-dofminus), robust meat * N/(N-dofminus), cluster untouched)
+    // and are never counted in the cluster small-sample K. See iv2sls_fit.
+    bool dofminus_fe = false;
+    // Set by iv2sls_fit when weights meet absorbed effects: the (weighted) within
+    // transform has already been applied, so the later demeaning passes are skipped.
+    bool fe_absorbed = false;
 
     const double* exog(int j) const { return Xexog.data() + static_cast<int64_t>(j) * n; }
     const double* endog(int j) const { return Xendog.data() + static_cast<int64_t>(j) * n; }
@@ -123,7 +158,8 @@ IvModelData build_iv_model(const Dataset& ds, const std::string& yname,
                            const std::vector<std::string>& clusternames,
                            const TsMeta* ts = nullptr,
                            bool drop_singleton = true,
-                           const std::vector<char>* row_mask = nullptr);
+                           const std::vector<char>* row_mask = nullptr,
+                           bool no_intercept = false);
 
 // Drop singleton FE groups from an IV model (FE levels with exactly one obs),
 // iterated to a fixed point. Rebuilds md in place; returns rows dropped.

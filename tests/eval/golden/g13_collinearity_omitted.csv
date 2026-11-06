@@ -1,0 +1,7 @@
+key,value
+n_obs,6.900000000000000e+01
+dof_resid,6.100000000000000e+01
+df_m,7.000000000000000e+00
+coeftable[1.foreign#5.rep78].b,0.000000000000000e+00
+coeftable[1.foreign#5.rep78].se,0.000000000000000e+00
+coeftable[1.foreign#5.rep78].p,1.000000000000000e+00

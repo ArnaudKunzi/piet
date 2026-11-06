@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — fixed-effects OLS: HDFE demean (FWL within transform) + OLS on the
 // demeaned data, with iid / HC1 / one-way-cluster standard errors.
 #pragma once
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/model.h"
@@ -54,6 +57,27 @@ struct FeolsResult {
     int cluster_dof_k = 0;              // params counted in the cluster (N-1)/(N-k) factor
     std::vector<std::string> nested_fe;  // FE nested within a cluster (dof-exempt)
     bool vcov_npd_fix = false;           // true if multiway vcov needed PSD repair
+    // Stata's built-in multiway convention only (multiway_subset_factors under
+    // Vcov::Multiway): e(rank) from the clipped (slopes, _cons) variance
+    // (multiway_vcov_rank) and the e(kcluster) combinations (multiway_cluster_combos).
+    // -1 / empty on every other fit.
+    int vcov_rank = -1;
+    std::vector<ClusterCombo> kcluster;
+    // The same unweighted multiway fit's e(V_modelbased): the bread, V/s2
+    // (regress's, and areg/xtreg,fe's under FE), laid out like vcov_matrix (the reconstructed _cons last
+    // under FE). Empty on every other fit.
+    std::vector<double> vcov_modelbased;
+    // Stata `regress`'s e(beta) ([R] regress, Stored results): b_j*sd(x_j)/sd(y)
+    // over the estimation sample, one entry per kept non-intercept column, in
+    // `names` order. Filled only on the unweighted no-FE fit with an intercept.
+    std::vector<std::pair<std::string, double>> beta_std;
+    // Stata `regress`'s exact-fit rule fired (feols_fit's regress_exact_fit): RSS,
+    // sigma2, V and se are 0. The reply then posts t, p and the CI as missing
+    // (Stata's r(table) prints `.` there). False on every other fit.
+    bool exact_fit = false;
+    // On that fit, the bread inv(X'X) that V = 0 scales, laid out like vcov_matrix:
+    // `test` still tells dependent constraints apart under it. Empty otherwise.
+    std::vector<double> exact_fit_bread;
 
     int demean_iters = 0;
     double demean_resid = 0;
@@ -72,8 +96,26 @@ struct FeolsResult {
 // keep_nested_fe_dof (BUG-568, Stata `areg`): the cluster/multiway small-sample
 // factor charges every absorbed parameter, including an FE nested in the cluster
 // (compute_vcov's switch of the same name). Default false = reghdfe/xtreg,fe.
+// multiway_subset_factors (FU-365, Stata `regress`/`areg` with vce(cluster a b)):
+// compute_vcov's switch of the same name — Stata's built-in multiway convention
+// (per-subset small-sample factors, then the negative-eigenvalue clip). Under
+// absorbed FE the clip acts on the full (slopes, _cons) matrix, as Stata's does.
+// Read only by Vcov::Multiway. Default false = reghdfe's Gmin convention. With it,
+// K follows keep_nested_fe_dof: true is areg's minus = rank + dfa, false xtreg,fe's
+// rank + dfax (an FE nested in a cluster is exempt). An [iweight=] is normalised to
+// mean 1, as regress does before its multiway VCE: e(N) is the row count and the factor's N the rows
+// (w2s_multiway_class.log:1320 mw_reg_c2_iw e(N) 180, se(x1) = the pweight fit's).
+// Without the switch, a multiway Gmin fit with absorbed FE clips its _cons row in
+// reghdfe's standardised units (compute_vcov clip_scale; FU-389); its slopes keep
+// the data-unit clip they always had.
+// regress_exact_fit (cmd_feols `--regress-exact-fit`): Stata's builtin `regress`
+// treats a fit with e(r2) > 1 - 1e-14 as exact (RSS 0; see feols.cpp). Only the
+// regress route asks for it: reghdfe, areg and xtreg,fe keep the computed RSS
+// (StataBE `reghdfe yx x, noabsorb` e(rss) 8.526e-28, _se[x] 1.72e-16). It acts on
+// an unweighted no-FE fit under the iid VCE only. Default false.
 FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index = 0, bool no_intercept = false,
-                      bool keep_nested_fe_dof = false);
+                      bool keep_nested_fe_dof = false, bool multiway_subset_factors = false,
+                      bool regress_exact_fit = false);
 
 // Multi-outcome batch: fit the SAME design (X/fe/cluster in md) against several
 // outcomes, sharing the expensive HDFE absorption of X and the (X'X)⁻¹ factor —

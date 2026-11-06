@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Distribution tail probabilities and critical values — ONE implementation,
 // shared by the engine's estimators and by PIET.
 //
@@ -8,11 +10,13 @@
 // two layers start disagreeing about a number — so they moved here VERBATIM and
 // both sides include this header. Nothing about the values changed.
 //
-// Header-only and dependency-free (<cmath>/<limits> only), so sharing them costs no new
-// link edge on either side.
+// Header-only and dependency-free (<cmath>/<limits>, and core/stata_arith.h, which is
+// header-only on the same two), so sharing them costs no new link edge on either side.
 #pragma once
 #include <cmath>
 #include <limits>
+
+#include "core/stata_arith.h"  // stata_normalden: Stata's exp() underflow edge
 
 namespace cecon {
 
@@ -249,17 +253,76 @@ inline double normal_upper_tail(double z) {
     return 0.5 * (std::erfc(xh) - xl * 1.1283791670955126 * std::exp(-xh * xh));
 }
 
-// Standard normal CDF, Stata's normal(z) = P(Z > -z). Always through erfc, never
-// 1 - (upper tail), so the lower tail keeps its relative precision. The erf form
-// 0.5 (1 + erf(z / sqrt 2)) is NOT used on the upper half either: over the 245
-// grid points with z >= 0 it matches StataBE bit for bit on 216, this form on
-// 234, and both are within 1 ulp of the reference. normal(1.96) is the case in
-// point: the correctly rounded value is 0x1.f33379d3bd367p-1, which this returns;
-// StataBE returns 0x1.f33379d3bd368p-1 (.9750021048517796, 1 ulp high).
-inline double stata_normal(double z) {
-    if (std::isnan(z)) return std::nan("");
-    const double v = normal_upper_tail(-z);
-    return (v < 2.2250738585072014e-308) ? 0.0 : v;  // subnormal -> 0, as measured
+// Portions derived from R-nmath 2024 (GPL-2.0-or-later).
+// See THIRD_PARTY_NOTICES.
+//
+// Standard normal CDF, Stata's normal(z): W. J. Cody's rational Chebyshev
+// approximation (ACM TOMS Algorithm 715, ANORM; the same code as R's
+// nmath/pnorm.c pnorm_both), lower tail. Identified from StataBE 19.5 %21x
+// bits (2026-10-27): 3,409 distinct z -- the 2,001-point grid z = -8(1/125)8,
+// 1,599 values from codex-recovery/normal-values.txt and the 800 probit
+// arguments of probit-spy.log -- match this form bit for bit, 3409/3409. The
+// erfc forms it replaces missed 1,385 of them (up to 81 ulp in the lower tail).
+// Every product and sum is rounded separately (no FMA), as in the reference.
+// Values below the smallest normal double are 0, as measured on StataBE.
+inline double stata_normal(double x) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    if (std::isnan(x)) return std::nan("");
+    if (!(std::fabs(x) < 40.0)) return x > 0 ? 1.0 : 0.0;  // incl. +-inf; |x| >= 40 is 0 or 1
+    static const double a[5] = {2.2352520354606839287, 161.02823106855587881, 1067.6894854603709582,
+                                18154.981253343561249, 0.065682337918207449113};
+    static const double b[4] = {47.20258190468824187, 976.09855173777669322, 10260.932208618978205,
+                                45507.789335026729956};
+    static const double c[9] = {0.39894151208813466764, 8.8831497943883759412, 93.506656132177855979,
+                                597.27027639480026226, 2494.5375852903726711, 6848.1904505362823326,
+                                11602.651437647350124, 9842.7148383839780218, 1.0765576773720192317e-8};
+    static const double d[8] = {22.266688044328115691, 235.38790178262499861, 1519.377599407554805,
+                                6485.558298266760755, 18615.571640885098091, 34900.952721145977266,
+                                38912.003286093271411, 19685.429676859990727};
+    static const double p[6] = {0.21589853405795699, 0.1274011611602473639, 0.022235277870649807,
+                                0.001421619193227893466, 2.9112874951168792e-5, 0.02307344176494017303};
+    static const double q[5] = {1.28426009614491121, 0.468238212480865118, 0.0659881378689285515,
+                                0.00378239633202758244, 7.29751555083966205e-5};
+    const double y = std::fabs(x);
+    double cum;
+    if (y <= 0.67448975) {
+        double xnum = 0, xden = 0;
+        if (y > 2.220446049250313e-16 * 0.5) {
+            const double xsq = x * x;
+            xnum = a[4] * xsq;
+            xden = xsq;
+            for (int i = 0; i < 3; ++i) {
+                xnum = (xnum + a[i]) * xsq;
+                xden = (xden + b[i]) * xsq;
+            }
+        }
+        const double temp = x * (xnum + a[3]) / (xden + b[3]);
+        return 0.5 + temp;
+    } else if (y <= 5.656854249492380195206754896838) {  // sqrt(32)
+        double xnum = c[8] * y, xden = y;
+        for (int i = 0; i < 7; ++i) {
+            xnum = (xnum + c[i]) * y;
+            xden = (xden + d[i]) * y;
+        }
+        const double temp = (xnum + c[7]) / (xden + d[7]);
+        const double xsq = std::trunc(y * 16) / 16, del = (y - xsq) * (y + xsq);
+        cum = std::exp(-xsq * xsq * 0.5) * std::exp(-del * 0.5) * temp;
+    } else {
+        const double xsq0 = 1.0 / (x * x);
+        double xnum = p[5] * xsq0, xden = xsq0;
+        for (int i = 0; i < 4; ++i) {
+            xnum = (xnum + p[i]) * xsq0;
+            xden = (xden + q[i]) * xsq0;
+        }
+        double temp = xsq0 * (xnum + p[4]) / (xden + q[4]);
+        temp = (0.398942280401432677939946059934 - temp) / y;  // 1/sqrt(2 pi)
+        const double xsq = std::trunc(x * 16) / 16, del = (x - xsq) * (x + xsq);
+        cum = std::exp(-xsq * xsq * 0.5) * std::exp(-del * 0.5) * temp;
+    }
+    if (x > 0) return 1.0 - cum;
+    return (cum < 2.2250738585072014e-308) ? 0.0 : cum;  // subnormal -> 0, as measured
 }
 
 // Stata's invnormal(p): Wichura's AS241 (normal_icdf above), which is already at
@@ -267,6 +330,23 @@ inline double stata_normal(double z) {
 inline double stata_invnormal(double p) {
     if (std::isnan(p) || !(p > 0.0) || !(p < 1.0)) return std::nan("");
     return normal_icdf(p);
+}
+
+// Stata's normalden(x[, m], s): the normal density ([FN] normalden(x,m,s) =
+// normalden((x-m)/s)/s; normalden(x,s) is m = 0). Read off StataBE 19.5 %21x bits
+// (BUG-1124, 2026-10-29): exp(-z*z/2) with Stata's exp() (an argument below -709
+// is exactly 0), DIVIDED by the double 0x1.40d931ff62706p+1 -- one ulp above
+// sqrt(2*pi) rounded to nearest -- and then by s. The 400-point grid
+// z = (n-200)/37.3, n = 1..400, matches bit for bit in all three forms; the
+// 0.3989422804014327 multiply misses 338 of them by an ulp. The density
+// underflows to a subnormal (normalden(37.65)), overflows to missing
+// (normalden(0, 1e-310)), and is missing for a missing argument and for s <= 0.
+// NaN = missing; the caller maps it to its own `.`.
+inline double stata_normalden(double x, double m = 0.0, double s = 1.0) {
+    if (std::isnan(x) || std::isnan(m) || std::isnan(s) || !(s > 0.0)) return std::nan("");
+    const double z = (x - m) / s;
+    const double d = stata_exp_value(-0.5 * z * z) / 0x1.40d931ff62706p+1 / s;
+    return std::isfinite(d) ? d : std::nan("");
 }
 
 // Student's t with df degrees of freedom: T > |t| has probability

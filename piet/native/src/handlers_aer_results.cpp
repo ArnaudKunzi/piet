@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // AER-SCOPE1 bundle B (RESULTS, 2026-09-03) -- r() made visible, and the
 // matrix <-> dataset round trip.
 //
@@ -51,6 +53,7 @@
 #include <memory>
 #include <optional>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -60,6 +63,7 @@
 #include "piet/cobra_runner.h"
 #include "piet/datastore.h"
 #include "piet/eval/errors.h"
+#include "piet/eval/exprfns.h"  // stataExtendedMissingKind (BUG-1511); stataMissingToken for a `.a` cell (BUG-1399)
 #include "piet/eval/session.h"
 #include "piet/eval/tokenizer.h"
 #include "piet/inrange_filter.h"
@@ -68,6 +72,7 @@
 #include "piet/mutation_result.h"
 #include "piet/scratch_seq.h"
 #include "piet/session_state.h"
+#include "piet/storage_type.h"
 #include "piet/stata_format.h"
 #include "piet/strutil.h"
 
@@ -169,6 +174,39 @@ bool writeValuesCsv(const std::string& path, const std::vector<double>& vals) {
   return static_cast<bool>(f);
 }
 
+// getmata stores from Mata's double vector, compresses exact integer values,
+// then permits a float copy unless `double` was requested. The fixed capture
+// w2c_ml_getmata.log:1058/1092 pins byte for the integer vector even with
+// `double`, and float-rounded fractional copies by default. Existing variables
+// retain at least their original type (getmata.ado combine_num_vartype).
+std::string getmataStoredType(const std::vector<double>& values, bool useDouble,
+                              const std::string& original) {
+  bool integer = true, exactFloat = true, floatFits = true;
+  double lo = 0.0, hi = 0.0;
+  for (double value : values) {
+    if (std::isnan(value)) continue;
+    integer = integer && std::isfinite(value) && std::trunc(value) == value;
+    lo = std::min(lo, value);
+    hi = std::max(hi, value);
+    const double f = static_cast<double>(static_cast<float>(value));
+    exactFloat = exactFloat && f == value;
+    floatFits = floatFits && std::isfinite(f) && std::fabs(f) <= 0x1.fffffep+126;
+  }
+  std::string compact;
+  if (integer) compact = storage::promotedType("byte", false, lo, hi);
+  else compact = exactFloat ? "float" : "double";
+  if (original.empty()) {
+    if (compact == "double" && !useDouble && floatFits) return "float";
+    return compact;
+  }
+  if (original == "double" || compact == "double") return "double";
+  if (original == compact) return original;
+  if (original == "float") return compact == "long" ? "double" : "float";
+  if (original == "long") return compact == "float" ? "double" : "long";
+  if (original == "int" && compact == "byte") return "int";
+  return compact;
+}
+
 // cobra reports a structured failure as {"error":{"code","message"}} on stderr.
 // Surfacing the raw blob would put JSON punctuation in front of the user;
 // surfacing nothing would make a failed setcol indistinguishable from a
@@ -194,16 +232,22 @@ std::string cobraFailure(const CobraRunResult& r) {
   return text;
 }
 
+// Widths count CHARACTERS (StataBE pads a Unicode name by characters:
+// scratch-r150/uni-v/p4.do), so a multi-byte label stays aligned.
 std::string rjust(const std::string& s, size_t w) {
-  return s.size() >= w ? s : std::string(w - s.size(), ' ') + s;
+  const size_t n = cecon::ident::codePointCount(s);
+  return n >= w ? s : std::string(w - n, ' ') + s;
 }
 
 // Replace-or-append into session.eval.matrices. handlers_m3.cpp has the same
 // three lines under the name storeMatrixResult, but that copy is file-local
 // (anonymous namespace) -- appending a duplicate instead would leave
 // findMatrix() answering the OLD entry forever, since it returns the first
-// match.
+// match. A scalar of the same name is destroyed: scalars and matrices share one
+// namespace ([P] matrix define, "Namespace").
 void storeMatrix(SessionState& session, const std::string& name, eval::EvalMatrix mat) {
+  session.eval.scalars.erase(name);
+  session.eval.stringScalars.erase(name);
   for (auto& p : session.eval.matrices) {
     if (p.first == name) {
       p.second = std::move(mat);
@@ -222,7 +266,8 @@ void storeMatrix(SessionState& session, const std::string& name, eval::EvalMatri
 // different stores. A second width here would let `ereturn list` and `return
 // list` drift into disagreeing about their own column.
 std::string padLabel22(const std::string& s) {
-  return s.size() >= 22 ? s : std::string(22 - s.size(), ' ') + s;
+  const size_t n = cecon::ident::codePointCount(s);
+  return n >= 22 ? s : std::string(22 - n, ' ') + s;
 }
 
 // runEreturnList's fmtScalar, plus the missing case. Its own scalars come from
@@ -230,8 +275,15 @@ std::string padLabel22(const std::string& s) {
 // genuinely carries missing -- program.cpp's handleReturnStmt stages the literal
 // "nan" whenever the `return scalar` expression did not evaluate, and Stata
 // prints that as ".".
+//
+// The other missing is Stata's own double, 2^1023 and up (kStataMissingSentinel):
+// summarize posts one observation's r(sd) and r(Var) that way, and centile a
+// missing r(c_#), r(lb_#), r(ub_#). It is listed by its kind, `.` or `.a`..`.z`
+// (StataBE 19.5, BUG-1511: `r(sd) =  .` where this printed 8.98846567431158e+307).
 std::string fmtRScalar(double v) {
   if (std::isnan(v)) return ".";
+  if (const auto kind = eval::stataExtendedMissingKind(v))
+    return *kind == 0 ? std::string(".") : std::string(".") + static_cast<char>('a' + *kind - 1);
   std::ostringstream oss;
   oss.precision(16);
   oss << v;
@@ -294,8 +346,10 @@ ojson runReturnList(SessionState& session) {
   // r() has no scalars, and it is what real Stata prints. Suppressing the
   // header would make "nothing set" indistinguishable from "this build does not
   // track that half".
+  // "display": output, not the command echo, so `noisily` shows it and `quietly`
+  // hides it (BUG-1505, as runEreturnList).
   ojson block;
-  block["type"] = "echo";
+  block["type"] = "display";
   block["text"] = out.str();
   return block;
 }
@@ -414,6 +468,20 @@ ojson runSvmat(const eval::ParsedCommand& parsed, SessionState& session) {
       return aerError("svmat: `" + name + "' is not a valid variable name. " +
                           strutil::stataIdentifierRuleText(),
                       "syntax_error");
+    }
+    // Stata's reserved names ([U] 11.3) are well-formed identifiers that no
+    // variable may take: `svmat b, names(col)` over e(b) meets `_cons` and
+    // stops with "_cons invalid varname", r(198) (w2g_ebmat.log:1388-1393
+    // e11_svmat). Reachable since e(b) carries Stata's `_cons` (eb-order T-P1)
+    // where it used to carry the engine's `(intercept)`.
+    {
+      static const std::set<std::string> kReserved = {
+          "_all", "_b",   "byte", "_coef", "_cons", "double", "float", "if",   "in",
+          "int",  "long", "_n",   "_N",    "_pi",   "_pred",  "_rc",   "_skip", "strL",
+          "using", "with"};
+      static const std::regex reStrN(R"(^str[0-9]+$)");
+      if (kReserved.count(name) || std::regex_match(name, reStrN))
+        return aerErrorRc(name + " invalid varname", 198);
     }
     if (std::find(newVars.begin(), newVars.end(), name) != newVars.end()) {
       // Two matrix columns sharing a colname would otherwise have the second
@@ -568,13 +636,7 @@ std::vector<std::string> getlistTokens(const std::string& s) {
   return out;
 }
 
-bool isMataName(const std::string& n) {
-  if (n.empty() || n.size() > 32) return false;
-  if (!(std::isalpha(static_cast<unsigned char>(n[0])) || n[0] == '_')) return false;
-  for (char ch : n)
-    if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch == '_')) return false;
-  return true;
-}
+bool isMataName(const std::string& n) { return cecon::ident::isValidName(n); }
 
 }  // namespace
 
@@ -584,14 +646,11 @@ ojson runGetmata(const eval::ParsedCommand& parsed, SessionState& session) {
     return ojson(*err);
   }
   bool force = false, replace = false;
+  bool useDouble = session.defaultStorageType == "double";
   for (const auto& kv : parsed.opts) {
     if (kv.first == "force") force = true;
     if (kv.first == "replace") replace = true;
-    // `double` is ACCEPTED AND IGNORED, the way runSvmat accepts a storage
-    // type: PIET has one numeric storage (f64), so every getmata variable is
-    // already stored at double precision, and the oracle shows the option does
-    // not widen the reported type either (getmata_double :1092, `: type cd` is
-    // byte). Values are exact; the on-disk width is the only thing not modelled.
+    if (kv.first == "double") useDouble = true;
   }
 
   std::string getlist;
@@ -605,7 +664,7 @@ ojson runGetmata(const eval::ParsedCommand& parsed, SessionState& session) {
   Datastore* ds = session.hasData() ? session.datastore() : nullptr;
   const int64_t curRows = ds ? ds->nRows() : 0;
   const size_t curVars = ds ? ds->names().size() : 0;
-  if (curRows == 0 && curVars == 0) force = true;  // getmata.ado: nothing in memory implies force
+  if (curRows == 0 && curVars == 0) force = true;  // getmata: nothing in memory implies force
 
   // ---- parse and validate every element before touching anything ----------
   std::vector<GetmataElement> els;
@@ -767,6 +826,12 @@ ojson runGetmata(const eval::ParsedCommand& parsed, SessionState& session) {
                            ? el.value.data[static_cast<size_t>(i)][j]
                            : std::numeric_limits<double>::quiet_NaN());
       }
+      const std::string original = el.exists[j]
+                                       ? storage::resolveReplaceType(session, el.vars[j])
+                                       : std::string();
+      const std::string stored = rows == 0
+                                     ? original.empty() ? (useDouble ? "double" : "float") : original
+                                     : getmataStoredType(vals, useDouble, original);
       const std::string csvPath = mintCsvPath(session.workdir(), "getmata_vals");
       if (!writeValuesCsv(csvPath, vals)) {
         return writeFailure("could not write the values for " + el.vars[j]);
@@ -774,6 +839,7 @@ ojson runGetmata(const eval::ParsedCommand& parsed, SessionState& session) {
       const std::string outPath = mintScratchPath(session.workdir(), "getmata");
       std::vector<std::string> args = {"setcol", "--data", *session.currentHbin(), "--var",
                                        el.vars[j], "--values", csvPath, "--dtype", "f64"};
+      storage::appendStoreTypeArg(args, stored);
       // An existing variable is REPLACED in place (getmata.ado stores missing
       // over the whole column first, then the vector's rows -- which is what a
       // full-length column with a missing tail is).
@@ -786,6 +852,7 @@ ojson runGetmata(const eval::ParsedCommand& parsed, SessionState& session) {
         return writeFailure("failed writing output dataset (disk full or I/O error)");
       }
       session.load(outPath);
+      storage::recordCreateType(session, el.vars[j], stored, stored);
       ++written;
       touched.push_back(el.vars[j]);
       if (el.exists[j]) kExisting += 1;
@@ -793,10 +860,10 @@ ojson runGetmata(const eval::ParsedCommand& parsed, SessionState& session) {
     }
   }
 
-  // getmata is r-class: r() is replaced by exactly these two.
-  session.eval.rValues = eval::OrderedFloatDict();
-  session.eval.rStrings.clear();
-  session.eval.rMatrices.clear();
+  // getmata is r-class: r() is replaced by exactly these two. eval::replaceRClass
+  // is the one replacement shape: it leaves the reserved \x01 keys (s()) alone,
+  // where clearing the whole rStrings dict destroyed them.
+  eval::replaceRClass(session.eval);
   session.eval.rValues.set("K_new", kNew);
   session.eval.rValues.set("K_existing", kExisting);
   return mutationResult(session, "gen", touched);
@@ -804,6 +871,14 @@ ojson runGetmata(const eval::ParsedCommand& parsed, SessionState& session) {
 
 // ---------------------------------------------------------------------------
 // mkmat
+
+// The if/in filter that keeps each row's position in the working frame
+// (inrange_filter.cpp; declared at its callers, as in handlers.cpp).
+InRangeFilterResult applyIfAndInFilterKeepingIndex(SessionState& session,
+                                                   const std::string& basePath,
+                                                   const std::optional<std::string>& ifExpr,
+                                                   const std::optional<std::string>& inRange,
+                                                   std::string* indexVar);
 
 namespace {
 
@@ -880,6 +955,10 @@ ojson runMkmat(const eval::ParsedCommand& parsed, SessionState& session) {
       useObsNumbers = true;
     }
   }
+  // StataBE 19.5: `mkmat x y, matrix(M) obs rownames(v)` is r(198), with or
+  // without if/in -- a row takes one name.
+  if (useObsNumbers && !rowVar.empty())
+    return aerErrorRc("options obs and rownames() are exclusive", 198);
   if (!matName.empty() && !strutil::isValidStataIdentifier(matName)) {
     return aerError("mkmat: `" + matName + "' is not a valid matrix name. " +
                         strutil::stataIdentifierRuleText(),
@@ -888,8 +967,13 @@ ojson runMkmat(const eval::ParsedCommand& parsed, SessionState& session) {
 
   const std::string basePath = *session.currentHbin();
   InRangeFilterResult fr;
+  // `obs` names a row after the observation it came from, so a filtered copy
+  // keeps each row's position in the data (indexVar names that column).
+  std::string indexVar;
   try {
-    fr = applyIfAndInFilter(session, basePath, parsed.ifExpr, parsed.inRange);
+    fr = useObsNumbers ? applyIfAndInFilterKeepingIndex(session, basePath, parsed.ifExpr,
+                                                        parsed.inRange, &indexVar)
+                       : applyIfAndInFilter(session, basePath, parsed.ifExpr, parsed.inRange);
   } catch (const CobraError& ce) {
     return aerError("mkmat: " + cobraErrorMessage(ce), ce.code);
   }
@@ -944,6 +1028,12 @@ ojson runMkmat(const eval::ParsedCommand& parsed, SessionState& session) {
     }
     cols.push_back(p);
   }
+  const double* obsIndex = nullptr;
+  if (!indexVar.empty()) {
+    if (!ds->has(indexVar) || ds->col(indexVar).f64() == nullptr)
+      return aerError("mkmat: could not read the observation numbers of the filtered data");
+    obsIndex = ds->col(indexVar).f64();
+  }
 
   std::vector<std::vector<double>> rows;
   std::vector<std::string> rowNames;
@@ -962,15 +1052,18 @@ ojson runMkmat(const eval::ParsedCommand& parsed, SessionState& session) {
     // carried into the matrix as missing rather than silently dropped.
     if (nomissing && anyMissing) continue;
     rows.push_back(std::move(row));
-    // The row NUMBER a name is built from is the position in the filtered
-    // data, so `r3` is the third row of the matrix, not the third row of the
-    // unfiltered dataset. Naming rows after pre-filter positions would produce
-    // a stripe with gaps in it.
+    // The row NUMBER a default name is built from is the position in the
+    // matrix: `r3` is its third row. `obs` names the row after its observation
+    // instead, prefix kept (BUG-403; StataBE 19.5, 2026-11-03 oracle: rows from
+    // observations 1 and 3 are r1 r3, `if y > 3` gives r4 r5 r6, and
+    // rowprefix(p) p3 p4 ...).
     const size_t k = rows.size();
     if (!rowVar.empty()) {
       rowNames.push_back(rowNameFromValue(*ds, rowVar, i));
     } else if (useObsNumbers) {
-      rowNames.push_back(std::to_string(k));
+      const int64_t obs =
+          obsIndex != nullptr ? static_cast<int64_t>(std::llround(obsIndex[i])) : i + 1;
+      rowNames.push_back(rowPrefix + std::to_string(obs));
     } else {
       rowNames.push_back(rowPrefix + std::to_string(k));
     }
@@ -1012,59 +1105,6 @@ ojson runMkmat(const eval::ParsedCommand& parsed, SessionState& session) {
 
 namespace {
 
-// The e(b)/e(V) extraction, taken from handlers_m3.cpp's runMatrixDef so
-// `matlist e(b)` and `matrix N = e(b)` cannot come to disagree about what e(b)
-// is. Both halves are reproduced, in the same order and for the same reasons:
-//   1. a POSTED e-class matrix wins (`estat event, post` writes eMatrices
-//      "b"/"V" with Stata's own stripe and a full covariance -- the
-//      Stata-faithful answer), and
-//   2. otherwise it is synthesised from the last estimation's coeftable, where
-//      e(V) is the DIAGONAL of se^2 only, because a coeftable carries standard
-//      errors and not covariances.
-// The off-diagonal zeros in (2) are a disclosed approximation inherited from
-// that path, not something this renderer invents.
-bool extractEMatrix(SessionState& session, const std::string& which, eval::EvalMatrix* out,
-                    std::string* err) {
-  for (const auto& p : session.eval.eMatrices) {
-    if (p.first == which) {
-      *out = p.second;
-      return true;
-    }
-  }
-  if (!session.lastEstBlock.has_value()) {
-    *err = "matlist: no estimation results are in memory for e(" + which + ")";
-    return false;
-  }
-  const ojson ct = session.lastEstBlock->value("coeftable", ojson::array());
-  std::vector<std::string> names;
-  std::vector<double> bs, ses;
-  for (const auto& row : ct) {
-    names.push_back(row.value("name", std::string()));
-    auto num = [&row](const char* key) -> double {
-      return (row.contains(key) && !row.at(key).is_null())
-                 ? row.at(key).get<double>()
-                 : std::numeric_limits<double>::quiet_NaN();
-    };
-    bs.push_back(num("b"));
-    ses.push_back(num("se"));
-  }
-  if (names.empty()) {
-    *err = "matlist: e(" + which + ") is empty";
-    return false;
-  }
-  out->colnames = names;
-  if (which == "b") {
-    out->rownames = {"y1"};
-    out->data.push_back(bs);  // 1 x k row vector
-  } else {
-    out->rownames = names;
-    const size_t k = names.size();
-    out->data.assign(k, std::vector<double>(k, 0.0));
-    for (size_t i = 0; i < k; ++i) out->data[i][i] = ses[i] * ses[i];
-  }
-  return true;
-}
-
 // The display layer's own spec grammar (stata_format.h documents why each layer
 // keeps its own regex and shares only the renderer): a FULL match, so `%td`,
 // `%9s` and anything else non-numeric is refused by name instead of being
@@ -1089,10 +1129,11 @@ bool parseNumericFmt(const std::string& raw, fmt::StataFmtSpec* sp) {
 
 std::string renderCell(double v, const fmt::StataFmtSpec& sp, size_t width) {
   std::string s;
-  if (std::isnan(v)) {
-    // Missing is "." at every width -- renderValue takes a finite double and
-    // has no missing concept, so the check cannot be pushed down into it.
-    s = ".";
+  if (auto miss = eval::stataMissingToken(v)) {
+    // Missing is its token at every width (`.`, or `.a` for a matrix cell that
+    // holds one, BUG-1399) -- renderValue takes a finite double and has no
+    // missing concept, so the check cannot be pushed down into it.
+    s = *miss;
   } else if (std::optional<std::string> r = fmt::renderValue(v, sp)) {
     s = *r;
   } else {
@@ -1138,19 +1179,46 @@ ojson runMatlist(const eval::ParsedCommand& parsed, SessionState& session) {
   // pca posts seven (Ev, L, C, Psi, means, sds, components) and sktest posts
   // r(table), and under the old regex every one of them was unreachable -- the
   // command would publish a matrix that no syntax could name.
-  static const std::regex reCls(R"(^([er])\(\s*([A-Za-z_]\w*)\s*\)$)");
-  std::smatch me;
-  if (std::regex_match(expr, me, reCls)) {
-    const char cls = me.str(1)[0];
-    const std::string name = me.str(2);
-    if (const eval::EvalMatrix* posted = session.eval.findClassMatrix(cls, name)) {
-      mat = posted;
-    } else if (cls == 'e' && (name == "b" || name == "V")) {
-      // Fall back to synthesising b/V from the last estimation's coeftable --
-      // the pre-existing behaviour, kept exactly, including its error text.
-      std::string err;
-      if (!extractEMatrix(session, name, &owned, &err)) return aerError(err);
+  // Parsed by hand, not a regex: the name may be Unicode (bytes >= 0x80 are
+  // identifier bytes, core/ident.h), which a narrow-char bracket range cannot
+  // express portably.
+  char cls = 0;
+  std::string name;
+  {
+    size_t p = 0;
+    if (expr.size() > 2 && (expr[0] == 'e' || expr[0] == 'r') && expr[1] == '(') {
+      p = 2;
+      while (p < expr.size() && std::isspace(static_cast<unsigned char>(expr[p]))) ++p;
+      const size_t b = p;
+      if (p < expr.size() && cecon::ident::isIdentStartByte(expr[p])) {
+        while (p < expr.size() && cecon::ident::isIdentByte(expr[p])) ++p;
+        name = expr.substr(b, p - b);
+        while (p < expr.size() && std::isspace(static_cast<unsigned char>(expr[p]))) ++p;
+        if (p + 1 == expr.size() && expr[p] == ')') cls = expr[0];
+        else name.clear();
+      }
+    }
+  }
+  if (cls != 0) {
+    if (cls == 'e') {
+      // eb-order T-P1: the one resolver `matrix N = e(NAME)` uses
+      // (EvalSession::resolveEMatrix), so `matlist e(b)` and the copied matrix
+      // cannot disagree. Its second copy of the coeftable synthesis (with a
+      // diagonal e(V)) is gone. A refusal carries the resolver's rc: r(301)
+      // with no e() at all (w2g_ebmat.log:2238 e15c_fresh_matlist_eb), r(111)
+      // for a name the live e() does not have -- never the coarse rc 1.
+      int rc = 111;
+      std::string why;
+      std::optional<eval::EvalMatrix> resolved = session.eval.resolveEMatrix(name, &rc, &why);
+      // A live e() with no e(b)/e(V): rc 0, nothing to list (w2g_ebmat.log:2096
+      // e15c_matlist_eb after pca; w2v_estpost_ematrix.log ep13_matlist_eb).
+      if (!resolved.has_value() && session.eval.eMatrixAbsentFromLiveE(name))
+        resolved = eval::EvalMatrix{};
+      if (!resolved.has_value()) return aerErrorRc("matlist: " + why, rc);
+      owned = std::move(*resolved);
       mat = &owned;
+    } else if (const eval::EvalMatrix* posted = session.eval.findClassMatrix(cls, name)) {
+      mat = posted;
     } else {
       return aerErrorRc("matlist: matrix " + expr + " not found", 111);
     }
@@ -1220,50 +1288,157 @@ ojson runMatlist(const eval::ParsedCommand& parsed, SessionState& session) {
 
   const size_t nrows = mat->data.size();
   const size_t ncols = nrows > 0 ? mat->data[0].size() : 0;
-  if (nrows == 0 || ncols == 0) return aerError("matlist: matrix " + expr + " has no elements");
-
-  // Missing stripe entries get positional names rather than an empty column:
-  // an unnamed column would render as a blank header the reader cannot map back
-  // to an index. Same defaulting handlers_m3.cpp's renderMatrixList uses.
-  std::vector<std::string> rlabels = mat->rownames;
-  rlabels.resize(nrows);
-  for (size_t i = 0; i < nrows; ++i) {
-    if (rlabels[i].empty()) rlabels[i] = "r" + std::to_string(i + 1);
-  }
-  std::vector<std::string> clabels = mat->colnames;
-  clabels.resize(ncols);
-  for (size_t j = 0; j < ncols; ++j) {
-    if (clabels[j].empty()) clabels[j] = "c" + std::to_string(j + 1);
+  // A 0x0 matrix (`matrix b = e(b)` after estpost/pca, or e(b) itself there) lists
+  // nothing at rc 0 (w2g_ebmat.log:2096 e15c_matlist_eb; w2v_estpost_ematrix.log
+  // ep13_matlist_eb, ep15c_matlist_eb) -- it used to be an rc-1 error.
+  if (nrows == 0 || ncols == 0) {
+    ojson empty;
+    empty["type"] = "echo";
+    empty["text"] = "";
+    return empty;
   }
 
+  // StataBE 19.5's default layout (BUG-1412; 2026-11-03 oracle, line for line):
+  //
+  //                | e1                   | e2
+  //                |         x          y |         z
+  //   -------------+----------------------+----------
+  //   q            |                      |
+  //              a |         1          2 |         3
+  //   -------------+----------------------+----------
+  //   w            |                      |
+  //              b |         4          5 |         6
+  //
+  // - A column is one blank, the cell (the format's width w, 9 for %9.0g), one
+  //   blank; the first has no leading blank without row names. The row-name
+  //   field is twidth() wide plus one blank, then `|`.
+  // - A column-equation change puts a `|` before the column, on every line.
+  //   With any equation, a header line carries each group's equation once,
+  //   left-aligned in the first column's w; with any row equation, each run
+  //   of rows with one equation opens with a line holding its equation (blank
+  //   for none) and a separator line comes before every run but the first.
+  // - A factor/operator name puts its `op.` (or the part up to the last `#`)
+  //   on a line above, right-aligned to end one place past the cell, `bn`
+  //   dropped. Names are cut as abbrev() cuts them, to w (columns, equations)
+  //   or twidth (rows).
+  // - Separator lines and the blank stretch of an equation line stop one
+  //   place short of the last column's right edge.
+  // - A symmetric matrix prints its lower triangle.
+  const auto abbrev = [](const std::string& s, size_t n) {
+    if (s.size() <= n) return s;
+    return n > 4 ? s.substr(0, n - 2) + "~" + s.back() : s.substr(0, n);
+  };
+  const auto splitEq = [](std::string full, std::string* eq) {
+    const size_t colon = full.find(':');
+    eq->clear();
+    if (colon != std::string::npos) {
+      *eq = full.substr(0, colon);
+      full = full.substr(colon + 1);
+    }
+    if (*eq == "_") eq->clear();  // Stata's name for "no equation" among named ones
+    return full;
+  };
   const size_t tw = static_cast<size_t>(twidth);
-  std::ostringstream out;
-  if (!noblank) out << "\n";
-  if (!title.empty()) out << title << "\n";
-
-  if (showCols) {
-    // The header's row-label field is BLANK, not omitted: dropping it would
-    // shift every column name off the numbers underneath.
-    if (showRows) out << std::string(tw, ' ') << " |";
-    for (size_t j = 0; j < ncols; ++j) out << "  " << rjust(clabels[j], cellWidth);
-    out << "\n";
-    if (showRows) out << std::string(tw + 1, '-') << "+";
-    for (size_t j = 0; j < ncols; ++j) out << std::string(cellWidth + 2, '-');
-    out << "\n";
+  const size_t w = cellWidth;
+  std::vector<std::string> req(nrows), rname(nrows), ceq(ncols), cname(ncols), cop(ncols);
+  bool anyRowEq = false, anyColEq = false, anyOp = false;
+  for (size_t i = 0; i < nrows; ++i) {
+    std::string full = i < mat->rownames.size() ? matrixNameAsListed(mat->rownames[i]) : "";
+    if (full.empty()) full = "r" + std::to_string(i + 1);
+    rname[i] = abbrev(splitEq(full, &req[i]), tw);
+    anyRowEq = anyRowEq || !req[i].empty();
+  }
+  for (size_t j = 0; j < ncols; ++j) {
+    std::string full = j < mat->colnames.size() ? matrixNameAsListed(mat->colnames[j]) : "";
+    if (full.empty()) full = "c" + std::to_string(j + 1);
+    std::string name = splitEq(full, &ceq[j]);
+    anyColEq = anyColEq || !ceq[j].empty();
+    size_t cut = name.rfind('#');
+    if (cut == std::string::npos) cut = name.rfind('.');
+    if (cut != std::string::npos && cut > 0 && cut + 1 < name.size()) {
+      cop[j] = abbrev(name.substr(0, cut), w) + name[cut];
+      name = name.substr(cut + 1);
+      anyOp = true;
+    }
+    cname[j] = abbrev(name, w);
+  }
+  bool lowerOnly = nrows == ncols;
+  for (size_t i = 0; i < nrows && lowerOnly; ++i) {
+    for (size_t j = 0; j < i && lowerOnly; ++j) {
+      const double a = mat->data[i][j], b = mat->data[j][i];
+      lowerOnly = a == b || (std::isnan(a) && std::isnan(b));
+    }
   }
 
-  for (size_t i = 0; i < nrows; ++i) {
-    if (showRows) out << rjust(rlabels[i], tw) << " |";
+  const auto lead = [&](size_t j) -> size_t { return j == 0 && !showRows ? 0 : 1; };
+  const auto full = [&](size_t j) { return lead(j) + w + 1; };
+  const auto fill = [&](size_t j) { return full(j) - (j + 1 == ncols ? 1 : 0); };
+  const auto bar = [&](size_t j) {
+    return j + 1 < ncols && anyColEq && ceq[j + 1] != ceq[j] ? "|" : "";
+  };
+  const auto ljust = [](const std::string& s, size_t width) {
+    return s.size() >= width ? s : s + std::string(width - s.size(), ' ');
+  };
+  const std::string headLead = showRows ? std::string(tw + 1, ' ') + "|" : std::string();
+  std::ostringstream out;
+  const auto separator = [&] {
+    if (showRows) out << std::string(tw + 1, '-') << "+";
+    for (size_t j = 0; j < ncols; ++j) out << std::string(fill(j), '-') << (*bar(j) ? "+" : "");
+    out << "\n";
+  };
+
+  if (!noblank) out << "\n";
+  if (!title.empty()) out << title << "\n\n";
+  if (showCols && anyColEq) {
+    out << headLead;
     for (size_t j = 0; j < ncols; ++j) {
-      const double v = j < mat->data[i].size() ? mat->data[i][j]
-                                               : std::numeric_limits<double>::quiet_NaN();
-      out << "  " << renderCell(v, spec, cellWidth);
+      if (j == 0 || ceq[j] != ceq[j - 1])
+        out << std::string(lead(j), ' ') << ljust(abbrev(ceq[j], w), w) << ' ';
+      else
+        out << std::string(fill(j), ' ');
+      out << bar(j);
+    }
+    out << "\n";
+  }
+  if (showCols && anyOp) {
+    out << headLead;
+    for (size_t j = 0; j < ncols; ++j) {
+      if (cop[j].empty()) out << std::string(full(j), ' ');
+      else out << std::string(lead(j), ' ') << rjust(cop[j], w + 1);
+      out << bar(j);
+    }
+    out << "\n";
+  }
+  if (showCols) {
+    out << headLead;
+    for (size_t j = 0; j < ncols; ++j)
+      out << std::string(lead(j), ' ') << rjust(cname[j], w) << ' ' << bar(j);
+    out << "\n";
+  }
+  for (size_t i = 0; i < nrows; ++i) {
+    const bool newGroup = anyRowEq && (i == 0 || req[i] != req[i - 1]);
+    if (i == 0 ? showCols : newGroup) separator();
+    if (newGroup && showRows) {
+      out << ljust(abbrev(req[i], tw), tw) << " |";
+      for (size_t j = 0; j < ncols; ++j) out << std::string(fill(j), ' ') << bar(j);
+      out << "\n";
+    }
+    if (showRows) out << rjust(rname[i], tw) << " |";
+    for (size_t j = 0; j < ncols; ++j) {
+      if (lowerOnly && j > i) {
+        out << std::string(full(j), ' ');
+      } else {
+        const double v = j < mat->data[i].size() ? mat->data[i][j]
+                                                 : std::numeric_limits<double>::quiet_NaN();
+        out << std::string(lead(j), ' ') << renderCell(v, spec, w) << ' ';
+      }
+      out << bar(j);
     }
     out << "\n";
   }
 
   ojson block;
-  block["type"] = "echo";
+  block["type"] = "display";  // output, not the command echo (BUG-1505, runReturnList)
   block["text"] = out.str();
   return block;
 }

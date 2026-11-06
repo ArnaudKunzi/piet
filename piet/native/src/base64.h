@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Minimal base64 encoder — used only to build a `data:text/html;base64,...`
 // URI for loading the demo page without a percent-encoding pass (see
 // main.cpp). Not a vendored dependency: ~20 lines, kept in-tree rather than

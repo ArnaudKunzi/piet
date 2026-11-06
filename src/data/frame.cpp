@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "data/frame.h"
 
 #include <fcntl.h>
@@ -12,12 +14,17 @@
 #include "io/win_compat.h"  // pread/pwrite shim + UTF-8 path helpers (no-op on POSIX)
 #include "core/error.h"     // EngineError("bad_input", ...) for the fweight honest-error paths
 #include "core/eng_counters.h"  // W0: patch-vs-full write-plane ledger (P2PERF §W0)
+#include "core/exact_sum.h"     // ExactSum: Stata's summary-statistic accumulation (BUG-1013)
+#include "core/stata_arith.h"   // exp()/invlogit()/^ with StataBE's bits
 #include "core/threads.h"   // MAXPERF Stage 3: ThreadPool for morsel-parallel collapse/merge
 #include "data/radix_sort.h"  // C2-F8: value-identical LSD radix for gsort
 #include "data/missing.h"     // Stata `.` / `.a`-`.z` kinds + their total order
 #include "core/rng_uniform.h"
+#include "core/rng_mt64.h"   // Stata-exact session stream (--rng-mt64)
 #include "core/distributions.h"  // normal/invnormal/ttail/invttail/invt: one copy, shared
 #include "data/stata_dates.h"  // BUG-371: %td calendar, shared with PIET's pyeval layer
+#include "core/ident.h"        // Unicode-aware identifier byte tests (non-ASCII bytes are name bytes)
+#include "core/expr_blanks.h"  // FU-875: the blanks Stata drops inside ( ) and [ ]
 #include "data/ts_operators.h"  // BUG-369: L./F./D./S. inside expressions (gen/replace/if)
 
 #include <algorithm>
@@ -35,6 +42,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "nlohmann/json.hpp"
@@ -63,6 +71,32 @@ inline int scmp(double a, double b) { return cecon::stata_cmp(a, b); }
 // genuine NaN input (already missing) maps to NAd unchanged; a finite result
 // passes through untouched (no-op for the overwhelming common case).
 inline double fin(double v) { return std::isfinite(v) ? v : NAd; }
+
+// log10, asinh and exp as StataBE 19.5 computes them (PIET's expression layer
+// carries the same rules, piet/native/src/eval/exprfns.cpp): log10(x) is
+// ln(x)/ln(10), so log10(1000) is 2.9999999999999996; asinh(x) is
+// ln(x + sqrt(x^2 + 1)), odd-symmetric, ln|x| + ln 2 where x^2 overflows
+// (asinh(1e-10) +1.b7cdffffa18d8X-022, not libm's ...fd9d7bdbb); exp past
+// Stata's largest double 2^1023 is missing and a result below 1e-323 is 0
+// (tests/eval/golden/aer_w2/w2x_fn_string_math.log fx_log10_gen/_edges,
+// fx_asinh_edges, fx_exp_edges). The underflow edge is an argument below -709,
+// not a result below 1e-323: exp(-717.5) is 0 in Stata (cecon::stata_exp_value,
+// core/stata_arith.h, identified from StataBE bits).
+inline double stata_log10(double x) {
+    static const double kLn10 = std::log(10.0);
+    return fin(std::log(x) / kLn10);
+}
+inline double stata_asinh(double x) {
+    const double ax = std::fabs(x);
+    const double sq = ax * ax + 1.0;
+    const double r = std::isfinite(sq) ? std::log(ax + std::sqrt(sq)) : std::log(ax) + std::log(2.0);
+    return fin(x < 0 ? -r : r);
+}
+inline double stata_exp(double x) {
+    const double r = cecon::stata_exp_value(x);
+    if (!(r < 0x1p1023)) return NAd;
+    return r;
+}
 // The truth value `!`, `&` and `|` read from an operand: nonzero is true, and a
 // missing value is nonzero, so it is TRUE ([U] 13.2.4). Oracle w2c_functions.log
 // operators_missing: `!x` is 0 on x = . and .a, `x & 1` and `x | 0` are 1 there,
@@ -90,6 +124,19 @@ int64_t g_rng_node_counter = 0;
 // the SAME column twice -- noise that is silently perfectly correlated, and a
 // `set seed` that is silently ignored.
 bool g_rng_coords_set = false;
+
+// Stata's session stream (core/rng_mt64.h). When the caller hands the state over
+// (--rng-mt64, PIET's injectRngContextForExpr) every draw comes from it in the
+// order the evaluator reaches the draw sites -- observation order, the rows a
+// generate actually evaluates, left to right within a row -- and g_mt64_draws
+// counts the raw 64-bit draws taken so the caller can advance its own copy.
+// Without it the Philox coordinates above stay in charge (direct CLI callers).
+// Owned by ONE eval call: begin_rng_mt64/end_rng_mt64 bracket it, so a resident
+// `cobra serve` process never hands a later request this request's stream.
+// g_mt64.taken() is the count of raw draws since the state arrived.
+cecon::Mt64 g_mt64;
+bool g_mt64_on = false;
+inline double mt64_uniform() { return g_mt64.runiform(); }
 
 // The coordinates belong to ONE call, not to the process. Under `cobra serve` (PIET's
 // default plane) one resident process answers every request, and a request that
@@ -132,7 +179,11 @@ enum {
     // Draws. Pure functions of (seed, stream, node, row) -- see core/rng_uniform.h.
     F_runiform, F_runiformint, F_rnormal, F_uniform,
     // Distribution functions (core/distributions.h) and sign().
-    F_normal, F_invnormal, F_ttail, F_invttail, F_invt, F_sign,
+    F_normal, F_invnormal, F_ttail, F_invttail, F_invt, F_sign, F_normalden,
+    // invlogit()/logit() (w2c_ml_getmata.do:21 `generate yb = invlogit(...)`).
+    F_invlogit, F_logit,
+    // reldif(x,y) (BUG-1046: `generate r = reldif(x,2)` was rc 1).
+    F_reldif,
     // group(k): needs _n/_N like a draw needs its row. See the ev() case.
     F_group
 };
@@ -197,7 +248,46 @@ const FnInfo FNS[] = {
     {"normal", F_normal, 1, 1}, {"invnormal", F_invnormal, 1, 1},
     {"ttail", F_ttail, 2, 2}, {"invttail", F_invttail, 2, 2}, {"invt", F_invt, 2, 2},
     {"sign", F_sign, 1, 1}, {"group", F_group, 1, 1},
+    // normalden(x), normalden(x,s), normalden(x,m,s) (BUG-1124: generate refused
+    // it, `generate d = normalden(x)` rc 1). Four arguments and none are r(198);
+    // the bits are core/distributions.h stata_normalden's.
+    {"normalden", F_normalden, 1, 3},
+    // [FN] invlogit(x) = exp(x)/(1+exp(x)), range (0,1); logit(x) = ln(x/(1-x)),
+    // missing outside the open interval (0,1). Oracle w2c_ml_getmata.do:21.
+    {"invlogit", F_invlogit, 1, 1}, {"logit", F_logit, 1, 1},
+    // [FN] reldif(x,y) = |x-y|/(|y|+1). StataBE 19.5 (2026-11-03): reldif(x,2) of
+    // 1,2,3 is .33333333, 0, .33333333; reldif(.a,.a) 0, reldif(.,.a) `.`.
+    {"reldif", F_reldif, 2, 2},
 };
+
+// invlogit/logit, shared by the scalar ev() and the vectorised ev_fn_vec().
+// Two-branched with Stata's exp() (core/stata_arith.h): invlogit(-717.5) is 0,
+// not the subnormal libm's exp(-717.5)/(1+...) gives.
+inline double stata_invlogit(double x) {
+    if (std::isnan(x)) return NAd;
+    return cecon::stata_invlogit_value(x);
+}
+inline double stata_logit(double x) {
+    if (!(x > 0.0 && x < 1.0)) return NAd;
+    return std::log(x / (1.0 - x));
+}
+
+// reldif(x,y), shared by the scalar ev() and the vectorised ev_fn_vec(), and the
+// rule PIET's display-layer fnReldif keeps: two missings are 0 when they are the
+// same one (reldif(.a,.a), reldif(1e308,1e308)), any other missing operand is
+// `.`. A value past c(maxdouble), such as the literal 1e308, is a missing too.
+inline double stata_reldif(double x, double y) {
+    constexpr double kMaxDouble = 0x1.fffffffffffffp+1022;
+    const bool mx = std::isnan(x) || x > kMaxDouble, my = std::isnan(y) || y > kMaxDouble;
+    if (mx || my) {
+        if (!(mx && my)) return NAd;
+        const bool same = std::isnan(x)
+                              ? std::isnan(y) && cecon::missing_kind(x) == cecon::missing_kind(y)
+                              : x == y;
+        return same ? 0.0 : NAd;
+    }
+    return fin(std::fabs(x - y) / (std::fabs(y) + 1.0));
+}
 
 // One switch, two callers. frame.cpp's documented way of going wrong is a name
 // that reaches FNS[] and the scalar ev() but not the vectorised ev_fn_vec(),
@@ -255,11 +345,13 @@ inline double stata_dist(double v) { return std::isnan(v) ? NAd : v; }
 // where the 1e-6 is Stata's own fuzz (k = 1 + 9.9e-7 on N = 2 answers 1, 1 + 1e-6
 // answers 2; k = 1e-9 gives 1 0 0 0 ...). n and N are the observation number and
 // count of the by-group under `by`, of the dataset otherwise; an `if` does not
-// renumber (group(2) if _n > 2 on N = 6 answers 1 2 2 2 on rows 3-6). k <= 0 or
-// missing is `.`. Under `in a/b` Stata renumbers within the range (N = b-a+1); that
-// shape is refused, in the parser when the range is folded into the expression and
-// in refuse_group_in_masked_range when it rides --gen-mask. Inside sum() the same
-// by-group n and N apply (materialize_sums evaluates its argument per group).
+// renumber (group(2) if _n > 2 on N = 6 answers 1 2 2 2 on rows 3-6; w2m_bymask
+// G02 :482). k <= 0 or missing is `.`. Under `in a/b` Stata renumbers within the
+// range: n = obs-a+1, N = b-a+1 (w2m_bymask G05 :514, `group(2) in 3/6` answers
+// . . 1 1 2 2). The range reaches the engine apart from the `if`
+// (GenQualifier, eval --gen-in) and bind_group_range stamps it on every
+// group() node of the command. Inside sum() the same n and N apply
+// (materialize_sums evaluates its argument per group).
 inline double stata_group(double k, int64_t n, int64_t N) {
     if (std::isnan(k) || !(k > 0.0)) return NAd;
     if (n <= 1 || N <= 1) return 1.0;
@@ -299,6 +391,12 @@ struct Node {
     std::string sval;
     const FrameColumn* fcol = nullptr;
     std::vector<double> owned;
+    // group() under an `in a/b` range: the range's first and last observation
+    // (1-based), 0 when there is none. Set by bind_group_range.
+    int64_t in_first = 0, in_last = 0;
+    // A function node one of whose arguments takes a draw: ev() then evaluates
+    // every argument up front, right to left, as Stata does. Set by mark_arg_draws.
+    bool arg_draws = false;
 };
 
 // Per-row evaluation context. order != null means we are inside a bysort group:
@@ -346,68 +444,94 @@ double ev(const Node* n, const EvalCtx& c) {
         }
         case Node::Neg: return -ev(n->a.get(), c);
         case Node::Not: return truthy(ev(n->a.get(), c)) ? 0.0 : 1.0;
-        case Node::Add: return fin(ev(n->a.get(), c) + ev(n->b.get(), c));
-        case Node::Sub: return fin(ev(n->a.get(), c) - ev(n->b.get(), c));
-        case Node::Mul: return fin(ev(n->a.get(), c) * ev(n->b.get(), c));
-        case Node::Div: return fin(ev(n->a.get(), c) / ev(n->b.get(), c));
-        case Node::Pow: return fin(std::pow(ev(n->a.get(), c), ev(n->b.get(), c)));
-        case Node::Lt: return scmp(ev(n->a.get(), c), ev(n->b.get(), c)) <  0 ? 1.0 : 0.0;
-        case Node::Gt: return scmp(ev(n->a.get(), c), ev(n->b.get(), c)) >  0 ? 1.0 : 0.0;
-        case Node::Le: return scmp(ev(n->a.get(), c), ev(n->b.get(), c)) <= 0 ? 1.0 : 0.0;
-        case Node::Ge: return scmp(ev(n->a.get(), c), ev(n->b.get(), c)) >= 0 ? 1.0 : 0.0;
-        case Node::Eq: return scmp(ev(n->a.get(), c), ev(n->b.get(), c)) == 0 ? 1.0 : 0.0;
-        case Node::Ne: return scmp(ev(n->a.get(), c), ev(n->b.get(), c)) != 0 ? 1.0 : 0.0;
+        // Operands are evaluated left then right, explicitly: C++ leaves the order
+        // of `f() + g()` unspecified, and with a draw on each side the order IS the
+        // answer (Stata: `runiform() - 2*runiform()` takes the left draw first,
+        // impl_C stata_probe P5).
+        case Node::Add: { const double x = ev(n->a.get(), c); return fin(x + ev(n->b.get(), c)); }
+        case Node::Sub: { const double x = ev(n->a.get(), c); return fin(x - ev(n->b.get(), c)); }
+        case Node::Mul: { const double x = ev(n->a.get(), c); return fin(x * ev(n->b.get(), c)); }
+        case Node::Div: { const double x = ev(n->a.get(), c); return fin(x / ev(n->b.get(), c)); }
+        // `^` is Stata's (core/stata_arith.h): x^2 is x*x, x^-2 is (1/x)*(1/x), and a
+        // non-integer power is exp(y*ln(x)); libm's pow differs in the last bit.
+        case Node::Pow: { const double x = ev(n->a.get(), c); return fin(cecon::stata_pow_value(x, ev(n->b.get(), c))); }
+        case Node::Lt: { const double x = ev(n->a.get(), c); return scmp(x, ev(n->b.get(), c)) <  0 ? 1.0 : 0.0; }
+        case Node::Gt: { const double x = ev(n->a.get(), c); return scmp(x, ev(n->b.get(), c)) >  0 ? 1.0 : 0.0; }
+        case Node::Le: { const double x = ev(n->a.get(), c); return scmp(x, ev(n->b.get(), c)) <= 0 ? 1.0 : 0.0; }
+        case Node::Ge: { const double x = ev(n->a.get(), c); return scmp(x, ev(n->b.get(), c)) >= 0 ? 1.0 : 0.0; }
+        case Node::Eq: { const double x = ev(n->a.get(), c); return scmp(x, ev(n->b.get(), c)) == 0 ? 1.0 : 0.0; }
+        case Node::Ne: { const double x = ev(n->a.get(), c); return scmp(x, ev(n->b.get(), c)) != 0 ? 1.0 : 0.0; }
         case Node::And: { double x = ev(n->a.get(), c), y = ev(n->b.get(), c);
             return (truthy(x) && truthy(y)) ? 1.0 : 0.0; }
         case Node::Or: { double x = ev(n->a.get(), c), y = ev(n->b.get(), c);
             return (truthy(x) || truthy(y)) ? 1.0 : 0.0; }
         case Node::Fn: {
             const auto& A = n->args;
-            auto a0 = [&] { return ev(A[0].get(), c); };
+            // Stata evaluates a function's arguments right to left, every one of
+            // them, cond()'s untaken branch included. Only a draw can tell (StataBE
+            // 19.5, 2026-11-03, after `set seed 1`: `min(runiform(), runiform()+10)`
+            // and `cond(1, runiform(), runiform()+10)` are both the SECOND draw, and
+            // a row of `cond(mod(_n,2)==1, 0, runiform())` takes a draw whichever
+            // branch wins, BUG-1050), so when an argument takes one they are all
+            // evaluated here first, in that order, and the cases read them back.
+            double pre_small[4];
+            std::vector<double> pre_big;
+            const double* pre = nullptr;
+            if (n->arg_draws) {
+                double* buf = pre_small;
+                if (A.size() > 4) { pre_big.resize(A.size()); buf = pre_big.data(); }
+                for (size_t k = A.size(); k-- > 0;) buf[k] = ev(A[k].get(), c);
+                pre = buf;
+            }
+            auto arg = [&](size_t k) { return pre ? pre[k] : ev(A[k].get(), c); };
+            auto a0 = [&] { return arg(0); };
             switch (n->fn) {
                 case F_ln: case F_log: return fin(std::log(a0()));
-                case F_exp: return fin(std::exp(a0()));
+                case F_exp: return stata_exp(a0());
                 case F_sqrt: return fin(std::sqrt(a0()));
-                case F_abs: return std::fabs(a0());
+                case F_abs: { double x = a0(); return std::isnan(x) ? NAd : std::fabs(x); }
                 case F_sin: return std::sin(a0());
                 case F_cos: return std::cos(a0());
                 case F_tan: return std::tan(a0());
-                case F_log10: return fin(std::log10(a0()));
-                case F_asinh: return fin(std::asinh(a0()));
+                case F_log10: return stata_log10(a0());
+                case F_asinh: return stata_asinh(a0());
                 case F_ln1p: return fin(std::log1p(a0()));
                 case F_ln1m: return fin(std::log1p(-a0()));
-                case F_int: { double x = a0(); return std::isnan(x) ? NAd : std::trunc(x); }
+                // floor(), ceil(), int() and round() of a missing x are x itself, so
+                // `.a` stays `.a` ([FN]: "x (not '.') if x is missing"), while abs()
+                // of any missing is plain `.` (BUG-1371). round() is Stata's
+                // y*floor(x/y + .5), cecon::stata_round_value (BUG-1364).
+                case F_int: { double x = a0(); return std::isnan(x) ? x : std::trunc(x); }
                 case F_float: return frame_detail::round_to_store(a0(), StoreType::Float);
                 case F_round: {
                     double x = a0();
-                    if (std::isnan(x)) return NAd;
-                    if (A.size() >= 2) {  // round(x, unit): Stata's unit*round(x/unit); unit 0/miss -> .
-                        double u = ev(A[1].get(), c);
+                    if (A.size() >= 2) {  // round(x, unit): a missing unit is `.`
+                        double u = arg(1);
                         if (std::isnan(u)) return NAd;
-                        return fin(std::round(x / u) * u);
+                        return std::isnan(x) ? x : fin(cecon::stata_round_value(x, u));
                     }
-                    return std::round(x);
+                    return std::isnan(x) ? x : cecon::stata_round_value(x, 1.0);
                 }
-                case F_floor: { double x = a0(); return std::isnan(x) ? NAd : std::floor(x); }
-                case F_ceil: { double x = a0(); return std::isnan(x) ? NAd : std::ceil(x); }
+                case F_floor: { double x = a0(); return std::isnan(x) ? x : std::floor(x); }
+                case F_ceil: { double x = a0(); return std::isnan(x) ? x : std::ceil(x); }
                 case F_missing:
-                    for (auto& q : A) if (std::isnan(ev(q.get(), c))) return 1.0;
+                    for (size_t k = 0; k < A.size(); ++k) if (std::isnan(arg(k))) return 1.0;
                     return 0.0;
                 case F_cond: {
-                    double cc = ev(A[0].get(), c);
-                    if (std::isnan(cc)) return A.size() == 4 ? ev(A[3].get(), c) : ev(A[1].get(), c);
-                    return cc != 0.0 ? ev(A[1].get(), c) : ev(A[2].get(), c);
+                    double cc = arg(0);
+                    if (std::isnan(cc)) return A.size() == 4 ? arg(3) : arg(1);
+                    return cc != 0.0 ? arg(1) : arg(2);
                 }
                 case F_inlist: {
-                    double z = ev(A[0].get(), c);
+                    double z = arg(0);
                     for (size_t k = 1; k < A.size(); ++k) {
-                        double v = ev(A[k].get(), c);
+                        double v = arg(k);
                         if ((std::isnan(z) && std::isnan(v)) || z == v) return 1.0;
                     }
                     return 0.0;
                 }
                 case F_inrange: {
-                    double z = ev(A[0].get(), c), lo = ev(A[1].get(), c), hi = ev(A[2].get(), c);
+                    double z = arg(0), lo = arg(1), hi = arg(2);
                     if (std::isnan(z)) return 0.0;
                     bool lm = std::isnan(lo), hm = std::isnan(hi);
                     if (lm && hm) return 1.0;
@@ -416,12 +540,12 @@ double ev(const Node* n, const EvalCtx& c) {
                     return (lo <= z && z <= hi) ? 1.0 : 0.0;
                 }
                 case F_mod: {
-                    double x = a0(), y = ev(A[1].get(), c);
+                    double x = a0(), y = arg(1);
                     if (std::isnan(x) || std::isnan(y) || y <= 0.0) return NAd;
                     return fin(x - y * std::floor(x / y));
                 }
                 case F_mdy:
-                    return stata_mdy(a0(), ev(A[1].get(), c), ev(A[2].get(), c));
+                    return stata_mdy(a0(), arg(1), arg(2));
                 case F_year: return stata_date_part(a0(), DP_year);
                 case F_month: return stata_date_part(a0(), DP_month);
                 case F_day: return stata_date_part(a0(), DP_day);
@@ -434,61 +558,96 @@ double ev(const Node* n, const EvalCtx& c) {
                     // Filled by materialize_sums before evaluation starts.
                     return n->owned.empty() ? NAd : n->owned[static_cast<size_t>(c.row)];
                 case F_runiform: {
+                    if (g_mt64_on) {
+                        // Stata: the bounds first; a degenerate or inverted range is
+                        // `.` WITHOUT a draw (impl_C stata_probe P1), else a+(b-a)u (P2).
+                        if (A.empty()) return mt64_uniform();
+                        const double lo = a0(), hi = arg(1);
+                        if (std::isnan(lo) || std::isnan(hi) || !(lo < hi)) return NAd;
+                        return lo + (hi - lo) * mt64_uniform();
+                    }
                     const double u = cecon::rng_uniform(g_rng_seed, g_rng_stream,
                                                         static_cast<int64_t>(n->num), c.row);
                     if (A.empty()) return u;
-                    const double lo = a0(), hi = ev(A[1].get(), c);
+                    const double lo = a0(), hi = arg(1);
                     // Stata answers missing for a degenerate or inverted range
                     // (runiform(3,3) is `.`, measured).
                     if (std::isnan(lo) || std::isnan(hi) || !(lo < hi)) return NAd;
                     return lo + u * (hi - lo);
                 }
                 case F_runiformint: {
-                    const double lo = a0(), hi = ev(A[1].get(), c);
+                    const double lo = a0(), hi = arg(1);
                     if (std::isnan(lo) || std::isnan(hi) || hi < lo) return NAd;
                     if (lo != std::floor(lo) || hi != std::floor(hi)) return NAd;
+                    if (g_mt64_on) {
+                        // Top-k-bit rejection, one raw draw per try (core/rng_mt64.h).
+                        return g_mt64.runiformint(lo, hi);
+                    }
                     return cecon::rng_uniform_int(g_rng_seed, g_rng_stream,
                                                   static_cast<int64_t>(n->num), c.row, lo, hi);
                 }
                 case F_uniform:
+                    if (g_mt64_on) return mt64_uniform();  // Stata: runiform()'s stream and transform
                     return cecon::rng_uniform(g_rng_seed, g_rng_stream,
                                               static_cast<int64_t>(n->num), c.row);
                 case F_rnormal: {
                     // Inverse CDF (AS241) over the same 53-bit word runiform() uses,
                     // centred into the open interval so the quantile is always finite.
-                    const uint64_t bits = cecon::uniform_bits(g_rng_seed, g_rng_stream,
-                                                              static_cast<int64_t>(n->num), c.row);
-                    const double u = (static_cast<double>(bits >> 11) + 0.5) *
-                                     (1.0 / 9007199254740992.0);
+                    // On the Stata stream this is ONE runiform() through the inverse
+                    // CDF: Stata's own rnormal() is a Knuth Algorithm M variant that
+                    // takes 3+ uniforms per normal and whose tables are unpublished
+                    // (internal g13 report 1.1), so its values are not Stata's yet.
+                    double u;
+                    if (g_mt64_on) {
+                        u = mt64_uniform();
+                    } else {
+                        const uint64_t bits = cecon::uniform_bits(g_rng_seed, g_rng_stream,
+                                                                  static_cast<int64_t>(n->num), c.row);
+                        u = (static_cast<double>(bits >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+                    }
                     const double z = cecon::normal_icdf(u);
                     if (A.empty()) return z;
                     const double m = a0();
-                    const double sd = A.size() >= 2 ? ev(A[1].get(), c) : 1.0;
+                    const double sd = A.size() >= 2 ? arg(1) : 1.0;
                     // rnormal(.,1), rnormal(0,-1) are `.`; rnormal(1,0) is 1 (measured).
                     if (std::isnan(m) || std::isnan(sd) || sd < 0.0) return NAd;
                     return fin(m + sd * z);
                 }
                 case F_normal: return stata_dist(cecon::stata_normal(a0()));
                 case F_invnormal: return stata_dist(cecon::stata_invnormal(a0()));
-                case F_ttail: return stata_dist(cecon::stata_ttail(a0(), ev(A[1].get(), c)));
-                case F_invttail: return stata_dist(cecon::stata_invttail(a0(), ev(A[1].get(), c)));
-                case F_invt: return stata_dist(cecon::stata_invt(a0(), ev(A[1].get(), c)));
+                case F_ttail: return stata_dist(cecon::stata_ttail(a0(), arg(1)));
+                case F_invttail: return stata_dist(cecon::stata_invttail(a0(), arg(1)));
+                case F_invt: return stata_dist(cecon::stata_invt(a0(), arg(1)));
+                case F_normalden: {
+                    const double x = a0();
+                    if (A.size() == 1) return stata_dist(cecon::stata_normalden(x));
+                    if (A.size() == 2) return stata_dist(cecon::stata_normalden(x, 0.0, arg(1)));
+                    const double m = arg(1);
+                    return stata_dist(cecon::stata_normalden(x, m, arg(2)));
+                }
                 case F_sign: return stata_sign(a0());
+                case F_invlogit: return stata_invlogit(a0());
+                case F_logit: return stata_logit(a0());
+                case F_reldif: return stata_reldif(a0(), ev(A[1].get(), c));
                 case F_group:
+                    // An `in` range comes only without a by-list or sort key
+                    // (Frame::bygen refuses the rest), so c.row is the observation.
+                    if (n->in_first > 0)
+                        return stata_group(a0(), c.row + 1 - n->in_first + 1,
+                                           n->in_last - n->in_first + 1);
                     return stata_group(a0(), c.order ? c.pos : c.row + 1,
                                        c.order ? (c.g1 - c.g0) : c.n_all);
-                case F_ym: return cecon::stata_ym(a0(), ev(A[1].get(), c));
-                case F_yq: return cecon::stata_yq(a0(), ev(A[1].get(), c));
-                case F_yh: return cecon::stata_yh(a0(), ev(A[1].get(), c));
-                case F_yw: return cecon::stata_yw(a0(), ev(A[1].get(), c));
+                case F_ym: return cecon::stata_ym(a0(), arg(1));
+                case F_yq: return cecon::stata_yq(a0(), arg(1));
+                case F_yh: return cecon::stata_yh(a0(), arg(1));
+                case F_yw: return cecon::stata_yw(a0(), arg(1));
                 case F_hms:
-                    return cecon::stata_hms(a0(), ev(A[1].get(), c), ev(A[2].get(), c));
+                    return cecon::stata_hms(a0(), arg(1), arg(2));
                 case F_dhms:
-                    return cecon::stata_dhms(a0(), ev(A[1].get(), c), ev(A[2].get(), c),
-                                             ev(A[3].get(), c));
-                case F_min: { double m = NAd; for (auto& q : A) { double v = ev(q.get(), c);
+                    return cecon::stata_dhms(a0(), arg(1), arg(2), arg(3));
+                case F_min: { double m = NAd; for (size_t k = 0; k < A.size(); ++k) { double v = arg(k);
                     if (!std::isnan(v)) m = std::isnan(m) ? v : std::min(m, v); } return m; }
-                case F_max: { double m = NAd; for (auto& q : A) { double v = ev(q.get(), c);
+                case F_max: { double m = NAd; for (size_t k = 0; k < A.size(); ++k) { double v = arg(k);
                     if (!std::isnan(v)) m = std::isnan(m) ? v : std::max(m, v); } return m; }
             }
             return NAd;
@@ -528,29 +687,17 @@ bool vectorizable(const Node* n) {
     return true;
 }
 
-// True when `fn` occurs anywhere in the tree.
-bool ast_has_fn(const Node* n, int fn) {
-    if (!n) return false;
-    if (n->kind == Node::Fn && n->fn == fn) return true;
-    if (ast_has_fn(n->a.get(), fn) || ast_has_fn(n->b.get(), fn)) return true;
-    for (const auto& q : n->args) if (ast_has_fn(q.get(), fn)) return true;
-    return false;
-}
-
-// group() whose `in a/b` range rides --gen-mask instead of the expression. PIET
-// sends a running sum's qualifier that way (egen.cpp runBysortGen, maskOut), so
-// `generate s = sum(group(3)) in 3/7` arrives as expr `sum(group(3))` with mask
-// `_n>=3 & _n<=7`, which the parser's check on the expression text never sees.
-// Stata numbers group() within the range; refuse rather than number over the
-// dataset (BUG-576). A mask that is only an `if` does not renumber, and passes.
-void refuse_group_in_masked_range(const Node* ast, const std::string& expr,
-                                  const std::string& mask_expr) {
-    if (mask_expr.find("_n>=") == std::string::npos ||
-        mask_expr.find("_n<=") == std::string::npos || !ast_has_fn(ast, F_group))
-        return;
-    throw std::runtime_error("expr: group() cannot be combined with an `in` range (or an "
-                             "`_n>=`/`_n<=` condition): Stata numbers group() within the "
-                             "range in '" + expr + "'");
+// group() under `in a/b` numbers within the range (w2m_bymask G01 :472, G03 :494,
+// G04 :504 inside sum(), G05 :514). The range is its own channel
+// (GenQualifier), so it can be told apart from an `if` such as
+// `_n>=2 & _n<=4`, which does not renumber (G02 :482). Every group() node of the
+// command takes it, the `if`'s included: they are evaluated over the same range.
+void bind_group_range(Node* n, int64_t first, int64_t last) {
+    if (!n || first <= 0) return;
+    if (n->kind == Node::Fn && n->fn == F_group) { n->in_first = first; n->in_last = last; }
+    bind_group_range(n->a.get(), first, last);
+    bind_group_range(n->b.get(), first, last);
+    for (auto& q : n->args) bind_group_range(q.get(), first, last);
 }
 
 void ev_vec(const Node* n, int64_t N, std::vector<double>& out);
@@ -562,11 +709,11 @@ void ev_fn_vec(const Node* n, int64_t N, std::vector<double>& out) {
         case F_ln: case F_log: ev_vec(A[0].get(), N, out);
             for (int64_t i = 0; i < N; ++i) out[i] = fin(std::log(out[i])); return;
         case F_exp: ev_vec(A[0].get(), N, out);
-            for (int64_t i = 0; i < N; ++i) out[i] = fin(std::exp(out[i])); return;
+            for (int64_t i = 0; i < N; ++i) out[i] = stata_exp(out[i]); return;
         case F_sqrt: ev_vec(A[0].get(), N, out);
             for (int64_t i = 0; i < N; ++i) out[i] = fin(std::sqrt(out[i])); return;
         case F_abs: ev_vec(A[0].get(), N, out);
-            for (int64_t i = 0; i < N; ++i) out[i] = std::fabs(out[i]); return;
+            for (int64_t i = 0; i < N; ++i) out[i] = std::isnan(out[i]) ? NAd : std::fabs(out[i]); return;
         case F_sin: ev_vec(A[0].get(), N, out);
             for (int64_t i = 0; i < N; ++i) out[i] = std::sin(out[i]); return;
         case F_cos: ev_vec(A[0].get(), N, out);
@@ -574,21 +721,21 @@ void ev_fn_vec(const Node* n, int64_t N, std::vector<double>& out) {
         case F_tan: ev_vec(A[0].get(), N, out);
             for (int64_t i = 0; i < N; ++i) out[i] = std::tan(out[i]); return;
         case F_log10: ev_vec(A[0].get(), N, out);
-            for (int64_t i = 0; i < N; ++i) out[i] = fin(std::log10(out[i])); return;
+            for (int64_t i = 0; i < N; ++i) out[i] = stata_log10(out[i]); return;
         case F_asinh: ev_vec(A[0].get(), N, out);
-            for (int64_t i = 0; i < N; ++i) out[i] = fin(std::asinh(out[i])); return;
+            for (int64_t i = 0; i < N; ++i) out[i] = stata_asinh(out[i]); return;
         case F_ln1p: ev_vec(A[0].get(), N, out);
             for (int64_t i = 0; i < N; ++i) out[i] = fin(std::log1p(out[i])); return;
         case F_ln1m: ev_vec(A[0].get(), N, out);
             for (int64_t i = 0; i < N; ++i) out[i] = fin(std::log1p(-out[i])); return;
         case F_int: ev_vec(A[0].get(), N, out);
-            for (int64_t i = 0; i < N; ++i) { double x = out[i]; out[i] = std::isnan(x) ? NAd : std::trunc(x); } return;
+            for (int64_t i = 0; i < N; ++i) { double x = out[i]; out[i] = std::isnan(x) ? x : std::trunc(x); } return;
         case F_float: ev_vec(A[0].get(), N, out);
             for (int64_t i = 0; i < N; ++i) out[i] = frame_detail::round_to_store(out[i], StoreType::Float); return;
         case F_floor: ev_vec(A[0].get(), N, out);
-            for (int64_t i = 0; i < N; ++i) { double x = out[i]; out[i] = std::isnan(x) ? NAd : std::floor(x); } return;
+            for (int64_t i = 0; i < N; ++i) { double x = out[i]; out[i] = std::isnan(x) ? x : std::floor(x); } return;
         case F_ceil: ev_vec(A[0].get(), N, out);
-            for (int64_t i = 0; i < N; ++i) { double x = out[i]; out[i] = std::isnan(x) ? NAd : std::ceil(x); } return;
+            for (int64_t i = 0; i < N; ++i) { double x = out[i]; out[i] = std::isnan(x) ? x : std::ceil(x); } return;
         // BUG-371 date extractors: 1-arg, same shape as the math functions above.
         case F_year: case F_month: case F_day: case F_dow:
         case F_doy: case F_quarter: case F_halfyear: {
@@ -619,10 +766,14 @@ void ev_fn_vec(const Node* n, int64_t N, std::vector<double>& out) {
             for (int64_t i = 0; i < N; ++i) out[i] = stata_dist(cecon::stata_invnormal(out[i])); return;
         case F_sign: ev_vec(A[0].get(), N, out);
             for (int64_t i = 0; i < N; ++i) out[i] = stata_sign(out[i]); return;
+        case F_invlogit: ev_vec(A[0].get(), N, out);
+            for (int64_t i = 0; i < N; ++i) out[i] = stata_invlogit(out[i]); return;
+        case F_logit: ev_vec(A[0].get(), N, out);
+            for (int64_t i = 0; i < N; ++i) out[i] = stata_logit(out[i]); return;
         case F_round:
-            if (A.size() < 2) {  // 1-arg round(x): std::round with missing passthrough
+            if (A.size() < 2) {  // 1-arg round(x): a missing x keeps its kind
                 ev_vec(A[0].get(), N, out);
-                for (int64_t i = 0; i < N; ++i) { double x = out[i]; out[i] = std::isnan(x) ? NAd : std::round(x); }
+                for (int64_t i = 0; i < N; ++i) { double x = out[i]; out[i] = std::isnan(x) ? x : cecon::stata_round_value(x, 1.0); }
                 return;
             }
             break;  // 2-arg round(x,u) handled in the multi-arg section below
@@ -633,11 +784,11 @@ void ev_fn_vec(const Node* n, int64_t N, std::vector<double>& out) {
     for (size_t k = 0; k < A.size(); ++k) ev_vec(A[k].get(), N, V[k]);
     out.resize(static_cast<size_t>(N));
     switch (n->fn) {
-        case F_round:  // round(x, unit): unit*round(x/unit); unit 0/miss -> .
+        case F_round:  // round(x, unit): a missing unit is `.`, a missing x keeps its kind
             for (int64_t i = 0; i < N; ++i) {
-                double x = V[0][i]; if (std::isnan(x)) { out[i] = NAd; continue; }
+                double x = V[0][i];
                 double u = V[1][i]; if (std::isnan(u)) { out[i] = NAd; continue; }
-                out[i] = fin(std::round(x / u) * u);
+                out[i] = std::isnan(x) ? x : fin(cecon::stata_round_value(x, u));
             }
             return;
         case F_mdy:  // BUG-371 — same validation as the scalar path, one shared helper
@@ -671,6 +822,16 @@ void ev_fn_vec(const Node* n, int64_t N, std::vector<double>& out) {
             return;
         case F_invt:
             for (int64_t i = 0; i < N; ++i) out[i] = stata_dist(cecon::stata_invt(V[0][i], V[1][i]));
+            return;
+        case F_reldif:
+            for (int64_t i = 0; i < N; ++i) out[i] = stata_reldif(V[0][i], V[1][i]);
+            return;
+        case F_normalden:
+            for (int64_t i = 0; i < N; ++i) {
+                const double m = V.size() == 3 ? V[1][i] : 0.0;
+                const double sd = V.size() == 1 ? 1.0 : V.back()[i];
+                out[i] = stata_dist(cecon::stata_normalden(V[0][i], m, sd));
+            }
             return;
         case F_mod:  // floored modulus; y<=0 or any missing -> .
             for (int64_t i = 0; i < N; ++i) {
@@ -762,7 +923,7 @@ void ev_vec(const Node* n, int64_t N, std::vector<double>& out) {
                 case Node::Sub: for (int64_t i = 0; i < N; ++i) out[i] = fin(out[i] - rb[i]); break;
                 case Node::Mul: for (int64_t i = 0; i < N; ++i) out[i] = fin(out[i] * rb[i]); break;
                 case Node::Div: for (int64_t i = 0; i < N; ++i) out[i] = fin(out[i] / rb[i]); break;
-                case Node::Pow: for (int64_t i = 0; i < N; ++i) out[i] = fin(std::pow(out[i], rb[i])); break;
+                case Node::Pow: for (int64_t i = 0; i < N; ++i) out[i] = fin(cecon::stata_pow_value(out[i], rb[i])); break;
                 case Node::Lt: for (int64_t i = 0; i < N; ++i) out[i] = scmp(out[i], rb[i]) <  0 ? 1.0 : 0.0; break;
                 case Node::Gt: for (int64_t i = 0; i < N; ++i) out[i] = scmp(out[i], rb[i]) >  0 ? 1.0 : 0.0; break;
                 case Node::Le: for (int64_t i = 0; i < N; ++i) out[i] = scmp(out[i], rb[i]) <= 0 ? 1.0 : 0.0; break;
@@ -812,6 +973,17 @@ void materialize_sums(Node* n, int64_t N, const std::vector<int64_t>* order,
 // answers 20 60 120 | 10 40 90 -- the group's first row, whose x[_n-1] is
 // missing, is in). The engine used to read a missing mask as false (BUG-837).
 inline bool if_selects(double m) { return std::isnan(m) || m != 0.0; }
+
+// The `in a/b` half of a generate/bygen selection (GenQualifier). The range
+// is folded into the `if` mask as 0 outside it, so every mask consumer
+// (materialize_sums, the output step) honours both; an absent mask selects every
+// row inside the range.
+void apply_in_range(std::vector<double>& mask, int64_t n, int64_t first, int64_t last) {
+    if (first <= 0) return;
+    if (mask.empty()) mask.assign(static_cast<size_t>(n), 1.0);
+    for (int64_t i = 0; i < n; ++i)
+        if (i + 1 < first || i + 1 > last) mask[static_cast<size_t>(i)] = 0.0;
+}
 
 std::vector<double> eval_column_node(const Node* ast, int64_t n);
 
@@ -868,6 +1040,32 @@ void materialize_sums(Node* n, int64_t N, const std::vector<int64_t>* order,
     }
 }
 
+// Stata's generate/replace runs observation by observation and stores each result
+// before it evaluates the next one, so an expression that reads the target column at
+// another observation sees the values already replaced: `replace c = c[_n-1] + c if
+// _n > 1` is a running sum (1 3 6 10 ...) and `replace a = a[_n-1] + 2 in 2/6` steps
+// by 2. Column evaluation reads a snapshot and answered 1 3 5 7 ... / 1 3 3 3 at rc 0
+// (a silent wrong answer on the corpus' running-sum idiom). Only an explicit subscript
+// of the target triggers the row-sequential path; every other expression keeps the
+// column evaluator, whose result is identical when no row reads another row's target.
+bool has_self_subscript(const Node* n, const double* target) {
+    if (n == nullptr || target == nullptr) return false;
+    if (n->kind == Node::Subscript && n->a && n->a->var == target) return true;
+    if (has_self_subscript(n->a.get(), target) || has_self_subscript(n->b.get(), target))
+        return true;
+    for (const auto& q : n->args)
+        if (has_self_subscript(q.get(), target)) return true;
+    return false;
+}
+
+void rebind_var(Node* n, const double* from, const double* to) {
+    if (n == nullptr) return;
+    if (n->kind == Node::Var && n->var == from) n->var = to;
+    rebind_var(n->a.get(), from, to);
+    rebind_var(n->b.get(), from, to);
+    for (auto& q : n->args) rebind_var(q.get(), from, to);
+}
+
 std::vector<double> eval_column_node(const Node* ast, int64_t n) {
     std::vector<double> out(static_cast<size_t>(n));
     if (vectorizable(ast)) {
@@ -878,6 +1076,54 @@ std::vector<double> eval_column_node(const Node* ast, int64_t n) {
         for (int64_t i = 0; i < n; ++i) { c.row = i; out[i] = ev(ast, c); }
     }
     return out;
+}
+
+// Whether the tree takes a draw anywhere (runiform/runiformint/rnormal/uniform).
+bool has_draw(const Node* n) {
+    if (!n) return false;
+    if (n->kind == Node::Fn && (n->fn == F_runiform || n->fn == F_runiformint ||
+                                n->fn == F_rnormal || n->fn == F_uniform))
+        return true;
+    if (has_draw(n->a.get()) || has_draw(n->b.get())) return true;
+    for (const auto& q : n->args) if (has_draw(q.get())) return true;
+    return false;
+}
+
+// Whether the tree calls function fn anywhere.
+bool has_fn(const Node* n, int fn) {
+    if (!n) return false;
+    if (n->kind == Node::Fn && n->fn == fn) return true;
+    if (has_fn(n->a.get(), fn) || has_fn(n->b.get(), fn)) return true;
+    for (const auto& q : n->args) if (has_fn(q.get(), fn)) return true;
+    return false;
+}
+
+// On Stata's stream a row's `if` is evaluated before its expression, and only a
+// row it selects evaluates the expression; a row outside `in` evaluates neither
+// (StataBE 19.5, 2026-11-03: `gen x = runiform() if runiform() < .3 in 2/4`
+// hands row 2's `if` the first draw and its value the second, and leaves rows 1
+// and 5 undrawn). When both take draws the mask cannot be computed ahead of the
+// rows, so it is evaluated inline, row by row. A running sum needs the whole
+// mask before the rows and keeps the column mask.
+bool inline_if_draws(const Node* mast, const Node* ast) {
+    return g_mt64_on && mast && has_draw(mast) && has_draw(ast) && !has_fn(ast, F_sum);
+}
+
+// Sets Node::arg_draws on every function node one of whose arguments takes a
+// draw when ev() evaluates it, and answers whether n's own evaluation does.
+// sum()'s argument is drawn ahead of the rows by materialize_sums, so a sum()
+// node draws nothing when ev() reaches it.
+bool mark_arg_draws(Node* n) {
+    if (!n) return false;
+    const bool ab = mark_arg_draws(n->a.get());
+    const bool bb = mark_arg_draws(n->b.get());
+    bool args = false;
+    for (auto& q : n->args) args = mark_arg_draws(q.get()) || args;
+    if (n->kind != Node::Fn) return ab || bb;
+    if (n->fn == F_sum) return false;
+    n->arg_draws = args;
+    return args || n->fn == F_runiform || n->fn == F_runiformint || n->fn == F_rnormal ||
+           n->fn == F_uniform;
 }
 
 std::vector<double> eval_column(const Node* ast, int64_t n) {
@@ -893,10 +1139,11 @@ std::vector<double> eval_column(const Node* ast, int64_t n) {
 }
 
 struct Parser {
-    const std::string& s;
+    const std::string s;
     size_t p = 0;
     const Frame& fr;
-    Parser(const std::string& src, const Frame& f) : s(src), fr(f) {}
+    // The text as Stata reads it (core/expr_blanks.h): `abs(1 2)` is abs(12).
+    Parser(const std::string& src, const Frame& f) : s(squeeze_bracketed_blanks(src)), fr(f) {}
 
     void ws() { while (p < s.size() && std::isspace((unsigned char)s[p])) ++p; }
     bool eat(const char* tok) {
@@ -914,10 +1161,20 @@ struct Parser {
     }
 
     int depth = 0;
-    // RAII recursion-depth guard: every nesting level passes through unary(), so a cap there
+    // RAII recursion-depth guard: every nesting level passes through neg() or unary(), so a cap there
     // bounds total recursion and rejects pathological input before the call stack overflows.
     struct DepthGuard { int& d; explicit DepthGuard(int& x) : d(x) { if (++d > 1000) throw std::runtime_error("expr: expression nested too deeply"); } ~DepthGuard() { --d; } };
-    std::unique_ptr<Node> parse() { auto n = orx(); ws(); if (p != s.size()) err("trailing input"); return n; }
+    // Brackets that do not pair are Stata's r(132) "too few ')' or ']'" ahead of
+    // any name the text holds: `generate g = nosuch + (1` and `nofn(1` (StataBE
+    // 19.5; core/expr_blanks.h).
+    std::unique_ptr<Node> parse() {
+        if (const std::string u = bracket_imbalance(s); !u.empty()) err(u);
+        auto n = orx();
+        ws();
+        if (p != s.size()) err("trailing input");
+        mark_arg_draws(n.get());
+        return n;
+    }
     std::unique_ptr<Node> orx() {
         auto a = andx();
         while (eat("|")) a = bin(Node::Or, std::move(a), andx());
@@ -928,19 +1185,36 @@ struct Parser {
         while (eat("&")) a = bin(Node::And, std::move(a), cmp());
         return a;
     }
-    std::unique_ptr<Node> cmp() {
-        // Left-associative like Stata: `1<2<3` parses as `(1<2)<3`, not a syntax
-        // error. Keep `<=`/`>=` ahead of `<`/`>` so the two-char ops win.
-        auto a = add();
-        for (;;) {
-            ws();
-            if (eat("<=")) a = bin(Node::Le, std::move(a), add());
-            else if (eat(">=")) a = bin(Node::Ge, std::move(a), add());
-            else if (eat("==")) a = eqne(Node::Eq, std::move(a), add());
-            else if (eat("!=")) a = eqne(Node::Ne, std::move(a), add());
-            else if (eat("<")) a = bin(Node::Lt, std::move(a), add());
-            else if (eat(">")) a = bin(Node::Gt, std::move(a), add());
-            else break;
+    // FU-844: each comparison operator is its own left-associative level, tightest
+    // first != > < <= >= == (the order in help operators; oracle w2ac_expr_relational
+    // gen_<o1>_<o2>, every ordered pair): `b==c>a` is b==(c>a), `1<2<3` is (1<2)<3.
+    static constexpr int kCmpLevels = 6;
+    // Eats the operator of comparison level `lvl` (0 = `==` ... 5 = `!=`); `<`/`>`
+    // never eat the first char of `<=`/`>=`.
+    bool eatCmp(int lvl) {
+        ws();
+        static const char* const kOp[kCmpLevels] = {"==", ">=", "<=", "<", ">", "!="};
+        const char* op = kOp[lvl];
+        size_t n = std::strlen(op);
+        if (lvl == kCmpLevels - 1 && s.compare(p, 2, "~=") == 0) { p += 2; return true; }  // gen_tilde_ne_gt
+        if (s.compare(p, n, op) != 0) return false;
+        if (n == 1 && p + 1 < s.size() && s[p + 1] == '=') return false;
+        p += n;
+        return true;
+    }
+    std::unique_ptr<Node> cmp(int lvl = 0) {
+        if (lvl == kCmpLevels) return add();
+        auto a = cmp(lvl + 1);
+        while (eatCmp(lvl)) {
+            auto b = cmp(lvl + 1);
+            switch (lvl) {
+                case 0: a = eqne(Node::Eq, std::move(a), std::move(b)); break;
+                case 1: a = bin(Node::Ge, std::move(a), std::move(b)); break;
+                case 2: a = bin(Node::Le, std::move(a), std::move(b)); break;
+                case 3: a = bin(Node::Lt, std::move(a), std::move(b)); break;
+                case 4: a = bin(Node::Gt, std::move(a), std::move(b)); break;
+                default: a = eqne(Node::Ne, std::move(a), std::move(b)); break;
+            }
         }
         return a;
     }
@@ -974,30 +1248,68 @@ struct Parser {
             err("string/factor comparison must be `factorvar ==/!= \"literal\"`");
         return bin(k, std::move(a), std::move(b));
     }
+    // EM0: [U] 13.2.5 orders the binary operators ^, -(negation), /, *, -(subtraction), +,
+    // each level left-associative, so a+b-c is a+(b-c) and a*b/c is a*(b/c)
+    // (oracle w2am_expr_binary_order eo_gen_pm / eo_gen_md; 0.1+0.2-0.3 = 2^-55).
     std::unique_ptr<Node> add() {
+        auto a = sub();
+        for (;;) { ws(); if (eat("+")) a = bin(Node::Add, std::move(a), sub()); else break; }
+        return a;
+    }
+    std::unique_ptr<Node> sub() {
         auto a = mul();
-        for (;;) { ws(); if (eat("+")) a = bin(Node::Add, std::move(a), mul());
-            else if (eat("-")) a = bin(Node::Sub, std::move(a), mul()); else break; }
+        for (;;) { ws(); if (eat("-")) a = bin(Node::Sub, std::move(a), mul()); else break; }
         return a;
     }
     std::unique_ptr<Node> mul() {
-        auto a = powx();
-        for (;;) { ws(); if (eat("*")) a = bin(Node::Mul, std::move(a), powx());
-            else if (eat("/")) a = bin(Node::Div, std::move(a), powx()); else break; }
+        auto a = div();
+        for (;;) { ws(); if (eat("*")) a = bin(Node::Mul, std::move(a), div()); else break; }
         return a;
+    }
+    std::unique_ptr<Node> div() {
+        auto a = neg();
+        for (;;) { ws(); if (eat("/")) a = bin(Node::Div, std::move(a), neg()); else break; }
+        return a;
+    }
+    // FU-811: negation and `!` bind looser than `^`, which is LEFT-associative
+    // (oracle w2ac_expr_precedence, StataBE 19.5): -a^2 is -(a^2) (gen_neg_pow),
+    // !a^0 is !(a^0) (gen_not_pow0), !a==b is (!a)==b (gen_not_eq), 2^3^2 is
+    // (2^3)^2 = 64 (gen_chain_const). A sign or `!` right of `^` covers only the
+    // next operand: 2^-a^2 is (2^(-a))^2 (gen_pow_neg_pow), -2^-a is -(2^(-a)).
+    // help operators lists `!` ahead of `^`; the capture refutes that.
+    // `~` is `!` (gen_tilde_pow0); a sign after `!`, spaces or not, is invalid
+    // syntax in Stata (w2ac_expr_relational gen_not_neg `!-t` r(198), disp_not_gt;
+    // w2ac_expr_valueref gen_not_neg_sp `! -t`, gen_not_plus `!+t`, gen_tilde_neg,
+    // gen_not_not_neg `!!-t`, gen_neg_not_neg `-!-t`, gen_pow_not_neg `2^!-t`).
+    bool eatNot() {
+        if (p >= s.size() || (s[p] != '!' && s[p] != '~') || (p + 1 < s.size() && s[p + 1] == '=')) return false;
+        ++p;
+        ws();
+        if (p < s.size() && (s[p] == '-' || s[p] == '+')) err("invalid syntax: a sign after `!`");
+        return true;
+    }
+    std::unique_ptr<Node> neg() {
+        DepthGuard _g(depth);
+        ws();
+        if (eatNot()) { auto n = mk(Node::Not); n->a = neg(); return n; }
+        if (eat("-")) { auto n = mk(Node::Neg); n->a = neg(); return n; }
+        if (eat("+")) return neg();
+        return powx();
     }
     std::unique_ptr<Node> powx() {
-        auto a = unary();
-        ws();
-        if (eat("^")) return bin(Node::Pow, std::move(a), powx());
+        auto a = primary();
+        for (;;) {
+            ws();
+            if (!eat("^")) break;
+            a = bin(Node::Pow, std::move(a), unary());
+        }
         return a;
     }
+    // The right operand of `^`: leading signs / `!` apply to the next primary only.
     std::unique_ptr<Node> unary() {
         DepthGuard _g(depth);
         ws();
-        if (p < s.size() && s[p] == '!' && (p + 1 >= s.size() || s[p + 1] != '=')) {
-            ++p; auto n = mk(Node::Not); n->a = unary(); return n;
-        }
+        if (eatNot()) { auto n = mk(Node::Not); n->a = unary(); return n; }
         if (eat("-")) { auto n = mk(Node::Neg); n->a = unary(); return n; }
         if (eat("+")) return unary();
         return primary();
@@ -1026,7 +1338,7 @@ struct Parser {
         // `a` is untouched because the '.' must lead).
         if (p + 1 < s.size() && s[p] == '.' && s[p + 1] >= 'a' && s[p + 1] <= 'z' &&
             (p + 2 >= s.size() ||
-             (!std::isalnum((unsigned char)s[p + 2]) && s[p + 2] != '_' && s[p + 2] != '.'))) {
+             (!cecon::ident::isIdentByte(s[p + 2]) && s[p + 2] != '.'))) {
             int kind = cecon::kMissA + (s[p + 1] - 'a');
             p += 2;
             auto n = mk(Node::Num);
@@ -1057,9 +1369,9 @@ struct Parser {
             if (consumed != tok.size()) err("invalid numeric literal '" + tok + "'");
             auto n = mk(Node::Num); n->num = val; return n;
         }
-        if (p < s.size() && (std::isalpha((unsigned char)s[p]) || s[p] == '_')) {
+        if (p < s.size() && cecon::ident::isIdentStartByte(s[p])) {
             size_t st = p;
-            while (p < s.size() && (std::isalnum((unsigned char)s[p]) || s[p] == '_')) ++p;
+            while (p < s.size() && cecon::ident::isIdentByte(s[p])) ++p;
             std::string id = s.substr(st, p - st);
             if (id == "_pi") { auto n = mk(Node::Num); n->num = M_PI; return n; }
             if (id == "_n") return mk(Node::ObsN);
@@ -1079,8 +1391,7 @@ struct Parser {
                 size_t save = p;
                 std::string tok = id;
                 size_t q = p;
-                while (q < s.size() && (std::isalnum((unsigned char)s[q]) ||
-                                        s[q] == '_' || s[q] == '.')) {
+                while (q < s.size() && (cecon::ident::isIdentByte(s[q]) || s[q] == '.')) {
                     tok += s[q];
                     ++q;
                 }
@@ -1152,8 +1463,13 @@ struct Parser {
                 // engine does not recognise falls back to a plain number, and a
                 // literal that does not fit the scale is an error rather than a
                 // quiet wrong window (Stata: r(198) for tin(2010,2011) on a
-                // quarterly series). No tsset at all is r(101) there; here it is
-                // an honest engine error with the same meaning.
+                // quarterly series). No tsset at all is r(101) there, whatever
+                // the arguments, so it is tested first; PIET words each refusal
+                // as Stata does (eval::timeSpanRefusal). A blank endpoint is no
+                // bound on that side, and a blank list none at all ([FN]
+                // tin(): "blank to indicate no minimum date"; StataBE 19.5 with a
+                // missing t: tin(2010q3,) counts it, tin(,2010q3) does not, and
+                // tin() and twithin(,) count every row).
                 if (id == "tin" || id == "twithin") {
                     size_t q = p + 1;
                     int depth = 1;
@@ -1164,6 +1480,9 @@ struct Parser {
                     }
                     if (depth) err("expected ) after " + id + "(");
                     const std::string raw = s.substr(p + 1, q - p - 1);
+                    const std::string tv = fr.panel_time();
+                    if (tv.empty())
+                        err(id + "() requires tsset");
                     size_t comma = std::string::npos;
                     int d2 = 0;
                     for (size_t k = 0; k < raw.size(); ++k) {
@@ -1171,11 +1490,9 @@ struct Parser {
                         else if (raw[k] == ')') --d2;
                         else if (raw[k] == ',' && d2 == 0) { comma = k; break; }
                     }
-                    if (comma == std::string::npos)
+                    const bool blankList = raw.find_first_not_of(" \t") == std::string::npos;
+                    if (comma == std::string::npos && !blankList)
                         err(id + "() takes two arguments");
-                    const std::string tv = fr.panel_time();
-                    if (tv.empty())
-                        err(id + "() requires tsset");
                     const std::string fmt = fr.ts_format();
                     auto conv = [&](std::string lit) -> double {
                         // trim
@@ -1202,9 +1519,15 @@ struct Parser {
                         }
                         return cecon::stata_datetime_literal(lit, sc);
                     };
-                    const double lo = conv(raw.substr(0, comma));
-                    const double hi = conv(raw.substr(comma + 1));
-                    if (std::isnan(lo) || std::isnan(hi))
+                    // An endpoint: blank (no bound), else a literal on the scale.
+                    const auto blank = [](const std::string& t) {
+                        return t.find_first_not_of(" \t") == std::string::npos;
+                    };
+                    const std::string loRaw = blankList ? std::string() : raw.substr(0, comma);
+                    const std::string hiRaw = blankList ? std::string() : raw.substr(comma + 1);
+                    const double lo = blank(loRaw) ? NAd : conv(loRaw);
+                    const double hi = blank(hiRaw) ? NAd : conv(hiRaw);
+                    if ((!blank(loRaw) && std::isnan(lo)) || (!blank(hiRaw) && std::isnan(hi)))
                         err(id + "(" + raw + ") does not match the tsset scale");
                     p = q + 1;
                     auto mkvar = [&]() {
@@ -1214,10 +1537,18 @@ struct Parser {
                     };
                     auto mknum = [&](double x) { auto n2 = mk(Node::Num); n2->num = x; return n2; };
                     const bool strict = (id == "twithin");
-                    auto left = mk(strict ? Node::Gt : Node::Ge);
-                    left->a = mkvar(); left->b = mknum(lo);
-                    auto right = mk(strict ? Node::Lt : Node::Le);
-                    right->a = mkvar(); right->b = mknum(hi);
+                    std::unique_ptr<Node> left, right;
+                    if (!blank(loRaw)) {
+                        left = mk(strict ? Node::Gt : Node::Ge);
+                        left->a = mkvar(); left->b = mknum(lo);
+                    }
+                    if (!blank(hiRaw)) {
+                        right = mk(strict ? Node::Lt : Node::Le);
+                        right->a = mkvar(); right->b = mknum(hi);
+                    }
+                    if (!left && !right) return mknum(1.0);
+                    if (!left) return right;
+                    if (!right) return left;
                     auto both = mk(Node::And);
                     both->a = std::move(left); both->b = std::move(right);
                     return both;
@@ -1250,17 +1581,7 @@ struct Parser {
                 int na = static_cast<int>(args.size());
                 if (na < fi->amin || na > fi->amax) err("wrong number of arguments to " + id);
                 auto n = mk(Node::Fn); n->fn = fi->id; n->args = std::move(args);
-                // group() under `in a/b`: Stata renumbers within the range (measured,
-                // `group(3) in 3/7` on N = 7 is . . 1 1 2 3 3), but PIET folds the range
-                // into this expression as the literal `_n>=a & _n<=b` (egen.cpp,
-                // runBysortGen), indistinguishable here from an `if` that does NOT
-                // renumber. Refuse that shape rather than answer with the dataset's
-                // numbering; a spaced user `if _n >= a` is unaffected.
-                if (n->fn == F_group && s.find("_n>=") != std::string::npos &&
-                    s.find("_n<=") != std::string::npos)
-                    err("group() cannot be combined with an `in` range (or an `_n>=`/`_n<=` "
-                        "condition): Stata numbers group() within the range");
-                if ((n->fn == F_rnormal || n->fn == F_uniform) && !g_rng_coords_set)
+                if ((n->fn == F_rnormal || n->fn == F_uniform) && !g_rng_coords_set && !g_mt64_on)
                     err(id + "() needs draw coordinates: the call carried no --rng-seed/"
                         "--rng-stream, and without them two successive draws would repeat "
                         "each other");
@@ -1359,6 +1680,20 @@ void set_rng_coords(long long seed, long long stream) {
     // differently depending on the resident process's history. Unchanged for a
     // one-shot process, whose counter starts at 0 anyway.
     g_rng_node_counter = 0;
+}
+
+void clear_rng_coords() { g_rng_coords_set = false; }
+
+bool begin_rng_mt64(const std::string& state) {
+    if (!g_mt64.restore(state)) return false;
+    g_mt64_on = true;
+    return true;
+}
+
+uint64_t end_rng_mt64() {
+    const uint64_t n = g_mt64_on ? g_mt64.taken() : 0;
+    g_mt64_on = false;
+    return n;
 }
 
 const std::vector<ExprFnInfo>& expr_function_table() {
@@ -1913,9 +2248,32 @@ Frame Frame::from_csv(const std::string& path, char delim,
     std::vector<std::string> rec;
     std::vector<char> quoted;
     bool structured;
+    // The file line each record starts on (a quoted field may span lines), so a
+    // refusal below can name it.
+    auto newlines = [](const std::vector<std::string>& fields) {
+        int64_t n = 0;
+        for (const auto& s : fields) n += std::count(s.begin(), s.end(), '\n');
+        return n;
+    };
+    int64_t line = 1 + newlines(header);
     while (csv_read_record(in, delim, rec, &structured, &quoted)) {
+        const int64_t at = line + 1;
+        line = at + newlines(rec);
         if (rec.size() == 1 && rec[0].empty() && !structured) continue;  // truly blank line
         ++nrows;
+        // BUG-414: a record with MORE fields than the names line has no column
+        // for the extra ones, and pass 2 never reads past K -- the value was
+        // dropped at rc 0. Refuse instead, naming the line. Empty extras (a
+        // trailing delimiter) hold nothing and stay accepted.
+        for (size_t k = static_cast<size_t>(K); k < rec.size(); ++k) {
+            const bool q = k < quoted.size() && quoted[k] != 0;
+            if (csv_trim_unquoted(rec[k], q).empty()) continue;
+            throw EngineError("bad_input",
+                              "line " + std::to_string(at) + " has " +
+                                  std::to_string(rec.size()) + " fields, but the names line has " +
+                                  std::to_string(K),
+                              path);
+        }
         for (int k = 0; k < K && k < static_cast<int>(rec.size()); ++k) {
             if (!is_num[k]) continue;
             // Type INFERENCE still trims either way: csv_parse_num tolerates the
@@ -2058,11 +2416,17 @@ void Frame::setcol(const std::string& name, FrameColumn&& newcol, bool is_new) {
     }
 }
 
+double Frame::store_round(double v, StoreType st) {
+    const double r = frame_detail::round_to_store(v, st);
+    if (std::isnan(r) && !std::isnan(v)) ++store_overflow_;
+    return r;
+}
+
 void Frame::set_or_replace(const std::string& name, std::vector<double> v, StoreType st) {
     // BUG-471 T1: the store boundary. Only the gen/egen/row-egen/bygen verbs pass a
     // non-Double type (cobra eval --store-type); Double skips the loop entirely.
     if (st != StoreType::Double)
-        for (double& x : v) x = frame_detail::round_to_store(x, st);
+        for (double& x : v) x = store_round(x, st);
     // BUG-272: replacing a column's VALUES invalidates any sort claim keyed on it
     // (gen/replace/egen/predict/... all funnel through here). A brand-new column can
     // never be a claim key (claims only ever name existing columns), so the append
@@ -2109,31 +2473,98 @@ void Frame::set_f64_column(const std::string& name, std::vector<double> v) {
     set_or_replace(name, std::move(v));
 }
 
+void Frame::check_gen_qualifier(const std::string& name, const GenQualifier& q) const {
+    if (q.in_first != 0 && (q.in_first < 1 || q.in_last < q.in_first || q.in_last > n_))
+        throw EngineError("bad_input", "--gen-in: range " + std::to_string(q.in_first) + "/" +
+                                           std::to_string(q.in_last) + " is not within 1/" +
+                                           std::to_string(n_));
+    if (q.keep_unselected && has(name) && col(name).is_factor)
+        throw EngineError("bad_input", "--gen-replace: '" + name + "' is a string variable", name);
+}
+
+// The output step shared by generate and bygen: a row the qualifiers exclude is
+// missing, or under replace (q.keep_unselected) keeps the column's current value.
+void Frame::store_qualified(const std::string& name, std::vector<double> out,
+                            const std::vector<double>& mask, StoreType st,
+                            const GenQualifier& q) {
+    if (!mask.empty()) {
+        const bool keep = q.keep_unselected && has(name);
+        F64Reader old;
+        if (keep) old = col(name).f64.reader();
+        for (int64_t i = 0; i < n_; ++i)
+            if (!if_selects(mask[static_cast<size_t>(i)]))
+                out[static_cast<size_t>(i)] = keep ? old[static_cast<size_t>(i)] : NAd;
+    }
+    set_or_replace(name, std::move(out), st);
+}
+
 void Frame::generate(const std::string& name, const std::string& expr, bool require_new,
-                     const std::string& mask_expr, StoreType st) {
+                     const std::string& mask_expr, StoreType st, const GenQualifier& q) {
     RngCallScope rng_call;  // draw coordinates are spent when this call returns
     if (require_new && idx_.find(name) != idx_.end())
         throw EngineError("bad_input", "generate: variable '" + name + "' already exists", name);
+    check_gen_qualifier(name, q);
     // Without `by` the frame is the one group, so the mask's _n/_N/subscripts are
     // the dataset's and the column evaluator is the right one. A sum() inside the
     // mask is a plain running total, as it is inside the folded cond() form.
-    std::vector<double> mask;
+    std::unique_ptr<Node> mast;
     if (!mask_expr.empty()) {
         Parser mp(mask_expr, *this);
-        auto mast = mp.parse();
+        mast = mp.parse();
+        bind_group_range(mast.get(), q.in_first, q.in_last);
         materialize_sums(mast.get(), n_, nullptr, nullptr, nullptr, nullptr, nullptr);
-        mask = eval_column(mast.get(), n_);
     }
     Parser parser(expr, *this);
     auto ast = parser.parse();
-    refuse_group_in_masked_range(ast.get(), expr, mask_expr);
+    bind_group_range(ast.get(), q.in_first, q.in_last);
+    const bool inline_if = inline_if_draws(mast.get(), ast.get());
+    std::vector<double> mask;
+    if (mast && !inline_if) mask = eval_column(mast.get(), n_);
+    apply_in_range(mask, n_, q.in_first, q.in_last);
+    if (inline_if && mask.empty()) mask.assign(static_cast<size_t>(n_), 1.0);
+    // Whether row c.row is selected; under inline_if its `if` is evaluated now.
+    auto selects = [&](const EvalCtx& c) {
+        double& m = mask[static_cast<size_t>(c.row)];
+        if (inline_if && if_selects(m)) m = ev(mast.get(), c);
+        return if_selects(m);
+    };
     materialize_sums(ast.get(), n_, nullptr, nullptr, nullptr, nullptr,
                      mask.empty() ? nullptr : &mask);
-    std::vector<double> out = eval_column(ast.get(), n_);
-    if (!mask.empty())
-        for (int64_t i = 0; i < n_; ++i)
-            if (!if_selects(mask[static_cast<size_t>(i)])) out[static_cast<size_t>(i)] = NAd;
-    set_or_replace(name, std::move(out), st);
+    if (auto it = idx_.find(name); it != idx_.end() && !cols_[it->second].is_factor) {
+        const double* target = static_cast<const FrameColumn&>(cols_[it->second]).f64.data();
+        if (has_self_subscript(ast.get(), target)) {
+            F64Reader old = cols_[it->second].f64.reader();
+            std::vector<double> buf(static_cast<size_t>(n_));
+            for (int64_t i = 0; i < n_; ++i) buf[static_cast<size_t>(i)] = old[static_cast<size_t>(i)];
+            rebind_var(ast.get(), target, buf.data());
+            EvalCtx c;
+            c.n_all = n_;
+            for (int64_t i = 0; i < n_; ++i) {
+                c.row = i;
+                if (!mask.empty() && !selects(c)) continue;
+                double v = ev(ast.get(), c);
+                buf[static_cast<size_t>(i)] = st == StoreType::Double ? v : store_round(v, st);
+            }
+            store_qualified(name, std::move(buf), mask, st, q);
+            return;
+        }
+    }
+    // On Stata's stream a row outside `if`/`in` draws nothing (`gen f = runiform()
+    // in 4/6` hands row 4 the stream's FIRST draw, impl_C stata_probe P4), so the
+    // rows are walked one at a time and the unselected ones are never evaluated.
+    if (g_mt64_on && !mask.empty() && has_draw(ast.get())) {
+        std::vector<double> out(static_cast<size_t>(n_), NAd);
+        EvalCtx c;
+        c.n_all = n_;
+        for (int64_t i = 0; i < n_; ++i) {
+            c.row = i;
+            if (!selects(c)) continue;
+            out[static_cast<size_t>(i)] = ev(ast.get(), c);
+        }
+        store_qualified(name, std::move(out), mask, st, q);
+        return;
+    }
+    store_qualified(name, eval_column(ast.get(), n_), mask, st, q);
 }
 
 void Frame::xtset(const std::string& id_col, const std::string& time_col) {
@@ -2400,13 +2831,14 @@ bool key_eq(const std::vector<std::vector<double>>& K, int64_t a, int64_t b) {
 using namespace frame_detail;
 
 void Frame::egen_by(const std::string& out, EgenFn fn, const std::string& expr,
-                    const std::vector<std::string>& by_cols, double pctile_p, StoreType st) {
-    // The store type: every function here ends in ONE `gen <type> v = ...` (_gmean,
-    // _gtotal, _gmax, ... .ado), so the result is rounded once, like a generate —
-    // except default rank. _grank.ado:55-58 stores `_n`, then `replace v = v + (_N-1)/2`
-    // over a tie, and replace WIDENS an integer variable (byte 2.7 -> float :810, byte
-    // 200 -> int :876) where a fixed store type would truncate or store `.`: refused.
-    // Float stays float under replace (:761), so float rank is the one final rounding.
+                    const std::vector<std::string>& by_cols, double pctile_p, StoreType st,
+                    const EgenOpts& eo) {
+    // The store type: every function here ends in ONE generate of the chosen type
+    // (egen's mean, total, max, ...), so the result is rounded once, like a generate —
+    // except default rank. Stata's rank stores `_n`, then adds (_N-1)/2
+    // over a tie with replace, and replace WIDENS an integer variable (byte 2.7 -> float,
+    // byte 200 -> int) where a fixed store type would truncate or store `.`: refused.
+    // Float stays float under replace, so float rank is the one final rounding.
     // track/field/unique only copy an earlier row's `_n` over a tie, which a single
     // store of the final rank reproduces (an out-of-range `_n` is `.` either way).
     if (fn == EgenFn::Rank && frame_detail::is_integer_store(st))
@@ -2414,9 +2846,25 @@ void Frame::egen_by(const std::string& out, EgenFn fn, const std::string& expr,
                           "egen rank(): --store-type byte|int|long is not supported (Stata builds "
                           "tied ranks with replace, which widens an integer variable)");
     RngCallScope rng_call;
-    Parser parser(expr, *this);
-    auto ast = parser.parse();
-    std::vector<double> v = eval_column(ast.get(), n_);
+    std::vector<double> v;
+    const size_t b0 = expr.find_first_not_of(" \t");
+    const std::string bare =
+        b0 == std::string::npos ? std::string() : expr.substr(b0, expr.find_last_not_of(" \t") - b0 + 1);
+    if (fn == EgenFn::Count && has(bare) && col(bare).is_factor) {
+        // BUG-1002: egen count counts the non-missing values, and a string's missing is
+        // "" (a factor's code -1 is that same empty string). The numeric
+        // evaluator below cannot read a factor at all, so count(s) was refused.
+        const FrameColumn& c = col(bare);
+        v.assign(static_cast<size_t>(n_), NAd);
+        for (int64_t i = 0; i < n_; ++i) {
+            const int32_t k = c.codes[i];
+            if (k >= 0 && !c.levels[static_cast<size_t>(k)].empty()) v[static_cast<size_t>(i)] = 1.0;
+        }
+    } else {
+        Parser parser(expr, *this);
+        auto ast = parser.parse();
+        v = eval_column(ast.get(), n_);
+    }
 
     std::vector<int64_t> order(n_);
     std::iota(order.begin(), order.end(), 0);
@@ -2426,6 +2874,25 @@ void Frame::egen_by(const std::string& out, EgenFn fn, const std::string& expr,
         std::stable_sort(order.begin(), order.end(),
                          [&](int64_t a, int64_t b) { return key_less(K, a, b); });
     }
+
+    // BUG-1150: without by() the official egen functions read `summarize`
+    // (total, mean, sd, std, pc run summarize and return r(sum) / r(mean) / r(sd)),
+    // so their sums are summarize's exactly
+    // rounded ones (core/exact_sum.h): total(x) of 1e16, twenty-two 1s and -1e16
+    // is 22 in StataBE 19.5. With by() they run `by g: gen double = sum(x)`, a
+    // running sum in data order, and that stays the naive sum below. gtools'
+    // gegen sums in data order with or without by() (EgenOpts::data_order).
+    const bool exact = by_cols.empty() && !eo.data_order;
+    auto sum_of = [exact](const std::vector<double>& s) {
+        if (exact) { ExactSum a; for (double x : s) a.add(x); return a.value(); }
+        double t = 0; for (double x : s) t += x; return t;
+    };
+    // The sum of squared deviations from `mean`: summarize's ExactSqDev without
+    // by() (r(sd) = sqrt(ss/(N-1))), the running `sum((x - m[_N])^2)` with it.
+    auto ssq_of = [exact](const std::vector<double>& s, double mean) {
+        if (exact) { ExactSqDev a(mean); for (double x : s) a.add(x); return a.value(); }
+        double ss = 0; for (double x : s) ss += (x - mean) * (x - mean); return ss;
+    };
 
     std::vector<double> out_col(n_, NAd);
     int64_t g0 = 0;
@@ -2443,7 +2910,7 @@ void Frame::egen_by(const std::string& out, EgenFn fn, const std::string& expr,
             fn == EgenFn::RankUnique) {
             // The four egen rank() flavours, all off ONE ascending stable sort of the
             // group's non-missing values. Missing input => missing rank in every one.
-            // Oracle private_oracle_b.log / _c.log on 10,10,20,30,30,30,40 (+3 missing):
+            // Oracle captures b and c on 10,10,20,30,30,30,40 (+3 missing):
             //   default    10 -> 1.5   30 -> 5     mean/midrank over the ranks spanned
             //   track      10 -> 1     30 -> 4     minimum rank, shared by every tied
             //                                      member (oracle_c: obs1 == obs2 == 1)
@@ -2487,15 +2954,29 @@ void Frame::egen_by(const std::string& out, EgenFn fn, const std::string& expr,
             double agg_std = NAd;  // group SD
             double mean = NAd;
             if (cnt >= 2) {
-                double t = 0; for (double x : s) t += x; mean = t / cnt;
-                double ss = 0; for (double x : s) ss += (x - mean) * (x - mean);
-                agg_std = std::sqrt(ss / (cnt - 1));
+                mean = sum_of(s) / cnt;
+                agg_std = std::sqrt(ssq_of(s, mean) / (cnt - 1));
             }
+            // std(): sd*(x - mean)/s + mean, in that order (the defaults
+            // sd 1 and mean 0 leave (x - mean)/s bit-for-bit).
             for (int64_t q = g0; q < g1; ++q) {
                 double x = v[order[q]];
                 if (!std::isnan(x) && !std::isnan(agg_std) && agg_std != 0.0)
-                    out_col[order[q]] = (x - mean) / agg_std;
+                    out_col[order[q]] = eo.std_sd * (x - mean) / agg_std + eo.std_mean;
                 // else leave missing
+            }
+            g0 = g1;
+            continue;
+        }
+        if (fn == EgenFn::Pc) {
+            // pc(): p*x divided by the group's sum of non-missing values (plain
+            // and by() agree on this).
+            // A zero total divides by zero, which is Stata's missing.
+            const double t = sum_of(s);
+            const double p = eo.pc_prop ? 1.0 : 100.0;
+            for (int64_t q = g0; q < g1; ++q) {
+                const double x = v[order[q]];
+                if (!std::isnan(x) && t != 0.0) out_col[order[q]] = p * x / t;
             }
             g0 = g1;
             continue;
@@ -2505,26 +2986,28 @@ void Frame::egen_by(const std::string& out, EgenFn fn, const std::string& expr,
         double agg = NAd;
         switch (fn) {
             case EgenFn::Count: agg = static_cast<double>(cnt); break;
-            case EgenFn::Sum: { double t = 0; for (double x : s) t += x; agg = t; break; }  // 0 if empty
+            // 0 if empty; `missing` makes an empty group missing .
+            case EgenFn::Sum: {
+                if (eo.missing && cnt == 0) break;
+                agg = sum_of(s); break;
+            }
             case EgenFn::Max: if (cnt) agg = *std::max_element(s.begin(), s.end()); break;
             case EgenFn::Min: if (cnt) agg = *std::min_element(s.begin(), s.end()); break;
-            case EgenFn::Mean: if (cnt) { double t = 0; for (double x : s) t += x; agg = t / cnt; } break;
+            case EgenFn::Mean: if (cnt) agg = sum_of(s) / cnt; break;
             case EgenFn::Sd:
                 if (cnt >= 2) {
-                    double t = 0; for (double x : s) t += x; double mean = t / cnt;
-                    double ss = 0; for (double x : s) ss += (x - mean) * (x - mean);
-                    agg = std::sqrt(ss / (cnt - 1));
+                    const double mean = sum_of(s) / cnt;
+                    agg = std::sqrt(ssq_of(s, mean) / (cnt - 1));
                 }
                 break;
             // egenmore `var` — the SAME sum-of-squares as Sd without the root, so the
             // two can never disagree about the divisor or the singleton rule. Oracle
-            // private_oracle_c.log: var(r) == summarize's r(Var)
+            // capture c: var(r) == summarize's r(Var)
             // == %21x +1.0124924924925X+007 == 900/7.
             case EgenFn::Var:
                 if (cnt >= 2) {
-                    double t = 0; for (double x : s) t += x; double mean = t / cnt;
-                    double ss = 0; for (double x : s) ss += (x - mean) * (x - mean);
-                    agg = ss / (cnt - 1);
+                    const double mean = sum_of(s) / cnt;
+                    agg = ssq_of(s, mean) / (cnt - 1);
                 }
                 break;
             case EgenFn::Median:
@@ -2537,7 +3020,7 @@ void Frame::egen_by(const std::string& out, EgenFn fn, const std::string& expr,
                 if (cnt) { std::sort(s.begin(), s.end());
                            agg = stata_pctile(s, 75.0) - stata_pctile(s, 25.0); }
                 break;
-            case EgenFn::Rank: case EgenFn::Std:
+            case EgenFn::Rank: case EgenFn::Std: case EgenFn::Pc:
             case EgenFn::RankTrack: case EgenFn::RankField: case EgenFn::RankUnique:
                 break;  // handled above
         }
@@ -2640,57 +3123,123 @@ void Frame::egen_group(const std::string& out, const std::vector<std::string>& b
     set_or_replace(out, std::move(out_col), st);
 }
 
-// egen seq(): running 1..N over the data's current order; resets at each by-group.
+// egen seq() ([D] egen, Example 7): a sawtooth over a group's rows. Every `block` rows
+// the value moves one step, it wraps after covering the closed range between from() and
+// to(), and it runs downward when from() is the larger bound. to() defaults to _N.
 void Frame::egen_seq(const std::string& out, const std::vector<std::string>& by_cols,
                      double from, double to, bool has_to, int64_t block) {
-    // BUG-433: the k-th observation of a group (k counted from 0) gets
-    //     from + ((k / block) mod span)      when to() was given, span = to-from+1
-    //     from + (k / block)                 otherwise
-    // so `b(2)` is 1 1 2 2 3 3 ... and `f(1) t(3)` is 1 2 3 1 2 3 ...  The bare
-    // form is from=1, block=1, no to, i.e. exactly the old 1..n.
-    if (block < 1) block = 1;
-    const double span = has_to ? (to - from + 1.0) : 0.0;
-    auto value_at = [&](int64_t k) {
-        const int64_t step = k / block;
-        if (has_to && span >= 1.0) {
-            const int64_t m = static_cast<int64_t>(span);
-            return from + static_cast<double>(((step % m) + m) % m);
-        }
-        return from + static_cast<double>(step);
+    if (block < 1) {
+        throw EngineError("bad_input",
+                          "egen seq(): block(" + std::to_string(block) + ") must be at least 1");
+    }
+    const double stop = has_to ? to : static_cast<double>(n_);
+    const double smaller = std::min(from, stop);
+    const double larger = std::max(from, stop);
+    const int64_t wrap_after = static_cast<int64_t>(larger - smaller) + 1;
+
+    // A stable sort on the keys walks each group in the frame's current order.
+    const auto keys = cols_as_double(*this, n_, by_cols);
+    std::vector<int64_t> walk(n_);
+    std::iota(walk.begin(), walk.end(), 0);
+    if (!keys.empty()) {
+        std::stable_sort(walk.begin(), walk.end(),
+                         [&](int64_t a, int64_t b) { return key_less(keys, a, b); });
+    }
+
+    std::vector<double> sawtooth(n_);
+    int64_t rows_into_group = 0;
+    for (int64_t j = 0; j < n_; ++j) {
+        if (j > 0 && !key_eq(keys, walk[j], walk[j - 1])) rows_into_group = 0;
+        const double offset = static_cast<double>((rows_into_group / block) % wrap_after);
+        sawtooth[walk[j]] = from <= stop ? smaller + offset : larger - offset;
+        ++rows_into_group;
+    }
+    set_or_replace(out, std::move(sawtooth));
+}
+
+// BUG-1002: egen mode() over a STRING source. Stata's egen mode runs the same
+// frequency count for a string, with "" as the missing value, and orders the
+// text by bytes: maxmode takes the largest tied mode, minmode the smallest ("" -- the
+// smallest string -- sorts last in that order, so under `missing` it wins a tie),
+// nummode(k) the k-th smallest; a plain tie stores "". The answer is the source's
+// own text. Oracle w2ap_egen_family eg_mode_byp_str (`bys g:
+// egen mo11 = mode(s), maxmode`: a a a a a a | b b b b | c | c c c | d d d d | e e).
+void Frame::egen_mode_text(const std::string& out, const FrameColumn& src,
+                           const std::vector<int64_t>& order,
+                           const std::vector<std::vector<double>>& K, bool one_group,
+                           const ModeOpts& mo) {
+    auto text_of = [&](int64_t r) -> const std::string& {
+        static const std::string kEmpty;
+        const int32_t k = src.codes[r];
+        return k >= 0 ? src.levels[static_cast<size_t>(k)] : kEmpty;
     };
-    std::vector<double> out_col(n_, NAd);
-    if (by_cols.empty()) {
-        for (int64_t i = 0; i < n_; ++i) out_col[i] = value_at(i);
-    } else {
-        std::vector<std::vector<double>> K = cols_as_double(*this, n_, by_cols);
-        // Stable sort by key preserves original order within group → seq follows
-        // the data's order inside each by-group (Stata bysort … : egen seq()).
-        std::vector<int64_t> order(n_);
-        std::iota(order.begin(), order.end(), 0);
-        std::stable_sort(order.begin(), order.end(),
-                         [&](int64_t a, int64_t b) { return key_less(K, a, b); });
-        int64_t g0 = 0;
-        while (g0 < n_) {
-            int64_t g1 = g0 + 1;
-            while (g1 < n_ && key_eq(K, order[g1], order[g0])) ++g1;
-            int64_t c = 0;
-            for (int64_t q = g0; q < g1; ++q) out_col[order[q]] = value_at(c++);
-            g0 = g1;
+    std::vector<std::string> answer_of(static_cast<size_t>(n_));
+    int64_t max_modes_any_group = 0;
+    int64_t g0 = 0;
+    while (g0 < n_) {
+        int64_t g1 = g0 + 1;
+        while (g1 < n_ && (one_group || key_eq(K, order[g1], order[g0]))) ++g1;
+        std::map<std::string, int64_t> freq;  // byte order, "" first
+        for (int64_t q = g0; q < g1; ++q) {
+            const std::string& t = text_of(order[q]);
+            if (mo.missing_as_value || !t.empty()) ++freq[t];
+        }
+        std::string answer;
+        if (!freq.empty()) {
+            int64_t best = 0;
+            for (const auto& f : freq) best = std::max(best, f.second);
+            std::vector<const std::string*> modes;  // ascending
+            for (const auto& f : freq) if (f.second == best) modes.push_back(&f.first);
+            max_modes_any_group = std::max(max_modes_any_group,
+                                           static_cast<int64_t>(modes.size()));
+            if (mo.nummode > 0) {
+                if (static_cast<size_t>(mo.nummode) <= modes.size())
+                    answer = *modes[static_cast<size_t>(mo.nummode) - 1];
+            } else if (mo.minmode) {
+                answer = *modes.front();
+            } else if (mo.maxmode) {
+                answer = *modes.back();
+            } else if (modes.size() == 1) {
+                answer = *modes.front();
+            }
+        }
+        for (int64_t q = g0; q < g1; ++q) answer_of[static_cast<size_t>(order[q])] = answer;
+        g0 = g1;
+    }
+    if (mo.nummode > 0 && max_modes_any_group > 0 &&
+        static_cast<int64_t>(mo.nummode) > max_modes_any_group)
+        throw EngineError("bad_input",
+                          "egen mode(): nummode(" + std::to_string(mo.nummode) +
+                          ") is greater than the number of modes in every group; the largest "
+                          "number of modes in a group is " +
+                          std::to_string(max_modes_any_group));
+    std::vector<int32_t> codes(static_cast<size_t>(n_));
+    std::vector<std::string> levels;
+    std::unordered_map<std::string, int32_t> dict;
+    for (size_t i = 0; i < answer_of.size(); ++i) {
+        auto it = dict.find(answer_of[i]);
+        if (it == dict.end()) {
+            const int32_t k = static_cast<int32_t>(levels.size());
+            dict.emplace(answer_of[i], k);
+            levels.push_back(answer_of[i]);
+            codes[i] = k;
+        } else {
+            codes[i] = it->second;
         }
     }
-    set_or_replace(out, std::move(out_col));
+    set_or_replace_factor(out, std::move(codes), std::move(levels));
 }
 
 // egen mode(x) [, by() minmode|maxmode|nummode(#) missing] — B4/W6.
-// Mechanism read from /Applications/StataNow/ado/base/_/_gmode.ado (v3.0.0), which is
-// the method identification behind the oracle: it counts each value's frequency within
+// Matches Stata's egen mode(), method identified from its ado and held by the oracle:
+// it counts each value's frequency within
 // the by-group, zeroes the frequency of missing unless `missing` is given, and then
 // picks among the values that share the maximum frequency. minmode/maxmode/nummode()
 // are opts_exclusive there and here. In the ado's sorts missing orders LAST ascending
 // (Stata's `. > any number`), so it is the largest candidate for maxmode and never the
 // smallest for minmode — reproduced below by sorting NaN to the end.
 //
-// Oracle private_oracle_b.log. On t = 1,1,2,2 and six missings, whose modes TIE:
+// Oracle capture b. On t = 1,1,2,2 and six missings, whose modes TIE:
 //   default -> missing everywhere · maxmode -> 2 · minmode -> 1 · missing -> `.` itself
 //              wins with frequency 6, so the answer is missing.
 // On m = 1,1,2,2,3,3,3,4,4,. (a unique mode) -> 3.
@@ -2703,10 +3252,6 @@ void Frame::egen_mode(const std::string& out, const std::string& expr,
                           "egen mode(): minmode, maxmode and nummode() are mutually exclusive");
     if (mo.nummode < 0)
         throw EngineError("bad_input", "egen mode(): nummode() must be a positive integer");
-    Parser parser(expr, *this);
-    auto ast = parser.parse();
-    std::vector<double> v = eval_column(ast.get(), n_);
-
     std::vector<int64_t> order(n_);
     std::iota(order.begin(), order.end(), 0);
     std::vector<std::vector<double>> K;
@@ -2715,6 +3260,16 @@ void Frame::egen_mode(const std::string& out, const std::string& expr,
         std::stable_sort(order.begin(), order.end(),
                          [&](int64_t a, int64_t b) { return key_less(K, a, b); });
     }
+    const size_t b0 = expr.find_first_not_of(" \t");
+    const std::string bare =
+        b0 == std::string::npos ? std::string() : expr.substr(b0, expr.find_last_not_of(" \t") - b0 + 1);
+    if (has(bare) && col(bare).is_factor) {
+        egen_mode_text(out, col(bare), order, K, by_cols.empty(), mo);
+        return;
+    }
+    Parser parser(expr, *this);
+    auto ast = parser.parse();
+    std::vector<double> v = eval_column(ast.get(), n_);
     // NaN sorts last — see the header comment. std::sort's comparator must be a strict
     // weak ordering, and `a < b` with NaN operands is not, so it is spelled out.
     auto less_nan_last = [](double a, double b) {
@@ -2769,7 +3324,7 @@ void Frame::egen_mode(const std::string& out, const std::string& expr,
         for (int64_t q = g0; q < g1; ++q) out_col[order[q]] = answer;
         g0 = g1;
     }
-    // _gmode's CheckNummode / CheckByNummodeEveryGroup: r(198) when nummode() exceeds
+    // Stata: r(198) when nummode() exceeds
     // the mode count of EVERY group (egen-six captured `nummode(4)` at rc 198 with
     // "The largest number of modes in a group is 2.").
     if (mo.nummode > 0 && max_modes_any_group > 0 &&
@@ -2784,7 +3339,7 @@ void Frame::egen_mode(const std::string& out, const std::string& expr,
 
 // egen nvals(varlist) [, by() missing] — egenmore, ACCEPTED-NAMED (see frame.h).
 // The number of DISTINCT values, or of distinct combinations for a multi-variable
-// varlist. Oracle private_oracle_c.log: nvals(r) = 4 over 10,10,20,30,30,30,40;
+// varlist. Oracle capture c: nvals(r) = 4 over 10,10,20,30,30,30,40;
 // the egen-six capture's nvals(g v) = 5 is the varlist form, and nvals(s) = 5 shows
 // it counts a string variable's distinct values too (a factor here).
 void Frame::egen_nvals(const std::string& out, const std::vector<std::string>& vars,
@@ -2850,10 +3405,9 @@ void Frame::egen_nvals(const std::string& out, const std::vector<std::string>& v
         for (int64_t q = g0; q < g1; ++q) out_col[order[q]] = answer;
         g0 = g1;
     }
-    // _gnvals.ado (egenmore, the copy bundled with the corpus): `gen <type> g = _n==1`,
-    // then `replace g = sum(g)` and `replace g = g[_N]`. Under float the last running
+    // egenmore's nvals builds the count as a running sum. Under float the last running
     // sum is stored once, so the count is rounded once; an integer type WIDENS under
-    // replace (w2e_float_default replace_byte_overflow :876, replace_int_overflow :893),
+    // replace (w2e_float_default replace_byte_overflow, replace_int_overflow),
     // so the count is exact.
     if (frame_detail::is_integer_store(st)) st = StoreType::Double;
     set_or_replace(out, std::move(out_col), st);
@@ -2861,7 +3415,7 @@ void Frame::egen_nvals(const std::string& out, const std::vector<std::string>& v
 
 // ---- Stata's %w.0g, and string()/strofreal() on top of it (B4/W7) ----------
 // Contract, the cell-by-cell derivation and the one UNPINNED edge are documented at
-// the declaration in frame.h. Oracle: tests/eval/golden/aer_b4/private_oracle_g2.log.
+// the declaration in frame.h. Oracle: B4 oracle capture g2.
 std::string stata_format_g(double v, int width) {
     if (std::isnan(v)) return ".";          // g2 `missing` cell: string(.) = "."
     if (width < 7) width = 7;               // below w7 the budget degenerates; no cell pins it
@@ -2930,252 +3484,276 @@ std::string stata_string_of(double v, const std::string& fmt) {
         "silently wrong value in a join key");
 }
 
-// Fresh implementations from the public [D] egen contract and synthetic cases.
-// No proprietary ado source or removed implementation is used here.
+namespace {
+
+// The bytes of a string column's cell; "" for a missing (negative) code.
+const std::string& factor_text(const FrameColumn& c, int64_t row) {
+    static const std::string kNothing;
+    const int32_t code = c.codes[row];
+    return code < 0 ? kNothing : c.levels[static_cast<std::size_t>(code)];
+}
+
+// string(x[, format]) of one number. stata_string_of writes every missing as ".", while
+// Stata's own text for an extended missing names its letter (.a).
+std::string numeric_field(double x, const std::string& format) {
+    const int kind = missing_kind(x);
+    if (kind > kMissSys) return std::string(".") + static_cast<char>('a' + kind - kMissA);
+    return stata_string_of(x, format);
+}
+
+std::string trim_blanks(const std::string& text) {
+    const std::size_t first = text.find_first_not_of(' ');
+    if (first == std::string::npos) return std::string();
+    return text.substr(first, text.find_last_not_of(' ') - first + 1);
+}
+
+// The largest i with x >= edges[i] for edges in non-decreasing order, so among tied
+// edges the higher index wins; -1 below the first edge.
+int64_t interval_of(const std::vector<double>& edges, double x) {
+    return (std::upper_bound(edges.begin(), edges.end(), x) - edges.begin()) - 1;
+}
+
+// Row functions over one row's cells, given in variable order. `kept_as` is the type the
+// running value is held in at every step: under Float a partial sum or an interim extreme
+// past float's range becomes missing right there (measured, StataBE 19.5).
+double row_mean_of(const std::vector<double>& cells) {
+    double sum = 0.0;
+    int64_t count = 0;
+    for (double x : cells) {
+        if (std::isnan(x)) continue;
+        sum += x;
+        ++count;
+    }
+    return count == 0 ? NAd : sum / static_cast<double>(count);
+}
+
+// The textbook two-pass sample deviation: deviations from the row mean are squared and
+// added in variable order, which is what StataBE's bits agree with.
+double row_sd_of(const std::vector<double>& cells) {
+#if defined(__clang__)
+#pragma clang fp contract(off)  // a fused multiply-add here changes the last bit
+#endif
+    const double centre = row_mean_of(cells);
+    double squares = 0.0;
+    int64_t count = 0;
+    for (double x : cells) {
+        if (std::isnan(x)) continue;
+        const double gap = x - centre;
+        squares += gap * gap;
+        ++count;
+    }
+    return count < 2 ? NAd : std::sqrt(squares / static_cast<double>(count - 1));
+}
+
+// `blank_when_empty` is rowtotal's missing option: an all-missing row stays missing, and
+// a sum knocked out of range restarts at the next value. Without it the sum starts at 0
+// and missing absorbs whatever follows.
+double row_total_of(const std::vector<double>& cells, bool blank_when_empty, StoreType kept_as) {
+    double total = blank_when_empty ? NAd : 0.0;
+    for (double x : cells) {
+        if (std::isnan(x)) continue;
+        total = round_to_store(blank_when_empty && std::isnan(total) ? x : total + x, kept_as);
+    }
+    return total;
+}
+
+// A missing running value yields to the next cell even when that cell is missing too,
+// so rowmax(., .a) is .a; only a real number can then be replaced by a larger one.
+double row_max_of(const std::vector<double>& cells, StoreType kept_as) {
+    double top = round_to_store(cells.front(), kept_as);
+    for (std::size_t j = 1; j < cells.size(); ++j) {
+        const double x = cells[j];
+        if (std::isnan(top) || x > top) top = round_to_store(x, kept_as);
+    }
+    return top;
+}
+
+double row_min_of(const std::vector<double>& cells, StoreType kept_as) {
+    double bottom = NAd;
+    for (double x : cells) {
+        if (std::isnan(x)) continue;
+        if (std::isnan(bottom) || x < bottom) bottom = round_to_store(x, kept_as);
+    }
+    return bottom;
+}
+
+}  // namespace
+
+// egen concat(): each variable's text with `punct` after it, the separator after the
+// last field taken off again, then blanks trimmed from both ends of the result. An
+// empty last field therefore leaves the separator before it in place.
 void Frame::egen_concat(const std::string& out, const std::vector<std::string>& vars,
                         const ConcatOpts& co) {
-    if (out.empty() || has(out))
-        throw EngineError("bad_input", "egen concat(): requires a new output variable", out);
-    if (vars.empty())
-        throw EngineError("bad_input", "egen concat(): requires a varlist");
-    if (co.maxlength < 0 || co.maxlength > 32000)
-        throw EngineError("bad_input", "egen concat(): maxlength() must be between 1 and 32000");
-
-    std::vector<const FrameColumn*> inputs;
-    inputs.reserve(vars.size());
-    for (const auto& name : vars) {
-        if (!has(name))
-            throw EngineError("missing_column", "egen concat(): variable '" + name + "' not found", name);
-        const FrameColumn& c = col(name);
-        if (!c.is_factor && !co.format.empty()) (void)stata_string_of(0.0, co.format);
-        inputs.push_back(&c);
+    if (vars.empty()) throw EngineError("bad_input", "egen concat(): requires a varlist");
+    if (co.decode) {
+        throw EngineError("unsupported",
+                          "egen concat(): decode is not available, engine columns carry no "
+                          "value labels");
     }
+    if (co.maxlength != 0 && (co.maxlength < 1 || co.maxlength > 32000))
+        throw EngineError("bad_input", "egen concat(): invalid maxlength( )");
 
-    std::vector<int32_t> codes(static_cast<size_t>(n_), -1);
+    std::vector<const FrameColumn*> sources;
+    sources.reserve(vars.size());
+    for (const std::string& name : vars) sources.push_back(&col(name));
+
+    std::vector<int32_t> codes(n_);
     std::vector<std::string> levels;
-    std::unordered_map<std::string, int32_t> dictionary;
+    std::unordered_map<std::string, int32_t> code_of;
     for (int64_t row = 0; row < n_; ++row) {
-        std::string joined;
-        for (size_t field = 0; field < inputs.size(); ++field) {
-            if (field != 0) joined += co.punct;
-            const FrameColumn& c = *inputs[field];
-            if (c.is_factor) {
-                const int32_t code = c.codes[static_cast<size_t>(row)];
-                if (code >= 0) joined += c.levels[static_cast<size_t>(code)];
-            } else {
-                const double value = c.f64[static_cast<size_t>(row)];
-                const std::string* decoded = nullptr;
-                if (co.decode && std::isfinite(value) && value == std::trunc(value) &&
-                    value >= std::numeric_limits<int>::min() &&
-                    value <= std::numeric_limits<int>::max()) {
-                    auto variable = co.valueLabels.find(vars[field]);
-                    if (variable != co.valueLabels.end()) {
-                        auto label = variable->second.find(static_cast<int>(value));
-                        if (label != variable->second.end()) decoded = &label->second;
-                    }
-                }
-                size_t labelBytes = decoded == nullptr ? 0 : std::min(
-                    decoded->size(), static_cast<size_t>(co.maxlength ? co.maxlength : 32000));
-                // Keep the byte limit at a UTF-8 boundary; an empty prefix uses
-                // the numeric fallback, just as an empty or absent label does.
-                while (decoded != nullptr && labelBytes > 0 && labelBytes < decoded->size() &&
-                       (static_cast<unsigned char>((*decoded)[labelBytes]) & 0xC0) == 0x80)
-                    --labelBytes;
-                if (labelBytes > 0) {
-                    joined.append(*decoded, 0, labelBytes);
-                } else {
-                    joined += std::isnan(value) ? missing_text(missing_kind(value))
-                                               : stata_string_of(value, co.format);
-                }
-            }
+        std::string text;
+        for (const FrameColumn* source : sources) {
+            text += source->is_factor ? factor_text(*source, row)
+                                      : numeric_field(source->f64[row], co.format);
+            text += co.punct;
         }
-        if (joined.empty()) continue;
-        auto found = dictionary.find(joined);
-        if (found == dictionary.end()) {
-            const int32_t code = static_cast<int32_t>(levels.size());
-            dictionary.emplace(joined, code);
-            levels.push_back(std::move(joined));
-            codes[static_cast<size_t>(row)] = code;
-        } else {
-            codes[static_cast<size_t>(row)] = found->second;
-        }
+        text.resize(text.size() - co.punct.size());
+        text = trim_blanks(text);
+        // "" gets a level like any other text: an all-empty concat is "", not missing.
+        const auto seen = code_of.emplace(std::move(text), static_cast<int32_t>(levels.size()));
+        if (seen.second) levels.push_back(seen.first->first);
+        codes[row] = seen.first->second;
     }
     set_or_replace_factor(out, std::move(codes), std::move(levels));
 }
+
+// egen cut(): left-closed intervals between ascending edges. group(k) takes its edges
+// from the data: the minimum, the k-1 inner quantiles by [D] pctile's default definition
+// (p = 100*i/k), and the maximum plus one. The result is an edge or, under icodes, an
+// interval index; `label` gives a string column whose levels name every edge.
 void Frame::egen_cut(const std::string& out, const std::string& var, const CutOpts& co,
-                     StoreType st, std::map<int, std::string>* labelsOut,
-                     StoreType* storedTypeOut) {
-    if (out.empty() || has(out))
-        throw EngineError("bad_input", "egen cut(): requires a new output variable", out);
-    if (!has(var))
-        throw EngineError("missing_column", "egen cut(): variable '" + var + "' not found", var);
-    const FrameColumn& input = col(var);
-    if (input.is_factor)
-        throw EngineError("factor_misuse", "egen cut(): requires a numeric variable", var);
-    if ((!co.at.empty() && co.group != 0) || (co.at.empty() && co.group < 2))
-        throw EngineError("bad_input", "egen cut(): specify exactly one of at() or group()");
+                     StoreType st) {
+    const bool from_quantiles = co.group != 0;
+    if (co.at.empty() && !from_quantiles)
+        throw EngineError("bad_input", "egen cut(): one of at() or group() must be specified");
+    if (!co.at.empty() && from_quantiles)
+        throw EngineError("bad_input", "egen cut(): cannot specify both at() and group() option");
+    for (std::size_t j = 1; j < co.at.size(); ++j) {
+        if (!(co.at[j - 1] < co.at[j]))
+            throw EngineError("bad_input", "egen cut(): at() invalid -- elements out of order");
+    }
+    const FrameColumn& source = col(var);
+    if (source.is_factor) {
+        throw EngineError("bad_input",
+                          "egen cut(): string variable used where a number is required: " + var);
+    }
+    const F64Reader x = source.f64.reader();
 
-    const bool grouped = co.at.empty();
-    const bool integer_codes = grouped || co.icodes || co.label;
     std::vector<double> edges = co.at;
-    if (!grouped) {
-        if (edges.size() < 2)
-            throw EngineError("bad_input", "egen cut(): at() requires at least two edges");
-        for (size_t i = 0; i < edges.size(); ++i) {
-            if (!std::isfinite(edges[i]) || (i && edges[i] <= edges[i - 1]))
-                throw EngineError("bad_input", "egen cut(): at() edges must be finite and strictly increasing");
-        }
-    } else {
-        std::vector<double> sorted;
-        sorted.reserve(static_cast<size_t>(n_));
+    if (from_quantiles) {
+        if (co.group < 2) throw EngineError("bad_input", "egen cut(): group() must be >= 2");
+        std::vector<double> ascending;
+        ascending.reserve(n_);
         for (int64_t row = 0; row < n_; ++row) {
-            const double value = input.f64[static_cast<size_t>(row)];
-            if (std::isfinite(value)) sorted.push_back(value);
+            if (!std::isnan(x[row])) ascending.push_back(x[row]);
         }
-        if (sorted.empty())
-            throw EngineError("no_obs", "egen cut(): no nonmissing observations");
-        if (static_cast<size_t>(co.group) > sorted.size() + 1)
-            throw EngineError("bad_input", "egen cut(): group() exceeds the number of nonmissing observations plus one");
-        std::sort(sorted.begin(), sorted.end());
-        edges.reserve(static_cast<size_t>(co.group) + 1);
-        edges.push_back(sorted.front());
-        // Use order-statistic quantiles, averaging adjacent values when the
-        // quantile position is integral. Equal values then stay in one bin.
-        for (int k = 1; k < co.group; ++k) {
-            const uint64_t numerator = static_cast<uint64_t>(sorted.size()) * static_cast<uint64_t>(k);
-            const size_t position = static_cast<size_t>(numerator / static_cast<uint64_t>(co.group));
-            edges.push_back(numerator % static_cast<uint64_t>(co.group) == 0
-                                ? sorted[position - 1] / 2.0 + sorted[position] / 2.0
-                                : sorted[position]);
+        if (ascending.empty()) {
+            throw EngineError("bad_input",
+                              "egen cut(): " + var + " has no non-missing values");
         }
-        edges.push_back(sorted.back() + 1.0);
+        std::sort(ascending.begin(), ascending.end());
+        edges.push_back(ascending.front());
+        for (int i = 1; i < co.group; ++i) {
+            edges.push_back(stata_pctile(ascending, 100.0 * i / co.group));
+        }
+        edges.push_back(ascending.back() + 1.0);
     }
 
-    std::map<int, std::string> labels;
+    // A value at or past the last at() edge has no interval; group()'s top edge lies
+    // above every value, so this test never fires for it.
+    const auto bin_of = [&](double v) -> int64_t {
+        if (std::isnan(v) || (!from_quantiles && v >= edges.back())) return -1;
+        return interval_of(edges, v);
+    };
+
     if (co.label) {
-        for (size_t i = 0; i < edges.size(); ++i)
-            labels.emplace(static_cast<int>(i), stata_string_of(edges[i], "") + "-");
+        std::vector<int32_t> codes(n_);
+        for (int64_t row = 0; row < n_; ++row) codes[row] = static_cast<int32_t>(bin_of(x[row]));
+        std::vector<std::string> names;
+        names.reserve(edges.size());
+        for (double edge : edges) names.push_back(stata_string_of(edge, "") + "-");
+        set_or_replace_factor(out, std::move(codes), std::move(names));
+        return;
     }
-    std::vector<double> comparisonEdges = edges;
-    for (double& edge : comparisonEdges) edge = static_cast<double>(static_cast<float>(edge));
-    std::vector<double> result(static_cast<size_t>(n_), NAd);
+
+    const bool as_index = co.icodes || from_quantiles;
+    std::vector<double> stored(n_, NAd);
     for (int64_t row = 0; row < n_; ++row) {
-        double value = input.f64[static_cast<size_t>(row)];
-        if (!std::isfinite(value)) continue;
-        value = static_cast<double>(static_cast<float>(value));
-        if (!grouped && (value < comparisonEdges.front() || value >= comparisonEdges.back())) continue;
-        // The terminal edge is metadata for group(), whose maximum is always in
-        // the final group; at() instead uses its final edge as an exclusive bound.
-        const auto last = grouped ? comparisonEdges.end() - 1 : comparisonEdges.end();
-        const size_t bin = static_cast<size_t>(std::upper_bound(comparisonEdges.begin(), last, value) -
-                                                comparisonEdges.begin() - 1);
-        result[static_cast<size_t>(row)] = integer_codes ? static_cast<double>(bin) : edges[bin];
+        const int64_t bin = bin_of(x[row]);
+        if (bin >= 0) stored[row] = as_index ? static_cast<double>(bin) : edges[bin];
     }
-    if (frame_detail::is_integer_store(st)) {
-        double lo = 0, hi = 0;
-        bool fractional = false;
-        for (double value : result) {
-            if (!std::isfinite(value)) continue;
-            lo = std::min(lo, value);
-            hi = std::max(hi, value);
-            fractional = fractional || value != std::trunc(value);
-        }
-        if (fractional) {
-            st = st == StoreType::Long ? StoreType::Double : StoreType::Float;
-        } else {
-            if (st == StoreType::Byte && (lo < frame_detail::kStoreByteLo || hi > frame_detail::kStoreByteHi))
-                st = StoreType::Int;
-            if (st == StoreType::Int && (lo < frame_detail::kStoreIntLo || hi > frame_detail::kStoreIntHi))
-                st = StoreType::Long;
-            if (st == StoreType::Long && (lo < frame_detail::kStoreLongLo || hi > frame_detail::kStoreLongHi))
-                st = StoreType::Double;
+    if (!is_integer_store(st)) {
+        set_or_replace(out, std::move(stored), st);
+        return;
+    }
+    for (double v : stored) {
+        if (!std::isnan(v) && (v != std::trunc(v) || v < kStoreLongLo || v > kStoreLongHi)) {
+            throw EngineError("bad_input",
+                              "egen cut(): --store-type byte|int|long with a non-integer cut "
+                              "point is not supported (Stata's replace widens the variable)");
         }
     }
-    set_or_replace(out, std::move(result), st);
-    if (labelsOut != nullptr) *labelsOut = std::move(labels);
-    if (storedTypeOut != nullptr) *storedTypeOut = st;
+    set_or_replace(out, std::move(stored));
 }
 
+// The row functions (help egen). Cells are read in the order the variables were written;
+// a string column is a value only to rowmiss and to rownonmiss with strok, where its
+// text being "" is what missing means.
 void Frame::row_egen(const std::string& out, RowFn fn, const std::vector<std::string>& cols,
-                     StoreType st) {
-    if (cols.empty()) throw std::runtime_error("egen row function: empty varlist");
-    // The store type, per function, from the ado that builds the result:
-    //  * rowmean/rowsd: one `gen <type> h = ...` (_growmean.ado, _growsd.ado), so the
-    //    value is rounded once, like any generate.
-    //  * rowtotal/rowmax/rowmin: `gen <type> g`, then `replace g = ...` per variable
-    //    (_growtotal/_growmax/_growmin.ado). Float stays float under replace (:761), so
-    //    float is modelled: total rounds every partial sum (below); max/min round the
-    //    pick once, which equals the ado's per-step rounding only while every input is
-    //    within float's range (float() is monotone there). Past that range the ado's
-    //    ORDER decides (_growmax.ado:19 stores `.` for an out-of-range x1 and the next
-    //    replace takes x2, so rowmax(1e39,5) is 5 where this returns `.`), and what
-    //    replace stores into a float for an out-of-range value is not captured: OPEN
-    //    (float-default follow-up FD-T1-A). An integer type WIDENS under replace (byte
-    //    2.7 -> float :810, byte 200 -> int :876, int -> long :893), which a fixed store
-    //    type cannot express: refused, not truncated.
-    //  * rowmiss/rownonmiss: integer counts, `replace g = g + ...` — widening keeps
-    //    them exact under every type, so they are stored unrounded.
-    if (frame_detail::is_integer_store(st) &&
-        (fn == RowFn::Total || fn == RowFn::Max || fn == RowFn::Min)) {
-        const char* nm = fn == RowFn::Total ? "rowtotal" : fn == RowFn::Max ? "rowmax" : "rowmin";
-        throw EngineError("bad_input", std::string("egen ") + nm +
-                                           "(): --store-type byte|int|long is not supported (Stata "
-                                           "builds it with replace, which widens an integer variable)");
+                     StoreType st, bool missing, bool strok) {
+    if (cols.empty()) throw EngineError("bad_input", "egen row function: empty varlist");
+    const bool counts = fn == RowFn::Miss || fn == RowFn::NonMiss;
+    const bool folds_while_storing = fn == RowFn::Total || fn == RowFn::Max || fn == RowFn::Min;
+    if (is_integer_store(st) && folds_while_storing) {
+        const char* const shown = fn == RowFn::Total ? "rowtotal"
+                                  : fn == RowFn::Max ? "rowmax"
+                                                     : "rowmin";
+        throw EngineError("bad_input",
+                          std::string("egen ") + shown + "(): --store-type byte|int|long is not "
+                          "supported (Stata builds it with replace, which widens an integer "
+                          "variable)");
     }
-    const StoreType store = (fn == RowFn::Miss || fn == RowFn::NonMiss) ? StoreType::Double : st;
-    std::vector<const double*> p;
-    p.reserve(cols.size());
-    for (const auto& c : cols) p.push_back(require_f64(c));
-    const int ncol = static_cast<int>(p.size());
+    const bool strings_allowed = fn == RowFn::Miss || (fn == RowFn::NonMiss && strok);
+    std::vector<const FrameColumn*> sources;
+    sources.reserve(cols.size());
+    for (const std::string& name : cols) {
+        const FrameColumn& source = col(name);
+        if (source.is_factor && !strings_allowed) {
+            throw EngineError("bad_input",
+                              "egen row function: string variable used where a number is "
+                              "required: " + name);
+        }
+        sources.push_back(&source);
+    }
 
-    std::vector<double> out_col(n_, NAd);
-    std::vector<double> s;
-    s.reserve(ncol);
-    for (int64_t i = 0; i < n_; ++i) {
-        s.clear();
-        for (int j = 0; j < ncol; ++j) {
-            double x = p[j][i];
-            if (!std::isnan(x)) s.push_back(x);
-        }
-        const int m = static_cast<int>(s.size());
-        double r = NAd;
-        switch (fn) {
-            case RowFn::NonMiss: r = m; break;
-            case RowFn::Miss: r = ncol - m; break;
-            case RowFn::Total: {  // 0 if all missing
-                double t = 0;
-                if (st == StoreType::Float) {
-                    // _growtotal.ado: `gen <type> g = x1`, then `replace g = g + xk`, and
-                    // replace keeps a float variable float (w2e_float_default
-                    // replace_float_23 :761), so under float every partial sum is stored
-                    // as a float (a partial sum past float's range is taken to store `.`,
-                    // the generate rule of :530; replace's rule there is uncaptured,
-                    // FD-T1-A). Oracle egen_rowtotal_untyped :1038 is
-                    // float(float(1/7) + 1/11) = +1.dec0d60000000X-003, one float ulp
-                    // above the single final rounding (…d4). A missing xk adds 0, which
-                    // leaves a stored partial sum unchanged, so skipping it is the same.
-                    // (Byte/Int/Long never get here: refused above.)
-                    for (double x : s) t = frame_detail::round_to_store(t + x, st);
-                } else {
-                    for (double x : s) t += x;
-                }
-                r = t;
-                break;
+    std::vector<double> cells(sources.size());
+    std::vector<double> result(n_);
+    for (int64_t row = 0; row < n_; ++row) {
+        if (counts) {
+            int64_t blanks = 0;
+            for (const FrameColumn* source : sources) {
+                const bool blank = source->is_factor ? factor_text(*source, row).empty()
+                                                     : std::isnan(source->f64[row]);
+                blanks += blank ? 1 : 0;
             }
-            case RowFn::Max: if (m) r = *std::max_element(s.begin(), s.end()); break;
-            case RowFn::Min: if (m) r = *std::min_element(s.begin(), s.end()); break;
-            case RowFn::Mean: if (m) { double t = 0; for (double x : s) t += x; r = t / m; } break;
-            case RowFn::Sd:
-                if (m >= 2) {
-                    double t = 0; for (double x : s) t += x; double mean = t / m;
-                    double ss = 0; for (double x : s) ss += (x - mean) * (x - mean);
-                    r = std::sqrt(ss / (m - 1));
-                }
-                break;
+            result[row] = static_cast<double>(fn == RowFn::Miss
+                                                  ? blanks
+                                                  : static_cast<int64_t>(sources.size()) - blanks);
+            continue;
         }
-        out_col[i] = r;
+        for (std::size_t j = 0; j < sources.size(); ++j) cells[j] = sources[j]->f64[row];
+        switch (fn) {
+            case RowFn::Mean: result[row] = row_mean_of(cells); break;
+            case RowFn::Sd: result[row] = row_sd_of(cells); break;
+            case RowFn::Total: result[row] = row_total_of(cells, missing, st); break;
+            case RowFn::Max: result[row] = row_max_of(cells, st); break;
+            default: result[row] = row_min_of(cells, st); break;
+        }
     }
-    set_or_replace(out, std::move(out_col), store);
+    // Mean and sd are computed in double and rounded once on store; the folds already hold
+    // their storage type, and the counts are exact whatever was declared.
+    set_or_replace(out, std::move(result),
+                   (fn == RowFn::Mean || fn == RowFn::Sd) ? st : StoreType::Double);
 }
 
 namespace {
@@ -3195,15 +3773,34 @@ std::vector<double> xtile_assign(const double* x, int64_t n, const std::vector<d
 }
 }  // namespace
 
-void Frame::xtile(const std::string& out, const std::string& var, int nq) {
+void Frame::xtile(const std::string& out, const std::string& var, int nq, const std::string& wvar) {
     const double* x = require_f64(var);
     if (nq < 2) throw std::runtime_error("xtile: nq must be >= 2");
-    std::vector<double> sorted;
-    for (int64_t i = 0; i < n_; ++i) if (!std::isnan(x[i])) sorted.push_back(x[i]);
-    std::sort(sorted.begin(), sorted.end());
     std::vector<double> cut;
-    for (int i = 1; i < nq; ++i) cut.push_back(stata_pctile(sorted, 100.0 * i / nq));
-    set_or_replace(out, xtile_assign(x, n_, cut));
+    if (wvar.empty()) {
+        std::vector<double> sorted;
+        for (int64_t i = 0; i < n_; ++i) if (!std::isnan(x[i])) sorted.push_back(x[i]);
+        std::sort(sorted.begin(), sorted.end());
+        for (int i = 1; i < nq; ++i) cut.push_back(stata_pctile(sorted, 100.0 * i / nq));
+        set_or_replace(out, xtile_assign(x, n_, cut));
+        return;
+    }
+    const double* w = require_f64(wvar);
+    std::vector<std::pair<double, double>> vw;
+    std::vector<double> xs(x, x + n_);
+    for (int64_t i = 0; i < n_; ++i) {
+        if (std::isnan(w[i]) || !(w[i] > 0.0)) { xs[static_cast<size_t>(i)] = NAd; continue; }
+        if (!std::isnan(x[i])) vw.emplace_back(x[i], w[i]);
+    }
+    std::stable_sort(vw.begin(), vw.end(),
+                     [](const std::pair<double, double>& a, const std::pair<double, double>& b) {
+                         return a.first < b.first;
+                     });
+    std::vector<double> pv, pw;
+    ExactSum W;
+    for (const auto& p : vw) { pv.push_back(p.first); pw.push_back(p.second); W.add(p.second); }
+    for (int i = 1; i < nq; ++i) cut.push_back(stata_pctile_weighted(pv, pw, W.value(), 100.0 * i / nq));
+    set_or_replace(out, xtile_assign(xs.data(), n_, cut));
 }
 
 void Frame::xtile_cuts(const std::string& out, const std::string& var,
@@ -3358,15 +3955,22 @@ std::vector<std::string> Frame::mkspline_cubic(const std::string& stub, const st
 void Frame::bygen(const std::string& out, const std::string& expr,
                   const std::vector<std::string>& by_cols,
                   const std::vector<std::string>& sort_cols,
-                  const std::string& mask_expr, StoreType st) {
+                  const std::string& mask_expr, StoreType st, const GenQualifier& qual) {
     RngCallScope rng_call;
+    check_gen_qualifier(out, qual);
+    // Stata's `in` is a range of the dataset's observations, which a by-group or a
+    // sort key would renumber; PIET sends a range only with neither.
+    if (qual.in_first != 0 && !(by_cols.empty() && sort_cols.empty()))
+        throw EngineError("bad_input", "--gen-in: an `in` range cannot be combined with by() "
+                                       "or sort() in --bygen");
     Parser parser(expr, *this);
     auto ast = parser.parse();
-    refuse_group_in_masked_range(ast.get(), expr, mask_expr);
+    bind_group_range(ast.get(), qual.in_first, qual.in_last);
     std::unique_ptr<Node> mast;
     if (!mask_expr.empty()) {
         Parser mp(mask_expr, *this);
         mast = mp.parse();
+        bind_group_range(mast.get(), qual.in_first, qual.in_last);
     }
 
     std::vector<std::string> sortkeys = by_cols;
@@ -3401,15 +4005,34 @@ void Frame::bygen(const std::string& out, const std::string& expr,
     // . 2 5 | . 2 5). It used to be evaluated over the dataset before the groups
     // existed, which answered . 2 5 | 1 3 6 at rc 0 (BUG-836). A sum() inside it
     // runs per group, as it does inside the folded cond() form.
+    // A replace walks the rows in place (see has_self_subscript below), and an
+    // `if` that reads the target through a subscript must see the rows already
+    // replaced: `replace y = runiform() + 1 if y[_n-1] != 0` after `replace y = 1
+    // in 1` replaces every row in StataBE 19.5. A drawing right-hand side sends
+    // its `if` here as the mask, so that mask is evaluated inline, row by row,
+    // against the buffer being written.
+    const double* target = nullptr;
+    if (auto it = idx_.find(out); it != idx_.end() && !cols_[it->second].is_factor)
+        target = static_cast<const FrameColumn&>(cols_[it->second]).f64.data();
+    const bool self_mask = target && mast && has_self_subscript(mast.get(), target) &&
+                           !has_fn(ast.get(), F_sum);
     std::vector<double> mask;
+    const bool inline_if = self_mask || inline_if_draws(mast.get(), ast.get());
     if (mast) {
         materialize_sums(mast.get(), n_, &order, &g0a, &g1a, &posa, nullptr);
-        mask.resize(static_cast<size_t>(n_));
-        for (int64_t i = 0; i < n_; ++i) {
+        mask.assign(static_cast<size_t>(n_), 1.0);
+        for (int64_t i = 0; i < n_ && !inline_if; ++i) {
             c.row = i; c.g0 = g0a[i]; c.g1 = g1a[i]; c.pos = posa[i];
             mask[static_cast<size_t>(i)] = ev(mast.get(), c);
         }
     }
+    apply_in_range(mask, n_, qual.in_first, qual.in_last);
+    // Whether row c.row is selected; under inline_if its `if` is evaluated now.
+    auto selects = [&](const EvalCtx& rc) {
+        double& m = mask[static_cast<size_t>(rc.row)];
+        if (inline_if && if_selects(m)) m = ev(mast.get(), rc);
+        return if_selects(m);
+    };
 
     // sum() restarts at every group boundary and walks in SORT order, so it is
     // materialised here where that order exists -- not row by row below, which
@@ -3417,19 +4040,42 @@ void Frame::bygen(const std::string& out, const std::string& expr,
     materialize_sums(ast.get(), n_, &order, &g0a, &g1a, &posa,
                      mask.empty() ? nullptr : &mask);
 
-    std::vector<double> out_col(n_);
+    // Row-sequential replace (see has_self_subscript): walk the observations in
+    // the by-sort order, as Stata's bysort processes them, so `by g: replace x =
+    // x[_n-1] + 1 if _n > 1` counts up within each group.
+    if (target) {
+        if (has_self_subscript(ast.get(), target) || self_mask) {
+            F64Reader old = cols_[idx_.at(out)].f64.reader();
+            std::vector<double> buf(static_cast<size_t>(n_));
+            for (int64_t i = 0; i < n_; ++i) buf[static_cast<size_t>(i)] = old[static_cast<size_t>(i)];
+            rebind_var(ast.get(), target, buf.data());
+            if (self_mask) rebind_var(mast.get(), target, buf.data());
+            for (int64_t t = 0; t < n_; ++t) {
+                const int64_t i = order[static_cast<size_t>(t)];
+                c.row = i; c.g0 = g0a[i]; c.g1 = g1a[i]; c.pos = posa[i];
+                if (!mask.empty() && !selects(c)) continue;
+                double v = ev(ast.get(), c);
+                buf[static_cast<size_t>(i)] = st == StoreType::Double ? v : store_round(v, st);
+            }
+            store_qualified(out, std::move(buf), mask, st, qual);
+            return;
+        }
+    }
+    std::vector<double> out_col(n_, NAd);
+    // On Stata's stream an unselected row draws nothing (see Frame::generate).
+    const bool skip_unselected = g_mt64_on && !mask.empty() && has_draw(ast.get());
     for (int64_t i = 0; i < n_; ++i) {
         c.row = i; c.g0 = g0a[i]; c.g1 = g1a[i]; c.pos = posa[i];
+        if (skip_unselected && !selects(c)) continue;
         out_col[i] = ev(ast.get(), c);
     }
-    if (!mask.empty())
-        for (int64_t i = 0; i < n_; ++i)
-            if (!if_selects(mask[static_cast<size_t>(i)])) out_col[i] = NAd;
-    set_or_replace(out, std::move(out_col), st);
+    store_qualified(out, std::move(out_col), mask, st, qual);
 }
 
 Frame::Summary Frame::summarize(const std::string& var, bool detail, const std::string& wvar,
-                                bool analytic) const {
+                                bool analytic, const std::vector<char>* keep, bool importance) const {
+    // A row outside `keep` is treated exactly as a row with a missing value.
+    auto out = [keep](int64_t i) { return keep != nullptr && !(*keep)[static_cast<size_t>(i)]; };
     // W:P5: weighted detail/percentiles now land (stata_pctile_weighted, above)
     // for BOTH weight kinds — the previous honest reject was a real gap, not a
     // semantic one: `summarize [aw=w] var, detail` is a legal Stata command and
@@ -3450,14 +4096,18 @@ Frame::Summary Frame::summarize(const std::string& var, bool detail, const std::
     Summary s;
     s.detail = detail;
     std::vector<double> vals;
-    double sum = 0;
+    // BUG-1013 (FU-1190): r(sum), and r(mean) = r(sum)/N, are Stata's exactly
+    // accumulated sum rounded once (core/exact_sum.h), not a data-order double
+    // sum: 1e16 + 22 ones - 1e16 is 22 in StataBE 19.5 and was 0 here
+    // (w2as_summary_stats_family sx_sum_acc3 / acc4 / su_acc5 / *_mo).
+    ExactSum acc;
     s.min = INF; s.max = -INF;
     if (wvar.empty()) {
-        // ---- unweighted path: BYTE-UNCHANGED from pre-fweight cobra ----
+        // ---- unweighted path ----
         for (int64_t i = 0; i < n_; ++i) {
-            if (std::isnan(x[i])) continue;
+            if (std::isnan(x[i]) || out(i)) continue;
             ++s.n;
-            sum += x[i];
+            acc.add(x[i]);
             s.min = std::min(s.min, x[i]);
             s.max = std::max(s.max, x[i]);
             if (detail) vals.push_back(x[i]);
@@ -3465,6 +4115,7 @@ Frame::Summary Frame::summarize(const std::string& var, bool detail, const std::
         // No non-missing observations: Stata posts r(N)=0 but does NOT post r(mean)/r(sd)
         // (they read as missing) — emit missing rather than the struct-default 0.0.
         if (s.n == 0) { s.mean = s.sd = s.var = s.min = s.max = NAd; return s; }
+        const double sum = acc.value();
         s.sum = sum;
         // BUG-344: Σw with w≡1 IS the observation count, and that is exactly what Stata
         // posts in r(sum_w) on an unweighted summarize. Leaving the struct default (0)
@@ -3473,8 +4124,14 @@ Frame::Summary Frame::summarize(const std::string& var, bool detail, const std::
         s.sum_w = static_cast<double>(s.n);
         s.mean = sum / s.n;
         if (s.n >= 2) {
-            double ss = 0;
-            for (int64_t i = 0; i < n_; ++i) if (!std::isnan(x[i])) ss += (x[i] - s.mean) * (x[i] - s.mean);
+            // The squared deviations accumulate exactly too (core/exact_sum.h
+            // ExactSqDev): a standardized variable's near-zero mean takes its
+            // sign from r(sd)'s last bits (AER 007's control means printed
+            // -0.000 for Stata's 0.000).
+            ExactSqDev sq(s.mean);
+            for (int64_t i = 0; i < n_; ++i)
+                if (!std::isnan(x[i]) && !out(i)) sq.add(x[i]);
+            const double ss = sq.value();
             s.var = ss / (s.n - 1);
             s.sd = std::sqrt(s.var);
         } else {
@@ -3506,7 +4163,7 @@ Frame::Summary Frame::summarize(const std::string& var, bool detail, const std::
     // previously only integrality was checked, so w=-1 silently made sumwx go negative → a
     // reported mean/sum OUTSIDE the data range.
     for (int64_t i = 0; i < n_; ++i) {
-        if (std::isnan(w[i])) continue;
+        if (std::isnan(w[i]) || importance) continue;
         if (w[i] < 0.0)
             throw EngineError("bad_input",
                 "summarize: " + std::string(analytic ? "aweight" : "fweight") + " '" + wvar +
@@ -3519,7 +4176,7 @@ Frame::Summary Frame::summarize(const std::string& var, bool detail, const std::
                 "summarize: fweight '" + wvar + "' has a non-integer value (" +
                 std::to_string(w[i]) + "); Stata requires integer frequency weights", wvar);
     }
-    double sumw = 0.0, sumwx = 0.0;
+    ExactSum accw, accwx;  // BUG-1013: the weighted sums accumulate as the unweighted one
     int64_t nrows = 0;
     // W:P5 detail: collect the (value, weight) pairs the moment loop below
     // would otherwise have to re-derive, so percentiles and the weighted
@@ -3530,19 +4187,20 @@ Frame::Summary Frame::summarize(const std::string& var, bool detail, const std::
         // excludes the row from N/mean/var (its already-validated weight contributes nowhere).
         // BUG-107: a zero weight = zero frequency = the obs is not in the dataset, so it must be
         // excluded from min/max too (it already contributes nothing to sumw/sumwx/N).
-        if (std::isnan(w[i]) || std::isnan(x[i]) || w[i] == 0.0) continue;
+        if (std::isnan(w[i]) || std::isnan(x[i]) || w[i] == 0.0 || out(i)) continue;
         ++nrows;
-        sumw += w[i];
-        sumwx += w[i] * x[i];
+        accw.add(w[i]);
+        accwx.add(w[i] * x[i]);
         s.min = std::min(s.min, x[i]);
         s.max = std::max(s.max, x[i]);
         if (detail) wvals.emplace_back(x[i], w[i]);
     }
+    const double sumw = accw.value(), sumwx = accwx.value();
     if (sumw == 0.0) { s.n = 0; s.mean = s.sd = s.var = s.min = s.max = NAd; return s; }
     // The one place the two weight kinds genuinely diverge: a frequency weight IS the
     // observation count, an analytic weight is a relative precision over `nrows` real
     // observations. Stata prints the former as Obs and the latter as Obs + Weight.
-    s.n = analytic ? nrows : static_cast<int64_t>(std::llround(sumw));
+    s.n = (analytic || importance) ? nrows : static_cast<int64_t>(std::llround(sumw));
     s.sum_w = sumw;
     s.sum = sumwx;
     s.mean = sumwx / sumw;
@@ -3553,7 +4211,7 @@ Frame::Summary Frame::summarize(const std::string& var, bool detail, const std::
     if (vdenom >= 1.0) {
         double ss = 0;
         for (int64_t i = 0; i < n_; ++i) {
-            if (std::isnan(w[i]) || std::isnan(x[i])) continue;
+            if (std::isnan(w[i]) || std::isnan(x[i]) || out(i)) continue;
             double d = x[i] - s.mean;
             ss += w[i] * vscale * d * d;
         }
@@ -3601,51 +4259,165 @@ Frame::Summary Frame::summarize(const std::string& var, bool detail, const std::
     return s;
 }
 
+namespace {
+
+// Weighted percentiles of one collapse group, per [R] summarize, Methods and formulas:
+// invert the weighted empirical distribution, averaging two neighbouring order
+// statistics when the cumulative weight sits on the target. Measured on StataBE
+// (collapse with each weight type) beyond what the manual states: the weights stay in
+// raw units, aweights included; a negative total (iweights only) flips every sign; a
+// zero total has no percentile; the target comes from the total as accumulated in
+// dataset order, so the caller hands in that sum rather than a re-summed one.
+class GroupWeightedPercentiles {
+public:
+    GroupWeightedPercentiles(const std::vector<double>& values, const std::vector<double>& weights,
+                             double total_in_dataset_order)
+        : total_(std::fabs(total_in_dataset_order)) {
+        const double sign = total_in_dataset_order < 0.0 ? -1.0 : 1.0;
+        std::vector<std::pair<double, double>> by_value(values.size());
+        for (size_t i = 0; i < values.size(); ++i) by_value[i] = {values[i], sign * weights[i]};
+        std::sort(by_value.begin(), by_value.end());  // inside a tie the order cannot change a result
+        ascending_.reserve(by_value.size());
+        running_.reserve(by_value.size());
+        double accumulated = 0.0;
+        for (const auto& [value, weight] : by_value) {
+            accumulated += weight;
+            ascending_.push_back(value);
+            running_.push_back(accumulated);
+        }
+    }
+
+    bool defined() const { return total_ != 0.0 && !ascending_.empty(); }
+
+    // Requires defined().
+    double at(double percent) const {
+        constexpr double kOnTargetBelow = 1e-6;  // raw weight units; only below the target
+        const double target = total_ * percent / 100.0;
+        // Mixed-sign iweights can make running_ non-monotone: scan rather than bisect.
+        // No cumulative above the target can happen only through rounding: take the last.
+        auto past = std::find_if(running_.begin(), running_.end(),
+                                 [target](double cumulative) { return cumulative > target; });
+        if (past == running_.end()) --past;
+        const size_t rank = static_cast<size_t>(past - running_.begin());
+        if (rank > 0 && target - running_[rank - 1] <= kOnTargetBelow)
+            return (ascending_[rank - 1] + ascending_[rank]) / 2.0;
+        return ascending_[rank];
+    }
+
+private:
+    double total_;
+    std::vector<double> ascending_;  // the values, sorted
+    std::vector<double> running_;    // running_[i] = cumulative weight through ascending_[i]
+};
+
+}  // namespace
+
 Frame Frame::collapse(const std::vector<CollapseSpec>& specs,
-                      const std::vector<std::string>& by, const std::string& wvar) const {
+                      const std::vector<std::string>& by, const std::string& wvar,
+                      const std::string& wtype_in, bool stata_by_order) const {
+    // Weight kind: "" with a weight variable is the historical fweight path.
+    const std::string wtype = wvar.empty() ? std::string() : (wtype_in.empty() ? std::string("fw") : wtype_in);
+    if (!wtype.empty() && wtype != "fw" && wtype != "aw" && wtype != "iw" && wtype != "pw")
+        throw EngineError("bad_input", "collapse: unknown weight type '" + wtype + "'", wvar);
+    const bool fw = wtype == "fw";
     std::vector<int64_t> order(n_);
     std::iota(order.begin(), order.end(), 0);
     std::vector<std::vector<double>> K;
-    if (!by.empty()) {
-        K = cols_as_double(*this, n_, by);
-        std::stable_sort(order.begin(), order.end(),
-                         [&](int64_t a, int64_t b) { return key_less(K, a, b); });
-    }
-    std::vector<const double*> vp;
-    for (const auto& s : specs) vp.push_back(require_f64(s.var));
-    // by-columns may be factor OR numeric: K (above) already casts a factor by-column
-    // to its int32 code as a double (cols_as_double), so grouping just works. Track
-    // which by-columns are factor so the output can rebuild a fresh, self-consistent
-    // dictionary below instead of require_f64()-rejecting them outright (this WAS the
-    // "column 'X' is a factor, not f64" reject some callers depended on — see the A12
-    // dependent sweep in frame.h's collapse() doc comment / the CONTRACT-engine.md diff).
+    // by-columns may be factor OR numeric: K casts a factor by-column to its int32
+    // code as a double (cols_as_double). Under stata_by_order a factor by-column
+    // groups and sorts by its TEXT instead (Stata's `sort by`: "" first, then
+    // byte order; w2au_collapse_family.log cz_c_bystr_v1c `[]|[a]|[c]|[d]|[eee]`),
+    // and "" and a missing code are the same group.
     std::vector<char> by_is_factor(by.size());
     for (size_t bc = 0; bc < by.size(); ++bc) by_is_factor[bc] = col(by[bc]).is_factor ? 1 : 0;
-    // fweight (optional): grouping itself (the `by` columns above) is NOT affected by weights.
+    if (!by.empty()) {
+        K = cols_as_double(*this, n_, by);
+        if (stata_by_order) {
+            for (size_t bc = 0; bc < by.size(); ++bc) {
+                if (!by_is_factor[bc]) continue;
+                const FrameColumn& fc = col(by[bc]);
+                const std::vector<std::string>& lv = fc.levels.ref();
+                std::vector<int32_t> idx(lv.size());
+                std::iota(idx.begin(), idx.end(), 0);
+                std::sort(idx.begin(), idx.end(), [&](int32_t a, int32_t b) { return lv[a] < lv[b]; });
+                std::vector<double> rank(lv.size(), -1.0);
+                double r = 0.0;
+                for (size_t k = 0; k < idx.size(); ++k) {
+                    if (lv[idx[k]].empty()) { rank[idx[k]] = -1.0; continue; }
+                    if (k > 0 && !lv[idx[k - 1]].empty() && lv[idx[k - 1]] == lv[idx[k]]) {
+                        rank[idx[k]] = rank[idx[k - 1]];
+                        continue;
+                    }
+                    rank[idx[k]] = r;
+                    r += 1.0;
+                }
+                for (int64_t i = 0; i < n_; ++i) {
+                    const double c = K[bc][i];
+                    K[bc][i] = c < 0 ? -1.0 : rank[static_cast<size_t>(c)];
+                }
+            }
+        }
+    }
+    // A string (factor) spec column serves first/last/firstnm/lastnm only
+    // (Stata refuses the rest with r(109); PIET checks first).
+    auto is_string_stat = [](const std::string& st) {
+        return st == "first" || st == "last" || st == "firstnm" || st == "lastnm";
+    };
+    std::vector<char> spec_is_factor(specs.size(), 0);
+    std::vector<const double*> vp;
+    std::vector<const int32_t*> vc;
+    for (size_t si = 0; si < specs.size(); ++si) {
+        const auto& s = specs[si];
+        if (has(s.var) && col(s.var).is_factor) {
+            if (!is_string_stat(s.statistic))
+                throw EngineError("bad_input", "collapse: string variable " + s.var +
+                                                   " not allowed with statistic " + s.statistic, s.var);
+            spec_is_factor[si] = 1;
+            vp.push_back(nullptr);
+            vc.push_back(col(s.var).codes.data());
+        } else {
+            vp.push_back(require_f64(s.var));
+            vc.push_back(nullptr);
+        }
+    }
+    // The weight (optional). Grouping itself is NOT affected by weights, but an
+    // observation with a missing or zero weight is marked out before the groups
+    // form (Stata's collapse marks them out), so it enters no statistic.
     const double* wcol = nullptr;
     if (!wvar.empty()) {
         wcol = require_f64(wvar);
-        // Validate the WHOLE weight column up front, same rule/rationale as Frame::summarize
-        // (BUG-107: negative weights are a hard error, not just non-integers).
         for (int64_t i = 0; i < n_; ++i) {
             if (std::isnan(wcol[i])) continue;
-            if (wcol[i] < 0.0)
+            if (wcol[i] < 0.0 && wtype != "iw")
                 throw EngineError("bad_input",
-                    "collapse: fweight '" + wvar + "' has a negative value (" +
+                    "collapse: " + std::string(fw ? "fweight" : (wtype == "aw" ? "aweight" : "pweight")) +
+                    " '" + wvar + "' has a negative value (" +
                     std::to_string(wcol[i]) + "); frequency weights must be non-negative", wvar);
-            if (wcol[i] != std::floor(wcol[i]))
+            if (fw && wcol[i] != std::floor(wcol[i]))
                 throw EngineError("bad_input",
                     "collapse: fweight '" + wvar + "' has a non-integer value (" +
                     std::to_string(wcol[i]) + "); Stata requires integer frequency weights", wvar);
         }
+        if (!fw) {
+            std::vector<int64_t> kept;
+            kept.reserve(order.size());
+            for (int64_t i : order)
+                if (!std::isnan(wcol[i]) && wcol[i] != 0.0) kept.push_back(i);
+            order.swap(kept);
+        }
+    }
+    const int64_t nact = static_cast<int64_t>(order.size());
+    if (!by.empty()) {
+        std::stable_sort(order.begin(), order.end(),
+                         [&](int64_t a, int64_t b) { return key_less(K, a, b); });
     }
 
     // group boundaries over `order`
     std::vector<std::pair<int64_t, int64_t>> groups;
     int64_t g0 = 0;
-    while (g0 < n_) {
+    while (g0 < nact) {
         int64_t g1 = g0 + 1;
-        while (g1 < n_ && (by.empty() || key_eq(K, order[g1], order[g0]))) ++g1;
+        while (g1 < nact && (by.empty() || key_eq(K, order[g1], order[g0]))) ++g1;
         groups.emplace_back(g0, g1);
         g0 = g1;
     }
@@ -3655,112 +4427,142 @@ Frame Frame::collapse(const std::vector<CollapseSpec>& specs,
     for (size_t b = 0; b < by.size(); ++b) outcols.push_back({by[b], std::vector<double>(G, NAd)});
     for (const auto& s : specs) outcols.push_back({s.out.empty() ? s.var : s.out, std::vector<double>(G, NAd)});
 
-    // MAXPERF Stage 3 — exception hoist: the per-group aggregation below runs on
-    // ThreadPool workers (a std::function on a std::thread), so a throw escaping it
-    // would std::terminate. Every throw the group loop can raise depends ONLY on the
-    // stat string / weighting (never on a group's data), so pre-validate each spec HERE,
-    // on the caller, reproducing the SAME conditions & messages the inner branches emit.
-    // The inner `else throw`/fweight-EngineError lines are then unreachable (kept as
-    // defensive dead code). Guarded by G>0 so an empty input still returns an empty frame
-    // WITHOUT throwing on a bad stat — byte-identical to the pre-parallel behavior.
+    static const std::unordered_set<std::string> kAggKnown = {
+        "sum", "count", "n", "max", "min", "mean", "sd",
+        "first", "last", "firstnm", "lastnm",
+        "semean", "sebinomial", "sepoisson", "sepoisson_nocap", "rawsum", "percent", "iqr"};
+    // MAXPERF Stage 3 — exception hoist: pre-validate each spec on the caller (the
+    // group loop runs on ThreadPool workers, where a throw would std::terminate).
+    auto pctile_of = [](const std::string& st, double* pp) -> bool {
+        if (st == "median" || st == "p50") { *pp = 50.0; return true; }
+        if (st.size() > 1 && st[0] == 'p') {
+            const std::string pstr = st.substr(1);
+            size_t consumed = 0;
+            try { *pp = std::stod(pstr, &consumed); }
+            catch (const std::exception&) { return false; }
+            return consumed == pstr.size();
+        }
+        return false;
+    };
     if (G > 0) {
-        static const std::unordered_set<std::string> kAggKnown = {
-            "sum", "count", "n", "max", "min", "mean", "sd",
-            "first", "last", "firstnm", "lastnm"};
         for (const auto& s : specs) {
             const std::string& st = s.statistic;
-            if (!wvar.empty()) {
-                // weighted path: median/p50/p<NN> are pre-rejected wholesale (mirrors the
-                // inner guard, which fires for ANY 'p…' token before parsing it).
-                if (st == "median" || st == "p50" || (st.size() > 1 && st[0] == 'p'))
-                    throw EngineError("bad_input",
-                        "collapse: fweight not supported with median/percentile stats yet (stat '" +
-                        st + "')", wvar);
-                if (!kAggKnown.count(st)) throw std::runtime_error("collapse: unknown stat '" + st + "'");
-            } else {
-                if (kAggKnown.count(st) || st == "median" || st == "p50") continue;
-                if (st.size() > 1 && st[0] == 'p') {
-                    // strict-consume the percentile number (C1-F11 discipline), identical to
-                    // the inner parse — `p2x5` must reject, not silently read as p2.
-                    const std::string pstr = st.substr(1);
-                    size_t consumed = 0;
-                    double pp;
-                    try { pp = std::stod(pstr, &consumed); (void)pp; }
-                    catch (const std::exception&) { throw std::runtime_error("collapse: unknown stat '" + st + "'"); }
-                    if (consumed != pstr.size()) throw std::runtime_error("collapse: unknown stat '" + st + "'");
-                    continue;
-                }
-                throw std::runtime_error("collapse: unknown stat '" + st + "'");
-            }
+            double pp;
+            if (kAggKnown.count(st) || pctile_of(st, &pp)) continue;
+            throw std::runtime_error("collapse: unknown stat '" + st + "'");
         }
     }
+    // percent's denominator: the whole sample's nonmissing count (or weight) of
+    // the spec's variable (Stata's collapse, _percent).
+    std::vector<double> pct_total(specs.size(), 0.0);
+    for (size_t si = 0; si < specs.size(); ++si) {
+        if (specs[si].statistic != "percent" || spec_is_factor[si]) continue;
+        double t = 0.0;
+        for (int64_t q = 0; q < nact; ++q) {
+            const int64_t r = order[q];
+            if (std::isnan(vp[si][r])) continue;
+            if (wcol != nullptr) {
+                if (std::isnan(wcol[r]) || wcol[r] == 0.0) continue;
+                t += wcol[r];
+            } else {
+                t += 1.0;
+            }
+        }
+        pct_total[si] = t;
+    }
 
-    // MAXPERF Stage 3 — morsel-parallel collapse, BY GROUP. Each group gi is aggregated
-    // WHOLE by one worker, visiting its rows in the SAME order[a..b) sequence as the serial
-    // path, and writes only its own disjoint output cells outcols[*][gi]. So every float
-    // accumulation (sum/mean/sd) keeps its exact per-group association — the result is
-    // BIT-IDENTICAL regardless of how ThreadPool splits [0,G) across workers (①-gate:
-    // test_morsel_determinism). ThreadPool::run falls back to serial for G<2 / 1 core /
-    // nested, so tiny/degenerate collapses are byte-unchanged.
-    // BUG-394 (2026-09-02): a GROUP floor — under 16 groups the fan-out is pure
-    // dispatch overhead (each group is one unit of work). Bit-identical either way.
+    // MAXPERF Stage 3 — morsel-parallel collapse, BY GROUP (bit-identical to
+    // serial: each group is aggregated whole by one worker, in order[a..b)).
     auto collapse_body = [&](int64_t glo, int64_t ghi, int) {
       for (int64_t gi = glo; gi < ghi; ++gi) {
         int64_t a = groups[gi].first, b = groups[gi].second;
-        // K[bc][order[a]] is byte-identical to the old require_f64(by[bc])[order[a]] for
-        // a numeric by-column (cols_as_double's non-factor branch is literally c.f64[i]);
-        // for a factor by-column it's the ORIGINAL int32 code cast to double — rebuilt
-        // into a fresh factor dictionary in the final assembly below.
-        for (size_t bc = 0; bc < by.size(); ++bc) outcols[bc].second[gi] = K[bc][order[a]];
+        for (size_t bc = 0; bc < by.size(); ++bc)
+            outcols[bc].second[gi] = by_is_factor[bc] ? static_cast<double>(col(by[bc]).codes[order[a]])
+                                                      : K[bc][order[a]];
         for (size_t si = 0; si < specs.size(); ++si) {
             const std::string& st = specs[si].statistic;
             double agg = NAd;
+            if (spec_is_factor[si]) {
+                // A string: the code of the first/last (nonmissing) row; "" is missing.
+                const FrameColumn& fc = col(specs[si].var);
+                auto is_missing = [&](int64_t r) {
+                    const int32_t c = vc[si][r];
+                    return c < 0 || fc.levels[static_cast<size_t>(c)].empty();
+                };
+                auto included = [&](int64_t r) {
+                    return wcol == nullptr || (!std::isnan(wcol[r]) && wcol[r] != 0.0);
+                };
+                int64_t pick = -1;
+                if (st == "first" || st == "firstnm") {
+                    for (int64_t q = a; q < b; ++q) {
+                        const int64_t r = order[q];
+                        if (!included(r)) continue;
+                        if (pick < 0) pick = r;
+                        if (st == "first" || !is_missing(r)) { pick = r; break; }
+                    }
+                } else {
+                    for (int64_t q = b; q > a; --q) {
+                        const int64_t r = order[q - 1];
+                        if (!included(r)) continue;
+                        if (pick < 0) pick = r;
+                        if (st == "last" || !is_missing(r)) { pick = r; break; }
+                    }
+                }
+                agg = (pick < 0 || is_missing(pick)) ? -1.0 : static_cast<double>(vc[si][pick]);
+                outcols[by.size() + si].second[gi] = agg;
+                continue;
+            }
+            double pp = 0.0;
             if (wvar.empty()) {
-                // ---- unweighted path: BYTE-UNCHANGED from pre-fweight cobra ----
+                // ---- unweighted path: existing statistics BYTE-UNCHANGED ----
                 std::vector<double> s;
                 for (int64_t q = a; q < b; ++q) { double x = vp[si][order[q]]; if (!std::isnan(x)) s.push_back(x); }
                 const int64_t cnt = static_cast<int64_t>(s.size());
                 if (st == "sum") { double t = 0; for (double x : s) t += x; agg = t; }
+                else if (st == "rawsum") { double t = 0; for (double x : s) t += x; agg = t; }
                 else if (st == "count" || st == "n") agg = static_cast<double>(cnt);
+                else if (st == "percent") { if (pct_total[si] > 0) agg = (static_cast<double>(cnt) / pct_total[si]) * 100.0; }
                 else if (st == "max") { if (cnt) agg = *std::max_element(s.begin(), s.end()); }
                 else if (st == "min") { if (cnt) agg = *std::min_element(s.begin(), s.end()); }
                 else if (st == "mean") { if (cnt) { double t = 0; for (double x : s) t += x; agg = t / cnt; } }
-                else if (st == "sd") {
+                else if (st == "sd" || st == "semean") {
                     if (cnt >= 2) { double t = 0; for (double x : s) t += x; double mn = t / cnt;
-                        double ss = 0; for (double x : s) ss += (x - mn) * (x - mn); agg = std::sqrt(ss / (cnt - 1)); }
+                        double ss = 0; for (double x : s) ss += (x - mn) * (x - mn);
+                        agg = std::sqrt(ss / (cnt - 1));
+                        if (st == "semean") agg = (1.0 / std::sqrt(static_cast<double>(cnt))) * agg; }
+                } else if (st == "sebinomial") {
+                    bool ok = true;
+                    for (double x : s) if (x != 0.0 && x != 1.0) { ok = false; break; }
+                    if (ok && cnt) { double t = 0; for (double x : s) t += x; double m = t / cnt;
+                        agg = std::sqrt((m * (1.0 - m)) / static_cast<double>(cnt)); }
+                } else if (st == "sepoisson" || st == "sepoisson_nocap") {
+                    // Stata's built-in collapse saturates k at 2^31 (cz_c_sepoisson_g_v6c
+                    // sqrt(2^31)/4); gtools does not (cz_g_sepoisson_g_v6c), and asks
+                    // for "sepoisson_nocap".
+                    bool ok = true;
+                    for (double x : s) if (x < 0.0) { ok = false; break; }
+                    if (ok && cnt) { double t = 0; for (double x : s) t += x; double m = t / cnt;
+                        double k = std::floor(m * static_cast<double>(cnt) + 0.5);
+                        if (st == "sepoisson" && k > 2147483648.0) k = 2147483648.0;
+                        agg = std::sqrt(k) / static_cast<double>(cnt); }
                 } else if (st == "first") { agg = vp[si][order[a]]; }        // RAW: first row, missing included
                 else if (st == "last") { agg = vp[si][order[b - 1]]; }        // RAW: last row, missing included
-                else if (st == "firstnm") { if (cnt) agg = s.front(); }       // first NON-missing value
-                else if (st == "lastnm") { if (cnt) agg = s.back(); }         // last  NON-missing value
-                else if (st == "median" || st == "p50") { if (cnt) { std::sort(s.begin(), s.end()); agg = stata_pctile(s, 50.0); } }
-                else if (st.size() > 1 && st[0] == 'p') {
-                    // BUG-112(4): strict-consume the percentile number (matches the C1-F11
-                    // literal discipline used in the expression evaluator) — `p2x5` must
-                    // reject, not silently read as p2.
-                    const std::string pstr = st.substr(1);
-                    size_t consumed = 0;
-                    double pp;
-                    try { pp = std::stod(pstr, &consumed); }
-                    catch (const std::exception&) { throw std::runtime_error("collapse: unknown stat '" + st + "'"); }
-                    if (consumed != pstr.size()) throw std::runtime_error("collapse: unknown stat '" + st + "'");
-                    if (cnt) { std::sort(s.begin(), s.end()); agg = stata_pctile(s, pp); }
-                } else throw std::runtime_error("collapse: unknown stat '" + st + "'");
+                else if (st == "firstnm") { agg = cnt ? s.front() : vp[si][order[a]]; }  // all missing: the first row's own missing
+                else if (st == "lastnm") { agg = cnt ? s.back() : vp[si][order[b - 1]]; }
+                else if (st == "iqr") { if (cnt) { std::sort(s.begin(), s.end()); agg = stata_pctile(s, 75.0) - stata_pctile(s, 25.0); } }
+                else if (pctile_of(st, &pp)) { if (cnt) { std::sort(s.begin(), s.end()); agg = stata_pctile(s, pp); } }
+                else throw std::runtime_error("collapse: unknown stat '" + st + "'");
             } else {
-                // ---- weighted path (Stata fweight), per group ----
-                // count=Sum(w), sum=Sum(w*x), mean=Sum(w*x)/Sum(w), sd denom Sum(w)-1;
-                // min/max/first/last stay plain unweighted row values (weight only gates
-                // inclusion — a row with missing wvar is excluded here exactly like a row with
-                // missing `var`). Percentile stats need a replicate algorithm — out of scope.
-                if (st == "median" || st == "p50" || (st.size() > 1 && st[0] == 'p'))
-                    throw EngineError("bad_input",
-                        "collapse: fweight not supported with median/percentile stats yet (stat '" +
-                        st + "')", wvar);
+                // ---- weighted path, per group ----
+                // fw (byte-unchanged for the statistics it always served):
+                // count=Sum(w), sum=Sum(w*x), mean=Sum(w*x)/Sum(w), sd denom Sum(w)-1.
+                // aw rescales the weights to sum to the group's count (remakew in
+                // Stata's collapse); iw/pw use the raw weights. min/max/
+                // first/last stay plain unweighted row values among included rows.
                 std::vector<double> s, sw;  // parallel: s[i] is the value, sw[i] its weight
                 for (int64_t q = a; q < b; ++q) {
                     double x = vp[si][order[q]];
                     double wi = wcol[order[q]];
-                    // BUG-107: a zero-frequency (w==0) row is not in the dataset — exclude it
-                    // from min/max (and everything). It already contributed 0 to sum/count/mean.
                     if (std::isnan(x) || std::isnan(wi) || wi == 0.0) continue;
                     s.push_back(x);
                     sw.push_back(wi);
@@ -3771,24 +4573,73 @@ Frame Frame::collapse(const std::vector<CollapseSpec>& specs,
                     sumw += sw[static_cast<size_t>(i)];
                     sumwx += sw[static_cast<size_t>(i)] * s[static_cast<size_t>(i)];
                 }
-                if (st == "sum") agg = sumwx;
-                else if (st == "count" || st == "n") agg = sumw;
+                // remakew: w* = w*obs/Sum(w), computed only where aw needs it.
+                auto normalised = [&]() {
+                    std::vector<double> ws(static_cast<size_t>(cnt));
+                    for (int64_t i = 0; i < cnt; ++i)
+                        ws[static_cast<size_t>(i)] = sw[static_cast<size_t>(i)] * static_cast<double>(cnt) / sumw;
+                    return ws;
+                };
+                // Weighted sd-type spread: sqrt(Sum(w(x-m)^2)/(Sum(w)-1)).
+                auto wspread = [&](const std::vector<double>& w) -> double {
+                    double tw = 0.0, twx = 0.0;
+                    for (int64_t i = 0; i < cnt; ++i) { tw += w[static_cast<size_t>(i)]; twx += w[static_cast<size_t>(i)] * s[static_cast<size_t>(i)]; }
+                    if (cnt == 0 || tw == 0.0) return NAd;
+                    const double mn = twx / tw;
+                    double ss = 0.0;
+                    for (int64_t i = 0; i < cnt; ++i) { double d = s[static_cast<size_t>(i)] - mn; ss += w[static_cast<size_t>(i)] * d * d; }
+                    const double den = tw - 1.0;
+                    if (!(den > 0.0)) return NAd;
+                    return std::sqrt(ss / den);
+                };
+                if (st == "sum") {
+                    if (wtype == "aw") { const auto ws = normalised(); double t = 0; for (int64_t i = 0; i < cnt; ++i) t += ws[static_cast<size_t>(i)] * s[static_cast<size_t>(i)]; agg = t; }
+                    else agg = sumwx;
+                }
+                else if (st == "rawsum") { double t = 0; for (double x : s) t += x; agg = t; }
+                else if (st == "count" || st == "n") agg = (wtype == "aw") ? static_cast<double>(cnt) : sumw;
+                else if (st == "percent") { if (pct_total[si] != 0.0) agg = (sumw / pct_total[si]) * 100.0; }
                 else if (st == "max") { if (cnt) agg = *std::max_element(s.begin(), s.end()); }
                 else if (st == "min") { if (cnt) agg = *std::min_element(s.begin(), s.end()); }
-                else if (st == "mean") { if (sumw > 0.0) agg = sumwx / sumw; }
+                else if (st == "mean") { if (sumw != 0.0 && cnt) agg = sumwx / sumw; }
                 else if (st == "sd") {
-                    if (sumw >= 2.0) {
-                        double mn = sumwx / sumw, ss = 0;
-                        for (int64_t i = 0; i < cnt; ++i) {
-                            double d = s[static_cast<size_t>(i)] - mn;
-                            ss += sw[static_cast<size_t>(i)] * d * d;
+                    if (fw) {
+                        if (sumw >= 2.0) {
+                            double mn = sumwx / sumw, ss = 0;
+                            for (int64_t i = 0; i < cnt; ++i) {
+                                double d = s[static_cast<size_t>(i)] - mn;
+                                ss += sw[static_cast<size_t>(i)] * d * d;
+                            }
+                            agg = std::sqrt(ss / (sumw - 1.0));
                         }
-                        agg = std::sqrt(ss / (sumw - 1.0));
+                    } else if (wtype == "aw") {
+                        agg = wspread(normalised());
+                    } else {
+                        agg = wspread(sw);
                     }
+                } else if (st == "semean") {
+                    // fw: obs = Sum(w); aw: obs = the count over rescaled weights.
+                    if (wtype == "aw") {
+                        const double sp = wspread(normalised());
+                        if (!std::isnan(sp)) agg = (1.0 / std::sqrt(static_cast<double>(cnt))) * sp;
+                    } else {
+                        const double sp = wspread(sw);
+                        if (!std::isnan(sp) && sumw > 0.0) agg = (1.0 / std::sqrt(sumw)) * sp;
+                    }
+                } else if (st == "sebinomial") {
+                    bool ok = true;
+                    for (double x : s) if (x != 0.0 && x != 1.0) { ok = false; break; }
+                    if (ok && cnt && sumw > 0.0) { const double m = sumwx / sumw;
+                        agg = std::sqrt((m * (1.0 - m)) / std::trunc(sumw)); }
+                } else if (st == "sepoisson" || st == "sepoisson_nocap") {
+                    bool ok = true;
+                    for (double x : s) if (x < 0.0) { ok = false; break; }
+                    if (ok && cnt && sumw > 0.0) { const double obs = std::trunc(sumw); const double m = sumwx / sumw;
+                        double k = std::floor(m * obs + 0.5);
+                        if (st == "sepoisson" && k > 2147483648.0) k = 2147483648.0;
+                        agg = std::sqrt(k) / obs; }
                 } else if (st == "first" || st == "last") {
-                    // RAW first/last row among fweight-INCLUDED rows (missing x kept; a
-                    // missing-weight OR zero-weight row is dropped by fweight, as if absent
-                    // from the data — BUG-107).
+                    // RAW first/last row among weight-INCLUDED rows (missing x kept).
                     for (int64_t q = a; q < b; ++q) {
                         double wi = wcol[order[q]];
                         if (std::isnan(wi) || wi == 0.0) continue;
@@ -3796,8 +4647,23 @@ Frame Frame::collapse(const std::vector<CollapseSpec>& specs,
                         if (st == "first") break;
                     }
                 }
-                else if (st == "firstnm") { if (cnt) agg = s.front(); }
-                else if (st == "lastnm") { if (cnt) agg = s.back(); }
+                else if (st == "firstnm" || st == "lastnm") {
+                    if (cnt) agg = st == "firstnm" ? s.front() : s.back();
+                    else {
+                        for (int64_t q = a; q < b; ++q) {
+                            double wi = wcol[order[q]];
+                            if (std::isnan(wi) || wi == 0.0) continue;
+                            agg = vp[si][order[q]];
+                            if (st == "firstnm") break;
+                        }
+                    }
+                }
+                else if (st == "iqr" || pctile_of(st, &pp)) {
+                    const GroupWeightedPercentiles percentiles(s, sw, sumw);
+                    if (percentiles.defined())
+                        agg = st == "iqr" ? percentiles.at(75.0) - percentiles.at(25.0)
+                                          : percentiles.at(pp);
+                }
                 else throw std::runtime_error("collapse: unknown stat '" + st + "'");
             }
             outcols[by.size() + si].second[gi] = agg;
@@ -3811,18 +4677,20 @@ Frame Frame::collapse(const std::vector<CollapseSpec>& specs,
     out.cols_.reserve(outcols.size());
     for (size_t oc = 0; oc < outcols.size(); ++oc) {
         auto& nc = outcols[oc];
-        if (oc < by.size() && by_is_factor[oc]) {
+        const bool by_factor = oc < by.size() && by_is_factor[oc];
+        const bool spec_factor = oc >= by.size() && spec_is_factor[oc - by.size()];
+        if (by_factor || spec_factor) {
             // Rebuild a FRESH, self-consistent factor dictionary from just the codes
             // actually present among the G output rows, in FIRST-SEEN output-row order
             // (same convention `cobra convert --factor` produces) — NOT alphabetical
             // (contrast egen_group(), which intentionally re-sorts alphabetically).
-            const FrameColumn& src_col = col(by[oc]);
+            const FrameColumn& src_col = by_factor ? col(by[oc]) : col(specs[oc - by.size()].var);
             std::vector<int32_t> new_codes(static_cast<size_t>(G));
             std::vector<std::string> new_levels;
             std::unordered_map<std::string, int32_t> dict;
             for (int64_t gi = 0; gi < G; ++gi) {
                 double raw = nc.second[static_cast<size_t>(gi)];
-                int32_t orig_code = (raw < 0.0) ? -1 : static_cast<int32_t>(std::llround(raw));
+                int32_t orig_code = (std::isnan(raw) || raw < 0.0) ? -1 : static_cast<int32_t>(std::llround(raw));
                 if (orig_code < 0) { new_codes[static_cast<size_t>(gi)] = -1; continue; }
                 const std::string& label = src_col.levels[static_cast<size_t>(orig_code)];
                 auto it = dict.find(label);

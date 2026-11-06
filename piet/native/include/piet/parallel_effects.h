@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // P9 automode · L2 — the effect table and the approval predicate's evidence base.
 //
 // THE SAFETY AXIOM (design brief §10.2, User-ratified): the recognizer says

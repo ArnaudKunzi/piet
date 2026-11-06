@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // AER-SCOPE1 bundle J (GRAPH-X, 2026-09-04) -- the community graph and geo
 // verbs the ninety-paper corpus reaches for around its figures:
 //
@@ -108,6 +110,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -205,9 +208,23 @@ const piet::eval::OptVocab& kVocabGeonear = piet::eval::registerOptVocab(
 // a log x scale; all three are real plot content this build does not draw, and
 // drawing the plot without them is answering a different question, so they are
 // refused rather than ignored.
+// cdfplot.ado 1.04 hands every option it does not own to its `twoway ...,
+// `goptions'`, so the graph-level twoway options PIET's twoway takes are known
+// here too (StataBE 19.5, BUG-1521: `cdfplot x, nodraw`, xlabel(), scheme(),
+// ysize(), xscale(), note(), graphregion(), subtitle(), caption(), xline(),
+// plotregion(), aspectratio() are rc 0; a plot option such as lcolor() or
+// msymbol() is twoway's r(198) "option lcolor() not allowed"). runCdfplot names
+// the ones it does not draw. xti/yti are twoway's spellings of xtitle/ytitle,
+// which xtick/ytick would otherwise make ambiguous.
 const piet::eval::OptVocab& kVocabCdfplot = piet::eval::registerOptVocab(
-    {"cdfplot"}, {{"by", "title", "xtitle", "ytitle", "ylabel", "legend", "name", "saving"},
-                  {"normal", "exponential", "xlog"}});
+    {"cdfplot"}, {{"by", "title", "xtitle", "ytitle", "ylabel", "legend", "name", "saving",
+                   "nodraw", "subtitle", "note", "caption", "ttitle", "xlabel", "tlabel", "xmlabel",
+                   "ymlabel", "tmlabel", "xtick", "ytick", "ttick", "xmtick", "ymtick", "xscale",
+                   "yscale", "tscale", "xline", "yline", "tline", "scheme", "graphregion",
+                   "plotregion", "xsize", "ysize", "fxsize", "fysize", "aspectratio", "scale", "text",
+                   "ttext"},
+                  {"normal", "exponential", "xlog"},
+                  {{"xti", "xtitle"}, {"yti", "ytitle"}, {"xlabels", "xlabel"}, {"ylabels", "ylabel"}}});
 
 // event_plot. `alpha()` becomes coefplot's `level()`; `stub_lag`/`stub_lead`
 // select and order the coefficients; `together` and the four cosmetic options
@@ -224,6 +241,12 @@ const piet::eval::OptVocab& kVocabEventPlot = piet::eval::registerOptVocab(
 namespace piet::handlers {
 
 using ojson = nlohmann::ordered_json;
+
+// Defined in graph_m4.cpp: the legend block twoway builds from legend() text
+// (quote- and paren-aware; `off` only as a standalone top-level token);
+// keyText(i) is the text of plot i's key (nullopt: no such plot).
+ojson legendBlock(const std::string& legendText,
+                  const std::function<std::optional<std::string>(int64_t)>& keyText, bool* hasOrder);
 
 namespace {
 
@@ -577,6 +600,11 @@ ojson newVarGuard(SessionState& session, const std::string& verb, const std::str
   if (!strutil::isValidStataIdentifier(newvar))
     return gxSyntax(verb + ": invalid variable name `" + newvar + "' — " +
                     strutil::stataIdentifierRuleText());
+  // BUG-1120: nor is a reserved name one (`geodist ..., gen(_cons)' is "_cons
+  // invalid varname" r(198), StataBE 19.5).
+  if (strutil::isReservedVarName(newvar))
+    return ojson(eval::errorBlock("syntax_error", newvar + " invalid varname", std::nullopt,
+                                  std::nullopt, std::nullopt, "r(198)"));
   Datastore* ds = nullptr;
   try {
     ds = session.datastore();
@@ -704,7 +732,7 @@ MaskResult qualifierMask(SessionState& session, const std::string& verb,
 // 321.2187, not 325.0.
 constexpr double kPi = 3.14159265358979323846;
 // 6371 EXACTLY, not the IUGG mean 6371.0088. Read out of the packages
-// themselves on 2026-09-04: `geodist.ado:150` and `geonear.ado:110` both write
+// themselves on 2026-09-04: `geodist` and `geonear` both write
 // `local radius 6371` / `scalar R = 6371`. The plan drafted the IUGG value, and
 // on the Seoul-Busan pair the two radii differ by 0.000444 km -- far too small
 // to see in any rendered output and exactly the kind of constant that gets
@@ -712,7 +740,7 @@ constexpr double kPi = 3.14159265358979323846;
 // contract; the more "correct" one would be a silent parity break.
 constexpr double kSphereRadiusKm = 6371.0;
 // BUG-463 (2026-09-09): this was `0.621371192`, a TRUNCATED reciprocal, and
-// geodist.ado:138 writes `local km_to_miles / 1.609344` -- a DIVISION by the
+// geodist writes `local km_to_miles / 1.609344` -- a DIVISION by the
 // exact international-mile definition, used at :160, :169 and :294. The two
 // differ at relative 3.8e-11: on the Seoul-Busan pair StataBE answers
 // 199.59602161268270 and the truncated constant gave 199.59602153644656.
@@ -1290,9 +1318,9 @@ ojson runGeonear(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!readGeoMode(parsed.opts, kCmd, /*allowSphere=*/false, &mode, &modeErr)) return modeErr;
   // geonear's DEFAULT IS THE SPHERE, and `ellipsoid` opts IN -- the opposite of
   // `geodist`, whose default is the ellipsoid. Read out of the package on
-  // 2026-09-04 rather than assumed: `geonear.ado:75-123` takes the ellipsoid
+  // 2026-09-04 rather than assumed: `geonear` takes the ellipsoid
   // branch only when an ellipsoid option is present and otherwise sets
-  // `local sphere 1` with `scalar R = 6371`, while `geodist.ado:146` takes
+  // `local sphere 1` with `scalar R = 6371`, while `geodist` takes
   // haversine only under `sphere`/`radius()` and is WGS84 Vincenty otherwise.
   //
   // Two sibling commands from the same author defaulting to different earth
@@ -1391,7 +1419,7 @@ ojson runGeonear(const eval::ParsedCommand& parsed, SessionState& session) {
 
   // ---- the generated column names, all guarded before the first write ----
   // BUG-418: the default stem is the LITERAL `nid`, not the neighbours' id
-  // variable. geonear.ado:39 is `if "`genstub'" == "" local genstub nid`, and the
+  // variable. geonear is `if "`genstub'" == "" local genstub nid`, and the
   // package's help documents `nid`/`km_to_nid` "unless genstub()". Taking the
   // variable name was a deliberate open decision here (the note below used to say
   // so); the 2026-09-06 oracle settled it, and taking the variable name is wrong
@@ -1496,7 +1524,7 @@ ojson runGeonear(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   session.load(cur);
 
-  // BUG-420: Stata returns the master SORTED BY BASEID. geonear.ado:186-193
+  // BUG-420: Stata returns the master SORTED BY BASEID. geonear
   // restores the master, sorts it by baseid and merges the results onto it, so
   // observation 1 afterwards is the lowest base id — not whatever row order the
   // caller had. This handler appended in place, which is a silent divergence
@@ -1661,6 +1689,7 @@ ojson runCdfplot(const eval::ParsedCommand& parsed, SessionState& session) {
 
   ojson layers = ojson::array();
   ojson legendOrder = ojson::array();
+  std::vector<std::string> keyLabels;  // each drawn layer's key text
   double xMin = std::numeric_limits<double>::infinity();
   double xMax = -std::numeric_limits<double>::infinity();
   int64_t nObs = 0;
@@ -1681,6 +1710,7 @@ ojson runCdfplot(const eval::ParsedCommand& parsed, SessionState& session) {
     if (byVar.has_value() && !byVar->empty()) {
       legendOrder.push_back(ojson::array({static_cast<int64_t>(layers.size()), groupLabels[g]}));
     }
+    keyLabels.push_back(groupLabels[g]);
     layers.push_back(lyr);
     nObs += static_cast<int64_t>(pts.size());
   }
@@ -1699,10 +1729,10 @@ ojson runCdfplot(const eval::ParsedCommand& parsed, SessionState& session) {
   block["type"] = "graph";
   block["kind"] = "twoway";
   block["title"] = optStr(parsed.opts, "title").value_or("Empirical CDF of " + var);
-  block["subtitle"] = std::string();
+  block["subtitle"] = optStr(parsed.opts, "subtitle").value_or(std::string());  // as twoway's
   block["x_label"] = optStr(parsed.opts, "xtitle").value_or(xDefault);
   block["y_label"] = optStr(parsed.opts, "ytitle").value_or(std::string("Cumulative probability"));
-  block["note"] = std::string();
+  block["note"] = optStr(parsed.opts, "note").value_or(std::string());  // as twoway's
   block["x_min"] = xMin;
   block["x_max"] = xMax;
   block["y_min"] = 0.0;
@@ -1721,14 +1751,19 @@ ojson runCdfplot(const eval::ParsedCommand& parsed, SessionState& session) {
     block["axes"] = axes;
   }
   {
-    ojson legend;
-    legend["order"] = legendOrder;
-    legend["cols"] = nullptr;
-    legend["size"] = nullptr;
-    std::string lg = lowerOf(optStr(parsed.opts, "legend").value_or(std::string()));
-    legend["off"] = hasFlag(parsed.opts, "legend") && optStr(parsed.opts, "legend").has_value()
-                        ? (lg.find("off") != std::string::npos)
-                        : false;
+    // cdfplot.ado hands legend() to its twoway (`goptions'), so it reads as
+    // twoway's does -- order() over the group lines included (StataBE 19.5,
+    // BUG-1309: `cdfplot x, by(g) legend(order(2 "two" 1 "one"))` rc 0); `off`
+    // is a top-level token, not a substring (legend(order(1 "Payoff")) keeps
+    // its legend). Without order() the keys are the groups in order.
+    bool hasOrder = false;
+    ojson legend = legendBlock(optStr(parsed.opts, "legend").value_or(std::string()),
+                               [&](int64_t idx) -> std::optional<std::string> {
+                                 if (idx < 0 || static_cast<size_t>(idx) >= keyLabels.size()) return std::nullopt;
+                                 return keyLabels[static_cast<size_t>(idx)];
+                               },
+                               &hasOrder);
+    if (!hasOrder) legend["order"] = legendOrder;
     block["legend"] = legend;
   }
   block["name"] = nullptr;  // filled by the dispatcher's name() capture (BS-011)
@@ -1736,6 +1771,22 @@ ojson runCdfplot(const eval::ParsedCommand& parsed, SessionState& session) {
   block["suppressed"] = session.graphicsOff;
 
   appendBlockNote(block, "(cdfplot: drawn as a line, not a step function)");
+  {
+    // The twoway options this block does not draw (BUG-1521), named as the twoway
+    // arm names its own (dispatcher.cpp graphAcceptedNotApplied).
+    static const std::unordered_set<std::string> kApplied = {
+        "by", "title", "subtitle", "xtitle", "ytitle", "note", "ylabel", "legend", "name", "saving"};
+    std::vector<std::string> noted;
+    for (const auto& kv : parsed.opts) {
+      if (kApplied.count(kv.first) == 0 && std::find(noted.begin(), noted.end(), kv.first) == noted.end())
+        noted.push_back(kv.first);
+    }
+    if (!noted.empty()) {
+      appendBlockNote(block, "(" + kCmd + ": " + joinWith(noted, ", ") +
+                                 " accepted and not applied — this build draws the plot without " +
+                                 (noted.size() == 1 ? "it" : "them") + ".)");
+    }
+  }
   if (layers.empty()) {
     // Plan edge case: zero observations is an EMPTY plot plus a note, never an
     // error -- a do-file that plots an empty subgroup keeps running.

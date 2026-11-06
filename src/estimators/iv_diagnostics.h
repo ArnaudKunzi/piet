@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — classic (i.i.d.) IV postestimation diagnostics after 2SLS:
 //   estat endogenous : Durbin χ² and Wu-Hausman F (Durbin-Wu-Hausman test)
 //   estat overid     : Sargan χ² and Basmann χ² overidentification tests

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // See piet/column_fetch.h for why this pair is shared rather than replicated.
 #include "piet/column_fetch.h"
 #include "piet/translate.h"
@@ -10,6 +12,7 @@
 
 #include "piet/cobra_session.h"
 #include "piet/datastore.h"
+#include "piet/eval/exprfns.h"  // eval::kRxName (the Unicode name rule, core/ident.h)
 #include "piet/session_state.h"
 #include "io/columnar.h"
 #include "io/win_compat.h"
@@ -66,7 +69,9 @@ std::optional<std::vector<std::string>> referencedColumns(
 
   std::set<std::string> want;
   if (!alsoInclude.empty() && known.count(alsoInclude)) want.insert(alsoInclude);
-  static const std::regex reIdent(R"([A-Za-z_]\w*)");
+  // A Unicode name is one name (core/ident.h): `strlen(ملاحظات) > x` must fetch
+  // ملاحظات, not only x.
+  static const std::regex reIdent(eval::kRxName);
   for (const std::string* e : exprs) {
     if (e == nullptr || e->empty()) continue;
     std::string masked = maskStringLiterals(*e);

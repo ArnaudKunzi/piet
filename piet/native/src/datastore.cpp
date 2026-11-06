@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "piet/datastore.h"
 
 #include <filesystem>
@@ -79,7 +81,9 @@ void Datastore::finishConstruct() {
     if (!ec) counters::addColumnarBytes(static_cast<int64_t>(sz));
   }
   names_.reserve(ds_.columns().size());
-  for (const auto& c : ds_.columns()) names_.push_back(c.name);
+  for (const auto& c : ds_.columns()) {
+    if (!isHiddenColumn(c.name)) names_.push_back(c.name);  // e(sample) T2 (datastore.h)
+  }
 }
 
 
@@ -181,7 +185,10 @@ VarInfo Datastore::buildVarInfo(const std::string& name) const {
   // key was absent (pre-A0 file or a format-less writer) — leave VarInfo's
   // own "%9.0g" member-initializer default in place rather than overwrite it
   // with "" (A0 law: "" = unknown, never a fabricated value).
-  if (!c.format.empty()) info.format = c.format;
+  if (!c.format.empty()) {
+    info.format = c.format;
+    info.formatStated = true;
+  }
   // BUG-198: the header's optional per-column `label` key reaches the card the
   // same way. VarInfo::label has NO default (unlike format's "%9.0g"), so an
   // absent key and an unstated label are the same empty string here — which is
@@ -216,6 +223,29 @@ VarInfo Datastore::varinfo(const std::string& name) {
   throw std::runtime_error("variable not found: " + name);
 }
 
+std::vector<VarInfo> Datastore::formatCard(
+    const std::optional<std::vector<std::string>>& vars) const {
+  std::vector<VarInfo> out;
+  auto add = [&](const std::string& name) {
+    if (!ds_.has(name)) return;
+    const cecon::Column& c = ds_.col(name);
+    VarInfo info;
+    info.name = name;
+    info.dtype = (c.dtype == cecon::DType::Factor) ? "factor" : "f64";
+    if (!c.format.empty()) {  // buildVarInfo's rule: "" = the file stated nothing
+      info.format = c.format;
+      info.formatStated = true;
+    }
+    out.push_back(std::move(info));
+  };
+  if (vars.has_value()) {
+    for (const auto& n : *vars) add(n);
+  } else {
+    for (const auto& n : names_) add(n);
+  }
+  return out;
+}
+
 nlohmann::ordered_json Datastore::browse(
     int64_t offset, int64_t limit, const std::optional<std::vector<std::string>>& vars,
     const std::vector<std::pair<std::string, std::vector<std::pair<int, std::string>>>>&
@@ -233,11 +263,10 @@ nlohmann::ordered_json Datastore::browse(
     return nullptr;
   };
 
-  // BS-005/D6: format_map lookup helper (varname -> %fmt string). Sparse —
-  // nullptr for every variable that never had `format VAR %fmt` applied in
-  // this session, which is why the "format" key below is conditional (never
-  // synthesizes a fabricated default like VarInfo's own "%9.0g" member-
-  // initializer would).
+  // format_map lookup helper (varname -> %fmt string): the caller's resolved
+  // formats (SessionState::displayFormatMap); nullptr for a variable the map
+  // does not name, which falls back to the file's own format below and never
+  // to a fabricated default like VarInfo's own "%9.0g" member-initializer.
   auto lookupFmt = [&](const std::string& name) -> const std::string* {
     for (const auto& [k, v] : formatMap) {
       if (k == name) return &v;

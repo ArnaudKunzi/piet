@@ -1,8 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // app.js — central state, event orchestration, keyboard, boot.
 // Single source of truth; panels/console/grid subscribe via CustomEvents.
 
 import { HTTPClient }  from './api.js';
-import { initConsole, appendBlock, appendBlocks, clearConsole, getGraphs, getGraphGalleryElidedCount, setMemoryBudgetMb, clearGraphGallery } from './console.js';
+import { initConsole, appendBlock, appendBlocks, clearConsole, endDisplayLine, getGraphEntries, getGraphById, getResidentGraph, getGraphSpilledCount, getGraphDroppedCount, setMemoryBudgetMb, clearGraphGallery } from './console.js';
 import { renderGraph } from './graph.js';
 import { initPanels, updateVariables, appendHistory, loadHistory, getVarlist } from './panels.js';
 import { VirtualizedGrid, setGridMemoryBudgetMb } from './grid.js';
@@ -54,7 +56,7 @@ const SPLIT_W_MIN = 0.25;
 const SPLIT_W_MAX = 4;
 
 // B10 (P8-S7): Graphics gallery full-view index. -1 = gallery grid (the
-// default); >=0 = single-graph full view, indexing getGraphs().
+// default); >=0 = single-graph full view, indexing getGraphEntries().
 let _graphicsFullIndex = -1;
 
 // B3 (P8-S6): Recent files — last RECENT_MAX opened data/do files, persisted
@@ -540,7 +542,7 @@ export async function init() {
       menuDropdowns.forEach(d => { if (d !== dropdown) d.classList.remove('open'); });
       dropdown.classList.toggle('open');
     });
-    // A12: a real item click (Open Data…, sysuse synthetic_panel, browse, …) is
+    // A12: a real item click (Open Data…, sysuse fatalities, browse, …) is
     // INSIDE the dropdown, so the outside-click handler below never sees it
     // and the menu stayed open after a selection. Close it here too — the
     // item's own [data-action]/[data-run] handler (wired elsewhere) still
@@ -748,7 +750,7 @@ export async function init() {
         state.varlist = vl.varlist;
         state.nRows   = vl.n_rows ?? 0;
         state.nCols   = vl.n_cols ?? vl.varlist.length;
-        state.currentFile = vl.source_file ?? 'synthetic_panel.csv';
+        state.currentFile = vl.source_file ?? 'fatalities.csv';
         updateVariables(vl.varlist);
         updateStatus();
       }
@@ -1741,7 +1743,7 @@ async function _runEditorBuffer(source, label, lineOffset = 0) {
  *  registered graph (console.js's registerGraph(), invoked from its own
  *  appendBlock() for every `type:'graph'` block) should appear immediately,
  *  with no close/reopen needed. openGraphics() is idempotent — it rebuilds
- *  from getGraphs() and re-applies the SAME open/docked state — so it's safe
+ *  from getGraphEntries() and re-applies the SAME open/docked state — so it's safe
  *  to call whenever a freshly appended batch of blocks included a graph. */
 function refreshGraphicsIfOpen() {
   const ov = document.getElementById('graphics-overlay');
@@ -1757,10 +1759,13 @@ function openGraphics() {
   // gallery is rebuilt either way.
   if (!splitOn) closeAllOverlays('graphics-overlay');
 
-  // Rebuild the gallery from the session's collected graph blocks.
+  // Rebuild the gallery from the session's collected graph entries — every
+  // one, in order: resident blocks render now, and a plot console.js has
+  // stored on disk (gallery spill) is a card loaded when it is opened or
+  // downloaded (BUG-1471; getGraphs() was resident-only).
   gal.replaceChildren();
-  const graphs = getGraphs();
-  if (!graphs.length) {
+  const entries = getGraphEntries();
+  if (!entries.length) {
     _graphicsFullIndex = -1;   // B10: nothing to view full
     const empty = document.createElement('div');
     empty.className = 'graphics-empty';
@@ -1770,34 +1775,53 @@ function openGraphics() {
     // B10: out-of-range guard — the gallery may have shrunk (a fresh session,
     // `graph drop _all`-equivalent, the BUG-066 byte/count cap, …) since a
     // prior full view was open.
-    if (_graphicsFullIndex >= graphs.length) _graphicsFullIndex = -1;
+    if (_graphicsFullIndex >= entries.length) _graphicsFullIndex = -1;
     // BUG-066: the gallery is byte- and count-bounded (console.js
     // enforceGalleryCap). Say so when it has actually dropped something —
     // the same honesty the console's elision marker carries, rather than
-    // letting older plots vanish silently.
-    const elided = getGraphGalleryElidedCount();
-    if (elided > 0) {
+    // letting older plots vanish silently — and how many it keeps on disk.
+    const galleryNote = text => {
       const note = document.createElement('div');
       note.className = 'graphics-elision';
-      note.textContent = `…${elided} older plot${elided === 1 ? '' : 's'} trimmed (memory budget)`;
+      note.textContent = text;
       gal.appendChild(note);
-    }
-    graphs.forEach((block, i) => {
+    };
+    const dropped = getGraphDroppedCount();
+    if (dropped > 0) galleryNote(`…${dropped} older plot${dropped === 1 ? '' : 's'} trimmed (memory budget)`);
+    const stored = getGraphSpilledCount();
+    if (stored > 0) galleryNote(`${stored} plot${stored === 1 ? '' : 's'} stored on disk (memory budget) — loaded when opened`);
+    entries.forEach((ent, i) => {
       const card = document.createElement('div');
       card.className = 'graphics-card';
       card.tabIndex = 0;
       card.setAttribute('role', 'button');
-      card.setAttribute('aria-label', `View ${block.kind || 'graph'} ${i + 1} of ${graphs.length} full size`);
-      // Re-render the SAME block as a thumbnail (no new rendering code).
-      const thumb = renderGraph(block);
+      card.setAttribute('aria-label', `View ${ent.kind || 'graph'} ${i + 1} of ${entries.length} full size`);
+      // Re-render the SAME block as a thumbnail (no new rendering code); a
+      // stored plot shows a placeholder until it is loaded.
+      const block = getResidentGraph(ent.id);
+      let thumb;
+      if (block) {
+        thumb = renderGraph(block);
+      } else {
+        thumb = document.createElement('div');
+        thumb.className = 'graphics-empty';
+        thumb.textContent = `${ent.title || ent.kind || 'graph'} — stored on disk; open to view`;
+      }
       card.appendChild(thumb);
       const dl = document.createElement('button');
       dl.className = 'graphics-dl-btn';
       dl.textContent = '⬇ PNG';
-      dl.addEventListener('click', e => {
+      dl.addEventListener('click', async e => {
         e.stopPropagation();   // B10: a download click must not ALSO open the full view
+        if (!thumb.querySelector('svg')) {
+          const loaded = await getGraphById(ent.id);
+          if (!loaded) { thumb.textContent = 'This plot could not be loaded from disk.'; return; }
+          const t = renderGraph(loaded);
+          card.replaceChild(t, thumb);
+          thumb = t;
+        }
         const svg = thumb.querySelector('svg');
-        if (svg) svgToPng(svg, `${block.kind || 'graph'}-${i + 1}.png`);
+        if (svg) svgToPng(svg, `${ent.kind || 'graph'}-${i + 1}.png`);
       });
       card.appendChild(dl);
       // B10: click (or Enter/Space) the card, outside the download button
@@ -1838,8 +1862,9 @@ function closeGraphics() {
 // _graphicsFullIndex; renderGraphicsFullView() toggles which of
 // #graphics-gallery / #graphics-full is visible and (re)builds the full-size
 // SVG via renderGraph(block) — the SAME pure renderer the thumbnail already
-// used, reading from the SAME in-memory getGraphs() array. No bridge/server
-// call either way ("don't re-fetch").
+// used, over the SAME getGraphEntries() list; a plot stored on disk is loaded
+// from the gallery's own store (getGraphById). No bridge/server call either
+// way ("don't re-fetch").
 
 function renderGraphicsFullView() {
   const gal     = document.getElementById('graphics-gallery');
@@ -1847,20 +1872,34 @@ function renderGraphicsFullView() {
   const actions = document.getElementById('graphics-full-actions');
   const posEl   = document.getElementById('graphics-full-pos');
   if (!gal || !full) return;
-  const graphs = getGraphs();
-  const showFull = _graphicsFullIndex >= 0 && _graphicsFullIndex < graphs.length;
+  const entries = getGraphEntries();
+  const showFull = _graphicsFullIndex >= 0 && _graphicsFullIndex < entries.length;
 
   gal.hidden  = showFull;
   full.hidden = !showFull;
   if (actions) actions.hidden = !showFull;
   if (!showFull) return;
 
-  const block = graphs[_graphicsFullIndex];
-  full.replaceChildren();
-  const big = renderGraph(block);
-  big.classList.add('graphics-full-svg');
-  full.appendChild(big);
-  if (posEl) posEl.textContent = `${_graphicsFullIndex + 1} / ${graphs.length}`;
+  const ent = entries[_graphicsFullIndex];
+  const show = block => {
+    const big = renderGraph(block);
+    big.classList.add('graphics-full-svg');
+    full.replaceChildren(big);
+  };
+  if (posEl) posEl.textContent = `${_graphicsFullIndex + 1} / ${entries.length}`;
+  const block = getResidentGraph(ent.id);
+  if (block) { show(block); return; }
+  // BUG-1471: a plot stored on disk is loaded when it is opened.
+  const wait = document.createElement('div');
+  wait.className = 'graphics-empty';
+  wait.textContent = 'Loading the plot from disk…';
+  full.replaceChildren(wait);
+  const idx = _graphicsFullIndex;
+  getGraphById(ent.id).then(loaded => {
+    if (_graphicsFullIndex !== idx || full.hidden) return;   // moved on meanwhile
+    if (loaded) show(loaded);
+    else wait.textContent = 'This plot could not be loaded from disk.';
+  });
 }
 
 function openGraphicsFull(idx) {
@@ -1871,9 +1910,9 @@ function openGraphicsFull(idx) {
 /** Prev/next (wraps around) — both toolbar buttons and the ArrowLeft/Right
  *  keydown wiring in init() call this. No-op with no graphs / not in full view. */
 function graphicsFullStep(delta) {
-  const graphs = getGraphs();
-  if (!graphs.length || _graphicsFullIndex < 0) return;
-  _graphicsFullIndex = (_graphicsFullIndex + delta + graphs.length) % graphs.length;
+  const n = getGraphEntries().length;
+  if (!n || _graphicsFullIndex < 0) return;
+  _graphicsFullIndex = (_graphicsFullIndex + delta + n) % n;
   renderGraphicsFullView();
 }
 
@@ -1901,7 +1940,7 @@ async function openAbout() {
     try {
       const v = await client.version();
       verEl.textContent = (v && v.piet_version)
-        ? `PIET ${v.piet_version.replace(/^(\d+)\.(\d+)\.0-beta\.(\d+)$/, '$1.$2 Beta $3')} · Powered by CoBrA ${v.cobra_version}`
+        ? `PIET ${v.piet_version} · engine CoBrA ${v.cobra_version}`
         : 'PIET (no kernel connected)';
     } catch {
       verEl.textContent = 'PIET (no kernel connected)';
@@ -2945,6 +2984,9 @@ function beginThemeFade() {
 
 function setBusy(busy) {
   state.busy = busy;
+  // BUG-1473: a run starts on its own line; a `_continue` line joins only
+  // within the run that opened it (console.js endDisplayLine).
+  if (busy) endDisplayLine();
   const inputEl = document.getElementById('cmd-input');
   if (inputEl) inputEl.disabled = busy;
   // #cmd-bar.busy (piet.css) replaces the old per-input opacity mutation —

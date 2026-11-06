@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // graph.js — render a GraphResult block (CONTRACT.md B v1.3.0) as inline SVG.
 // The kernel ships plot DATA (point arrays / histogram bins / line series); we
 // draw the axes, ticks, gridless Stata-style frame, labels, and title here.
@@ -796,33 +798,42 @@ function renderTwoway(block) {
     const layers = block.layers || [];
     const LEGEND_X = M.left + PLOT_W + 4;
     const smallFont = (legend.size === 'vsmall' || legend.size === 'small');
+    // `row` counts the rows drawn: an index with no layer takes none (BUG-1308).
+    // A key's text lines are joined by "\n", one row each; index -1 is text with
+    // no key (`order(- "text")`, BUG-1311).
+    let row = 0;
     for (let li = 0; li < legendOrder.length; li++) {
       const [layerIdx, label] = legendOrder[li];
-      const lyr = layers[layerIdx];
-      if (!lyr) continue;
-      const lst = lyr.style || {};
-      const color = lyr.kind === 'rarea'
-        ? (lst.fcolor || seriesColors[layerIdx % seriesColors.length])
-        : (lst.color || seriesColors[layerIdx % seriesColors.length]);
-      const legendY = M.top + 14 + li * (smallFont ? 12 : 14);
-      if (lyr.kind === 'rarea') {
-        svg.appendChild(svgEl('rect', {
-          x: LEGEND_X, y: legendY - 7, width: 10, height: 8,
-          fill: color, 'fill-opacity': String(lst.opacity != null ? lst.opacity : 0.3),
-        }));
-      } else {
-        svg.appendChild(svgEl('line', {
-          x1: LEGEND_X, y1: legendY - 3, x2: LEGEND_X + 10, y2: legendY - 3,
-          stroke: color, 'stroke-width': '1.5',
-        }));
+      const lyr = layerIdx === -1 ? null : layers[layerIdx];
+      if (layerIdx !== -1 && !lyr) continue;
+      const legendY = M.top + 14 + row * (smallFont ? 12 : 14);
+      if (lyr) {
+        const lst = lyr.style || {};
+        const color = lyr.kind === 'rarea'
+          ? (lst.fcolor || seriesColors[layerIdx % seriesColors.length])
+          : (lst.color || seriesColors[layerIdx % seriesColors.length]);
+        if (lyr.kind === 'rarea') {
+          svg.appendChild(svgEl('rect', {
+            x: LEGEND_X, y: legendY - 7, width: 10, height: 8,
+            fill: color, 'fill-opacity': String(lst.opacity != null ? lst.opacity : 0.3),
+          }));
+        } else {
+          svg.appendChild(svgEl('line', {
+            x1: LEGEND_X, y1: legendY - 3, x2: LEGEND_X + 10, y2: legendY - 3,
+            stroke: color, 'stroke-width': '1.5',
+          }));
+        }
       }
-      const lt = svgEl('text', {
-        x: LEGEND_X + 13, y: legendY,
-        class: 'g-ticklabel', 'text-anchor': 'start',
-        'font-size': smallFont ? '8' : '9',
-      });
-      lt.textContent = String(label);
-      svg.appendChild(lt);
+      for (const line of String(label).split('\n')) {
+        const lt = svgEl('text', {
+          x: LEGEND_X + 13, y: M.top + 14 + row * (smallFont ? 12 : 14),
+          class: 'g-ticklabel', 'text-anchor': 'start',
+          'font-size': smallFont ? '8' : '9',
+        });
+        lt.textContent = line;
+        svg.appendChild(lt);
+        row++;
+      }
     }
   }
 

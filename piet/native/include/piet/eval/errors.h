@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Structured error payloads — C++ port of piet/backend/piet/router/errors.py.
 //
 // Mirrors CONTRACT.md CommandErrorResult exactly: {type:"error", code, message,
@@ -111,6 +113,9 @@ nlohmann::json engineError(const std::string& message, const std::string& code =
 //     SAME message/rc for both; BETA campaign C4/BS-045)
 //   engine_error, message says "variable"/"scalar" + "not found" -> "111"
 //     (confirm variable/scalar; BETA campaign C1/C4)
+//   engine_error, message says "unknown variable" -> "111" (an unknown name in
+//     a row expression: engine shapes `unknown variable X in '...'` and
+//     `unknown variable 'X'`; w2n_followups E12-E22)
 //   engine_error, message is a confirm type/format mismatch ("is not
 //     numeric"/"is not a string variable"/"is not an integer value"/
 //     "found where number expected"/"invalid name") -> "7" (type mismatch;
@@ -126,6 +131,26 @@ nlohmann::json engineError(const std::string& message, const std::string& code =
 // nlohmann::ordered_json`), sidestepping any cross-basic_json-specialization
 // conversion question entirely.
 std::string coarseRc(const nlohmann::ordered_json& block);
+
+// FU-852: the literal of an impossible date-literal refusal -- `tq(2010q5)` out of
+// Stata's "tq(2010q5) invalid" (r(198)) or of the engine Parser's "expr:
+// tq(2010q5) invalid in '<expression>'" -- else "". The name must be one of the
+// literal pseudo-functions (cecon::literal_scale_for).
+std::string invalidDateLiteral(const std::string& msg);
+
+// FU-875: Stata's r(132) text -- "too few ')' or ']'" / "too many ')' or ']'"
+// (cecon::bracket_imbalance) -- for an engine Parser syntax error ("expr: <what>
+// in '<expression>'") whose expression does not pair its brackets, else "".
+std::string unbalancedExpr(const std::string& msg);
+
+// FU-875: Stata's refusal of a tin()/twithin() call the engine Parser cannot
+// expand (src/data/frame.cpp, "expr: tin() requires tsset in '<expression>'" and
+// its siblings), else "", with the rc in *rc: no tsset is "time-series operators
+// not allowed", r(101), whatever the arguments; on a tsset series a call without
+// its comma, or an endpoint off the series' scale, is "invalid syntax", r(198)
+// (StataBE 19.5: `count if tin(2010q2)`, `tin(2010q2, 2010q3, 2010q4)` and
+// `tin(2010, 2011)` on a %tq series).
+std::string timeSpanRefusal(const std::string& msg, std::string* rc);
 
 // ---------------------------------------------------------------------------
 // BS-097: shared option consume-or-reject net (PIET's analog of the engine's

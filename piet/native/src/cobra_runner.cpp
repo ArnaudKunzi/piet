@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "piet/cobra_runner.h"
 
 #include <chrono>
@@ -22,6 +24,7 @@
 #include <sstream>
 
 #include "piet/bundle_paths.h"
+#include "piet/eval/errors.h"  // invalidDateLiteral, unbalancedExpr, timeSpanRefusal (cobraErrorMessage)
 #include "piet/session_state.h"  // Stage 1b: the intercept routes to the active session's worker
 #include "io/win_compat.h"  // cecon::native_exists (BUG-050 wide _waccess)
 
@@ -75,8 +78,8 @@ std::string resolveCobraBin() {
   // (PIET.app/Contents/MacOS/piet_native), prefer the cobra binary bundled
   // alongside it at Contents/Resources/cobra over the dev-tree Art 7 pin. A
   // packaged .app must be self-contained and reproducible off the machine
-  // that built it — the dev pin path (private-notes/releases/engine/current/
-  // cobra) is a worktree-relative dev convenience that won't exist on a
+  // that built it — the dev pin path (releases/engine/current/cobra in the
+  // private coordination tree) is a worktree-relative dev convenience that won't exist on a
   // machine that only has the .app installed. bundleResourcesDir() returns
   // std::nullopt for any non-bundled invocation (dev build run in place,
   // --run-block/--selftest headless harness against piet/native/build/
@@ -541,6 +544,30 @@ std::string cobraErrorMessage(const CobraError& ce) {
     std::smatch m;
     if (std::regex_search(msg, m, reUnknownFn)) {
       return "function " + m.str(1) + "() is not supported";
+    }
+    // FU-852: the Parser's "expr: tq(2010q5) invalid in '<expression>'" is
+    // Stata's "tq(2010q5) invalid" (r(198), eval::coarseRc), whatever expression
+    // held it.
+    const std::string badLiteral = eval::invalidDateLiteral(msg);
+    if (!badLiteral.empty()) return badLiteral + " invalid";
+    // FU-875: a syntax error in an expression whose brackets do not pair is
+    // Stata's "too few ')' or ']'" / "too many ')' or ']'" (r(132), coarseRc).
+    const std::string unbalanced = eval::unbalancedExpr(msg);
+    if (!unbalanced.empty()) return unbalanced;
+    // ... and a tin()/twithin() call it could not expand is "invalid syntax"
+    // (r(198)), or "time-series operators not allowed" (r(101)) with no tsset.
+    std::string spanRc;
+    const std::string span = eval::timeSpanRefusal(msg, &spanRc);
+    if (!span.empty()) return span;
+    // BUG-1368: an unknown name in a row expression is Stata's `X not found`
+    // (r(111); `count if nosuchvar > 0`, `generate g = nosuchvar + 1`, `assert
+    // nosuchvar > 0` ..., w2n_followups.log:1051), not the engine's text
+    // `engine error: expr: unknown variable X in '...'` (src/data/frame.cpp) or
+    // `... unknown variable 'X'` (src/core/expr_eval.h). eval::coarseRc reads
+    // the sentence as 111.
+    static const std::regex reUnknownVar(R"(unknown variable (?:'([^']+)'|(\S+) in '))");
+    if (std::regex_search(msg, m, reUnknownVar)) {
+      return (m[1].matched ? m.str(1) : m.str(2)) + " not found";
     }
     return "engine error: " + msg;
   }

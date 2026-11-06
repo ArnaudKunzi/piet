@@ -1,7 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "piet/cobra_session.h"
 
 #include <chrono>
 #include "piet/counters.h"
+#include "piet/datastore.h"
 
 #include <atomic>
 #include <cstdio>
@@ -100,10 +103,18 @@ void fillFrameMeta(CobraFrameMeta* meta, const nlohmann::json& resp) {
   // client's shadow logic needs (a name list is redundant with vars_delta for
   // changed/added; dropped>0 just gates a full rebuild). Tolerate a bare number
   // too, so a future scalar-count contract revision stays parseable.
+  // e(sample) T2 (piet/datastore.h isHiddenColumn): the card is the USER's
+  // varlist, so a hidden `__piet_*` column is not counted and not carried; the
+  // name arrays let the counts below drop it exactly.
   auto count_of = [&f](const char* key) -> int64_t {
     if (!f.contains(key)) return 0;
     const auto& v = f.at(key);
-    if (v.is_array()) return static_cast<int64_t>(v.size());
+    if (v.is_array()) {
+      int64_t n = 0;
+      for (const auto& e : v)
+        if (!(e.is_string() && piet::isHiddenColumn(e.get<std::string>()))) ++n;
+      return n;
+    }
     if (v.is_number()) return v.get<int64_t>();
     return 0;
   };
@@ -113,7 +124,8 @@ void fillFrameMeta(CobraFrameMeta* meta, const nlohmann::json& resp) {
   meta->droppedNames.clear();
   if (f.contains("dropped") && f["dropped"].is_array()) {
     for (const auto& d : f["dropped"])
-      if (d.is_string()) meta->droppedNames.push_back(d.get<std::string>());
+      if (d.is_string() && !piet::isHiddenColumn(d.get<std::string>()))
+        meta->droppedNames.push_back(d.get<std::string>());
   }
   meta->structure = f.value("structure", false);
   // Default is `!meta->structure`, NOT a bare true/false: an older engine
@@ -135,19 +147,45 @@ void fillFrameMeta(CobraFrameMeta* meta, const nlohmann::json& resp) {
     meta->mergeMatched    = mc.value("matched", (int64_t)0);
     meta->mergeCountsValid = true;
   }
+  // e(sample) T2: hidden columns leave the card here, before
+  // seedShadowFromFrameVars or a delta fold can see them. `cols` is the frame's
+  // column count and must match the card's, so it drops the hidden columns
+  // whenever the response names them all: a full card (`vars`) or a FULL delta
+  // (every column changed: sort, keep if, ...). A partial delta that names none
+  // leaves `cols` as sent, so a frame that does carry one looks one column wider
+  // than the card and the fold declines into a full rebuild -- slower, never a
+  // wrong card.
+  const int64_t rawCols = meta->cols;
+  int64_t hiddenInVars = 0, hiddenInDelta = 0, rawDelta = 0;
   if (f.contains("vars_delta") && f.at("vars_delta").is_array()) {
     for (const auto& jv : f.at("vars_delta")) {
       CobraFrameVar v;
       fillFrameVar(v, jv);
+      ++rawDelta;
+      if (piet::isHiddenColumn(v.name)) {
+        ++hiddenInDelta;
+        continue;
+      }
       meta->varsDelta.push_back(std::move(v));
     }
   }
+  bool haveVars = false;
   if (f.contains("vars") && f.at("vars").is_array()) {
+    haveVars = true;
     for (const auto& jv : f.at("vars")) {
       CobraFrameVar v;
       fillFrameVar(v, jv);
+      if (piet::isHiddenColumn(v.name)) {
+        ++hiddenInVars;
+        continue;
+      }
       meta->vars.push_back(std::move(v));
     }
+  }
+  if (haveVars) {
+    meta->cols = rawCols - hiddenInVars;
+  } else if (rawDelta == rawCols) {
+    meta->cols = rawCols - hiddenInDelta;
   }
 }
 

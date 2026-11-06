@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — Philox4x32-10 counter-based RNG. Stateless: a draw is a pure function
 // of (seed, counter), so resampling is bit-identical regardless of how replicates
 // are scheduled across threads. Used for wild-bootstrap / permutation weights.

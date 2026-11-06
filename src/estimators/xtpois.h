@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Conditional fixed-effects Poisson (xtpoisson, fe in Stata).
 //
 // Conditional on the panel sum Σ_t y_it, the unit-specific intercept α_i drops
@@ -23,9 +25,17 @@ struct XtpoisFeResult {
     int64_t n_groups = 0;       // panels used (after drops)
     int64_t n_dropped_zero = 0; // panels dropped: sum(y) == 0
     int64_t n_dropped_size = 0; // panels dropped: size == 1
+    // Row counts of the panels used (after the drops): Stata's e(g_min)/e(g_avg)/
+    // e(g_max) (xtpoisson). 0 when no panel is kept.
+    int64_t g_min = 0, g_max = 0;
+    double g_avg = 0;
     std::vector<double> beta;
     std::vector<double> se_iid;
     std::vector<double> se_robust;
+    // The full covariances the se come from (k*k, symmetric): (-H)^{-1} and the
+    // Wooldridge sandwich -- e(V) for --emit-v (margins reads it, ME06).
+    std::vector<double> V_iid;
+    std::vector<double> V_robust;
     double loglik = 0;
     int iters = 0;
     bool converged = false;

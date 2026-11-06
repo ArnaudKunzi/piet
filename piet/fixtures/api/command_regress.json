@@ -1,0 +1,20 @@
+{
+  "blocks": [
+    { "type": "echo", "text": ".  regress price mpg weight, robust" },
+    {
+      "type": "estimation",
+      "estimator": "feols",
+      "depvar": "price",
+      "n_obs": 74,
+      "vcov_type": "hc1",
+      "r2": 0.2984,
+      "dof_resid": 71,
+      "coeftable": [
+        { "name": "mpg",         "b": -49.51,     "se": 86.16,    "t": -0.57, "p": 0.567, "ci_lo": -221.32,   "ci_hi": 122.29   },
+        { "name": "weight",      "b": 1.747,      "se": 0.6412,   "t": 2.72,  "p": 0.008, "ci_lo": 0.469,     "ci_hi": 3.025    },
+        { "name": "(intercept)", "b": 1946.07,    "se": 3597.05,  "t": 0.54,  "p": 0.591, "ci_lo": -5228.19,  "ci_hi": 9120.33  }
+      ]
+    }
+  ],
+  "varlist_after": null
+}

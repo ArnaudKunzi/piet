@@ -1,0 +1,121 @@
+--------------------------------------------------------------------------------
+ADOPTED CODE — source adapted from other open-source projects
+--------------------------------------------------------------------------------
+
+This section is the project's register of code adapted from other open-source
+projects (as distinct from the components vendored whole, listed elsewhere in
+this file). PIET is GPL-3.0-or-later, so GPL-compatible source may be adopted;
+what the project requires in exchange is that the adoption be VISIBLE. Hiding a
+derivation is the violation, not the derivation itself.
+
+Rules (authority: the project's distribution policy, sections 1.b, 3.2, 3.3):
+
+  * Every adoption carries a source-file header comment in this exact form:
+        // Portions derived from <project> <version-or-commit> (<license>).
+        // See THIRD_PARTY_NOTICES.
+  * Every adoption adds a row to the register below IN THE SAME COMMIT that
+    lands the code. A header without a row, or a row without a header, is a
+    release-gate failure (the packaging preflight greps both directions).
+  * "Consulted" is not "adopted": reading a source to confirm a formula, and
+    then writing our own implementation, is recorded in the source comment as
+    a method reference and does NOT belong in this register. Copying,
+    transliterating, or closely tracking the structure of someone's code DOES.
+  * Compatible to adopt: GPL-3.0, GPL-2.0-or-later, LGPL, MPL-2.0, Apache-2.0,
+    MIT, BSD, BSL-1.0, and other GPL-3-compatible licenses.
+  * NOT adoptable, escalate instead: GPL-2.0-only, AGPL, SSPL, and anything
+    whose license cannot be established. An SSC .ado with no license file and
+    no license statement anywhere is in this class; one whose SSC/RePEc
+    listing states its license (lassopack, swindex: GPL v3) is adoptable,
+    and its notice file records that the license is stated in the listing.
+
+--------------------------------------------------------------------------------
+REGISTER
+--------------------------------------------------------------------------------
+
+Format: <project> | <version/commit> | <license> | <our file(s)> | <scope>
+
+  LAPACK | 3.12.0 (Netlib, incl. reference BLAS) | BSD-3-Clause |
+    piet/native/src/lapack_dsyevr.h, lapack_dsyevr.cpp, lapack_dlaruv_mm.inc |
+    C++ translation of DSYEVR(JOBZ='V',RANGE='A',UPLO='L') and the routines
+    it reaches (DSYTRD/DLATRD/DSYTD2, DSTEMR/DLARRE/DLARRV/DLASQ2-6,
+    DSTEBZ/DLAEBZ/DSTEIN/DLAGTF/DLAGTS, DORMTR/DORMQR/DORM2R/DLARFT/DLARFB,
+    reference BLAS DDOT..DGEMM); used
+    by ml's `difficult` step. License text: 50-LAPACK-BSD-3-Clause.txt.
+
+--------------------------------------------------------------------------------
+
+  R-nmath (R Mathlib, src/nmath/pnorm.c) | 2024 (copyright 2000-2024) | GPL-2.0-or-later |
+    src/core/distributions.h |
+    stata_normal(): W. J. Cody's rational Chebyshev normal CDF (ACM TOMS 715
+    ANORM) in the form of R's pnorm_both() (lower tail; coefficient tables,
+    interval structure, tail evaluation). Used by Stata's normal(), probit
+    and every normal-tail p-value. Notice: 60-R-nmath-pnorm-GPL-2.0-or-later.txt.
+
+  MT19937-64 | mt19937-64.c, 2004/9/29 version | BSD-3-Clause |
+    src/core/rng_mt64.h |
+    64-bit Mersenne Twister of Nishimura & Matsumoto (init_genrand64,
+    genrand64_int64 tempering, genrand64_real3); Stata's default `mt64` RNG,
+    behind runiform(), runiformint(), bsample, boottest and the lasso CV
+    folds. Notice: 61-MT19937-64-BSD-3-Clause.txt.
+
+  lassopack | 1.3 (rlasso.ado 1.0.10, lassoutils.ado 1.1.03; SSC s458458) | GPL-3.0 |
+    piet/native/src/handlers_e3_lasso.cpp |
+    The `rlasso` default path (plug-in penalty loadings, lasso coefficients),
+    derived from the Mata in lassoutils.ado and the ado bookkeeping in
+    rlasso.ado. License: GPL v3 as stated in the SSC listing (no LICENSE file
+    ships with the package). Notice: 62-lassopack-GPL-3.0.txt.
+
+  swindex | SSC s458912 (listing revision 2021-02-24; SJ 20-4 st0622) | GPL-3.0 |
+    piet/native/src/handlers_e3_swindex.cpp |
+    The `swindex` command (Anderson 2008 inverse-covariance-weighted index),
+    derived from swindex.ado. License: GPL v3 as stated in the SSC listing
+    (the ado header names the authors but no license). Notice:
+    63-swindex-GPL-3.0.txt.
+
+  estout (estout, esttab, estadd, eststo; Ben Jann) | 3.33 | MIT |
+    piet/native/src/handlers_aer_tables.cpp (estadd section; "estout core" WRITE
+    phase), piet/native/src/eststo_esttab.cpp (esttab) |
+    The estout WRITE phase and its helpers, esttab's option translation onto it,
+    and estadd, derived from the ados (line cites in the comments). Notice and
+    verbatim MIT text: 64-estout-MIT.txt.
+
+  coefplot (Ben Jann) | 1.8.8 | MIT |
+    piet/native/src/handlers_coefplot.cpp |
+    The coefplot data pipeline (subgraph/plot/model grammar, collection, keep/
+    drop, arrangement, offsets, generate(), r() results), derived from
+    coefplot.ado; the drawn graph is not derived. Notice: 65-coefplot-MIT.txt.
+
+  texsave (Julian Reif) | 1.6.1 | MIT |
+    piet/native/src/handlers_aer_tables.cpp (texsave section) |
+    `texsave` (dataset as a LaTeX table), derived from texsave.ado. Notice:
+    66-texsave-MIT.txt.
+
+  outreg2 (Roy Wada) | 2.3.2 | GPL-3.0 |
+    piet/native/src/handlers_aer_tables.cpp (outreg2 section) |
+    `outreg2` (ledger grid, makeFile/appendFile/cleanFile, tex and xml
+    outputs), derived from outreg2.ado. License: GPL v3 as stated in the SSC
+    listing (no licence header in the ado). Notice: 67-outreg2-GPL-3.0.txt.
+
+  mat2txt (Ben Jann, Michael Blasnik) | 1.1.2 | GPL-3.0 |
+    piet/native/src/handlers_aer_tables.cpp (mat2txt section) |
+    `mat2txt` (matrix as tab-separated text), derived from mat2txt.ado.
+    License: GPL v3 as stated in the SSC listing. Notice: 68-mat2txt-GPL-3.0.txt.
+
+  acreg (Colella, Lalive, Sakalli, Thoenig) | 1.1.0 (Dec 2020) | GPL-3.0 |
+    piet/native/src/handlers_e3_acreg.cpp |
+    `acreg` corpus paths (arbitrary-cluster standard errors), derived from
+    acreg.ado. License: GPL v3 as stated in the SSC listing; the ado header
+    reads "Beta Version, please do not circulate" (recorded in the notice).
+    Notice: 69-acreg-GPL-3.0.txt.
+
+  qreg2 (Machado, Parente, Santos Silva) | 4.00 (31 Aug 2020) | GPL-3.0 |
+    piet/native/src/handlers_e3_qreg2.cpp |
+    `qreg2` (quantile regression with robust and clustered SEs), derived from
+    qreg2.ado. License: GPL v3 as stated in the SSC listing; the ado carries
+    only an as-is warranty disclaimer. Notice: 70-qreg2-GPL-3.0.txt.
+
+  ritest (Simon Hess) | 1.1.7 | GPL-3.0 |
+    piet/native/src/handlers_e3_ritest.cpp |
+    `ritest` (randomization inference), derived from ritest.ado. License: GPL
+    v3 as stated in the SSC listing (the GitHub repository has no LICENSE
+    file). Notice: 71-ritest-GPL-3.0.txt.

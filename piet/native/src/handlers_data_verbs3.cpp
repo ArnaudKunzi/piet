@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // R2 (giant-file split, 2026-09-01): continuation TU of handlers_data_verbs.cpp
 // — a MOVE-ONLY cut along pre-existing anonymous-namespace boundaries. The
 // preamble is the original file head verbatim; shared helpers come from
@@ -54,10 +56,13 @@
 #include <iconv.h>   // AER scope-2 W3a: `import delimited, encoding()`
 
 #include "piet/cobra_runner.h"
+#include "piet/dispatcher.h"  // dispatch(): xtile/cumul evaluate exp with the user's generate
 #include "piet/counters.h"
 #include "piet/eval/errors.h"
 #include "piet/eval/exprfns.h"  // gFormat/applyStataFmt (BS-003 tostring default + usedisplayformat rendering)
 #include "piet/eval/pyvalue.h"
+#include "piet/display_hardening.h"  // resolveVarName: xtile cutpoints()
+#include "piet/delimited_io.h"  // import delimited: the one native reader
 #include "piet/inrange_filter.h"
 #include "piet/mutation_result.h"
 #include "piet/strutil.h"
@@ -80,6 +85,8 @@
 // copied: each net now binds a reference back to its registered entry, so there is
 // still exactly one place each spelling is written.
 #include "handlers_data_verbs_internal.h"
+#include "estimation_m4_internal.h"  // e(sample) T2: the copy verbs' mask helpers
+#include "scratch_columns.h"          // xtile's sample, source and weight columns
 
 namespace piet::handlers {
 using ojson = nlohmann::ordered_json;
@@ -109,21 +116,33 @@ namespace {
 struct JoinbyUsingResult {
   bool ok = false;
   std::string hbinPath;
+  std::string usingPath;  // the resolved file (a checkpoint's metadata is keyed by it)
+  std::string metaPath;
   ojson errBlock;
 };
 
+std::string stripOneQuotePair(const std::string& v);
+
 JoinbyUsingResult resolveJoinbyUsing(SessionState& session, const std::string& usingPathArg) {
   JoinbyUsingResult r;
-  std::string usingPath = resolveUserPath(session, usingPathArg);
-  session.materializeVirtualSave(usingPath);  // BUG-125: a save_virtual'd tempfile becomes real on demand
+  // cross hands the file over still quoted; a message names it without them
+  // (`cross using "nof"`: StataBE `file nof.dta not found`).
+  std::string usingShown = stripOneQuotePair(trim(usingPathArg));
+  std::string usingPath = resolveUsingDataset(session, usingPathArg, &usingShown);
+  r.usingPath = usingPath;
   if (!fileExists(usingPath)) {
-    r.errBlock = engineErrorBlock("joinby using: file not found: '" + usingPath + "'");
+    // `use using` finds no file: r(601) (w2aw_data_combine_family.log dc_j_nofile),
+    // naming the NAME.dta a bare stem stood for.
+    r.errBlock = ojson(eval::errorBlock("engine_error", "file " + usingShown + " not found",
+                                        std::nullopt, std::nullopt, std::nullopt, "r(601)"));
     return r;
   }
   std::string ext = extOf(usingPath);
-  if (ext == ".dta") {
+  if (ext == ".dta" || usingFileIsDta(usingPath)) {
     std::string conv = nextPath(session.workdir(), "joinby_using_dta");
-    CobraRunResult cr = runCobra({"import-dta", usingPath, conv});
+    r.metaPath = conv + ".meta.json";
+    registerScratchMint(r.metaPath);
+    CobraRunResult cr = runCobra({"import-dta", usingPath, conv, "--out-meta", r.metaPath});
     if (!cr.ok) {
       CobraError ce = errorFromRaw(cr);
       r.errBlock =
@@ -137,9 +156,7 @@ JoinbyUsingResult resolveJoinbyUsing(SessionState& session, const std::string& u
     CobraRunResult cr = runCobra(
         {"convert", "--data", usingPath, "--out", conv, "--delim", std::string(1, delim)});
     if (!cr.ok) {
-      CobraError ce = errorFromRaw(cr);
-      r.errBlock =
-          engineErrorBlock("joinby using: cannot convert '" + usingPath + "': " + ce.what());
+      r.errBlock = delimitedUsingRefused(usingShown, 610);
       return r;
     }
     r.hbinPath = conv;
@@ -150,10 +167,35 @@ JoinbyUsingResult resolveJoinbyUsing(SessionState& session, const std::string& u
   return r;
 }
 
+// The variables only the using file has keep what it states about them -- its
+// variable label, format, storage type and value label (dc_j_base_v5 uval
+// `float|%7.1f|[u val]`; BUG-1157: joinby and cross of a file whose int u
+// carries ul list u through ul, StataBE).
+void adoptUsingOwnVars(SessionState& session, const JoinbyUsingResult& ur,
+                       const std::map<std::string, UsingVarMeta>& uMeta,
+                       const std::vector<std::string>& usingOnly) {
+  for (const auto& nm : usingOnly) {
+    auto it = uMeta.find(nm);
+    if (it == uMeta.end()) continue;
+    const UsingVarMeta& u = it->second;
+    if (!u.label.empty()) session.setVarLabel(nm, u.label);
+    if (!u.format.empty()) {
+      VarMeta& vm = session.varMeta[nm];
+      if (!vm.format.has_value() || vm.format->empty()) vm.format = u.format;
+    }
+    if (u.stataType.has_value()) {
+      session.implicitFloatVars.erase(nm);
+      session.varMeta[nm].stataType = *u.stataType;
+    }
+  }
+  adoptUsingValueLabels(session, ur.usingPath, ur.metaPath, usingOnly, true);
+}
+
 }  // namespace
 
 ojson runJoinby(const std::vector<std::string>& keylist, const std::string& usingPathArg,
-                SessionState& session) {
+                SessionState& session, const std::string& unmatched,
+                const std::optional<std::string>& mergeVar) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   // INSPECT-2608: everything this function asks of the MASTER frame is metadata
   // — does a key exist, what are the non-key names, how many rows — and
@@ -190,9 +232,24 @@ ojson runJoinby(const std::vector<std::string>& keylist, const std::string& usin
     if (!masterHas(k)) return engineErrorBlock("joinby: variable '" + k + "' not found");
   }
 
+  // joinby: the marker is `_merge` unless _merge() names it, and
+  // exists only when unmatched() is not none or _merge() is given; a name in
+  // use is `confirm new var` r(110) (dc_j_merge_exists).
+  std::string marker;
+  if (mergeVar.has_value()) marker = *mergeVar;
+  else if (unmatched != "none") marker = "_merge";
+  if (!marker.empty() && masterHas(marker))
+    return ojson(eval::errorBlock("engine_error", "variable " + marker + " already defined",
+                                  std::nullopt, std::nullopt, std::nullopt, "r(110)"));
+
   JoinbyUsingResult ur = resolveJoinbyUsing(session, usingPathArg);
   if (!ur.ok) return ur.errBlock;
   Datastore usingDs(ur.hbinPath);
+  // What the using file states about its variables (labels, formats, str#),
+  // adopted by the variables the join brings in (dc_j_base_v5 uval
+  // `float|%7.1f|[u val]`).
+  const std::map<std::string, UsingVarMeta> uMeta =
+      usingVarMetaOf(session, ur.usingPath, ur.metaPath, usingDs);
 
   for (const auto& k : keylist) {
     if (!usingDs.has(k)) {
@@ -281,9 +338,19 @@ ojson runJoinby(const std::vector<std::string>& keylist, const std::string& usin
     // `cr.ok` and the card, never the "wrote N rows" notice), so no status
     // count depends on the one-shot leg being taken.
     SessionState::ResidentEligible residentJoinby(session);
-    cr = runCobra({"joinby", "--data", master ? master->path() : *session.currentHbin(),
-                   "--using", ur.hbinPath,
-                   "--keys", joinedKeys, "--out", outPath});
+    std::vector<std::string> jargs = {"joinby", "--data",
+                                      master ? master->path() : *session.currentHbin(),
+                                      "--using", ur.hbinPath, "--keys", joinedKeys,
+                                      "--out", outPath};
+    if (unmatched != "none") {
+      jargs.push_back("--unmatched");
+      jargs.push_back(unmatched);
+    }
+    if (!marker.empty()) {
+      jargs.push_back("--merge-var");
+      jargs.push_back(marker);
+    }
+    cr = runCobra(jargs);
   }
   if (!cr.ok) {
     CobraError ce = errorFromRaw(cr);
@@ -297,6 +364,38 @@ ojson runJoinby(const std::vector<std::string>& keylist, const std::string& usin
     return engineErrorBlock("joinby: failed writing output dataset (disk full or I/O error)");
 
   session.load(outPath);
+  // e(sample) T2: Stata keeps the marker on ONE copy of each matched master row
+  // (w2_esample_copies.log:470 X4 `0|19|72|m0=38|m0_diff=19|`); which copy
+  // follows its own sort tie order (X4b `not_first_of_run=8`), and PIET keeps
+  // the first of each master row's run (handlers.cpp esampleKeepFirstCopy). A
+  // frame whose keys cannot be read withdraws the marker by name.
+  const std::map<std::string, int64_t> runLen = esampleUsingRunLengths(usingDs, keylist);
+  if (!esampleKeepFirstCopy(session, keylist, &runLen) &&
+      !esampleMarkHeadLost(session, EsampleLostBy::kJoinby)) {
+    return engineErrorBlock(
+        "joinby: the data were joined, but the estimation-sample marker could not be "
+        "withdrawn from the result; e(sample) is not reliable until the next estimation.");
+  }
+  adoptUsingOwnVars(session, ur, uMeta, usingExtra);
+  // The marker (joinby.ado DefLabel): a byte with value label
+  // __MERGE (1-3 and the 9999 "signature" entry), no variable label, displayed
+  // as wide as "both in master and using data" (dc_j_both_v5 `byte|%29.0g|[]`).
+  if (!marker.empty()) {
+    session.implicitFloatVars.erase(marker);
+    VarMeta& vm = session.varMeta[marker];
+    vm.stataType = std::string("byte");
+    vm.format = std::string("%29.0g");
+    vm.label.reset();
+    session.labelDefs["__MERGE"] = {{"1", "only in master data"},
+                                    {"2", "only in using data"},
+                                    {"3", "both in master and using data"},
+                                    {"9999", "signature"}};
+    session.varLblname[marker] = "__MERGE";
+    session.valueLabels[marker] = {{1, "only in master data"},
+                                   {2, "only in using data"},
+                                   {3, "both in master and using data"},
+                                   {9999, "signature"}};
+  }
   ojson result = mutationResult(session, "joinby", usingExtra);
   result["n_master"] = nMaster;
   result["n_using"] = nUsing;
@@ -313,7 +412,7 @@ ojson runJoinby(const std::vector<std::string>& keylist, const std::string& usin
 // (estimation_m4.cpp, same file as those D4 estimators — this one lives
 // here instead because it is a data-mutation verb like gsort/order/recode
 // above, not an estimation command). Oracle D4f
-// (private-notes/plans/BETA-20260712-campaign/probes/d45-oracle-stata.log):
+// (internal capture d45-oracle-stata.log):
 // after `drop if mod(t,7)==0` (48 of 336 rows dropped — INCLUDING t=336
 // itself, since 336 is itself a multiple of 7), `tsfill` restores the full
 // grid from the SURVIVING min/max t, i.e. 1..335 (not 1..336 — tsfill only
@@ -321,37 +420,49 @@ ojson runJoinby(const std::vector<std::string>& keylist, const std::string& usin
 // highest t still present) — live-verified byte-for-byte: 335 rows out,
 // matching the oracle's own `count` = 335 exactly, with every OTHER column
 // (income, etc.) missing/NaN on the newly-filled rows (also live-verified).
-// Real Stata's `full` option (materializes every panelvar x timevar
-// combination even for panels that never had ANY observation at a given
-// period) has no engine equivalent (cobra tsfill's own usage banner has no
-// --full flag at all) — honest-rejected rather than silently ignored.
-ojson runTsfill(const std::vector<std::pair<std::string, eval::OptValue>>& opts,
-                SessionState& session) {
+// BUG-897: `full` (every panel over the overall min..max of the
+// time variable, on the delta grid) is cobra tsfill --full; it was refused by
+// name before the engine had it. tsfill's own refusals carry its rc
+// (w2w_tsset_tsfill.log rf_tsfill_none r(111), rf_tsfill_if r(101),
+// rf_tsfill_full_tmiss r(451)); the registry's allowIf=false row is
+// descriptive only, so an `if` reached this arm and was silently ignored.
+ojson runTsfill(const eval::ParsedCommand& parsed, SessionState& session) {
+  auto refuse = [](const std::string& msg, int rc) {
+    return ojson(eval::errorBlock("engine_error", msg, std::nullopt, std::nullopt, std::nullopt,
+                                  "r(" + std::to_string(rc) + ")"));
+  };
+  // `syntax [, Full]` runs first.
+  if (!parsed.varlist.empty()) return refuse("varlist not allowed", 101);
+  if (parsed.ifExpr.has_value()) return refuse("if not allowed", 101);
+  if (parsed.inRange.has_value()) return refuse("in range not allowed", 101);
+  if (parsed.weightType.has_value()) return refuse("weights not allowed", 101);
+  // BUG-233: the one copy of this vocabulary now lives in the file-scope
+  // registration block (see top of file).
+  const std::unordered_set<std::string>& kKnown = kVocabTsfill.known;
+  if (auto err = eval::rejectUnknownOptions(parsed.opts, kKnown)) {
+    return *err;
+  }
+  bool full = false;
+  for (const auto& [k, v] : parsed.opts)
+    if (k == "full" && v.isBool && v.boolValue) full = true;
   if (!session.currentHbin().has_value() || session.datastore() == nullptr) {
     return eval::noDataLoaded();
   }
+  // tsfill declares no further options here.
   if (!session.timevar.has_value() || session.timevar->empty()) {
-    return engineErrorBlock(
-        "tsfill: run `tsset timevar` (or `xtset panelvar timevar`) first so PIET knows the time "
-        "variable.",
-        "unsupported_option");
+    return refuse("time variable not set, use tsset varname ...", 111);
   }
-  for (const auto& [k, v] : opts) {
-    if (k == "full" && v.isBool && v.boolValue) {
-      return engineErrorBlock(
-          "Option `full` is a valid Stata option that this version of PIET does not yet "
-          "implement for `tsfill` (the engine's tsfill CLI has no equivalent — it always fills "
-          "only the gaps within each panel's own observed time range, never manufactures rows "
-          "for a panel/period combination that never had ANY observation at all).",
-          "unsupported_option");
+  if (full) {
+    Datastore* ds = session.datastore();
+    if (ds->has(*session.timevar) && ds->dtype(*session.timevar) == "f64") {
+      const double* tv = ds->col(*session.timevar).f64();
+      const int64_t n = ds->nRows();
+      for (int64_t i = 0; i < n; ++i)
+        if (std::isnan(tv[i]))
+          return refuse("timevar (" + *session.timevar +
+                            ") may not contain missing values when option full is specified",
+                        451);
     }
-  }
-  // BUG-233: the one copy of this vocabulary now lives in the file-scope
-  // registration block (see top of file); this binding keeps every existing
-  // use — including the reject net below — reading the same set.
-  const std::unordered_set<std::string>& kKnown = kVocabTsfill.known;
-  if (auto err = eval::rejectUnknownOptions(opts, kKnown)) {
-    return *err;
   }
 
   std::vector<std::string> argv = {"tsfill", "--data", *session.currentHbin(), "--timevar",
@@ -366,6 +477,7 @@ ojson runTsfill(const std::vector<std::pair<std::string, eval::OptValue>>& opts,
     argv.push_back("--delta");
     argv.push_back(buf);
   }
+  if (full) argv.push_back("--full");
   std::string outPath = nextPath(session.workdir(), "tsfill");
   argv.push_back("--out");
   argv.push_back(outPath);
@@ -381,6 +493,13 @@ ojson runTsfill(const std::vector<std::pair<std::string, eval::OptValue>>& opts,
   }
   if (!cr.ok) {
     CobraError ce = errorFromRaw(cr);
+    // tsfill.ado's own check after a declaration the data no longer satisfies
+    // (rows appended since `tsset`): r(451), as tsset's.
+    if (cobraErrorStr(ce).find("repeated time value") != std::string::npos)
+      return refuse(session.panelvar.has_value() && !session.panelvar->empty()
+                        ? "repeated time values within panel"
+                        : "repeated time values in sample",
+                    451);
     return engineErrorBlock(cobraErrorStr(ce), ce.code);
   }
   session.load(outPath);
@@ -439,11 +558,21 @@ bool columnExistsDV(SessionState& session, const std::string& name) {
   return ds != nullptr && ds->has(name);
 }
 
+// A refused new-variable name under Stata's own code (strutil::NameRefusal).
+ojson nameRefusalBlock(const strutil::NameRefusal& r) {
+  return ojson(eval::errorBlock("syntax_error", r.message, std::nullopt, std::nullopt,
+                                std::nullopt, "r(" + std::to_string(r.rc) + ")"));
+}
+
 ojson newVarGuardDV(SessionState& session, const std::string& verb, const std::string& newvar) {
   if (!strutil::isValidStataIdentifier(newvar))
     return engineErrorBlock(
         verb + ": invalid variable name `" + newvar + "' — " + strutil::stataIdentifierRuleText(),
         "syntax_error");
+  // BUG-1120: `tssmooth ma _cons = x, window(1)' is "_cons invalid varname" r(198)
+  // (StataBE 19.5); ipolate and expand answer the rest of the rule first.
+  if (strutil::isReservedVarName(newvar))
+    return nameRefusalBlock(strutil::NameRefusal{198, newvar + " invalid varname"});
   if (columnExistsDV(session, newvar))
     return engineErrorBlock(verb + ": variable " + newvar + " already defined", "bad_input");
   return ojson();  // empty => no objection
@@ -453,7 +582,9 @@ ojson newVarGuardDV(SessionState& session, const std::string& verb, const std::s
 
 ojson runXtile(const std::string& newvar, const std::string& srcvar,
                const std::vector<std::pair<std::string, eval::OptValue>>& opts,
-               const std::optional<std::string>& ifExpr, SessionState& session) {
+               const std::optional<std::string>& ifExpr, SessionState& session,
+               const std::optional<std::string>& weightType,
+               const std::optional<std::string>& weightVar) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   if (srcvar.empty())
     return engineErrorBlock("xtile: syntax is `xtile newvar = varname, nquantiles(#)`",
@@ -498,6 +629,19 @@ ojson runXtile(const std::string& newvar, const std::string& srcvar,
     return engineErrorBlock("xtile: nquantiles() must be at least 2", "bad_input");
   if (!cutvar.empty() && !columnExistsDV(session, cutvar))
     return engineErrorBlock("variable " + cutvar + " not found", "unknown_variable");
+  if (weightType.has_value() && !weightType->empty() && weightVar.has_value() &&
+      !weightVar->empty()) {
+    // Quantile cutpoints are the weighted percentiles
+    // (handlers_aer_reshape.cpp runXtileWeighted). With cutpoints() xtile.ado's
+    // MakeCut ignores the weight but `mark` still drops the zero- and
+    // missing-weight rows, which the engine's --xtile cannot do: refused by
+    // name rather than categorizing rows Stata leaves missing.
+    if (!cutvar.empty())
+      return engineErrorBlock(
+          "xtile: cutpoints() with a weight is not supported in this version of PIET.",
+          "unsupported_option");
+    return runXtileWeighted(newvar, srcvar, nq, *weightVar, *weightType, session);
+  }
 
   std::string outPath = nextPath(session.workdir(), "xtile");
   const std::string spec =
@@ -514,6 +658,256 @@ ojson runXtile(const std::string& newvar, const std::string& srcvar,
   }
   session.load(outPath);
   return mutationResult(session, "gen", {newvar});
+}
+
+namespace {
+
+// `[type] newvar` as typed before the `=`. A storage type in front of a name is
+// accepted and ignored; the same word alone is what Stata's syntax reads as a
+// misplaced type, hence its sentence about n() (StataBE 19.5).
+std::optional<ojson> readXtileTarget(const std::string& typed, std::string* name) {
+  std::vector<std::string> words;
+  std::istringstream splitter(typed);
+  for (std::string word; splitter >> word;) words.push_back(word);
+  if (words.size() == 2 && strutil::isStorageTypeWord(words[0])) words.erase(words.begin());
+  if (words.size() > 1) return rcErrorBlock("too many variables specified", 103);
+  if (words.empty() || words[0] == "if") return rcErrorBlock("varlist required", 100);
+  const std::string& word = words[0];
+  if (word == "_all" || word == "_skip") return rcErrorBlock(word + " not allowed", 101);
+  if (strutil::isStorageTypeWord(word))
+    return rcErrorBlock("option n() incorrectly specified", 198);
+  if (strutil::isReservedVarName(word) || word == "in" || word == "using" || word == "with")
+    return rcErrorBlock(word + " invalid varname", 198);
+  if (!strutil::isValidStataIdentifier(word)) return rcErrorBlock(word + " invalid name", 198);
+  *name = word;
+  return std::nullopt;
+}
+
+// cutpoints(): one numeric variable, abbreviations as anywhere in a varlist.
+std::optional<ojson> readXtileCutVariable(const eval::OptValue& option, SessionState& session,
+                                          std::string* resolved) {
+  const std::string typed = option.isBool ? std::string() : trim(option.strValue);
+  if (typed.empty()) return rcErrorBlock("option cutpoints() incorrectly specified", 198);
+  if (typed.find_first_of(" \t") != std::string::npos)
+    return rcErrorBlock("cutpoints():  too many variables specified", 103);
+  bool ambiguous = false;
+  const auto found = resolveVarName(typed, session, &ambiguous);
+  if (ambiguous) return rcErrorBlock(typed + " ambiguous abbreviation\n(error in option cutpoints())", 111);
+  if (!found.has_value())
+    return rcErrorBlock("variable " + typed + " not found\n(error in option cutpoints())", 111);
+  if (session.datastore()->col(*found).dtype == cecon::DType::Factor)
+    return rcErrorBlock("string variables not allowed in option cutpoints();\n" + *found +
+                            " is a string variable",
+                        109);
+  *resolved = *found;
+  return std::nullopt;
+}
+
+// nquantiles(): `2`, `2.0` and `3.` are integers as written; `2.5` and `1e1` are
+// not; a bare word is evaluated as a name, which is how `n(abc)` comes to be
+// "abc not found". `shown` keeps the number as typed, for the variable label.
+std::optional<ojson> readXtileCount(const eval::OptValue& option, SessionState& session,
+                                    long long* count, std::string* shown) {
+  const ojson malformed = rcErrorBlock("option n() incorrectly specified", 198);
+  if (option.isBool) return malformed;
+  const std::string typed = trim(option.strValue);
+  if (typed.empty()) return std::nullopt;  // n() keeps the default
+  if (strutil::isValidStataIdentifier(typed)) {
+    if (resolveVarName(typed, session).has_value()) return malformed;
+    return rcErrorBlock(typed + " not found", 111);
+  }
+  const size_t digitsFrom = (typed[0] == '+' || typed[0] == '-') ? 1 : 0;
+  const size_t point = typed.find('.');
+  const std::string whole = typed.substr(digitsFrom, point == std::string::npos ? point : point - digitsFrom);
+  const std::string fraction = point == std::string::npos ? std::string() : typed.substr(point + 1);
+  if (whole.empty() || whole.find_first_not_of("0123456789") != std::string::npos ||
+      fraction.find_first_not_of('0') != std::string::npos)
+    return malformed;
+  *count = std::strtoll(whole.c_str(), nullptr, 10);
+  if (typed[0] == '-') *count = -*count;
+  *shown = typed;
+  return std::nullopt;
+}
+
+// Stata's limit on a variable label, in characters.
+std::string clippedVarLabel(const std::string& text) {
+  constexpr size_t kLabelCharacters = 80;
+  size_t characters = 0;
+  for (size_t at = 0; at < text.size(); ++at) {
+    if ((static_cast<unsigned char>(text[at]) & 0xC0) == 0x80) continue;
+    if (characters++ == kLabelCharacters) return text.substr(0, at);
+  }
+  return text;
+}
+
+// The smallest integer type that holds the result's largest category.
+const char* xtileStorageType(double largestCategory) {
+  if (largestCategory <= 100.0) return "byte";
+  if (largestCategory <= 32740.0) return "int";
+  return "long";
+}
+
+}  // namespace
+
+// The `xtile` command, [D] pctile: the checks in the order Stata answers them when
+// several faults meet (black-box oracle in the item's folder), the sample as a
+// source column that is missing outside it, and `cobra eval --xtile` for the
+// quantile work.
+ojson runXtileStata(const std::string& newvar, const std::string& expText,
+                    const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                    const std::optional<std::string>& ifExpr,
+                    const std::optional<std::string>& inRange,
+                    const std::optional<std::string>& weightVar, SessionState& session,
+                    const std::optional<std::string>& weightType) {
+  if (!session.currentHbin().has_value()) return eval::noDataLoaded();
+
+  std::string target;
+  if (auto refusal = readXtileTarget(newvar, &target)) return *refusal;
+  if (columnExistsDV(session, target))
+    return rcErrorBlock("variable " + target + " already defined", 110);
+
+  const eval::OptValue* countOption = nullptr;
+  const eval::OptValue* cutOption = nullptr;
+  bool countRepeated = false, cutRepeated = false;
+  for (const auto& [key, value] : opts) {
+    if (key == "nquantiles") {
+      countRepeated = countRepeated || countOption != nullptr;
+      countOption = &value;
+    } else if (key == "cutpoints") {
+      cutRepeated = cutRepeated || cutOption != nullptr;
+      cutOption = &value;
+    }
+  }
+
+  std::string cutVariable;
+  if (cutOption != nullptr)
+    if (auto refusal = readXtileCutVariable(*cutOption, session, &cutVariable)) return *refusal;
+
+  // if/in and exp, evaluated by generate: its "not found" and range answers are the
+  // ones Stata gives here, and they outrank everything about the options.
+  std::string qualifier;
+  if (ifExpr.has_value() && !trim(*ifExpr).empty()) qualifier += " if " + *ifExpr;
+  if (inRange.has_value() && !trim(*inRange).empty()) qualifier += " in " + *inRange;
+
+  ScratchColumns scratch(session);
+  std::string restrictionColumn;
+  if (!qualifier.empty())
+    if (auto failed = scratch.add("1", qualifier, &restrictionColumn)) return *failed;
+
+  std::string sourceColumn;
+  bool sourceIsString = false;
+  if (auto failed = scratch.add(expText, qualifier, &sourceColumn)) {
+    if (eval::coarseRc(*failed) != "109") return *failed;
+    sourceIsString = true;
+  }
+
+  if (countOption != nullptr && cutOption != nullptr)
+    return rcErrorBlock("both nquantiles() and cutpoints() cannot be specified", 198);
+
+  const bool weighted = weightVar.has_value() && !weightVar->empty();
+  std::string weightColumn;
+  if (weighted)
+    if (auto failed = scratch.add(*weightVar, "", &weightColumn)) return *failed;
+  if (sourceIsString) return rcErrorBlock("type mismatch", 109);
+
+  const auto rowCount = static_cast<size_t>(session.datastore()->nRows());
+  std::vector<char> restricted(rowCount, 1);
+  if (!restrictionColumn.empty()) {
+    const auto marks = scratch.values(restrictionColumn);
+    for (size_t row = 0; row < rowCount; ++row) restricted[row] = std::isnan(marks[row]) ? 0 : 1;
+  }
+
+  // Weight values: over the whole dataset for quantiles, over the restriction for
+  // cutpoints() (measured; [D] pctile documents neither).
+  std::vector<double> weights;
+  if (weighted) {
+    weights = scratch.values(weightColumn);
+    const std::string kind = weightType.value_or("");
+    const bool frequencyWeight = kind == "fw" || kind == "fweight";
+    bool negative = false, fractional = false;
+    for (size_t row = 0; row < rowCount; ++row) {
+      if (std::isnan(weights[row]) || (cutOption != nullptr && !restricted[row])) continue;
+      negative = negative || weights[row] < 0.0;
+      fractional = fractional || weights[row] != std::floor(weights[row]);
+    }
+    if (negative) return rcErrorBlock("negative weights encountered", 402);
+    if (frequencyWeight && fractional)
+      return rcErrorBlock("may not use noninteger frequency weights", 401);
+  }
+
+  long long quantileCount = kXtileDefaultNq;
+  std::string countShown = std::to_string(kXtileDefaultNq);
+  if (countRepeated) return rcErrorBlock("option n() not allowed", 198);
+  if (cutRepeated) return rcErrorBlock("option cutpoints() not allowed", 198);
+  if (countOption != nullptr)
+    if (auto refusal = readXtileCount(*countOption, session, &quantileCount, &countShown))
+      return *refusal;
+
+  // The marked sample: if, in, and a positive non-missing weight. A marked row
+  // whose exp is missing still counts towards N.
+  const auto sourceCells = scratch.values(sourceColumn);
+  long long markedRows = 0, usableRows = 0;
+  bool weightDropsARow = false;
+  for (size_t row = 0; row < rowCount; ++row) {
+    if (!restricted[row]) continue;
+    if (weighted && !(weights[row] > 0.0)) {
+      weightDropsARow = true;
+      continue;
+    }
+    ++markedRows;
+    if (!std::isnan(sourceCells[row])) ++usableRows;
+  }
+  if (cutOption == nullptr) {
+    if (quantileCount < 2)
+      return rcErrorBlock("nquantiles() must be greater than or equal to 2", 198);
+    if (quantileCount > markedRows + 1)
+      return rcErrorBlock(
+          "nquantiles() must be less than or equal to number of observations plus one", 198);
+  }
+  if (usableRows == 0) return rcErrorBlock("no observations", 2000);
+
+  if (weighted && weightDropsARow) {
+    const std::string keep = sourceColumn;
+    if (auto failed = scratch.add(keep, " if " + weightColumn + " > 0 & " + weightColumn + " < .",
+                                  &sourceColumn))
+      return *failed;
+  }
+
+  std::string engineCall = target + "=" + sourceColumn + ", ";
+  if (cutOption != nullptr) {
+    engineCall += "cutpoints(" + cutVariable + ")";
+  } else {
+    engineCall += "nq(" + std::to_string(quantileCount) + ")";
+    if (weighted) engineCall += " w(" + weightColumn + ")";
+  }
+  (void)session.datastore();  // the head file the engine reads
+  const std::string written = nextPath(session.workdir(), "xtile");
+  {
+    SessionState::ResidentEligible resident(session);
+    const CobraRunResult run =
+        runCobra({"eval", "--data", *session.currentHbin(), "--xtile", engineCall, "--out", written});
+    if (!run.ok) {
+      const CobraError failure = errorFromRaw(run);
+      return engineErrorBlock(cobraErrorStr(failure), failure.code);
+    }
+  }
+  session.load(written);
+  scratch.dropAll();
+
+  const Datastore* result = session.datastore();
+  const double* categories = result->col(target).f64();
+  double largest = 0.0;
+  for (size_t row = 0; row < rowCount; ++row)
+    if (categories[row] > largest) largest = categories[row];  // false for a missing category
+
+  VarMeta& meta = session.varMeta[target];
+  meta.stataType = xtileStorageType(largest);
+  meta.format = "%8.0g";
+  meta.label = clippedVarLabel(cutOption != nullptr
+                                   ? expText + " categorized by " + cutVariable
+                                   : countShown + " quantiles of " + expText);
+  scratch.noteDataChanged();
+  return mutationResult(session, "gen", {target});
 }
 
 ojson runIpolate(const std::vector<std::string>& varlist,
@@ -548,6 +942,9 @@ ojson runIpolate(const std::vector<std::string>& varlist,
   }
   if (newvar.empty())
     return engineErrorBlock("ipolate: generate(newvar) is required", "syntax_error");
+  // BUG-1120 review: `ipolate x t, gen(_cons)' and gen(int) are "NAME invalid
+  // varname" r(198) (StataBE 19.5).
+  if (auto r = strutil::newVarNameRefusal(newvar)) return nameRefusalBlock(*r);
   ojson guard = newVarGuardDV(session, "ipolate", newvar);
   if (!guard.is_null() && !guard.empty()) return guard;
   if (ifExpr.has_value() && !ifExpr->empty()) {
@@ -684,7 +1081,8 @@ ojson runTssmoothMa(const std::string& newvar, const std::string& srcvar,
 // them), and each key cell is compared by its exact f64 bits so the extended
 // missings `.a`-`.z` (data/missing.h) stay distinct from `.` — the same
 // kind-exact identity the expression layer uses.
-ojson runIsid(const std::vector<std::string>& varlist, SessionState& session) {
+ojson runIsid(const std::vector<std::string>& varlist, SessionState& session, bool missok,
+              bool sort) {
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   Datastore* ds = session.datastore();
   if (ds == nullptr) return eval::noDataLoaded();
@@ -698,7 +1096,7 @@ ojson runIsid(const std::vector<std::string>& varlist, SessionState& session) {
   }
 
   const int64_t n = ds->nRows();
-  if (n <= 1) {  // 0 or 1 observation is trivially unique
+  if (n == 0) {  // no observation is trivially unique (one is checked for a missing key)
     return ojson::array();
   }
 
@@ -720,6 +1118,29 @@ ojson runIsid(const std::vector<std::string>& varlist, SessionState& session) {
       kc.f64 = c.f64();
     }
     keys.push_back(kc);
+  }
+
+  // isid.ado CheckUniq: without `missok' a missing key value is r(459) before
+  // uniqueness is looked at ("... should never be missing"; markout, strok: a
+  // numeric `.'-`.z' or an empty string). w2ah_data_verbs.log ah_isid_missing:
+  // rc 459 on a key whose third value is `.' -- main accepted it at rc 0.
+  // BUG-1135: `missok' skips that check and a missing value is then one more key
+  // value (two `.' keys do not identify their rows).
+  for (size_t k = 0; k < keys.size() && !missok; ++k) {
+    for (int64_t i = 0; i < n; ++i) {
+      const bool miss = keys[k].codes != nullptr ? keys[k].codes[i] < 0
+                                                 : std::isnan(keys[k].f64[i]);
+      if (miss) {
+        std::string joined;
+        for (size_t j = 0; j < varlist.size(); ++j) {
+          if (j) joined += " ";
+          joined += varlist[j];
+        }
+        return rcErrorBlock((varlist.size() == 1 ? "variable " : "variables ") + joined +
+                                " should never be missing",
+                            459);
+      }
+    }
   }
 
   auto cellBits = [&keys](size_t k, int64_t row) -> uint64_t {
@@ -751,16 +1172,40 @@ ojson runIsid(const std::vector<std::string>& varlist, SessionState& session) {
           if (j) joined += " ";
           joined += varlist[j];
         }
-        return engineErrorBlock(
+        return rcErrorBlock(
             (varlist.size() == 1 ? "variable " : "variables ") + joined +
                 " do" + (varlist.size() == 1 ? "es" : "") +
                 " not uniquely identify the observations",
-            "engine_error");
+            459);
       }
     }
     bucket.push_back(i);
   }
-  return ojson::array();  // unique: silent, rc 0 (Stata prints nothing)
+  if (!sort) return ojson::array();  // unique: silent, rc 0 (Stata prints nothing)
+  // BUG-1135: `sort' then sorts by the varlist unless the sort marker already
+  // begins with it, and says which: "(data now sorted by x)" / "(data already
+  // sorted by x)" (isid.ado; StataBE 19.5).
+  std::string joined;
+  for (const auto& v : varlist) joined += (joined.empty() ? "" : " ") + v;
+  std::vector<std::string> marker;
+  {
+    std::istringstream in(session.eval.sortedBy ? session.eval.sortedBy() : std::string());
+    for (std::string k; in >> k;) marker.push_back(k);
+  }
+  const bool already = varlist.size() <= marker.size() &&
+                       std::equal(varlist.begin(), varlist.end(), marker.begin());
+  ojson out = ojson::array();
+  if (!already) {
+    ojson sorted = runSort(varlist, session);
+    if (sorted.is_object() && sorted.value("type", std::string()) == "error") return sorted;
+    out.push_back(std::move(sorted));
+  }
+  ojson note;
+  note["type"] = "display";
+  note["class"] = "note";
+  note["text"] = "(data " + std::string(already ? "already" : "now") + " sorted by " + joined + ")";
+  out.push_back(std::move(note));
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -771,6 +1216,17 @@ ojson runIsid(const std::vector<std::string>& varlist, SessionState& session) {
 
 ojson runExpand(const std::string& countArg, const std::optional<std::string>& genVar,
                 SessionState& session) {
+  return runExpandIf(countArg, genVar, std::nullopt, std::nullopt, session);
+}
+
+// `expand N [if] [in]`: the observations the qualifier selects become N copies
+// each, the others stay once (w2_esample.log:1076 E6 `expand 2 if id==3`: rc 0,
+// _N 61 -> 67). Built as filter -> expand the selected rows N-1 times -> append
+// those copies after the data, which is where Stata puts created observations
+// and the order Frame::expand writes them in (rep by rep, each in data order).
+ojson runExpandIf(const std::string& countArg, const std::optional<std::string>& genVar,
+                  const std::optional<std::string>& ifExpr,
+                  const std::optional<std::string>& inRange, SessionState& session) {
   if (!session.currentHbin().has_value() || session.datastore() == nullptr) {
     return eval::noDataLoaded();
   }
@@ -788,21 +1244,83 @@ ojson runExpand(const std::string& countArg, const std::optional<std::string>& g
     }
   }
   if (genVar.has_value() && !genVar->empty()) {
+    // BUG-1120 review: the new-variable rule with _se and the r(table) row names:
+    // `expand 2, gen(_cons)' is "_cons invalid varname" r(198) (StataBE 19.5).
+    if (auto r = strutil::newVarNameRefusal(*genVar, /*resultRows=*/true))
+      return nameRefusalBlock(*r);
     ojson guard = newVarGuardDV(session, "expand", *genVar);
     if (!guard.is_null() && !guard.empty()) return guard;
   }
   const int64_t rowsBefore = session.datastore()->nRows();
   std::string outPath = nextPath(session.workdir(), "expand");
+  const bool qualified = (ifExpr.has_value() && !ifExpr->empty()) ||
+                         (inRange.has_value() && !inRange->empty());
+  long long copies = 0;
+  try {
+    copies = std::stoll(n);
+  } catch (const std::exception&) {
+    copies = 0;  // the engine names the malformed count below
+  }
   CobraRunResult cr;
-  {
+  if (!qualified || copies <= 1) {
+    // N <= 1 leaves every observation once whatever the qualifier selects, but
+    // the range is still read: `expand 1 in 9` on 3 rows is "observation numbers
+    // out of range" r(198) (StataBE 19.5, BUG-1115).
+    if (inRange.has_value() && !inRange->empty()) {
+      const InRangeBounds rr = parseInRangeBounds(*inRange, rowsBefore);
+      if (!rr.ok) {
+        InRangeFilterResult fr;
+        fr.ok = false;
+        fr.refusal = rr.refusal;
+        return inRangeRejectError(fr, *inRange, "expand");
+      }
+    }
     SessionState::ResidentEligible residentExpand(session);  // BUG-394
     cr = runCobra({"expand", "--data", *session.currentHbin(), "--n", n, "--out", outPath});
+  } else {
+    InRangeFilterResult fr;
+    try {
+      fr = applyIfAndInFilter(session, *session.currentHbin(), ifExpr, inRange);
+    } catch (const CobraError& ce) {
+      return engineErrorBlock(cobraErrorStr(ce), ce.code);
+    }
+    if (!fr.ok) return inRangeRejectError(fr, inRange.value_or(std::string()), "expand");
+    std::string created = fr.dataPath;
+    if (copies > 2) {
+      created = nextPath(session.workdir(), "expand_copies");
+      const CobraRunResult er = runCobra({"expand", "--data", fr.dataPath, "--n",
+                                          std::to_string(copies - 1), "--out", created});
+      if (!er.ok) {
+        CobraError ce = errorFromRaw(er);
+        return engineErrorBlock(cobraErrorStr(ce), ce.code);
+      }
+    }
+    session.ensureMaterializedHead("expand-if");
+    SessionState::ResidentEligible residentExpand(session);  // the append's --out is the head
+    cr = runCobra({"append", "--data", *session.currentHbin(), "--using", created, "--out",
+                   outPath, "--type-clash", "error"});
   }
   if (!cr.ok) {
     CobraError ce = errorFromRaw(cr);
     return engineErrorBlock(cobraErrorStr(ce), ce.code);
   }
   session.load(outPath);
+  // e(sample) T2: a created observation is outside the estimation sample; the
+  // originals keep their marker (w2_esample.log:1076 E6 `0|0|28|67|`; StataBE
+  // capture w2_esample_copies X1 `old=23|created=0`). The copies carried the
+  // mask like any column, so their cells are rewritten to 0.
+  if (std::optional<std::vector<double>> cells = esampleHeadMask(session)) {
+    bool any = false;
+    for (size_t i = static_cast<size_t>(rowsBefore); i < cells->size(); ++i) {
+      any = any || (*cells)[i] != 0.0;
+      (*cells)[i] = 0.0;
+    }
+    if (any && !esampleRewriteHeadMask(session, *cells)) {
+      return engineErrorBlock(
+          "expand: the observations were created, but the estimation-sample marker could not "
+          "be cleared on them; e(sample) is not reliable until the next estimation.");
+    }
+  }
   // B4-W3b `generate(newvar)`. Built from `_n > <rows before>` AFTER the
   // expansion, because that is the only fact that distinguishes an original
   // from a copy: the copies are byte-identical to their sources in every other
@@ -857,12 +1375,21 @@ ojson runCross(const std::string& usingPathArg, SessionState& session) {
   if (!ur.ok) return ur.errBlock;
 
   std::vector<std::string> newCols;
+  int64_t usingRows = 0, masterRows = 0;
+  std::map<std::string, UsingVarMeta> uMeta;
   {
     Datastore usingDs(ur.hbinPath);
     Datastore* master = session.datastore();
     for (const auto& nm : usingDs.names())
       if (!master->has(nm)) newCols.push_back(nm);
+    usingRows = usingDs.nRows();
+    masterRows = master->nRows();
+    uMeta = usingVarMetaOf(session, ur.usingPath, ur.metaPath, usingDs);
   }
+  // A using file with no observations stops cross.ado inside its own expand/sort
+  // of the using data, on its row-number tempvar: r(111), the data as they were
+  // (StataBE 19.5, named as a fresh session names it; BUG-1105).
+  if (usingRows == 0) return rcErrorBlock("variable __000001 not found", 111);
   std::string outPath = nextPath(session.workdir(), "cross");
   CobraRunResult cr;
   {
@@ -874,6 +1401,20 @@ ojson runCross(const std::string& usingPathArg, SessionState& session) {
     return engineErrorBlock(cobraErrorStr(ce), ce.code);
   }
   session.load(outPath);
+  // e(sample) T2: each master observation keeps its marker on its pairing with
+  // the FIRST using observation, every other pairing reads 0 (StataBE capture
+  // w2_esample_copies X3 `23|183|m0=69`, X3b `k1=23|k2=0|k3=0`). The engine
+  // writes those pairings first, in master order, and the rest after them
+  // (Frame::cross, src/data/frame2.cpp), so rows from masterRows on read 0.
+  if (std::optional<std::vector<double>> cells = esampleHeadMask(session); cells && usingRows > 1) {
+    for (size_t p = static_cast<size_t>(masterRows); p < cells->size(); ++p) (*cells)[p] = 0.0;
+    if (!esampleRewriteHeadMask(session, *cells)) {
+      return engineErrorBlock(
+          "cross: the data were formed, but the estimation-sample marker could not be "
+          "cleared on the added pairings; e(sample) is not reliable until the next estimation.");
+    }
+  }
+  adoptUsingOwnVars(session, ur, uMeta, newCols);
   return mutationResult(session, "cross", newCols);
 }
 
@@ -891,6 +1432,10 @@ ojson runContract(const std::vector<std::string>& varlist, SessionState& session
     if (i) joined += ",";
     joined += varlist[i];
   }
+  // e(sample) T2: a result row carries its group's first observation's marker,
+  // as collapse's (StataBE capture w2_esample_copies K6 `contract id` 4 of 11,
+  // K7 `contract id m0` m0_diff=0).
+  const EsampleGroupMarks esMarks = esampleGroupMarksBefore(session, varlist, false);
   std::string outPath = nextPath(session.workdir(), "contract");
   CobraRunResult cr;
   {
@@ -902,6 +1447,11 @@ ojson runContract(const std::vector<std::string>& varlist, SessionState& session
     return engineErrorBlock(cobraErrorStr(ce), ce.code);
   }
   session.load(outPath);
+  if (!esampleGroupMarksAfter(session, esMarks, varlist, EsampleLostBy::kContract)) {
+    return engineErrorBlock(
+        "contract: the data were contracted, but the estimation-sample marker could not be "
+        "written onto the result; e(sample) is not reliable until the next estimation.");
+  }
   return mutationResult(session, "contract", {"_freq"});
 }
 
@@ -911,21 +1461,6 @@ ojson runContract(const std::vector<std::string>& varlist, SessionState& session
 
 namespace {
 
-// One CSV field, quoted only when it must be (delimiter, quote, CR or LF).
-std::string csvField(const std::string& s, char delim) {
-  bool needQuote = false;
-  for (char c : s) {
-    if (c == delim || c == '"' || c == '\n' || c == '\r') { needQuote = true; break; }
-  }
-  if (!needQuote) return s;
-  std::string out = "\"";
-  for (char c : s) {
-    if (c == '"') out += "\"\"";
-    else out += c;
-  }
-  out += "\"";
-  return out;
-}
 
 // A numeric cell the way Stata's `export delimited` writes it. A missing is
 // `.` or its extended code `.a`..`.z` (oracle: Stata's own p1_roundtrip.csv
@@ -1209,24 +1744,6 @@ std::string formatStataDate(double v, char family) {
   }
 }
 
-// The delimiter named by `delimiter(D)`; Stata spells tab/comma/semicolon out.
-bool parseDelimiterOpt(const std::vector<std::pair<std::string, eval::OptValue>>& opts,
-                       char* out, std::string* err) {
-  for (const auto& kv : opts) {
-    if (kv.first != "delimiter" && kv.first != "delim") continue;
-    if (kv.second.isBool) continue;
-    std::string v = trim(kv.second.strValue);
-    if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
-    std::string lower = strutil::lower(v);
-    if (lower == "tab" || v == "\\t") { *out = '\t'; return true; }
-    if (lower == "comma") { *out = ','; return true; }
-    if (lower == "semicolon") { *out = ';'; return true; }
-    if (v.size() == 1) { *out = v[0]; return true; }
-    *err = "delimiter(): expected a single character, `tab`, `comma` or `semicolon` (got '" + v + "')";
-    return false;
-  }
-  return true;  // absent -> caller's default
-}
 
 bool hasFlagOpt(const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                 const std::string& name) {
@@ -1254,196 +1771,174 @@ std::optional<std::string> optStrOf(const std::vector<std::pair<std::string, eva
   return std::nullopt;
 }
 
-// --- AER scope-2 W3a: `import delimited`'s subsetting options ---------------
-//
-// These five options are implemented by STAGING a rewritten .csv and handing it
-// to the same loader the option-free path already uses, rather than by teaching
-// the loader five new arguments. The reason is containment: the option-free
-// path is byte-for-byte the one that captured every existing fixture, and it
-// stays untouched — `needsDelimPreprocess()` is false unless one of the new
-// options is actually present.
+}  // namespace
 
-// One delimited document -> rows of fields. Quoting is RFC 4180's: a field may
-// be double-quoted, a doubled quote inside one is a literal quote, and a quoted
-// field may contain the delimiter AND newlines. Handling the embedded newline
-// is not decoration — a row-window (`rowrange`) computed by splitting on '\n'
-// would cut such a record in half and stage a corrupt file at rc 0.
-std::vector<std::vector<std::string>> splitDelimitedRows(const std::string& text, char delim) {
-  std::vector<std::vector<std::string>> rows;
-  std::vector<std::string> row;
-  std::string field;
-  bool inQuotes = false;
-  bool sawAny = false;
-  size_t i = 0;
-  const size_t n = text.size();
-  while (i < n) {
-    const char c = text[i];
-    if (inQuotes) {
-      if (c == '"') {
-        if (i + 1 < n && text[i + 1] == '"') { field.push_back('"'); i += 2; continue; }
-        inQuotes = false; ++i; continue;
+namespace {
+
+// Stata's pathsuffix(): the extension of the last path component, "" when it
+// has none. export delimited / import delimited supply ".csv" and the excel
+// pair ".xlsx" to a name without one (w2ar dx_exd_noext log:760-769 writes
+// ne1.csv and leaves the bare name absent; dx_exx_noext log:1527).
+bool pathHasSuffix(const std::string& p) {
+  const size_t slash = p.find_last_of("/\\");
+  const size_t dot = p.find_last_of('.');
+  if (dot == std::string::npos) return false;
+  if (slash != std::string::npos && dot < slash) return false;
+  return true;
+}
+
+std::string withDefaultSuffix(const std::string& p, const char* suffix) {
+  return pathHasSuffix(p) ? p : p + suffix;
+}
+
+std::string stripOneQuotePair(const std::string& v);
+
+// The file as the user typed it, with the suffix the command supplies: what
+// Stata's export messages name (`file out.csv saved`, `file ./sub/o2.csv
+// saved`, `file out.xlsx already exists`), never the resolved absolute path,
+// which would put this machine's working directory into every captured
+// transcript (BUG-410).
+std::string typedFileName(const std::string& pathArg, const char* suffix) {
+  return withDefaultSuffix(stripOneQuotePair(trim(pathArg)), suffix);
+}
+
+// True when the directory a file would be written into does not exist:
+// Stata's export answers r(603) "file could not be opened" there (w2ar
+// dx_exd_missing_dir, log:796).
+bool parentDirMissing(const std::string& p) {
+  const size_t slash = p.find_last_of('/');
+  if (slash == std::string::npos || slash == 0) return false;
+  std::error_code ec;
+  return !std::filesystem::is_directory(cecon::to_native_path(p.substr(0, slash)), ec);
+}
+
+// A float column's text: Stata writes float storage at 8 significant digits
+// (w2ar dx_exd_plain_L2 `1.01` for float 1.01, log:455; w2b 7.0100002,
+// w2b log:420-423), integers in full, without the leading zero of |x|<1 (the
+// same tidy rule the double path uses).
+void appendFloatNumeric(std::string& out, double v) {
+  if (std::isnan(v) || v == std::floor(v)) { appendCsvNumeric(out, v); return; }
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%.8g", v);
+  std::string s(buf);
+  if (s.rfind("0.", 0) == 0) s.erase(0, 1);
+  else if (s.rfind("-0.", 0) == 0) s.erase(1, 1);
+  out += s;
+}
+
+std::string trimBlanks(const std::string& s) {
+  const size_t a = s.find_first_not_of(' ');
+  if (a == std::string::npos) return std::string();
+  const size_t b = s.find_last_not_of(' ');
+  return s.substr(a, b - a + 1);
+}
+
+void appendQuotedField(std::string& out, const std::string& s, char delim,
+                       DelimWriteSpec::Quote q) {
+  switch (q) {
+    case DelimWriteSpec::Quote::kMinimal: appendCsvField(out, s, delim); return;
+    case DelimWriteSpec::Quote::kNone: out += s; return;
+    case DelimWriteSpec::Quote::kAllVerbatim: out += '"'; out += s; out += '"'; return;
+    case DelimWriteSpec::Quote::kAll:
+      out += '"';
+      for (char c : s) {
+        if (c == '"') out += "\"\"";
+        else out += c;
       }
-      field.push_back(c); ++i; continue;
-    }
-    if (c == '"') { inQuotes = true; sawAny = true; ++i; continue; }
-    if (c == delim) { row.push_back(field); field.clear(); sawAny = true; ++i; continue; }
-    if (c == '\r') { ++i; continue; }          // CRLF and lone CR both end the line at '\n'
-    if (c == '\n') {
-      row.push_back(field); field.clear();
-      rows.push_back(std::move(row));
-      row.clear();
-      sawAny = false;
-      ++i; continue;
-    }
-    field.push_back(c); sawAny = true; ++i;
+      out += '"';
+      return;
   }
-  if (!field.empty() || sawAny || !row.empty()) {
-    row.push_back(field);
-    rows.push_back(std::move(row));
-  }
-  return rows;
-}
-
-// `rowrange(a:b)` / `colrange(a:b)` — both ends optional, 1-based inclusive.
-// 0 comes back for an end the user left out.
-bool parseIndexRangeOpt(const std::string& what, const std::string& spec, long long* lo,
-                        long long* hi, std::string* err) {
-  const std::string s = trim(spec);
-  const size_t colon = s.find(':');
-  const std::string a = colon == std::string::npos ? s : trim(s.substr(0, colon));
-  const std::string b = colon == std::string::npos ? std::string() : trim(s.substr(colon + 1));
-  auto num = [&](const std::string& t, long long* out) {
-    if (t.empty()) { *out = 0; return true; }
-    if (t.find_first_not_of("0123456789") != std::string::npos) return false;
-    try { *out = std::stoll(t); } catch (...) { return false; }
-    return *out > 0;
-  };
-  if (!num(a, lo) || !num(b, hi)) {
-    *err = what + "(" + s + "): expected first:last, both 1-based (either side may be omitted)";
-    return false;
-  }
-  if (*hi > 0 && *lo > *hi) {
-    *err = what + "(" + s + "): the range ends before it starts";
-    return false;
-  }
-  return true;
-}
-
-// `numericcols(numlist)` — Stata's numlist, in the two shapes this option is
-// ever written in: space/comma-separated indices and `a/b` runs, plus `_all`.
-bool parseColumnNumlist(const std::string& spec, std::set<long long>* out, bool* all,
-                        std::string* err) {
-  *all = false;
-  const std::string s = trim(spec);
-  if (strutil::lower(s) == "_all") { *all = true; return true; }
-  std::string tok;
-  std::istringstream iss(s);
-  bool any = false;
-  while (iss >> tok) {
-    while (!tok.empty() && tok.back() == ',') tok.pop_back();
-    if (tok.empty()) continue;
-    const size_t slash = tok.find('/');
-    auto num = [&](const std::string& t, long long* v) {
-      if (t.empty() || t.find_first_not_of("0123456789") != std::string::npos) return false;
-      try { *v = std::stoll(t); } catch (...) { return false; }
-      return *v > 0;
-    };
-    if (slash == std::string::npos) {
-      long long v = 0;
-      if (!num(tok, &v)) { *err = "numericcols(" + s + "): `" + tok + "` is not a column number"; return false; }
-      out->insert(v);
-    } else {
-      long long a = 0, b = 0;
-      if (!num(tok.substr(0, slash), &a) || !num(tok.substr(slash + 1), &b) || a > b) {
-        *err = "numericcols(" + s + "): `" + tok + "` is not a column run";
-        return false;
-      }
-      for (long long v = a; v <= b; ++v) out->insert(v);
-    }
-    any = true;
-  }
-  if (!any) { *err = "numericcols(): expected column numbers, for example numericcols(2 4/6)"; return false; }
-  return true;
-}
-
-// A field that `numericcols()` names but that is not a number becomes MISSING —
-// which is what forcing a column numeric means. Stata's own missing tokens are
-// left alone so the loader still reads them as missing.
-bool looksNumericField(const std::string& raw) {
-  const std::string t = trim(raw);
-  if (t.empty()) return true;
-  if (t == "." ) return true;
-  if (t.size() == 2 && t[0] == '.' && t[1] >= 'a' && t[1] <= 'z') return true;
-  size_t used = 0;
-  try { (void)std::stod(t, &used); } catch (...) { return false; }
-  return used == t.size();
-}
-
-// iconv(3) to UTF-8. `fromCode` is Stata's `encoding()` argument passed through
-// verbatim — iconv speaks the same names ("latin1", "ISO-8859-1",
-// "windows-1252", ...), so a name it rejects is reported rather than guessed at.
-bool iconvToUtf8(const std::string& in, const std::string& fromCode, std::string* out,
-                 std::string* err) {
-  const std::string from = trim(fromCode);
-  const std::string lowered = strutil::lower(from);
-  if (lowered == "utf-8" || lowered == "utf8") { *out = in; return true; }
-  iconv_t cd = ::iconv_open("UTF-8", from.c_str());
-  if (cd == reinterpret_cast<iconv_t>(-1)) {
-    *err = "encoding(" + from + "): this system's iconv does not know that character encoding";
-    return false;
-  }
-  std::string result;
-  result.reserve(in.size() + in.size() / 4 + 16);
-  std::vector<char> inBuf(in.begin(), in.end());
-  char* inPtr = inBuf.empty() ? nullptr : inBuf.data();
-  size_t inLeft = inBuf.size();
-  std::vector<char> chunk(65536);
-  bool ok = true;
-  while (inLeft > 0) {
-    char* outPtr = chunk.data();
-    size_t outLeft = chunk.size();
-    const size_t rc = ::iconv(cd, &inPtr, &inLeft, &outPtr, &outLeft);
-    result.append(chunk.data(), chunk.size() - outLeft);
-    if (rc == static_cast<size_t>(-1)) {
-      if (errno == E2BIG) continue;            // output chunk full — drain and go on
-      *err = "encoding(" + from + "): the file is not valid " + from +
-             " (iconv stopped after " + std::to_string(result.size()) + " converted bytes)";
-      ok = false;
-      break;
-    }
-  }
-  ::iconv_close(cd);
-  if (!ok) return false;
-  *out = std::move(result);
-  return true;
 }
 
 }  // namespace
 
-ojson runExportDelimited(const std::vector<std::string>& varlist, const std::string& pathArg,
-                         const std::vector<std::pair<std::string, eval::OptValue>>& opts,
-                         SessionState& session) {
+ojson reEchoPath(ojson block, const std::string& resolved, const std::string& shown) {
+  if (!block.is_object()) return block;
+  // A success line carries "text"; an error block carries "message".
+  for (const char* key : {"text", "message"}) {
+    if (!block.contains(key) || !block[key].is_string()) continue;
+    std::string text = block[key].get<std::string>();
+    const size_t at = text.find(resolved);
+    if (at == std::string::npos) continue;
+    block[key] = text.substr(0, at) + shown + text.substr(at + resolved.size());
+  }
+  return block;
+}
+
+ojson writeDelimitedFile(const std::vector<std::string>& varlist, const std::string& path,
+                         const DelimWriteSpec& spec, const std::optional<std::string>& ifExpr,
+                         const std::optional<std::string>& inRange, SessionState& session) {
   if (!session.currentHbin().has_value() || session.datastore() == nullptr) {
     return eval::noDataLoaded();
   }
-  Datastore* ds = session.datastore();
-
-  char delim = ',';
-  std::string derr;
-  if (!parseDelimiterOpt(opts, &delim, &derr)) return engineErrorBlock(derr, "unsupported_option");
-  const bool noLabel = hasFlagOpt(opts, "nolabel");
-  const bool replace = hasFlagOpt(opts, "replace");
-
+  const std::string& shown = spec.shown.empty() ? path : spec.shown;
+  Datastore* base = session.datastore();
   std::vector<std::string> cols = varlist;
-  if (cols.empty()) cols = ds->names();
+  if (cols.empty()) cols = base->names();
   for (const auto& v : cols) {
-    if (!ds->has(v)) return engineErrorBlock("variable " + v + " not found", "unknown_variable");
+    if (!base->has(v)) return engineErrorBlock("variable " + v + " not found", "unknown_variable");
   }
 
-  std::string path = resolveUserPath(session, pathArg);
-  if (cecon::native_exists(path) && !replace) {
-    return engineErrorBlock("export delimited: file " + path +
-                            " already exists (add `replace` to overwrite)");
+  // Per-column facts read from the SESSION's frame (formats, storage types and
+  // value labels are keyed by name), before any row filter.
+  struct OutCol {
+    std::string name;
+    const std::map<std::string, std::string>* labels = nullptr;  // value labels, if any
+    char dateFamily = 0;   // W:P8: letter after `%t`, 0 for a non-date column
+    std::string dispFmt;   // display format (datafmt / outsheet)
+    bool isFloat = false;  // float storage: 8 significant digits
+  };
+  std::vector<OutCol> oc;
+  oc.reserve(cols.size());
+  for (const auto& name : cols) {
+    OutCol o;
+    o.name = name;
+    if (!spec.noLabel) {
+      auto lv = session.varLblname.find(name);
+      if (lv != session.varLblname.end()) {
+        auto ld = session.labelDefs.find(lv->second);
+        if (ld != session.labelDefs.end()) o.labels = &ld->second;
+      }
+    }
+    const cecon::Column& col = base->col(name);
+    if (col.dtype != cecon::DType::Factor) {
+      const VarInfo vi = base->varinfo(name);
+      o.dispFmt = session.displayFormat(vi);
+      o.dateFamily = dateFamilyOf(o.dispFmt);
+      auto vm = session.varMeta.find(name);
+      if (vm != session.varMeta.end() && vm->second.stataType.has_value() &&
+          !vm->second.stataType->empty()) {
+        o.isFloat = *vm->second.stataType == "float";
+      } else {
+        // No declared storage: Stata's default numeric type is float, but this
+        // frame's undeclared columns can hold doubles (an engine result), so a
+        // column is written as float only when every value IS one.
+        o.isFloat = true;
+        const auto& f = col.f64();
+        for (int64_t r = 0; r < base->nRows(); ++r) {
+          const double v = f[r];
+          if (!std::isnan(v) && static_cast<double>(static_cast<float>(v)) != v) {
+            o.isFloat = false;
+            break;
+          }
+        }
+      }
+    }
+    oc.push_back(std::move(o));
+  }
+
+  Datastore* ds = base;
+  std::unique_ptr<Datastore> filtered;
+  if ((ifExpr.has_value() && !ifExpr->empty()) || (inRange.has_value() && !inRange->empty())) {
+    InRangeFilterResult fr;
+    try {
+      fr = applyIfAndInFilter(session, base->path(), ifExpr, inRange);
+    } catch (const CobraError& ce) {
+      return engineErrorBlock(cobraErrorStr(ce), ce.code);
+    }
+    if (!fr.ok) return inRangeRejectError(fr, inRange.value_or(std::string()), spec.verb);
+    filtered = std::make_unique<Datastore>(fr.dataPath);
+    ds = filtered.get();
   }
 
   // Write to a sibling temp then rename, so a failure never leaves a truncated
@@ -1451,38 +1946,24 @@ ojson runExportDelimited(const std::vector<std::string>& varlist, const std::str
   std::string tmpPath = path + ".piet_tmp";
   {
     std::ofstream f(cecon::to_native_path(tmpPath), std::ios::binary);
-    if (!f) return engineErrorBlock("export delimited: cannot write " + path, "data_io");
-
-    for (size_t c = 0; c < cols.size(); ++c) {
-      if (c) f << delim;
-      f << csvField(cols[c], delim);
+    if (!f) {
+      return eval::errorBlock("engine_error", "file " + shown + " could not be opened",
+                              std::nullopt, std::nullopt, std::nullopt, "r(603)");
     }
-    f << "\n";
 
-    // Per-column accessors resolved once, outside the row loop.
-    struct OutCol {
-      const cecon::Column* col = nullptr;
-      const std::map<std::string, std::string>* labels = nullptr;  // value labels, if any
-      char dateFamily = 0;  // W:P8: letter after `%t`, 0 for a non-date column
-    };
-    std::vector<OutCol> oc;
-    oc.reserve(cols.size());
-    for (const auto& name : cols) {
-      OutCol o;
-      o.col = &ds->col(name);
-      if (!noLabel) {
-        auto lv = session.varLblname.find(name);
-        if (lv != session.varLblname.end()) {
-          auto ld = session.labelDefs.find(lv->second);
-          if (ld != session.labelDefs.end()) o.labels = &ld->second;
-        }
+    if (spec.header) {
+      std::string head;
+      for (size_t c = 0; c < cols.size(); ++c) {
+        if (c) head += spec.delim;
+        head += cols[c];
       }
-      auto vm = session.varMeta.find(name);
-      if (vm != session.varMeta.end() && vm->second.format.has_value()) {
-        o.dateFamily = dateFamilyOf(*vm->second.format);
-      }
-      oc.push_back(o);
+      head += '\n';
+      f.write(head.data(), static_cast<std::streamsize>(head.size()));
     }
+
+    std::vector<const cecon::Column*> colp;
+    colp.reserve(cols.size());
+    for (const auto& name : cols) colp.push_back(&ds->col(name));
 
     // P2-PERF ARC-B/S08: rows accumulate into a ~1 MB block and go out with one
     // write() each, instead of one operator<< per row through the stream's
@@ -1492,29 +1973,51 @@ ojson runExportDelimited(const std::vector<std::string>& varlist, const std::str
     block.reserve(kCsvBlockBytes + 4096);
     for (int64_t r = 0; r < n; ++r) {
       for (size_t c = 0; c < oc.size(); ++c) {
-        if (c) block += delim;
-        const cecon::Column& col = *oc[c].col;
+        if (c) block += spec.delim;
+        const cecon::Column& col = *colp[c];
         if (col.dtype == cecon::DType::Factor) {
           int32_t code = col.codes()[r];
-          if (code >= 0) appendCsvField(block, col.levels[static_cast<size_t>(code)], delim);
-        } else {
-          double v = col.f64()[r];
-          // A value-labeled numeric exports as its LABEL (Stata's default;
-          // `nolabel` gives the code) — the reason this writer lives in PIET.
-          if (oc[c].labels != nullptr && !std::isnan(v)) {
-            std::string key = eval::pythonFloatRepr(v);
-            auto it = oc[c].labels->find(key);
-            if (it == oc[c].labels->end() && v == std::floor(v)) {
-              it = oc[c].labels->find(std::to_string(static_cast<long long>(v)));
-            }
-            if (it != oc[c].labels->end()) { appendCsvField(block, it->second, delim); continue; }
+          if (code >= 0) {
+            appendQuotedField(block, col.levels[static_cast<size_t>(code)], spec.delim, spec.quote);
+          } else if (spec.quote == DelimWriteSpec::Quote::kAll ||
+                     spec.quote == DelimWriteSpec::Quote::kAllVerbatim) {
+            block += "\"\"";
           }
-          if (oc[c].dateFamily != 0 && !std::isnan(v)) {
-            std::string ds8 = formatStataDate(v, oc[c].dateFamily);
-            if (!ds8.empty()) { appendCsvField(block, ds8, delim); continue; }
-          }
-          appendCsvNumeric(block, v);
+          continue;
         }
+        double v = col.f64()[r];
+        // A value-labeled numeric exports as its LABEL (Stata's default;
+        // `nolabel` gives the code) — the reason this writer lives in PIET.
+        if (oc[c].labels != nullptr && !std::isnan(v)) {
+          std::string key = eval::pythonFloatRepr(v);
+          auto it = oc[c].labels->find(key);
+          if (it == oc[c].labels->end() && v == std::floor(v)) {
+            it = oc[c].labels->find(std::to_string(static_cast<long long>(v)));
+          }
+          if (it != oc[c].labels->end()) {
+            appendQuotedField(block, it->second, spec.delim, spec.quote);
+            continue;
+          }
+        }
+        if (oc[c].dateFamily != 0 && !std::isnan(v)) {
+          std::string ds8 = formatStataDate(v, oc[c].dateFamily);
+          if (!ds8.empty()) {
+            if (spec.quote == DelimWriteSpec::Quote::kMinimal) appendCsvField(block, ds8, spec.delim);
+            else block += ds8;
+            continue;
+          }
+        }
+        if (spec.dataFmt && !std::isnan(v) && !oc[c].dispFmt.empty()) {
+          std::string s;
+          try {
+            s = trimBlanks(eval::applyStataFmt(v, oc[c].dispFmt));
+          } catch (...) {
+            s.clear();
+          }
+          if (!s.empty()) { block += s; continue; }
+        }
+        if (oc[c].isFloat) appendFloatNumeric(block, v);
+        else appendCsvNumeric(block, v);
       }
       block += '\n';
       if (block.size() >= kCsvBlockBytes) {
@@ -1528,8 +2031,7 @@ ojson runExportDelimited(const std::vector<std::string>& varlist, const std::str
       f.close();
       std::error_code rmEc;
       std::filesystem::remove(cecon::to_native_path(tmpPath), rmEc);
-      return engineErrorBlock("export delimited: failed writing " + path + " (disk full?)",
-                              "data_io");
+      return engineErrorBlock(spec.verb + ": failed writing " + shown + " (disk full?)", "data_io");
     }
   }
   std::error_code mvEc;
@@ -1537,301 +2039,595 @@ ojson runExportDelimited(const std::vector<std::string>& varlist, const std::str
   if (mvEc) {
     std::error_code rmEc;
     std::filesystem::remove(cecon::to_native_path(tmpPath), rmEc);
-    return engineErrorBlock("export delimited: failed writing " + path, "data_io");
+    return engineErrorBlock(spec.verb + ": failed writing " + shown, "data_io");
   }
 
   ojson block;
   block["type"] = "display";
-  block["text"] = "file " + path + " saved";
+  block["text"] = "file " + shown + " saved";
   return block;
+}
+
+ojson runExportDelimited(const std::vector<std::string>& varlist, const std::string& pathArg,
+                         const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                         SessionState& session) {
+  return runExportDelimited(varlist, pathArg, opts, std::nullopt, std::nullopt, session);
+}
+
+ojson runExportDelimited(const std::vector<std::string>& varlist, const std::string& pathArg,
+                         const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                         const std::optional<std::string>& ifExpr,
+                         const std::optional<std::string>& inRange, SessionState& session) {
+  if (!session.currentHbin().has_value() || session.datastore() == nullptr) {
+    return eval::noDataLoaded();
+  }
+  DelimWriteSpec spec;
+  // export delimited: delimiter() is "tab" or ONE character, anything
+  // longer is r(198) "<d> invalid character in delimiter() option".
+  for (const auto& kv : opts) {
+    if (kv.first != "delimiter" && kv.first != "delim") continue;
+    if (kv.second.isBool) continue;
+    std::string v = trim(kv.second.strValue);
+    if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+    if (v == "tab" || v == "\\t") spec.delim = '\t';
+    else if (v.size() == 1) spec.delim = v[0];
+    else {
+      return engineErrorBlock(v + " invalid character in delimiter() option", "unsupported_option");
+    }
+  }
+  spec.noLabel = hasFlagOpt(opts, "nolabel");
+  spec.header = !hasFlagOpt(opts, "novarnames");
+  spec.dataFmt = hasFlagOpt(opts, "datafmt");
+  if (hasFlagOpt(opts, "quote")) spec.quote = DelimWriteSpec::Quote::kAll;
+  const bool replace = hasFlagOpt(opts, "replace");
+
+  Datastore* ds = session.datastore();
+  for (const auto& v : varlist) {
+    if (!ds->has(v)) return engineErrorBlock("variable " + v + " not found", "unknown_variable");
+  }
+
+  const std::string path = withDefaultSuffix(resolveUserPath(session, pathArg), ".csv");
+  spec.shown = typedFileName(pathArg, ".csv");
+  if (cecon::native_exists(path) && !replace) {
+    return eval::errorBlock("engine_error", "file " + spec.shown + " already exists", std::nullopt,
+                            std::nullopt, std::nullopt, "r(602)");
+  }
+  if (parentDirMissing(path)) {
+    return eval::errorBlock("engine_error", "file " + spec.shown + " could not be opened",
+                            std::nullopt, std::nullopt, std::nullopt, "r(603)");
+  }
+  return writeDelimitedFile(varlist, path, spec, ifExpr, inRange, session);
 }
 
 namespace {
 
-// `import delimited ..., case(preserve|lower|upper)` -- BUG-477. Unlike
-// import excel (default preserve, [D] import excel p.495), import
-// delimited's OWN default is to LOWER-CASE the header -- measured against
-// StataBE 19.5 on a `make,price,MPG,Foreign` header (tests/eval/golden/
-// aer_b4/b5_importcase_pins.log):
-//   B5REC|import_delimited|no_case_default|0|
-//   B5VAL|vars_default|make price mpg foreign|x|0     <- no option at all
-//   B5VAL|vars_preserve|make price MPG Foreign|x|0    <- case(preserve)
-//   B5VAL|vars_lower|make price mpg foreign|x|0
-//   B5VAL|vars_upper|MAKE PRICE MPG FOREIGN|x|0
-// An unrecognised value is refused, not silently ignored (case_bogus|198).
-// Scope: `import delimited` only -- `import excel`'s case() and its
-// (different) default are a separate, already-measured option
-// (handlers_data_verbs3.cpp's NameCase/sanitizeVarName above) and this item
-// does not touch it.
-enum class DelimCase { kPreserve, kLower, kUpper };
+std::string stripOneQuotePair(const std::string& v) {
+  if (v.size() >= 4 && v.compare(0, 2, "`\"") == 0 && v.compare(v.size() - 2, 2, "\"'") == 0)
+    return v.substr(2, v.size() - 4);
+  if (v.size() >= 2 && v.front() == '"' && v.back() == '"') return v.substr(1, v.size() - 2);
+  return v;
+}
 
-// Only the ASCII letters change case -- the header cells reaching this point
-// are already legal Stata identifiers (the loader would have rejected an
-// illegal one), so this is a pure letter-case transform, never a re-legalize.
-std::string asciiCaseFold(const std::string& s, DelimCase c) {
-  if (c == DelimCase::kPreserve) return s;
-  std::string out = s;
-  for (char& ch : out) {
-    if (c == DelimCase::kLower && ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
-    else if (c == DelimCase::kUpper && ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
+}  // namespace
+
+namespace {
+// The block an import answers with: `use`'s own `open` shape (the frontend
+// reads source_file/filepath off it), over the frame just adopted.
+ojson openBlockFor(SessionState& session, const std::string& path) {
+  ojson m = mutationResult(session, "open");
+  ojson out;
+  out["type"] = "data_mutation";
+  out["action"] = "open";
+  out["source_file"] = path;
+  out["filepath"] = path;
+  for (auto it = m.begin(); it != m.end(); ++it) {
+    if (it.key() == "type" || it.key() == "action") continue;
+    out[it.key()] = it.value();
   }
   return out;
 }
-
-// Applied AFTER the frame is already loaded (by either the fast path's bare
-// `runUse` or the preprocess path's staged-CSV `runUse`), so this is one
-// rename pass over whatever names actually landed -- never a second parse of
-// the file. A header that collides after folding (two cells differing only
-// in case) surfaces as runRename's own "already exists" error, same as Stata.
-// The same rule `rename` enforces: a letter or underscore, then letters, digits and
-// underscores, at most 32 bytes. Used only to SKIP a column this loader already named
-// something `rename` would refuse (BUG-480); it is not a second name adjudicator.
-bool isValidStataVarName(const std::string& n) {
-  if (n.empty() || n.size() > 32) return false;
-  if (!(std::isalpha(static_cast<unsigned char>(n[0])) || n[0] == '_')) return false;
-  for (char ch : n)
-    if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch == '_')) return false;
-  return true;
-}
-
-ojson applyImportDelimCase(SessionState& session, DelimCase c, ojson loadBlock) {
-  if (c == DelimCase::kPreserve) return loadBlock;
-  if (loadBlock.is_object() && loadBlock.value("type", std::string()) == "error") return loadBlock;
-  Datastore* ds = session.datastore();
-  if (ds == nullptr) return loadBlock;
-  const std::vector<std::string> names = ds->names();  // snapshot: rename below mutates the datastore
-  for (const auto& name : names) {
-    const std::string want = asciiCaseFold(name, c);
-    if (want == name) continue;
-    // A name this loader already created but `rename` will not accept is left
-    // alone. `import delimited ..., varnames(9)` on a file whose ninth row is
-    // DATA makes a column literally named `buick regal` -- space and all -- and
-    // that is a pre-existing loader defect (BUG-480), not something case() can
-    // repair: folding an invalid name leaves it invalid. Failing the whole
-    // import here would turn one bad column name into a dead statement, and it
-    // is how this change first went RED against the AER b4 probe and the
-    // registry pangram. Case-folding is not the place to adjudicate names.
-    if (!isValidStataVarName(name) || !isValidStataVarName(want)) continue;
-    ojson r = runRename(name, want, session);
-    if (r.is_object() && r.value("type", std::string()) == "error") return r;
-  }
-  return loadBlock;
-}
-
 }  // namespace
 
 ojson runImportDelimited(const std::string& pathArg,
                          const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                          SessionState& session) {
-  // `delimiter()` is accepted and honored by the shared loader's own sniffing
-  // for tab/comma; an explicit exotic delimiter is not plumbed through yet, so
-  // say so rather than silently reading the file with the wrong separator.
-  char delim = ',';
-  bool delimGiven = false;
-  {
-    std::string derr;
-    char probe = ',';
-    if (!parseDelimiterOpt(opts, &probe, &derr)) {
-      return engineErrorBlock(derr, "unsupported_option");
-    }
-    for (const auto& kv : opts) {
-      if (kv.first == "delimiter" || kv.first == "delim") { delimGiven = true; break; }
-    }
-    delim = probe;
-  }
+  return runImportDelimited(std::vector<std::string>(), pathArg, opts, session);
+}
 
-  // BUG-477: case() is parsed and validated up front, unconditionally --
-  // every import delimited call has a case (the default IS one, `lower`),
-  // not just the ones that also pass varnames()/rowrange()/etc.
-  DelimCase nameCase = DelimCase::kLower;
-  if (auto c = optStrOf(opts, "case")) {
-    const std::string v = strutil::lower(*c);
-    if (v == "preserve") nameCase = DelimCase::kPreserve;
-    else if (v == "lower") nameCase = DelimCase::kLower;
-    else if (v == "upper") nameCase = DelimCase::kUpper;
-    else {
-      return engineErrorBlock(
-          "import delimited: case(" + *c + ") is not one of preserve, lower or upper",
-          "unsupported_option");
-    }
-  }
-
-  // AER scope-2 W3a. Absent every one of these OTHER four, nothing below
-  // runs and the option-free path is the byte-identical one that has always
-  // shipped -- case() is handled separately, as a post-load rename pass, so
-  // it does not have to route through the CSV-restaging machinery below.
-  const std::optional<std::string> varnamesOpt = optStrOf(opts, "varnames");
-  const std::optional<std::string> rowrangeOpt = optStrOf(opts, "rowrange");
-  const std::optional<std::string> colrangeOpt = optStrOf(opts, "colrange");
-  const std::optional<std::string> numericcolsOpt = optStrOf(opts, "numericcols");
-  const std::optional<std::string> encodingOpt = optStrOf(opts, "encoding");
-  const bool preprocess = varnamesOpt.has_value() || rowrangeOpt.has_value() ||
-                          colrangeOpt.has_value() || numericcolsOpt.has_value() ||
-                          encodingOpt.has_value();
-  // Each of the five takes an argument; a bare spelling is a syntax error in
-  // Stata, and accepting it here would mean silently ignoring the request.
-  for (const char* k : {"varnames", "rowrange", "colrange", "numericcols", "encoding"}) {
-    for (const auto& kv : opts) {
-      if (kv.first == k && kv.second.isBool) {
-        return engineErrorBlock(std::string("import delimited: ") + k +
-                                    " takes an argument, for example " +
-                                    (std::string(k) == "varnames" ? "varnames(1)" : std::string(k) + "(...)"),
-                                "unsupported_option");
-      }
-    }
-  }
-
-  if (!preprocess) {
-    if (delim != ',' && delim != '\t') {
-      return engineErrorBlock(
-          "import delimited: this build reads comma- and tab-separated files (delimiter(" +
-          std::string(1, delim) + ") is not implemented)");
-    }
-    // Everything else — path resolution, content sniffing, factor detection — is
-    // the SAME loader `use` runs, so a .csv reads identically either way.
-    return applyImportDelimCase(session, nameCase, runUse(pathArg, session));
-  }
-
+std::string importSourcePath(SessionState& session, const std::string& pathArg, bool excel) {
   const std::string path = resolveUserPath(session, pathArg);
-  if (!cecon::native_exists(path)) {
-    return engineErrorBlock("import delimited: file " + path + " not found", "data_io");
-  }
-  std::string text;
-  {
-    std::ifstream f(cecon::to_native_path(path), std::ios::binary);
-    if (!f) return engineErrorBlock("import delimited: cannot read " + path, "data_io");
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    text = ss.str();
-  }
-  if (encodingOpt.has_value()) {
-    std::string converted, err;
-    if (!iconvToUtf8(text, *encodingOpt, &converted, &err)) {
-      return engineErrorBlock("import delimited: " + err, "data_io");
-    }
-    text = std::move(converted);
-  }
-  if (!delimGiven) {
-    // "import delimited will automatically detect either a comma or a tab as
-    // the delimiter" ([D] import delimited). The loader does this for itself on
-    // the option-free path; when this arm re-splits the file it has to make the
-    // same call, and splitting a tab file on commas would stage ONE column.
-    const size_t eol = text.find('\n');
-    const std::string first = text.substr(0, eol == std::string::npos ? text.size() : eol);
-    delim = std::count(first.begin(), first.end(), '\t') >
-                    std::count(first.begin(), first.end(), ',')
-                ? '\t'
-                : ',';
-  }
+  if (!excel) return withDefaultSuffix(path, ".csv");
+  if (pathHasSuffix(path)) return path;
+  // A stem names NAME.xlsx, or NAME.xls when only that exists (StataBE 19.5:
+  // `import excel using e2` reads e2.xls, `import excel e1` reads e1.xlsx).
+  if (!cecon::native_exists(path + ".xlsx") && cecon::native_exists(path + ".xls")) return path + ".xls";
+  return path + ".xlsx";
+}
 
-  std::vector<std::vector<std::string>> rows = splitDelimitedRows(text, delim);
-  if (rows.empty()) return engineErrorBlock("import delimited: " + path + " has no rows to read");
+namespace {
 
-  // varnames(# | nonames): WHICH PHYSICAL ROW holds the names. Stata reads it
-  // independently of rowrange -- "import delimited still used the first line of
-  // the file to obtain the variable names even though we did not start our
-  // rowrange() specification with 1" ([D] import delimited p.488).
-  long long namesRow = 1;  // 0 == nonames
-  if (varnamesOpt.has_value()) {
-    const std::string v = strutil::lower(trim(*varnamesOpt));
-    if (v == "nonames") {
-      namesRow = 0;
-    } else if (!v.empty() && v.find_first_not_of("0123456789") == std::string::npos) {
-      try { namesRow = std::stoll(v); } catch (...) { namesRow = -1; }
-      if (namesRow <= 0) namesRow = -1;
-    } else {
-      namesRow = -1;
-    }
-    if (namesRow < 0) {
-      return engineErrorBlock(
-          "import delimited: varnames(" + *varnamesOpt + ") is not a row number or `nonames`",
-          "unsupported_option");
-    }
-    if (namesRow > 0 && static_cast<size_t>(namesRow) > rows.size()) {
-      return engineErrorBlock("import delimited: varnames(" + std::to_string(namesRow) +
-                                  ") — the file has only " + std::to_string(rows.size()) + " rows",
-                              "unsupported_option");
-    }
-  }
+using ImportOptionList = std::vector<std::pair<std::string, eval::OptValue>>;
 
-  long long rowLo = 0, rowHi = 0, colLo = 0, colHi = 0;
-  if (rowrangeOpt.has_value()) {
-    std::string err;
-    if (!parseIndexRangeOpt("rowrange", *rowrangeOpt, &rowLo, &rowHi, &err)) {
-      return engineErrorBlock("import delimited: " + err, "unsupported_option");
-    }
-  }
-  if (colrangeOpt.has_value()) {
-    std::string err;
-    if (!parseIndexRangeOpt("colrange", *colrangeOpt, &colLo, &colHi, &err)) {
-      return engineErrorBlock("import delimited: " + err, "unsupported_option");
-    }
-  }
+// Stata's sentence under r(198): every option-grammar refusal below is one.
+ojson importRefusal(const std::string& sentence) { return rcErrorBlock(sentence, 198); }
 
-  // The header, sliced by colrange exactly as the data rows are.
-  size_t width = 0;
-  for (const auto& r : rows) width = std::max(width, r.size());
-  const size_t cLo = colLo > 0 ? static_cast<size_t>(colLo) - 1 : 0;
-  size_t cHi = colHi > 0 ? static_cast<size_t>(colHi) : width;   // exclusive
-  if (cHi > width) cHi = width;
-  if (cLo >= cHi) {
-    return engineErrorBlock("import delimited: colrange(" + colrangeOpt.value_or(std::string()) +
-                                ") selects no columns — the file has " + std::to_string(width),
-                            "unsupported_option");
-  }
-  const size_t outWidth = cHi - cLo;
+bool abbreviates(const std::string& typed, const char* word, size_t shortest) {
+  return typed.size() >= shortest && std::string(word).compare(0, typed.size(), typed) == 0;
+}
 
-  std::vector<std::string> header;
-  if (namesRow > 0) {
-    const std::vector<std::string>& src = rows[static_cast<size_t>(namesRow) - 1];
-    for (size_t c = cLo; c < cHi; ++c) header.push_back(c < src.size() ? src[c] : std::string());
+// A whole number spelled with digits and at most a leading sign. Far too many
+// digits saturate rather than fail, so they still read as "a big number".
+bool readWholeNumber(const std::string& text, long long* out) {
+  const size_t digitsAt = (!text.empty() && (text[0] == '+' || text[0] == '-')) ? 1 : 0;
+  if (digitsAt == text.size()) return false;
+  if (text.find_first_not_of("0123456789", digitsAt) != std::string::npos) return false;
+  *out = std::strtoll(text.c_str(), nullptr, 10);
+  return true;
+}
+
+// One inclusive 1-based stretch of records or columns; 0 leaves a side open.
+struct ImportSpan {
+  long long first = 0;
+  long long last = 0;
+};
+
+// rowrange() and colrange() share one grammar and differ in wording: Stata says
+// "start column" but "end col", and answers a lone colon differently for each.
+struct SpanWording {
+  const char* option;
+  const char* item;
+  const char* endItem;
+  const char* loneColon;
+};
+const SpanWording kRecordSpan{"rowrange", "row", "row", ": invalid end row in rowrange() option"};
+const SpanWording kColumnSpan{"colrange", "column", "col",
+                              " is an invalid end column in colrange() option"};
+
+std::optional<ojson> readSpan(const std::string& typed, const SpanWording& words,
+                              ImportSpan* span) {
+  const std::string inOption = std::string(" in ") + words.option + "() option";
+  const size_t colon = typed.find(':');
+  const std::string head = trim(typed.substr(0, colon));
+  const std::string tail =
+      colon == std::string::npos ? std::string() : trim(typed.substr(colon + 1));
+  if (colon != std::string::npos && head.empty() && tail.empty())
+    return importRefusal(words.loneColon);
+  if (!head.empty() && (!readWholeNumber(head, &span->first) || span->first < 1))
+    return importRefusal(head + " is an invalid start " + words.item + inOption);
+  if (tail.empty()) return std::nullopt;
+
+  double end = 0.0;
+  if (!delimited::parseNumber(tail, &end))
+    return importRefusal(tail + ": invalid end " + words.endItem + inOption);
+  if (end < static_cast<double>(std::max(span->first, 1LL)))
+    return importRefusal(typed + " is an invalid " + words.item + " range" + inOption + "\nstart " +
+                         words.item + " is greater than end " + words.item);
+  // A fractional end leaves the stretch open (StataBE: rowrange(2:2.5) reads
+  // to the last record).
+  if (end == std::floor(end)) span->last = static_cast<long long>(end);
+  return std::nullopt;
+}
+
+// numericcols()/stringcols(): file column numbers, held as stepped runs so that
+// a huge `1/99999999` costs nothing.
+struct ColumnPicks {
+  struct Run {
+    long long from, step, to;
+  };
+  bool everyColumn = false;
+  std::vector<Run> runs;
+
+  bool holds(long long column) const {
+    if (everyColumn) return true;
+    return std::any_of(runs.begin(), runs.end(), [column](const Run& r) {
+      const long long gap = column - r.from;
+      return gap % r.step == 0 && gap / r.step >= 0 && gap / r.step <= (r.to - r.from) / r.step;
+    });
+  }
+};
+
+bool readColumnRun(const std::string& word, ColumnPicks::Run* run) {
+  const size_t slash = word.find('/');
+  const size_t open = word.find('(');
+  const size_t close = word.find(')');
+  std::string from = word, to = word;
+  long long step = 1;
+  if (slash != std::string::npos) {
+    from = word.substr(0, slash);
+    to = word.substr(slash + 1);
+  } else if (open != std::string::npos && close != std::string::npos && open < close) {
+    from = word.substr(0, open);
+    to = word.substr(close + 1);
+    if (!readWholeNumber(word.substr(open + 1, close - open - 1), &step) || step == 0) return false;
+  }
+  if (!readWholeNumber(from, &run->from) || !readWholeNumber(to, &run->to)) return false;
+  if (run->from < 1 || run->to < 1) return false;
+  // `5/1` counts down; a stated step has to point from its start towards its end.
+  const long long reach = run->to - run->from;
+  if (slash != std::string::npos && reach < 0) step = -1;
+  if (reach != 0 && (reach < 0) != (step < 0)) return false;
+  run->step = step;
+  return true;
+}
+
+std::optional<ojson> readColumnPicks(const std::string& typed, const std::string& option,
+                                     ColumnPicks* picks) {
+  if (typed == "_all") {
+    picks->everyColumn = true;
+    return std::nullopt;
+  }
+  std::string spaced = typed;
+  std::replace(spaced.begin(), spaced.end(), ',', ' ');
+  std::istringstream words(spaced);
+  std::string word;
+  bool anyWord = false;
+  while (words >> word) {
+    ColumnPicks::Run run{};
+    if (!readColumnRun(word, &run))
+      return importRefusal(typed + ": invalid numlist in " + option + "() option");
+    picks->runs.push_back(run);
+    anyWord = true;
+  }
+  if (!anyWord) return importRefusal(typed + ": invalid numlist in " + option + "() option");
+  return std::nullopt;
+}
+
+// delimiters(): a shortcut word or a quoted set of characters, then at most one
+// sub-option after a comma. *named stays false for `""` and for nothing at all,
+// which both leave the choice to the reader.
+std::optional<ojson> readDelimiters(const std::string& raw, delimited::ReadSpec* reader,
+                                    bool* named) {
+  const std::string text = raw.substr(std::min(raw.find_first_not_of(" \t"), raw.size()));
+  std::string characters;
+  std::string afterPart;
+  const bool compoundQuoted = text.compare(0, 2, "`\"") == 0;
+  if (compoundQuoted || (!text.empty() && text[0] == '"')) {
+    const size_t open = compoundQuoted ? 2 : 1;
+    const size_t close = compoundQuoted ? text.find("\"'", open) : text.find('"', open);
+    if (close == std::string::npos) return importRefusal("unmatched quote");
+    characters = text.substr(open, close - open);
+    if (characters.find('"') != std::string::npos) return importRefusal("unmatched quote");
+    afterPart = text.substr(close + (compoundQuoted ? 2 : 1));
+    // backslash-t stands for a tab; a quoted word is its characters, never a shortcut.
+    for (size_t at = characters.find("\\t"); at != std::string::npos;
+         at = characters.find("\\t", at + 1))
+      characters.replace(at, 2, "\t");
   } else {
-    // `nonames`: Stata's own generated names.
-    for (size_t c = 0; c < outWidth; ++c) header.push_back("v" + std::to_string(c + 1));
-  }
-
-  std::set<long long> numericCols;
-  bool numericAll = false;
-  if (numericcolsOpt.has_value()) {
-    std::string err;
-    if (!parseColumnNumlist(*numericcolsOpt, &numericCols, &numericAll, &err)) {
-      return engineErrorBlock("import delimited: " + err, "unsupported_option");
+    const size_t comma = text.find(',');
+    const std::string part = text.substr(0, comma);
+    if (comma != std::string::npos) afterPart = text.substr(comma);
+    static const std::map<std::string, std::string> kShortcuts = {
+        {"tab", "\t"}, {"comma", ","}, {"space", " "}, {"whitespace", "\t "}};
+    const std::string word = trim(part);
+    if (word.empty() && comma != std::string::npos)
+      return importRefusal("invalid delimiter() argument");
+    if (!word.empty()) {
+      const auto shortcut = kShortcuts.find(word);
+      if (shortcut == kShortcuts.end())
+        return importRefusal(part + ": invalid delimiter() shortcut");
+      characters = shortcut->second;
     }
   }
 
-  const size_t rLo = rowLo > 0 ? static_cast<size_t>(rowLo) - 1 : 0;
-  size_t rHi = rowHi > 0 ? static_cast<size_t>(rowHi) : rows.size();   // exclusive
-  if (rHi > rows.size()) rHi = rows.size();
-
-  std::string csvPath = nextPath(session.workdir(), "import_delim") + ".csv";
-  registerScratchMint(csvPath);   // BUG-389 class: the staging file joins the ledger
-  {
-    std::ofstream f(cecon::to_native_path(csvPath), std::ios::binary);
-    if (!f) return engineErrorBlock("import delimited: cannot stage " + csvPath, "data_io");
-    for (size_t c = 0; c < header.size(); ++c) {
-      if (c) f << ',';
-      f << csvField(header[c], ',');
-    }
-    f << "\n";
-    for (size_t r = rLo; r < rHi; ++r) {
-      // The names row is never also a data row: rowrange picks rows to import,
-      // and Stata has already spent that one on the variable names.
-      if (namesRow > 0 && r == static_cast<size_t>(namesRow) - 1) continue;
-      const std::vector<std::string>& src = rows[r];
-      for (size_t c = cLo; c < cHi; ++c) {
-        if (c > cLo) f << ',';
-        if (c >= src.size()) continue;
-        const long long outCol = static_cast<long long>(c - cLo) + 1;
-        if ((numericAll || numericCols.count(outCol) > 0) && !looksNumericField(src[c])) {
-          continue;   // forced numeric, and this field is not a number -> missing
-        }
-        f << csvField(src[c], ',');
-      }
-      f << "\n";
-    }
-    if (!f) return engineErrorBlock("import delimited: failed staging " + csvPath, "data_io");
+  const std::string rest = trim(afterPart);
+  if (!rest.empty() && rest[0] != ',') return importRefusal(rest + ": invalid delimiter() argument");
+  const std::string subOption = rest.empty() ? rest : trim(rest.substr(1));
+  if (abbreviates(subOption, "collapse", 5)) {
+    reader->collapse = true;
+  } else if (abbreviates(subOption, "asstring", 5)) {
+    reader->asString = true;
+  } else if (!subOption.empty()) {
+    return importRefusal(subOption + ": invalid delimiter() argument");
   }
-  return applyImportDelimCase(session, nameCase, runUse(csvPath, session));
+
+  if (!characters.empty()) {
+    reader->delims = characters;
+    *named = true;
+  }
+  return std::nullopt;
+}
+
+// Everything `import delimited`'s options ask for, once they have been accepted.
+struct ImportRequest {
+  delimited::ReadSpec reader;
+  bool delimiterNamed = false;
+  delimited::Case nameCase = delimited::Case::kLower;
+  bool noNamesRecord = false;
+  long long namesRecord = 0;  // 1-based; 0 = decide from the first record
+  std::string namesRecordTyped;
+  ImportSpan records;
+  ImportSpan columns;
+  ColumnPicks numericColumns;
+  ColumnPicks stringColumns;
+  bool asDouble = false;
+  bool asFloat = false;
+  std::string encoding;  // "" = work it out from the bytes
+};
+
+std::optional<ojson> readOneImportOption(const std::string& key, const std::string& raw,
+                                         ImportRequest* request) {
+  using Bind = delimited::ReadSpec::Bind;
+  using Strip = delimited::ReadSpec::Strip;
+  const std::string typed = optDequote(raw);
+  if (key == "delimiters" || key == "delimiter" || key == "delim")
+    return readDelimiters(raw, &request->reader, &request->delimiterNamed);
+  if (key == "rowrange") return readSpan(typed, kRecordSpan, &request->records);
+  if (key == "colrange") return readSpan(typed, kColumnSpan, &request->columns);
+  if (key == "numericcols") return readColumnPicks(typed, key, &request->numericColumns);
+  if (key == "stringcols") return readColumnPicks(typed, key, &request->stringColumns);
+
+  if (key == "bindquotes") {
+    if (abbreviates(typed, "loose", 1)) request->reader.bind = Bind::kLoose;
+    else if (abbreviates(typed, "strict", 1)) request->reader.bind = Bind::kStrict;
+    else if (abbreviates(typed, "nobind", 3)) request->reader.bind = Bind::kNoBind;
+    else
+      return importRefusal(typed + " is an invalid bindquotes() argument; use loose, strict, or nobind");
+  } else if (key == "stripquotes") {
+    if (abbreviates(typed, "yes", 1)) request->reader.strip = Strip::kYes;
+    else if (abbreviates(typed, "no", 1)) request->reader.strip = Strip::kNo;
+    else if (abbreviates(typed, "default", 3)) request->reader.strip = Strip::kDefault;
+    else
+      return importRefusal(typed + " is an invalid stripquotes() argument; use yes, no, or default");
+  } else if (key == "maxquotedrows") {
+    long long limit = 0;
+    if (typed != "unlimited" && !readWholeNumber(typed, &limit))
+      return importRefusal("option maxquotedrows() incorrectly specified.");
+    request->reader.maxQuotedRows = std::max(limit, 0LL);
+  } else if (key == "emptylines") {
+    if (typed != "skip" && typed != "include")
+      return importRefusal(typed + " is an invalid emptylines() argument; use skip, or include");
+    request->reader.skipEmptyLines = typed == "skip";
+  } else if (key == "case") {
+    if (abbreviates(typed, "lower", 1)) request->nameCase = delimited::Case::kLower;
+    else if (abbreviates(typed, "upper", 1)) request->nameCase = delimited::Case::kUpper;
+    else if (abbreviates(typed, "preserve", 3)) request->nameCase = delimited::Case::kPreserve;
+    else
+      return importRefusal(typed + ": invalid argument in option case();\n   use upper, lower, or preserve");
+  } else if (key == "varnames") {
+    if (abbreviates(typed, "nonames", 3)) {
+      request->noNamesRecord = true;
+    } else if (readWholeNumber(typed, &request->namesRecord) && request->namesRecord >= 1) {
+      request->namesRecordTyped = typed;
+    } else {
+      return importRefusal(typed + ": invalid row number in varnames() option");
+    }
+  } else if (key == "encoding" || key == "charset") {
+    const std::string folded = strutil::lower(typed);
+    if (folded == "utf-8" || folded == "utf8") {
+      request->encoding.clear();
+    } else {
+      const iconv_t probe = iconv_open("UTF-8", typed.c_str());
+      if (probe == reinterpret_cast<iconv_t>(-1)) return importRefusal("encoding not supported");
+      iconv_close(probe);
+      request->encoding = typed;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<ojson> readImportOptions(const ImportOptionList& opts, ImportRequest* request) {
+  for (const auto& [key, value] : opts) {
+    if (key == "clear" || key == "collapsedelimiters") continue;  // the latter: accepted, no effect
+    if (key == "asdouble" || key == "asfloat") {
+      if (!value.isBool) return importRefusal("option " + key + "() incorrectly specified");
+      (key == "asdouble" ? request->asDouble : request->asFloat) = true;
+      continue;
+    }
+    if (value.isBool) {
+      const bool delimiterSpelling = key == "delimiter" || key == "delim";
+      return importRefusal("option " + (delimiterSpelling ? std::string("delimiters") : key) +
+                           " incorrectly specified");
+    }
+    if (auto refusal = readOneImportOption(key, value.strValue, request)) return refusal;
+  }
+  if (request->numericColumns.everyColumn && request->stringColumns.everyColumn)
+    return importRefusal("numericcols(_all) cannot be combined with stringcols(_all)");
+  if (request->asDouble && request->asFloat)
+    return importRefusal("asfloat() and asdouble() are mutually exclusive options");
+  return std::nullopt;
+}
+
+// Strict RFC 3629 shape: no overlong forms, no surrogates, nothing past U+10FFFF.
+bool holdsOnlyUtf8(const std::string& bytes) {
+  static const unsigned long kSmallest[] = {0, 0x80, 0x800, 0x10000};
+  for (size_t at = 0; at < bytes.size();) {
+    const auto lead = static_cast<unsigned char>(bytes[at]);
+    int extra = -1;
+    if (lead < 0x80) extra = 0;
+    else if ((lead >> 5) == 0x06) extra = 1;
+    else if ((lead >> 4) == 0x0E) extra = 2;
+    else if ((lead >> 3) == 0x1E) extra = 3;
+    if (extra < 0 || at + static_cast<size_t>(extra) >= bytes.size()) return false;
+    unsigned long point = extra == 0 ? lead : lead & (0x3Fu >> extra);
+    for (int k = 1; k <= extra; ++k) {
+      const auto next = static_cast<unsigned char>(bytes[at + static_cast<size_t>(k)]);
+      if ((next & 0xC0) != 0x80) return false;
+      point = (point << 6) | (next & 0x3F);
+    }
+    if (point < kSmallest[extra] || point > 0x10FFFF || (point >= 0xD800 && point <= 0xDFFF))
+      return false;
+    at += static_cast<size_t>(extra) + 1;
+  }
+  return true;
+}
+
+// nullopt when the bytes are not valid in `encoding`.
+std::optional<std::string> decodeToUtf8(const std::string& bytes, const std::string& encoding) {
+  const iconv_t converter = iconv_open("UTF-8", encoding.c_str());
+  if (converter == reinterpret_cast<iconv_t>(-1)) return std::nullopt;
+  std::string decoded;
+  decoded.reserve(bytes.size() + bytes.size() / 8);
+  char* input = const_cast<char*>(bytes.data());
+  size_t inputLeft = bytes.size();
+  char chunk[16384];
+  bool clean = true;
+  while (clean && inputLeft > 0) {
+    char* output = chunk;
+    size_t outputLeft = sizeof chunk;
+    const size_t status = iconv(converter, &input, &inputLeft, &output, &outputLeft);
+    decoded.append(chunk, sizeof chunk - outputLeft);
+    if (status == static_cast<size_t>(-1) && errno != E2BIG) clean = false;
+  }
+  if (clean) {  // a stateful encoding may still owe its closing bytes
+    char* output = chunk;
+    size_t outputLeft = sizeof chunk;
+    iconv(converter, nullptr, nullptr, &output, &outputLeft);
+    decoded.append(chunk, sizeof chunk - outputLeft);
+  }
+  iconv_close(converter);
+  if (!clean) return std::nullopt;
+  return decoded;
+}
+
+// The file's text as UTF-8; an error block when it cannot be had.
+std::optional<ojson> loadImportText(const std::string& path, const std::string& shownName,
+                                    const std::string& encoding, std::string* text) {
+  std::ifstream file(cecon::to_native_path(path), std::ios::binary);
+  if (!file) return rcErrorBlock("file " + shownName + " could not be opened", 603);
+  std::ostringstream slurped;
+  slurped << file.rdbuf();
+  *text = slurped.str();
+  if (!encoding.empty() || !holdsOnlyUtf8(*text)) {
+    const std::string source = encoding.empty() ? std::string("ISO-8859-1") : encoding;
+    auto decoded = decodeToUtf8(*text, source);
+    if (!decoded.has_value()) return importRefusal("file " + shownName + " is not valid " + source);
+    *text = std::move(*decoded);
+  }
+  if (text->compare(0, 3, "\xEF\xBB\xBF") == 0) text->erase(0, 3);
+  return std::nullopt;
+}
+
+// With no varnames(), the first record names the columns when, leaving its
+// missing tokens aside, it holds text and no number.
+bool recordReadsAsNames(const std::vector<std::string>& record) {
+  bool sawText = false;
+  for (const std::string& field : record) {
+    if (delimited::isMissingToken(field)) continue;
+    double unused = 0.0;
+    if (delimited::parseNumber(field, &unused)) return false;
+    sawText = true;
+  }
+  return sawText;
+}
+
+ojson answerEmptyImport(SessionState& session) {
+  ojson cleared = runClear("", session);
+  if (cleared.is_object() && cleared.value("type", std::string()) == "error") return cleared;
+  ojson answer;
+  answer["type"] = "display";
+  answer["text"] = "(0 vars, 0 obs)";
+  return answer;
+}
+
+// The namelist of `import delimited a b using f`: the leading names change and
+// nothing else does.
+std::optional<ojson> renameLeadingColumns(const std::vector<std::string>& namelist,
+                                          std::vector<std::string>* names) {
+  if (namelist.empty()) return std::nullopt;
+  if (namelist.size() > names->size()) return rcErrorBlock("too many variables specified", 103);
+  std::copy(namelist.begin(), namelist.end(), names->begin());
+  const std::set<std::string> distinct(names->begin(), names->end());
+  if (distinct.size() != names->size()) return importRefusal("could not name variables specified");
+  return std::nullopt;
+}
+
+}  // namespace
+
+// `import delimited`, [D] import delimited. The option layer above settles what
+// was asked; delimited_io.h's reader does the parsing, naming and typing.
+ojson runImportDelimited(const std::vector<std::string>& varlist, const std::string& pathArg,
+                         const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                         SessionState& session) {
+  for (const std::string& word : varlist)
+    if (!strutil::isValidStataIdentifier(word))
+      return importRefusal(word + ": invalid variable name");
+
+  ImportRequest request;
+  if (auto refusal = readImportOptions(opts, &request)) return *refusal;
+
+  const std::string path = importSourcePath(session, pathArg, /*excel=*/false);
+  const std::string shownName = typedFileName(pathArg, ".csv");
+  if (!cecon::native_exists(path)) return rcErrorBlock("file " + shownName + " not found", 601);
+
+  std::string text;
+  if (auto failure = loadImportText(path, shownName, request.encoding, &text)) return *failure;
+  if (!request.delimiterNamed)
+    request.reader.delims = std::string(1, delimited::detectDelimiter(text));
+
+  const auto records = delimited::parse(text, request.reader);
+  text.clear();
+  if (records.empty()) return answerEmptyImport(session);
+
+  // Which record names the columns, and which records hold data (both 0-based
+  // here). A record at or before the names record is never data.
+  const auto recordCount = static_cast<long long>(records.size());
+  if (request.namesRecord > recordCount)
+    return importRefusal(request.namesRecordTyped + ": invalid row number in varnames() option");
+  long long namesAt = -1;
+  if (request.namesRecord > 0) namesAt = request.namesRecord - 1;
+  else if (!request.noNamesRecord && recordReadsAsNames(records.front())) namesAt = 0;
+  const long long dataFrom = std::max(request.records.first - 1, namesAt + 1);
+  const long long dataEnd =
+      request.records.last > 0 ? std::min(request.records.last, recordCount) : recordCount;
+
+  // The file's width over the records in play, then the colrange() window in it.
+  size_t width = namesAt >= 0 ? records[static_cast<size_t>(namesAt)].size() : 0;
+  for (long long r = dataFrom; r < dataEnd; ++r)
+    width = std::max(width, records[static_cast<size_t>(r)].size());
+  const long long firstColumn = std::max(request.columns.first, 1LL);
+  const long long lastColumn = request.columns.last > 0
+                                   ? std::min(request.columns.last, static_cast<long long>(width))
+                                   : static_cast<long long>(width);
+  if (firstColumn > lastColumn) return answerEmptyImport(session);
+  const auto windowSize = static_cast<size_t>(lastColumn - firstColumn + 1);
+  const auto fileColumnOf = [firstColumn](size_t slot) {
+    return firstColumn + static_cast<long long>(slot);
+  };
+  static const std::string kAbsentCell;
+  const auto cellOf = [&](const std::vector<std::string>& record,
+                          size_t slot) -> const std::string& {
+    const auto index = static_cast<size_t>(fileColumnOf(slot) - 1);
+    return index < record.size() ? record[index] : kAbsentCell;
+  };
+
+  // Names and labels.
+  std::vector<std::string> headerCells(windowSize);
+  if (namesAt >= 0)
+    for (size_t slot = 0; slot < windowSize; ++slot)
+      headerCells[slot] = cellOf(records[static_cast<size_t>(namesAt)], slot);
+  delimited::NameResult named = delimited::legalNames(headerCells, request.nameCase);
+  if (named.clash) return importRefusal("Error creating variables");
+  if (auto refusal = renameLeadingColumns(varlist, &named.names)) return *refusal;
+
+  delimited::Table table;
+  table.names = std::move(named.names);
+  table.labels = namesAt >= 0 ? std::move(named.labels) : std::vector<std::string>(windowSize);
+
+  // Storage types, each from its column's data cells.
+  const bool typeAsDouble =
+      request.asDouble || (!request.asFloat && session.defaultStorageType == "double");
+  std::vector<const std::string*> columnCells;
+  for (size_t slot = 0; slot < windowSize; ++slot) {
+    columnCells.clear();
+    for (long long r = dataFrom; r < dataEnd; ++r)
+      columnCells.push_back(&cellOf(records[static_cast<size_t>(r)], slot));
+    const bool numericForced = request.numericColumns.holds(fileColumnOf(slot));
+    const bool stringForced = !numericForced && request.stringColumns.holds(fileColumnOf(slot));
+    table.types.push_back(
+        delimited::typeColumn(columnCells, stringForced, numericForced, typeAsDouble));
+  }
+
+  for (long long r = dataFrom; r < dataEnd; ++r) {
+    std::vector<std::string> row;
+    row.reserve(windowSize);
+    for (size_t slot = 0; slot < windowSize; ++slot)
+      row.push_back(cellOf(records[static_cast<size_t>(r)], slot));
+    table.rows.push_back(std::move(row));
+  }
+
+  if (auto failure = delimited::stageAndAdopt(session, table, "import delimited", path))
+    return *failure;
+  return openBlockFor(session, path);
 }
 
 // ---------------------------------------------------------------------------
@@ -1844,37 +2640,6 @@ namespace {
 // to the names read by `firstrow`, and Stata's default is preserve.
 enum class NameCase { kPreserve, kLower, kUpper };
 
-// A header cell -> a legal Stata variable name: non-alphanumerics become '_',
-// a leading digit gains a '_' prefix, empty becomes v<N>, and a duplicate gains
-// a numeric suffix. Mirrors what `import excel, firstrow` has to do.
-//
-// AER scope-2 W3a: the case is now a PARAMETER. It used to be a hard
-// `strutil::lower`, which is `case(lower)` — one of the three spellings, wired
-// as if it were the only one, and not the one Stata defaults to.
-std::string sanitizeVarName(const std::string& raw, size_t idx,
-                            std::set<std::string>& taken, NameCase nameCase) {
-  std::string s;
-  for (char c : raw) {
-    if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') s.push_back(c);
-    else s.push_back('_');
-  }
-  while (!s.empty() && s.front() == '_') s.erase(s.begin());
-  if (s.empty()) s = "v" + std::to_string(idx + 1);
-  if (std::isdigit(static_cast<unsigned char>(s.front()))) s.insert(s.begin(), '_');
-  // "Only the ASCII letters in names are changed to lowercase or uppercase.
-  // Unicode characters beyond ASCII range are not changed." ([D] import excel)
-  if (nameCase == NameCase::kLower) s = strutil::lower(s);
-  else if (nameCase == NameCase::kUpper) {
-    for (char& c : s) {
-      if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
-    }
-  }
-  std::string cand = s;
-  int suffix = 1;
-  while (taken.count(cand)) cand = s + std::to_string(++suffix);
-  taken.insert(cand);
-  return cand;
-}
 
 // One A1-style cell address. `col`/`row` come back 0 for a side the address
 // leaves out, so "A" is column 1 with an unbounded row and "8" is row 8 with an
@@ -1949,22 +2714,38 @@ std::string excelColumnName(size_t idx0) {
 ojson runExportExcel(const std::vector<std::string>& varlist, const std::string& pathArg,
                      const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                      SessionState& session) {
+  return runExportExcel(varlist, pathArg, opts, std::nullopt, std::nullopt, session);
+}
+
+ojson runExportExcel(const std::vector<std::string>& varlist, const std::string& pathArg,
+                     const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                     const std::optional<std::string>& ifExpr,
+                     const std::optional<std::string>& inRange, SessionState& session) {
   if (!session.currentHbin().has_value() || session.datastore() == nullptr) {
     return eval::noDataLoaded();
   }
   Datastore* ds = session.datastore();
   const bool replace = hasFlagOpt(opts, "replace");
   const bool noLabel = hasFlagOpt(opts, "nolabel");
-  // `firstrow(variables)` writes the names as row 1 (Stata's spelling).
+  // `firstrow(variables|varlabels)` writes row 1: the names, or each
+  // variable's label (its name when it has none). The value takes the
+  // abbreviations `var` and `varl` (w2ar dx_exx_first_var `first(var)` rc 0,
+  // log:1073; dx_exx_varlabels log:1394; the import-excel fixture's
+  // `firstrow(varlabels)` Sheet1, log:1691-1716).
   bool header = false;
+  bool headerLabels = false;
   for (const auto& kv : opts) {
     if (kv.first != "firstrow") continue;
     header = true;
     if (!kv.second.isBool) {
-      std::string v = strutil::lower(trim(kv.second.strValue));
-      if (!v.empty() && v != "variables" && v != "varl" && v != "variable") {
+      std::string v = strutil::lower(optDequote(kv.second.strValue));
+      if (v.size() >= 3 && std::string("variables").compare(0, v.size(), v) == 0) {
+        headerLabels = false;
+      } else if (v.size() >= 4 && std::string("varlabels").compare(0, v.size(), v) == 0) {
+        headerLabels = true;
+      } else {
         return engineErrorBlock(
-            "export excel: firstrow(" + v + ") is not supported — use firstrow(variables)",
+            "export excel: firstrow(" + v + ") — the value is `variables` or `varlabels`",
             "unsupported_option");
       }
     }
@@ -1977,12 +2758,31 @@ ojson runExportExcel(const std::vector<std::string>& varlist, const std::string&
   std::string sheetName;
   bool sheetMerge = false;      // the sub-option asks to keep the rest of the workbook
   std::string sheetMergeWord;
-  if (auto sh = optStrOf(opts, "sheet")) {
-    std::string v = *sh;
-    const size_t comma = v.find(',');
+  std::optional<std::string> sheetRaw;
+  for (const auto& kv : opts) {
+    if (kv.first == "sheet" && !kv.second.isBool) sheetRaw = kv.second.strValue;
+  }
+  if (sheetRaw.has_value()) {
+    // The name is verbatim inside its quotes: `sheet("8-2 ")` keeps the
+    // trailing blank (w2ar log:1655 `[8-2 ]`).
+    auto unquote = [](std::string t) {
+      const size_t a = t.find_first_not_of(" \t");
+      const size_t b = t.find_last_not_of(" \t");
+      t = a == std::string::npos ? std::string() : t.substr(a, b - a + 1);
+      if (t.size() >= 2 && t.front() == '"' && t.back() == '"') t = t.substr(1, t.size() - 2);
+      return t;
+    };
+    std::string v = *sheetRaw;
+    size_t comma = std::string::npos;
+    bool inQ = false;
+    for (size_t i = 0; i < v.size(); ++i) {
+      if (v[i] == '"') inQ = !inQ;
+      else if (v[i] == ',' && !inQ) { comma = i; break; }
+    }
+    if (comma == std::string::npos) v = unquote(v);
     if (comma != std::string::npos) {
       sheetMergeWord = strutil::lower(trim(v.substr(comma + 1)));
-      v = optDequote(v.substr(0, comma));
+      v = unquote(v.substr(0, comma));
       if (sheetMergeWord != "modify" && sheetMergeWord != "replace") {
         return engineErrorBlock(
             "export excel: sheet(\"" + v + "\", " + sheetMergeWord +
@@ -2007,10 +2807,11 @@ ojson runExportExcel(const std::vector<std::string>& varlist, const std::string&
     if (!ds->has(v)) return engineErrorBlock("variable " + v + " not found", "unknown_variable");
   }
 
-  std::string path = resolveUserPath(session, pathArg);
+  std::string path = withDefaultSuffix(resolveUserPath(session, pathArg), ".xlsx");
+  const std::string typed = typedFileName(pathArg, ".xlsx");
   const bool workbookExists = cecon::native_exists(path);
-  // "replace cannot be specified when modifying or replacing a given
-  // worksheet" ([D] import excel p.496) — the two mean opposite things about
+  // the manual rules out combining replace with a per-worksheet modify or
+  // replace ([D] import excel) — the two mean opposite things about
   // the rest of the workbook, so accepting both would have to pick one
   // silently.
   if (sheetMerge && replace) {
@@ -2020,8 +2821,35 @@ ojson runExportExcel(const std::vector<std::string>& varlist, const std::string&
         "unsupported_option");
   }
   if (workbookExists && !replace && !sheetMerge) {
-    return engineErrorBlock("export excel: file " + path +
-                            " already exists (add `replace` to overwrite)");
+    return eval::errorBlock("engine_error", "file " + typed + " already exists", std::nullopt,
+                            std::nullopt, std::nullopt, "r(602)");
+  }
+  // A workbook whose directory is missing (StataBE 19.5, BUG-410): `replace`
+  // attempts the write, `file nodir/o.xlsx could not be saved` r(603); a sheet()
+  // first loads the workbook, `could not be loaded` r(603); with neither,
+  // export excel's own existence test answers `already exists` r(602).
+  if (parentDirMissing(path)) {
+    const bool loads = sheetRaw.has_value() || sheetMerge;
+    const std::string what = replace ? " could not be saved"
+                             : loads ? " could not be loaded"
+                                     : " already exists";
+    return eval::errorBlock("engine_error", "file " + typed + what, std::nullopt, std::nullopt,
+                            std::nullopt, replace || loads ? "r(603)" : "r(602)");
+  }
+
+  // [if] [in] (export excel): the rows come from a
+  // filtered copy; names, labels and formats stay the session's.
+  std::unique_ptr<Datastore> filtered;
+  if ((ifExpr.has_value() && !ifExpr->empty()) || (inRange.has_value() && !inRange->empty())) {
+    InRangeFilterResult fr;
+    try {
+      fr = applyIfAndInFilter(session, ds->path(), ifExpr, inRange);
+    } catch (const CobraError& ce) {
+      return engineErrorBlock(cobraErrorStr(ce), ce.code);
+    }
+    if (!fr.ok) return inRangeRejectError(fr, inRange.value_or(std::string()), "export excel");
+    filtered = std::make_unique<Datastore>(fr.dataPath);
+    ds = filtered.get();
   }
 
   const int64_t n = ds->nRows();
@@ -2031,6 +2859,31 @@ ojson runExportExcel(const std::vector<std::string>& varlist, const std::string&
     const cecon::Column& col = ds->col(name);
     xlsx::OutColumn oc;
     oc.name = name;
+    if (headerLabels) {
+      auto vm = session.varMeta.find(name);
+      if (vm != session.varMeta.end() && vm->second.label.has_value() && !vm->second.label->empty())
+        oc.name = *vm->second.label;
+    }
+    // A %td variable is written as Excel date serials (Stata date + 21916)
+    // under the m/d/yyyy format, a %#.2f one under 0.00 (w2ar
+    // dx_exx_first_var_s1n_v7 int %tdnn/dd/CCYY and _v3 double %14.2f read
+    // back, log:1095-1104).
+    bool asExcelDate = false;
+    if (col.dtype != cecon::DType::Factor) {
+      const std::string fmt = session.displayFormat(session.datastore()->varinfo(name));
+      std::string f = fmt;
+      if (!f.empty() && f[0] == '%') f.erase(0, 1);
+      if (!f.empty() && f[0] == '-') f.erase(0, 1);
+      if (f.rfind("td", 0) == 0) {
+        asExcelDate = true;
+        oc.numFmtId = 14;
+      } else if (!hasFlagOpt(opts, "keepcellfmt")) {
+        // Under keepcellfmt the 0.00 format is not written (w2ar dx_exx_097
+        // reads x back %10.0g, log:1375; without it %14.2f, log:1196).
+        static const std::regex reTwoDec(R"(^%-?[0-9]*\.2fc?$)");
+        if (std::regex_match(fmt, reTwoDec)) oc.numFmtId = 2;
+      }
+    }
     oc.isNumber.assign(static_cast<size_t>(n), false);
     oc.isBlank.assign(static_cast<size_t>(n), false);
     oc.numbers.assign(static_cast<size_t>(n), 0.0);
@@ -2068,7 +2921,7 @@ ojson runExportExcel(const std::vector<std::string>& varlist, const std::string&
           if (it != labels->end()) { oc.strings[i] = it->second; continue; }
         }
         oc.isNumber[i] = true;
-        oc.numbers[i] = v;
+        oc.numbers[i] = asExcelDate ? v + 21916.0 : v;
       }
     }
     out.push_back(std::move(oc));
@@ -2076,17 +2929,18 @@ ojson runExportExcel(const std::vector<std::string>& varlist, const std::string&
 
   try {
     // A sheetreplace against a workbook that is not there yet is just a write:
-    // "If there is no worksheet named sheetname in the workbook, a new sheet
-    // named sheetname is created" ([D] import excel p.496), and there is no
+    // a sheet name that the workbook does not have yet simply gets created
+    // ([D] import excel), and there is no
     // workbook to preserve.
     if (sheetMerge && workbookExists) xlsx::writeSheetInto(path, sheetName, out, header);
     else xlsx::write(path, out, header, sheetName);
   } catch (const std::exception& e) {
-    return engineErrorBlock(std::string("export excel: ") + e.what(), "data_io");
+    return reEchoPath(engineErrorBlock(std::string("export excel: ") + e.what(), "data_io"), path,
+                      typed);
   }
   ojson block;
   block["type"] = "display";
-  block["text"] = "file " + path + " saved";
+  block["text"] = "file " + typed + " saved";
   return block;
 }
 
@@ -2096,6 +2950,115 @@ ojson runExportExcel(const std::vector<std::string>& varlist, const std::string&
 // The option cluster this build was missing is the single most frequent one in
 // the twelve-paper corpus (`import excel` appears 273 times, 243 of them in
 // paper 015), and every one of those calls names a sheet.
+namespace {
+
+// How Stata's import excel reads an Excel date/time number format (StataBE
+// scratch-r150/t7-007/stata/dt: dt2.golden + dt3.golden -- every built-in date
+// id and four custom codes, as numeric, allstring and text-mixed columns; AER
+// 007's survey exports, whose dates sort and merge its cleaning). A numeric
+// column holds the Stata date (`time` false: days, %td) or datetime (`time`
+// true: milliseconds, %tc) with the fraction kept, shown in `stataFmt`. Read as
+// text (allstring, or a column that also holds text) a built-in id is drawn as
+// Excel draws it -- four-digit years, id 22's `h` a 12-hour clock with no
+// AM/PM -- right-aligned in `width`; a custom code is drawn in Stata's own
+// default (%tc `08may2019 05:58:59`, %td `08may2019`, time-only `05:58:59`).
+struct ExcelDateStyle {
+  bool time = false;
+  std::string stataFmt;
+  int id = 0;  // the built-in id drawn Excel's way; 0 = drawn in stataFmt's default
+  size_t width = 0;
+};
+
+ExcelDateStyle excelDateStyle(int id, const std::string& code) {
+  switch (id) {
+    case 14: return {false, "%tdnn/dd/CCYY", 14, 10};
+    case 15: return {false, "%tddd-Mon-YY", 15, 9};
+    case 16: return {false, "%tddd-Mon", 16, 6};
+    case 17: return {false, "%tdMon-YY", 17, 6};
+    case 18: return {true, "%tchh:MM_AM", 18, 8};
+    case 19: return {true, "%tchh:MM:SS_AM", 19, 11};
+    case 20: return {true, "%tchH:MM", 20, 5};
+    case 21: case 46: return {true, "%tcHH:MM:SS", 21, 8};
+    case 22: return {true, "%tcnn/dd/ccYY_hh:MM", 22, 16};
+    case 45: case 47: return {true, "%tcMM:SS", 45, 5};
+    default: break;
+  }
+  // DESIGN DECISION (no oracle arm): a locale id (27-36, 50-58) carries no
+  // code here and reads as id 14.
+  if (code.empty()) return {false, "%tdnn/dd/CCYY", 14, 10};
+  // A custom code: its date letters (y, d) and clock letters (h, s) outside
+  // quoted literals, escapes and [brackets]; `m` is a month or a minute and
+  // decides nothing.
+  bool date = false, clock = false, inQ = false, inB = false;
+  for (size_t i = 0; i < code.size(); ++i) {
+    const char c = code[i];
+    if (c == '"') { inQ = !inQ; continue; }
+    if (inQ) continue;
+    if (c == '[') { inB = true; continue; }
+    if (c == ']') { inB = false; continue; }
+    if (inB) continue;
+    if (c == '\\') { ++i; continue; }
+    const char l = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (l == 'y' || l == 'd') date = true;
+    if (l == 'h' || l == 's') clock = true;
+  }
+  if (clock && date) return {true, "%tc", 0, 0};
+  if (clock) return {true, "%tcHH:MM:SS", 0, 0};
+  return {false, "%td", 0, 0};
+}
+
+// The Stata milliseconds of an Excel serial. Excel counts a 29feb1900 that
+// never was, so a serial before 61 is one day later than the 21916 offset
+// gives: serial 0 is 31dec1899, 59.5 noon of 28feb1900, 61.25 is 01mar1900
+// 06:00 (dt2.golden). Days, then seconds, then milliseconds, in that order:
+// 43593.24929861111 is 1872914339399.999756 in Stata, where days*86400000
+// gives ...400; the %td value is this over 86400000 (21677.2492986111065).
+double excelSerialToTc(double serial) {
+  return ((serial - (serial < 61.0 ? 21915.0 : 21916.0)) * 86400.0) * 1000.0;
+}
+double excelSerialToTd(double serial) { return excelSerialToTc(serial) / 86400000.0; }
+
+// A date cell read as text. The clock comes from the %tc value, truncated
+// like every %tc display: 23:59:59 stored as 44555.99998842592 is 23:59:58.
+std::string excelDateText(double serial, const ExcelDateStyle& st) {
+  static const char* const kMon[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  const int64_t ms = static_cast<int64_t>(std::floor(excelSerialToTc(serial)));
+  const int64_t day =
+      st.time ? floorDiv(ms, kMsPerDay) : static_cast<int64_t>(std::floor(excelSerialToTd(serial)));
+  const int64_t msd = ms - floorDiv(ms, kMsPerDay) * kMsPerDay;
+  const int hh = static_cast<int>(msd / 3600000), mi = static_cast<int>(msd / 60000 % 60),
+            ss = static_cast<int>(msd / 1000 % 60);
+  const int h12 = hh % 12 == 0 ? 12 : hh % 12;
+  const char* ampm = hh < 12 ? "AM" : "PM";
+  int64_t y;
+  unsigned m, d;
+  civilFromDays(day - kDaysTdEpochToUnix, &y, &m, &d);
+  const long long yy = static_cast<long long>(y), y2 = ((yy % 100) + 100) % 100;
+  char buf[64];
+  switch (st.id) {
+    case 14: std::snprintf(buf, sizeof buf, "%u/%u/%lld", m, d, yy); break;
+    case 15: std::snprintf(buf, sizeof buf, "%u-%s-%02lld", d, kMon[m - 1], y2); break;
+    case 16: std::snprintf(buf, sizeof buf, "%u-%s", d, kMon[m - 1]); break;
+    case 17: std::snprintf(buf, sizeof buf, "%s-%02lld", kMon[m - 1], y2); break;
+    case 18: std::snprintf(buf, sizeof buf, "%d:%02d %s", h12, mi, ampm); break;
+    case 19: std::snprintf(buf, sizeof buf, "%d:%02d:%02d %s", h12, mi, ss, ampm); break;
+    case 20: std::snprintf(buf, sizeof buf, "%d:%02d", hh, mi); break;
+    case 21: std::snprintf(buf, sizeof buf, "%02d:%02d:%02d", hh, mi, ss); break;
+    case 22: std::snprintf(buf, sizeof buf, "%u/%u/%lld %d:%02d", m, d, yy, h12, mi); break;
+    case 45: std::snprintf(buf, sizeof buf, "%02d:%02d", mi, ss); break;
+    default:
+      if (st.stataFmt == "%td") return tdDayString(day);
+      std::snprintf(buf, sizeof buf, "%02d:%02d:%02d", hh, mi, ss);
+      return st.stataFmt == "%tc" ? tdDayString(day) + " " + buf : std::string(buf);
+  }
+  std::string t(buf);
+  if (t.size() < st.width) t.insert(0, st.width - t.size(), ' ');
+  return t;
+}
+
+}  // namespace
+
 ojson runImportExcel(const std::string& pathArg,
                      const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                      SessionState& session) {
@@ -2106,12 +3069,18 @@ ojson runImportExcel(const std::string& pathArg,
   // case(preserve|lower|upper). Stata's default is preserve ([D] import excel
   // p.495); this build hard-lowercased until W3a, which is case(lower) wired as
   // if it were the only rule.
+  // The value takes abbreviations: `case(l)` is lower (w2ar
+  // dx_imx_077_case_l_ok rc 0, log:1954).
   NameCase nameCase = NameCase::kPreserve;
   if (auto c = optStrOf(opts, "case")) {
     const std::string v = strutil::lower(*c);
-    if (v == "preserve") nameCase = NameCase::kPreserve;
-    else if (v == "lower") nameCase = NameCase::kLower;
-    else if (v == "upper") nameCase = NameCase::kUpper;
+    auto isPrefixOf = [&](const char* full) {
+      const std::string f(full);
+      return !v.empty() && v.size() <= f.size() && f.compare(0, v.size(), v) == 0;
+    };
+    if (isPrefixOf("preserve")) nameCase = NameCase::kPreserve;
+    else if (isPrefixOf("lower")) nameCase = NameCase::kLower;
+    else if (isPrefixOf("upper")) nameCase = NameCase::kUpper;
     else {
       return engineErrorBlock(
           "import excel: case(" + *c + ") is not one of preserve, lower or upper",
@@ -2121,9 +3090,24 @@ ojson runImportExcel(const std::string& pathArg,
 
   xlsx::ReadOptions ro;
   ro.firstRowIsHeader = firstrow;
-  if (auto sh = optStrOf(opts, "sheet")) ro.sheetName = *sh;
+  // The sheet name is taken verbatim inside its quotes: `sheet("8-2 ")` names
+  // a sheet whose name ends in a blank (w2ar log:1655).
+  for (const auto& kv : opts) {
+    if (kv.first != "sheet" || kv.second.isBool) continue;
+    std::string v = kv.second.strValue;
+    const size_t a = v.find_first_not_of(" \t");
+    const size_t b = v.find_last_not_of(" \t");
+    v = a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
+    if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+    ro.sheetName = v;
+  }
   if (auto cr = optStrOf(opts, "cellrange")) {
     std::string err;
+    // A range ending in `:` names no end cell: r(198) (w2ar
+    // dx_imx_bad_range_syntax `cellrange(A1:)`, log:2047).
+    if (!cr->empty() && cr->back() == ':') {
+      return engineErrorBlock("import excel: cellrange(" + *cr + ") invalid", "unsupported_option");
+    }
     if (!parseCellRangeOpt(*cr, &ro, &err)) {
       return engineErrorBlock("import excel: " + err, "unsupported_option");
     }
@@ -2141,9 +3125,12 @@ ojson runImportExcel(const std::string& pathArg,
     }
   }
 
-  std::string path = resolveUserPath(session, pathArg);
+  std::string path = importSourcePath(session, pathArg, true);
   if (!cecon::native_exists(path)) {
-    return engineErrorBlock("import excel: file " + path + " not found", "data_io");
+    // StataBE: `file sub/nofile.xlsx not found` r(601), the file as typed; a
+    // stem found under neither suffix is named bare (`file nofile not found`).
+    return eval::errorBlock("engine_error", "file " + stripOneQuotePair(trim(pathArg)) + " not found",
+                            std::nullopt, std::nullopt, std::nullopt, "r(601)");
   }
 
   // ---- `describe`: a pure QUERY. It must not touch the dataset, so it returns
@@ -2163,12 +3150,14 @@ ojson runImportExcel(const std::string& pathArg,
       session.eval.rStrings.set("range_" + n, info[i].range);
     }
     size_t nameWidth = 5;  // "Sheet"
-    for (const auto& si : info) nameWidth = std::max(nameWidth, si.name.size());
+    // Widths count CHARACTERS (a sheet may be named in Arabic), not bytes.
+    for (const auto& si : info) nameWidth = std::max(nameWidth, cecon::ident::codePointCount(si.name));
     std::string text = "\n";
     text += "Sheet" + std::string(nameWidth - 5 + 3, ' ') + "Range\n";
     text += std::string(nameWidth + 3 + 20, '-') + "\n";
     for (const auto& si : info) {
-      text += si.name + std::string(nameWidth - si.name.size() + 3, ' ') + si.range + "\n";
+      text += si.name + std::string(nameWidth - cecon::ident::codePointCount(si.name) + 3, ' ') +
+              si.range + "\n";
     }
     ojson block;
     block["type"] = "display";
@@ -2180,8 +3169,11 @@ ojson runImportExcel(const std::string& pathArg,
   try {
     sheet = xlsx::read(path, ro);
   } catch (const xlsx::SheetNotFound& e) {
+    // `clear` drops the data before the sheet is looked up, so a missing
+    // sheet leaves k=0 (w2ar dx_imx_bad_sheet 601 k=0, log:2028).
+    if (hasFlagOpt(opts, "clear") && session.hasData()) (void)runClear("", session);
     // Stata's own code and message, both captured (aer_b4
-    // private_oracle_g.log:136-139: `worksheet NoSuchSheet not found`, r(601)).
+    // pins_oracle_g.log:136-139: `worksheet NoSuchSheet not found`, r(601)).
     // The rc travels as an explicit `reason`, because coarseRc's file/directory
     // rule would otherwise never see a message that says "worksheet".
     return eval::errorBlock("engine_error", e.what(), std::nullopt, std::nullopt, std::nullopt,
@@ -2203,103 +3195,189 @@ ojson runImportExcel(const std::string& pathArg,
   if (nCols == 0) return engineErrorBlock("import excel: " + path + " has no cells to read");
 
   // BUG-425: without `firstrow`, Stata names the variables after the SHEET's own
-  // column letters — A, B, ... Z, AA, AB — not v1, v2. It is a documented naming
-  // rule ([D] import excel) and the reason `summarize B` is what a do-file
-  // written against Stata says; `v2` made those stop at rc 111.
+  // column letters — A, B, ... Z, AA, AB — the ORIGINAL spreadsheet's, not the
+  // window's (`cellrange(C3:D9)` gives C and D).
   //
-  // W3a: those letters are the ORIGINAL spreadsheet's, not the window's. With
-  // `cellrange(C3:D9)` the two columns are still C and D — which is why
-  // xlsx::Sheet carries firstCol at all.
+  // With `firstrow`, the header cell is legalized with the case kept (`Value X`
+  // -> ValueX, `2nd col` -> ndcol) and becomes EVERY column's label, [id]
+  // included; a blank header cell gives the column letter and no label (w2ar
+  // log:1702-1716, :1784). case(lower|upper) folds the names, and two that
+  // fold together are r(110) before any data moves (log:1727, :1914).
   const size_t colBase = sheet.firstCol > 0 ? static_cast<size_t>(sheet.firstCol) - 1 : 0;
   std::vector<std::string> names;
+  std::vector<std::string> labels;
   {
     std::set<std::string> taken;
+    std::set<std::string> seenHeaders;  // legal header names, case kept, in column order
+    const delimited::Case dc = nameCase == NameCase::kLower   ? delimited::Case::kLower
+                               : nameCase == NameCase::kUpper ? delimited::Case::kUpper
+                                                              : delimited::Case::kPreserve;
     for (size_t c = 0; c < nCols; ++c) {
       std::string raw = (firstrow && c < sheet.header.size()) ? sheet.header[c] : std::string();
-      if (!raw.empty()) {
-        names.push_back(sanitizeVarName(raw, c, taken, nameCase));
-      } else if (firstrow) {
-        // A header row with an EMPTY cell: Stata falls back to its positional
-        // name there, which is what sanitizeVarName("") already produces.
-        names.push_back(sanitizeVarName("", c, taken, nameCase));
-      } else {
-        // The letter goes in VERBATIM, not through sanitizeVarName: Stata's
-        // generated names are upper case — `A`, not `a` — and they are not
-        // user-supplied headers, so case() has no say over them. Legality is
-        // not in question for A..ZZ, so the only thing left to guard is a
-        // collision with a name an earlier column already took.
-        std::string nm = excelColumnName(colBase + c);
-        while (taken.count(nm) > 0) nm += "_";
-        taken.insert(nm);
-        names.push_back(nm);
+      std::string nm;
+      std::string label;
+      if (firstrow && !raw.empty()) {
+        // excel cuts the RAW header to 32 characters BEFORE it drops what a name
+        // cannot hold, so `Have you heard about this program?` becomes
+        // `Haveyouheardaboutthisprogra` (27 letters: the cut lands on "progra"),
+        // where import delimited cleans first and keeps 28. StataBE probe sp.do
+        // (scratch-r150/uni-oracle); 007's Wave 1 cleaning reads the 27-letter name.
+        const std::string cut = cecon::ident::truncateCodePoints(raw, 32);
+        nm = delimited::legalNames({cut}, dc).names.front();
+        // legalNames' positional fallback means nothing legal was left in the
+        // cell; excel's fallback is the column letter instead.
+        if ((nm == "v1" || nm == "V1") && strutil::lower(raw) != "v1") nm.clear();
+        label = raw;
+        // A header whose legal name (case kept) repeats an EARLIER column's gets
+        // the column letter too, not an error: StataBE names the second `source`
+        // of 007's baseline sheet `L`, and two long headers that truncate to the
+        // same 32 characters `AZ` and `BD` (T7 probe ie2.do, scratch-r150/t7-int).
+        // The r(110) below stays for names that only COLLIDE once case() folds
+        // them, which the w2ar oracle pins.
+        if (!nm.empty()) {
+          std::string kept = delimited::legalNames({cut}, delimited::Case::kPreserve).names.front();
+          if (!seenHeaders.insert(kept).second) nm.clear();
+        }
       }
+      if (nm.empty()) {
+        // The letter goes in VERBATIM: Stata's generated names are upper case
+        // and case() has no say over them.
+        nm = excelColumnName(colBase + c);
+      }
+      if (taken.count(nm)) {
+        return eval::errorBlock("engine_error", "variable " + nm + " already defined",
+                                std::nullopt, std::nullopt, std::nullopt, "r(110)");
+      }
+      taken.insert(nm);
+      names.push_back(nm);
+      labels.push_back(label);
     }
   }
 
-  // Materialize as CSV in the session workdir and hand it to the SAME loader
-  // `use`/`import delimited` run, so type inference, factor detection and
-  // missing handling are one implementation, not three.
-  std::string csvPath = nextPath(session.workdir(), "import_excel") + ".csv";
-  // BUG-389 class: register the mint. Without this the staging CSV belongs to no
-  // ledger, so the moment it stops being the session head -- an `import excel`
-  // followed by `clear`, or by any other load -- it survives to exit as an
-  // ORPHAN. Every sibling stager in the tree carries this line; this one was
-  // missed. Found by AER-SCOPE1 bundle G's corpus probe, which is the only leg
-  // that looks at the exit census.
-  registerScratchMint(csvPath);
-  {
-    std::ofstream f(cecon::to_native_path(csvPath), std::ios::binary);
-    if (!f) return engineErrorBlock("import excel: cannot stage " + csvPath, "data_io");
-    for (size_t c = 0; c < names.size(); ++c) {
-      if (c) f << ',';
-      f << csvField(names[c], ',');
-    }
-    f << "\n";
+  // Column types from the cells themselves (C16): a column holding any text
+  // cell is a string, its numbers written as text; a numeric column is
+  // byte/int/long when every value is an integer in range, double otherwise --
+  // never float -- shown %10.0g; a column of date-formatted numbers is int
+  // the Stata date or datetime its number format names (excelDateStyle;
+  // integer serials under id 14 are int %tdnn/dd/CCYY, log:1624-1639); a
+  // 0.00-formatted one shows %14.2f (log:1091-1104). `allstring` makes every
+  // column a string: numbers at 16 significant digits, date cells drawn by
+  // excelDateText (m/d/yyyy right-aligned in 10 under id 14, log:1607-1622).
+  auto numText = [](double v) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.16g", v);
+    std::string t(buf);
+    if (t.rfind("0.", 0) == 0) t.erase(0, 1);
+    else if (t.rfind("-0.", 0) == 0) t.erase(1, 1);
+    return t;
+  };
+  delimited::Table table;
+  table.names = names;
+  table.labels = labels;
+  table.types.resize(nCols);
+  std::vector<std::string> formats(nCols);
+  std::vector<std::vector<std::string>> cells(sheet.rows.size(), std::vector<std::string>(nCols));
+  for (size_t c = 0; c < nCols; ++c) {
+    bool anyText = allstring, anyNum = false, allInt = true, allDate = true, all2dec = true;
+    double lo = 0.0, hi = 0.0;
     for (const auto& row : sheet.rows) {
-      for (size_t c = 0; c < names.size(); ++c) {
-        if (c) f << ',';
-        if (c >= row.size() || row[c].blank) continue;   // empty field = missing
-        if (row[c].isNumber) f << eval::pythonFloatRepr(row[c].number);
-        else f << csvField(row[c].text, ',');
+      if (c >= row.size() || row[c].blank) continue;
+      const xlsx::Cell& cell = row[c];
+      if (!cell.isNumber) {
+        anyText = true;
+        continue;
       }
-      f << "\n";
+      const double v = cell.number;
+      if (!anyNum) { lo = hi = v; anyNum = true; }
+      lo = std::min(lo, v);
+      hi = std::max(hi, v);
+      if (v != std::floor(v)) allInt = false;
+      if (!cell.isDate) allDate = false;
+      if (cell.numFmtId != 2) all2dec = false;
     }
-    if (!f) return engineErrorBlock("import excel: failed staging " + csvPath, "data_io");
-  }
-  ojson block = runUse(csvPath, session);
-
-  // `allstring` — every column as string. Reuses `tostring`'s own converter
-  // rather than adding a second numeric->string rendering: BUG-207 measured
-  // what Stata writes for a missing (the `.`/`.a` token, not ""), and a private
-  // copy here would be the place that quietly disagrees with it.
-  if (allstring && block.is_object() && block.value("type", std::string()) == "data_mutation") {
-    Datastore* ds = session.datastore();
-    if (ds != nullptr) {
-      std::vector<std::string> numeric;
-      for (const auto& nm : ds->names()) {
-        if (ds->dtype(nm) == "f64") numeric.push_back(nm);
+    if (anyText) {
+      size_t width = 0;
+      for (size_t r = 0; r < sheet.rows.size(); ++r) {
+        const auto& row = sheet.rows[r];
+        std::string t;
+        if (c < row.size() && !row[c].blank) {
+          const xlsx::Cell& cell = row[c];
+          t = !cell.isNumber ? cell.text
+              : cell.isDate  ? excelDateText(cell.number, excelDateStyle(cell.numFmtId, cell.numFmtCode))
+                             : numText(cell.number);
+        }
+        width = std::max(width, t.size());
+        cells[r][c] = std::move(t);
       }
-      for (const auto& nm : numeric) {
-        ojson r = runTostring(nm, /*doReplace=*/true, std::nullopt, /*useDisplayFormat=*/false,
-                              session);
-        if (r.is_object() && r.value("type", std::string()) == "error") return r;
+      table.types[c].isString = true;
+      table.types[c].stataType =
+          width > 2045 ? std::string("strL") : "str" + std::to_string(std::max<size_t>(1, width));
+      continue;
+    }
+    std::string type = "byte";
+    std::string fmt = "%10.0g";
+    if (anyNum && allDate) {
+      // One format for the column: its cells' when they agree, else plain %tc
+      // when any cell has a clock (dt3.golden m1422/m2214: id 14 and id 22
+      // cells -> %tc) and %td otherwise. The value keeps its fraction, so a
+      // column is int/long only when every value is whole (log:1624-1639).
+      bool first = true, same = true, time = false;
+      std::string fmt0;
+      for (const auto& row : sheet.rows) {
+        if (c >= row.size() || row[c].blank || !row[c].isNumber) continue;
+        const ExcelDateStyle st = excelDateStyle(row[c].numFmtId, row[c].numFmtCode);
+        if (first) fmt0 = st.stataFmt;
+        else if (st.stataFmt != fmt0) same = false;
+        first = false;
+        time = time || st.time;
       }
-      // The open block was rendered BEFORE the conversions, so its varlist_after
-      // still says f64. Re-render it from the datastore the conversions left
-      // behind; the shape is runUse's own (session_state's fold), not a second
-      // description of a variable.
-      ds = session.datastore();
-      if (ds != nullptr) {
-        ojson varlist = ojson::array();
-        auto vlist = session.varlistWithMeta(ds);
-        for (const auto& v : vlist) varlist.push_back(v.toJson());
-        session.updateNMissCache(vlist);
-        block["varlist_after"] = varlist;
-        block["n_rows_after"] = ds->nRows();
+      fmt = same ? fmt0 : (time ? "%tc" : "%td");
+      bool whole = true, seen = false;
+      double vlo = 0.0, vhi = 0.0;
+      for (size_t r = 0; r < sheet.rows.size(); ++r) {
+        const auto& row = sheet.rows[r];
+        if (c < row.size() && !row[c].blank && row[c].isNumber) {
+          const double v = time ? excelSerialToTc(row[c].number) : excelSerialToTd(row[c].number);
+          if (v != std::floor(v)) whole = false;
+          vlo = seen ? std::min(vlo, v) : v;
+          vhi = seen ? std::max(vhi, v) : v;
+          seen = true;
+          char buf[64];
+          std::snprintf(buf, sizeof(buf), "%.17g", v);
+          cells[r][c] = buf;
+        }
+      }
+      if (whole && vlo >= -32767 && vhi <= 32740) type = "int";
+      else if (whole && vlo >= -2147483647.0 && vhi <= 2147483620.0) type = "long";
+      else type = "double";
+    } else {
+      if (anyNum) {
+        if (allInt && lo >= -127 && hi <= 100) type = "byte";
+        else if (allInt && lo >= -32767 && hi <= 32740) type = "int";
+        else if (allInt && lo >= -2147483647.0 && hi <= 2147483620.0) type = "long";
+        else type = "double";
+        if (all2dec) fmt = "%14.2f";
+      }
+      for (size_t r = 0; r < sheet.rows.size(); ++r) {
+        const auto& row = sheet.rows[r];
+        if (c < row.size() && !row[c].blank && row[c].isNumber) {
+          char buf[64];
+          std::snprintf(buf, sizeof(buf), "%.17g", row[c].number);
+          cells[r][c] = buf;
+        }
       }
     }
+    table.types[c].isString = false;
+    table.types[c].stataType = type;
+    formats[c] = fmt;
   }
-  return block;
+  table.rows = std::move(cells);
+  if (auto err = delimited::stageAndAdopt(session, table, "import excel", path)) return *err;
+  for (size_t c = 0; c < nCols; ++c) {
+    if (!formats[c].empty()) session.varMeta[table.names[c]].format = formats[c];
+  }
+  session.invalidateDatastore();
+  return openBlockFor(session, path);
 }
 
 

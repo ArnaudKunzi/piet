@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
+// Portions derived from estout 3.33 (MIT).
+// See THIRD_PARTY_NOTICES.
+//
 // M4a item 3: stored-estimates surface — eststo/esttab/coefplot. C++ port
 // of piet/backend/piet/eststo.py + esttab.py (make_snapshot/render_esttab/
 // parse_esttab_opts) + coefplot.py (run_coefplot), and dispatcher.py's
@@ -20,8 +25,12 @@
 #include <sstream>
 #include <unordered_set>
 
+#include "core/ident.h"       // the shared Unicode name rule
+#include "piet/datastore.h"   // kEsampleColumn
+#include "piet/dispatcher.h"  // `estimates esample:` marks its rows through `generate`
 #include "piet/eval/errors.h"
 #include "piet/eval/macros.h"  // eScalarKey(): the ONE e()-name table
+#include "estimation_m4_internal.h"  // e(sample) T2's mask writer (esampleRewriteHeadMask)
 #include "io/win_compat.h"     // cecon::native_exists / to_native_path
 
 // ---------------------------------------------------------------------------
@@ -100,18 +109,18 @@ const piet::eval::OptVocab& kVocabEsttab = piet::eval::registerOptVocab(
       "nocons", "noconstant", "noomit", "noomitted", "nobaselevels", "type",
       "obslast", "noabbrev", "style", "varlabels",
       // W1a-2 (2026-09-17, BUG-407): `cells` leaves the unimplemented list.
-      // esttab has no cell renderer of its own -- esttab.ado:550-658 builds a
+      // esttab has no cell renderer of its own -- esttab builds a
       // cells() spec out of main/aux when cells() is absent and hands it to
       // estout -- so `main`/`aux` join it as the same option wearing two other
       // names, and `writeEsttabFile` now reads all three through the one
       // grammar that already parses this syntax (estout's parseCells).
       // `wide` stays UNIMPLEMENTED on purpose: it is the quoted side-by-side
-      // form (esttab.ado:657), which this writer's coefficient-row-over-aux-row
+      // form (esttab), which this writer's coefficient-row-over-aux-row
       // model cannot render, and accepting it would be the exact
       // accept-and-ignore BUG-407 was filed against.
       "cells", "main", "aux",
       // W1a-5b (2026-09-18). `s` is estout's one-character minimum for
-      // `Stats()` (estout.ado:21 `Stats(string asis)`), measured rc 0 in
+      // `Stats()` (estout `Stats(string asis)`), measured rc 0 in
       // w1b_stats_grammar.log s7 and written by 18 of the 32 obslast uses and
       // 13 of the 82 sfmt uses. It is added as an EXACT name: `resolveOption
       // AbbrevAcross` floors abbreviation at two characters, so a one-letter
@@ -152,7 +161,18 @@ const piet::eval::OptVocab& kVocabEsttab = piet::eval::registerOptVocab(
       // allowed" for it in Stata too (w1b_indicate.log tr_pose), so the six
       // corpus lines that spell it do not run there either and this build
       // refusing them is PARITY -- the `table, contents()` shape again.
-      "indicate", "eqlabels", "unstack"},
+      "indicate", "eqlabels", "unstack",
+      // W2AK (2026-10-21): esttab is now derived from esttab.ado's
+      // translation onto ONE estout writer (handlers_aer_tables.cpp eoRender),
+      // so the rest of its option list is honoured as the ado reads it --
+      // modes (esttab), the switches of _more_syntax and the
+      // estout pass-throughs of _estout_options.
+      "tab", "scsv", "fixed", "z", "abs", "staraux", "constant", "aic", "bic", "wide",
+      "brackets", "parentheses", "noparentheses", "depvars", "notes", "numbers", "lines",
+      "noeqlines", "eqlines", "float", "nofloat", "note", "begin", "delimiter", "end",
+      "incelldelimiter", "abbrev", "legend", "stardetach", "interaction", "hlinechar",
+      "nolz", "lz", "noisily", "outfilenoteoff", "nooutfilenoteoff", "notype", "omitted",
+      "baselevels", "longtable", "standalone", "fonttbl", "attributes", "onecell"},
      // UNIMPLEMENTED, and `cells`/`p` are here deliberately. This handler reads
      // nostar/b/se/t/star and nothing else from the cell layer, so listing
      // either as KNOWN would accept it and silently ignore it -- the class
@@ -165,7 +185,9 @@ const piet::eval::OptVocab& kVocabEsttab = piet::eval::registerOptVocab(
      // already did. `cells` stays -- runEsttab still does not read a cells()
      // spec, and accepting one would silently render the default layout under a
      // different request (BUG-407).
-     {"rtf", "html", "md", "wide", "unstack", "interaction", "smcl"}});
+     {"rtf", "html", "html5", "md", "mmd", "smcl", "equations", "eform", "margin",
+      "discrete", "dropped", "lastend", "dmarker", "msign", "stardrop", "starkeep",
+      "topfile", "bottomfile"}});
 }  // namespace
 
 namespace piet::handlers {
@@ -178,8 +200,8 @@ ojson engineErrorBlockEt(const std::string& message, const std::string& code = "
   return eval::engineError(message, code);
 }
 
-// W2 esttabnames (BUG-552): a failed namelist expansion, under the exact rc
-// est_expand.ado exits with (111 no match, 301 no active `.`, 198 count). The
+// W2 esttabnames (BUG-552): a failed namelist expansion, under Stata's exact
+// rc (111 no match, 301 no active `.`, 198 count). The
 // `reason` field is the channel that carries an exact rc (BUG-187).
 ojson estNamelistError(const SessionState::EstNamelist& ex) {
   return ojson(eval::errorBlock("engine_error", ex.message, std::nullopt, std::nullopt,
@@ -210,6 +232,12 @@ ojson makeSnapshot(const ojson& estBlock) {
   snap["depvar"] = estBlock.value("depvar", std::string());
   snap["estimator"] = estBlock.value("estimator", std::string());
   snap["fe"] = estBlock.contains("absorbed") ? estBlock["absorbed"] : ojson(nullptr);
+  // W2AK: a multi-outcome fit (mlogit) carries its coefficients per outcome and
+  // no top-level coeftable; esttab/estout render one equation per outcome
+  // (estout keys rows by equation), so the outcomes travel with the snapshot.
+  if (estBlock.contains("outcomes") && estBlock["outcomes"].is_array()) {
+    snap["outcomes"] = estBlock["outcomes"];
+  }
   return snap;
 }
 
@@ -227,6 +255,8 @@ ojson escalarsFrom(const ojson& estBlock) {
   for (const auto& [stataName, cobraKey] : eval::eScalarKey()) {
     if (!estBlock.contains(cobraKey)) continue;
     const ojson& v = estBlock[cobraKey];
+    // n_clusters 0 is an unclustered fit, which has no e(N_clust) (BUG-1466)
+    if (stataName == "N_clust" && v.is_number() && v.get<double>() == 0.0) continue;
     if (v.is_number()) out[stataName] = v;
   }
   return out;
@@ -274,6 +304,9 @@ ojson lastModelToJson(const LastModel& lm) {
   m["fit_keepif"] = lm.fitKeepif;
   m["fit_weight"] = lm.fitWeight;
   m["fit_wtype"] = lm.fitWtype;
+  // e(wexp) as typed (`= wf `, `= 1/wf`): without it `estimates use` rebuilt it
+  // from the weight column (BUG-1215). Written only for a weighted fit.
+  if (!lm.fitWexp.empty()) m["fit_wexp"] = lm.fitWexp;
   if (lm.timevar.has_value()) m["timevar"] = *lm.timevar;
   if (lm.gvar.has_value()) m["gvar"] = *lm.gvar;
   if (lm.method.has_value()) m["method"] = *lm.method;
@@ -316,6 +349,7 @@ LastModel lastModelFromJson(const ojson& m) {
   lm.fitKeepif = m.value("fit_keepif", std::string());
   lm.fitWeight = m.value("fit_weight", std::string());
   lm.fitWtype = m.value("fit_wtype", std::string());
+  lm.fitWexp = m.value("fit_wexp", std::string());
   lm.timevar = jsonOptStr(m, "timevar");
   lm.gvar = jsonOptStr(m, "gvar");
   lm.method = jsonOptStr(m, "method");
@@ -332,7 +366,7 @@ LastModel lastModelFromJson(const ojson& m) {
 bool fileExistsEt(const std::string& path) { return cecon::native_exists(path); }
 
 // Stata's `estimates save` appends `.ster` when the name carries no suffix
-// (oracle private_oracle_g.log:284 — `estimates save "b4g_est", replace`
+// (oracle pins_oracle_g.log:284 — `estimates save "b4g_est", replace`
 // answers "(note: file b4g_est.ster not found) / file b4g_est.ster saved").
 // Only a suffix on the LAST path component counts, so `dir.v2/est` still gets
 // one.
@@ -343,7 +377,92 @@ std::string withSterSuffix(const std::string& path) {
   return path + ".ster";
 }
 
+// ---------------------------------------------------------------------------
+// e(sample) T3 (internal note esample/SPEC.md §6, corrected toward
+// the StataBE 19.5 records of tests/eval/golden/aer_w2/w2_esample.log section G
+// and toward Stata's own estimates.ado, which the records follow):
+//  * `estimates store NAME` (and `eststo NAME`) drops any `_est_NAME`, then
+//    writes e(sample) into a new byte variable `_est_NAME` labelled
+//    "esample() from estimates store" at the end of the data (estimates.ado
+//    Store: `capture drop _est_NAME`, `_est hold NAME, ... varname(_est_NAME)`;
+//    G0b `0|28|`, G0c, G0d r(k) 19, G0e `... zb27 _est_A|`, G9 `0|0|28|`).
+//  * `estimates restore NAME` of results that are NOT the active stored ones
+//    reads e(sample) back from `_est_NAME` -- nonzero and nonmissing is in --
+//    and leaves `_est_NAME` as the LAST variable (est_unhold drops it,
+//    est_hold re-creates it; G2 28, G12 `28|31|`, I1). When NAME already IS the
+//    active results Restore does nothing at all (`if ! inlist("NAME", ".",
+//    e(_estimates_name))`), so the live mask keeps following the rows: G3
+//    after `sort` 28, G4 after `drop` 22, G4b after `expand` 28 (the copies
+//    are outside the sample, as for any fit, w2_esample.log:1076 E6).
+//  * `estimates drop`/`clear` and `eststo clear` drop `_est_NAME` (G8b, G9b
+//    r(111)) and leave the active e(sample) alone (G8 28, G10 `0|28|28|`).
+// The DATA side is a visible user variable, so it follows every row verb the
+// way Stata's does. Layers: none of these touch an expression evaluator; the
+// mask they write is read through the row rewrite (dispatcher.cpp
+// rewriteEsampleToken) and the macro layer's obs-1 hook, unchanged.
+std::string estVarName(const std::string& name) { return "_est_" + name; }
+
+bool dataHasVar(SessionState& session, const std::string& var) {
+  if (!session.hasData()) return false;
+  try {
+    Datastore* ds = session.datastore();
+    return ds != nullptr && ds->has(var);
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+// Writes `_est_NAME` = e(sample) (byte, 1/0). True when it was written. The
+// old variable goes first in every case, as in Stata's estimates store: a stale
+// `_est_NAME` from an earlier store of the same name would otherwise answer for
+// these results. No block: Stata's store prints nothing about the variable.
+bool esampleStoreVar(const std::string& name, SessionState& session) {
+  if (!session.hasData()) return false;
+  const std::string var = estVarName(name);
+  if (dataHasVar(session, var)) {
+    const ojson d = runDrop({var}, session);
+    if (d.is_object() && d.value("type", std::string()) == "error") return false;
+  }
+  const SessionState::EsampleReading r = session.esampleReading();
+  std::string expr;
+  switch (r.kind) {
+    case SessionState::EsampleReading::Kind::kColumn:
+      expr = std::string("(") + kEsampleColumn + "==" + std::to_string(r.serial) + ")";
+      break;
+    case SessionState::EsampleReading::Kind::kZero:
+      expr = "0";
+      break;
+    case SessionState::EsampleReading::Kind::kRefused:
+      return false;  // PIET does not have these results' sample: no variable
+  }
+  const ojson g = runGen(var + " = " + expr, std::nullopt, session, "byte");
+  if (!g.is_object() || g.value("type", std::string()) == "error") return false;
+  // describe: `_est_A  byte  %8.0g  esample() from estimates store`
+  // (w2_esample.log:1375 G0c).
+  session.varMeta[var].stataType = "byte";
+  session.varMeta[var].format = "%8.0g";
+  session.setVarLabel(var, "esample() from estimates store");
+  return true;
+}
+
+// The `_est_NAME` variables PIET wrote for these stored names, dropped
+// together (estimates.ado Drop: `_est drop NAME` takes the held variable).
+void esampleDropStoreVars(const std::vector<std::string>& names, SessionState& session) {
+  std::vector<std::string> doomed;
+  for (const auto& n : names) {
+    const auto it = session.estimatesModels.find(n);
+    if (it == session.estimatesModels.end() || !it->second || !it->second->esampleVar) continue;
+    if (dataHasVar(session, estVarName(n))) doomed.push_back(estVarName(n));
+  }
+  if (!doomed.empty()) (void)runDrop(doomed, session);
+}
+
 }  // namespace
+
+void clearStoredEstimates(SessionState& session) {
+  esampleDropStoreVars(session.estimatesNames(), session);
+  session.estimatesClear();
+}
 
 // ===========================================================================
 // eststo / est store / estimates store
@@ -353,13 +472,89 @@ ojson runEststo(const std::optional<std::string>& name,
                 const std::string& autoPrefix, bool viaEststo) {
   const auto& lmOpt = session.lastModel();
   bool hasEstBlock = session.lastEstBlock.has_value();
+  // FU-1176: estimates.ado Store refuses only an EMPTY e(cmd) (r(301), the
+  // G5b case below). An `ereturn post` e() whose eclass program set e(cmd)
+  // (w2an_coefplot_family.do cf_lpost: `ereturn post cfb cfV` + `ereturn local
+  // cmd "lpost"`, then `estimates store lp`, rc 0 in Stata: cf_at_eq) is
+  // stored as that posting.
+  const std::string* postedCmd = session.eval.eStrings.find("cmd");
+  // BUG-1045: eststo first fills an empty e(cmd) with "." whenever e() holds
+  // anything (eststo's placeholder `eret local cmd "."`), then stores it; only
+  // `estimates store` itself keeps the empty-e(cmd) refusal below.
+  if (viaEststo && !hasEstBlock && !lmOpt.has_value() && session.ePostedLive &&
+      (postedCmd == nullptr || postedCmd->empty()) &&
+      (!session.eval.eScalars.items().empty() || !session.eval.eStrings.items().empty() ||
+       !session.eval.eMatrices.empty())) {
+    session.eval.setEString("cmd", ".");
+    postedCmd = session.eval.eStrings.find("cmd");
+  }
+  const bool postedWithCmd = !hasEstBlock && !lmOpt.has_value() && session.ePostedLive &&
+                             postedCmd != nullptr && !postedCmd->empty();
+  if (postedWithCmd) {
+    ojson snapshot;
+    if (session.eval.lastModelResult.has_value() && session.eval.lastModelResult->is_object())
+      snapshot = makeSnapshot(*session.eval.lastModelResult);
+    if (!snapshot.contains("coeftable")) snapshot["coeftable"] = ojson::array();
+    const std::string* dv = session.eval.eStrings.find("depvar");
+    snapshot["depvar"] = dv != nullptr ? *dv : std::string();
+    snapshot["estimator"] = *postedCmd;
+    const double* nE = session.eval.eScalars.find("N");
+    snapshot["n_obs"] = nE != nullptr ? ojson(*nE) : ojson(nullptr);
+    snapshot["escalars"] = ojson::object();
+    snapshot["added"] = emptyAddedBag();
+    if (title.has_value()) snapshot["title"] = *title;
+    std::string storedName = session.eststo(name, snapshot, autoPrefix, viaEststo);
+    auto sm = std::make_shared<SessionState::StoredModel>();
+    sm->lastModelResult = session.eval.lastModelResult;
+    sm->eScalars = session.eval.eScalars;
+    sm->eStrings = session.eval.eStrings;
+    sm->eMatrices = session.eval.eMatrices;
+    sm->eOnFitNames = session.eOnFitNames;
+    sm->postedE = true;
+    sm->postedEsampleSerial = session.ePostedEsampleSerial;
+    if (dataHasVar(session, estVarName(storedName)))
+      (void)runDrop({estVarName(storedName)}, session);  // never another results' sample
+    session.estimatesModelSet(storedName, std::move(sm));
+    session.activeEstimatesName = storedName;
+    ojson out;
+    out["type"] = "display";
+    out["text"] = "(stored as " + storedName + ")";
+    return out;
+  }
+  if (!hasEstBlock && lmOpt.has_value() && !lmOpt->ePosted) {
+    // e15d_eststo2 (w2g_ebmat.log:2497-2504): an e() that no `ereturn post`
+    // produced (rddensity, LastModel::ePosted) is not storable. estimates store
+    // exits 301 on its empty e(cmd); eststo fills
+    // e(cmd) "." first, and the hold step then refuses the
+    // unposted e() with r(301) "last estimates not found".
+    return ojson(eval::errorBlock(
+        "engine_error",
+        viaEststo ? "last estimates not found"
+                  : "last estimation results not found, nothing to store",
+        std::nullopt, std::nullopt, std::nullopt, std::string("r(301)")));
+  }
   if (!hasEstBlock && !lmOpt.has_value()) {
-    return engineErrorBlockEt("eststo: no estimation result in memory. Run a regression first.");
+    // FU-580: estimates.ado Store exits 301 when e(cmd) is empty -- after
+    // `ereturn post` too (w2_esample.log:1507 G5b `301|...`). The rc rides the
+    // errors.h builder; a bare engine error surfaced as rc 1.
+    return ojson(eval::errorBlock(
+        "engine_error",
+        viaEststo ? "eststo: no estimation result in memory. Run a regression first."
+                  : "last estimation results not found, nothing to store",
+        std::nullopt, std::nullopt, std::nullopt, std::string("r(301)")));
   }
 
   ojson snapshot;
   if (hasEstBlock) {
     snapshot = makeSnapshot(*session.lastEstBlock);
+    // mlogit's block names no depvar (its outcomes each carry one); e(depvar)
+    // is the fitted model's, which esttab heads the column with (ek_e34 `k3`).
+    // The block (and so e(depvar)) is empty for mlogit; the fit's own --y is
+    // the dependent variable.
+    if (snapshot.value("depvar", std::string()).empty() && snapshot.contains("outcomes") &&
+        lmOpt.has_value()) {
+      snapshot["depvar"] = !lmOpt->depvar.empty() ? lmOpt->depvar : lmOpt->y;
+    }
   } else if (lmOpt.has_value() && lmOpt->result.has_value()) {
     snapshot = makeSnapshot(*lmOpt->result);
   } else {
@@ -372,6 +567,13 @@ ojson runEststo(const std::optional<std::string>& name,
     snapshot["depvar"] = lmOpt.has_value() ? lmOpt->depvar : std::string();
     snapshot["estimator"] = lmOpt.has_value() ? lmOpt->cobraCmd : std::string();
     snapshot["fe"] = nullptr;
+  }
+
+  // W2AK BASELEV: the factor base levels, read while this fit's data and
+  // e(sample) are still the live ones (handlers_aer_tables.cpp).
+  if (snapshot.contains("coeftable")) {
+    const ojson bl = factorBaseLevels(snapshot["coeftable"], session);
+    if (!bl.empty()) snapshot["base_levels"] = bl;
   }
 
   // AER-SCOPE1 bundle E: e() scalars + whatever `estadd` attached to the ACTIVE
@@ -443,11 +645,28 @@ ojson runEststo(const std::optional<std::string>& name,
     if (modelMatchesBlock) {
       sm->lastModel = session.lastModel();
       sm->lastModelResult = session.eval.lastModelResult;
+      sm->eNameContract = session.eNameContract;
+    }
+    // eb-order T-P3: the e() stores belong to the live e() whether or not a
+    // fitted model stands behind its block -- an estpost posting has none, and
+    // `estimates restore` installs such a store as the posting it was
+    // (SessionState::estimatesRestore), its e(N)/e(cmd)/e(mean) included.
+    if (modelMatchesBlock || hasEstBlock) {
       sm->eScalars = session.eval.eScalars;
       sm->eStrings = session.eval.eStrings;
       sm->eMatrices = session.eval.eMatrices;
     }
     sm->estBlock = session.lastEstBlock;
+    // A posted e() keeps its `ereturn post ..., esample()` mask serial.
+    if (!session.lastModel().has_value() && session.ePostedLive)
+      sm->postedEsampleSerial = session.ePostedEsampleSerial;
+    // e(sample) T3: `_est_NAME`, for results whose model PIET holds (a posting
+    // with no model behind it has no sample PIET could write).
+    if (modelMatchesBlock) {
+      sm->esampleVar = esampleStoreVar(storedName, session);
+    } else if (dataHasVar(session, estVarName(storedName))) {
+      (void)runDrop({estVarName(storedName)}, session);  // never another results' sample
+    }
     session.estimatesModelSet(storedName, std::move(sm));
     session.activeEstimatesName = storedName;
   }
@@ -465,7 +684,7 @@ ojson runEststoDirNames(const std::vector<std::string>& namelist, SessionState& 
 ojson runEststoDir(SessionState& session) { return runEststoDirNames({}, session); }
 
 // W2 esttabnames (BUG-552): `estimates dir A_*` lists only what the namelist
-// expands to (estimates.ado Dir: est_expand, default `_all`). Declared here and
+// expands to (no namelist = every stored name). Declared here and
 // in dispatcher.cpp's forward block, not in handlers.h (outside this lane).
 ojson runEststoDirNames(const std::vector<std::string>& namelist, SessionState& session) {
   std::vector<std::string> names = session.estimatesNames();
@@ -508,7 +727,7 @@ ojson runEststoDirNames(const std::vector<std::string>& namelist, SessionState& 
 // ===========================================================================
 // B4-W3b / BUG-470: estimates save / estimates use
 //
-// Stata runs all four links at rc 0 (oracle private_oracle_g.log:283-298):
+// Stata runs all four links at rc 0 (oracle pins_oracle_g.log:283-298):
 //   estimates save "b4g_est", replace -> 0
 //   estimates use  "b4g_est"          -> 0
 //   e(cmd)==regress, e(depvar)==price   <- the RESTORE puts e() back
@@ -519,9 +738,11 @@ ojson runEststoDirNames(const std::vector<std::string>& namelist, SessionState& 
 // which is what predict/test/lincom/margins all read — and not just a display.
 
 ojson runEstimatesSave(const std::string& fileArg, bool replace, SessionState& session) {
+  // BUG-1248: StataBE 19.5 `estimates save a` with no estimates, after `ereturn
+  // clear` as well: "last estimates not found" r(301).
   if (!session.lastEstBlock.has_value() && !session.lastModel().has_value()) {
-    return engineErrorBlockEt(
-        "estimates save: no estimation result in memory. Run a regression first.");
+    return ojson(eval::errorBlock("engine_error", "last estimates not found", std::nullopt,
+                                  std::nullopt, std::nullopt, "r(301)"));
   }
   std::string fp = withSterSuffix(resolveUserPath(session, fileArg));
   if (fileExistsEt(fp) && !replace) {
@@ -539,6 +760,27 @@ ojson runEstimatesSave(const std::string& fileArg, bool replace, SessionState& s
   doc["last_model"] = session.lastModel().has_value() ? lastModelToJson(*session.lastModel())
                                                       : ojson(nullptr);
   doc["added"] = session.estAdded;
+  // eb-order T-P3: a posting with no fitted model behind it (estpost) has no
+  // LastModel to republish its e() on `use`, so its e() stores travel in the
+  // file -- e(cmd)/e(subcmd), e(N), e(mean)/e(sd)/... (w2v_estpost_ematrix.log
+  // ep14s_ecmd `estpost|summarize`, ep14s_emean_12). A fit's stores come back
+  // from its LastModel, as before.
+  if (!session.lastModel().has_value()) {
+    ojson strs = ojson::object(), scs = ojson::object(), mats = ojson::object();
+    for (const auto& [k, v] : session.eval.eStrings.items()) strs[k] = v;
+    for (const auto& [k, v] : session.eval.eScalars.items())
+      scs[k] = std::isnan(v) ? ojson(nullptr) : ojson(v);
+    for (const auto& [k, m] : session.eval.eMatrices) {
+      ojson data = ojson::array();
+      for (const auto& row : m.data) {
+        ojson r = ojson::array();
+        for (double v : row) r.push_back(std::isnan(v) ? ojson(nullptr) : ojson(v));
+        data.push_back(r);
+      }
+      mats[k] = {{"rownames", m.rownames}, {"colnames", m.colnames}, {"data", data}};
+    }
+    doc["e_posted"] = {{"strings", strs}, {"scalars", scs}, {"matrices", mats}};
+  }
 
   std::ofstream f(cecon::to_native_path(fp), std::ios::binary);
   if (!f) return engineErrorBlockEt("estimates save: could not write file: " + fp);
@@ -583,6 +825,51 @@ ojson runEstimatesUse(const std::string& fileArg, SessionState& session) {
   // re-points eval.lastModelResult, so it must run before anything reads e().
   if (doc.contains("last_model") && doc["last_model"].is_object()) {
     session.setLastModel(lastModelFromJson(doc["last_model"]));
+    // e(sample) T3: results read from a file carry no estimation sample; Stata
+    // answers 0 for every row (w2_esample.log:1531 G6 `0|0|0|28|`), and
+    // `estimates esample:` may then set one without `replace` (:1542 G7).
+    const LastModel& used = *session.lastModel();
+    session.setLastModelEsample(LastModel::EsampleState::kNone, 0, std::string(), used.dataPath);
+  } else {
+    // eb-order T-P3: a file with no fitted model behind it (an estpost
+    // posting) replaces the whole e() -- the previous fit's LastModel, its
+    // stores and its posted matrices go, so neither `_b[]` nor predict/test
+    // can answer from that fit (SPEC C: the stale `last_model` after estpost).
+    session.lastModel_reset();
+    session.eval.eScalars = eval::OrderedFloatDict();
+    session.eval.eStrings.clear();
+    session.eval.eMatrices.clear();
+    session.ePostedLive = doc.contains("est_block") && doc["est_block"].is_object();
+    if (doc.contains("e_posted") && doc["e_posted"].is_object()) {
+      const ojson& ep = doc["e_posted"];
+      if (ep.contains("strings") && ep["strings"].is_object())
+        for (const auto& [k, v] : ep["strings"].items())
+          if (v.is_string()) session.eval.setEString(k, v.get<std::string>());
+      if (ep.contains("scalars") && ep["scalars"].is_object())
+        for (const auto& [k, v] : ep["scalars"].items())
+          session.eval.setEScalar(k, v.is_number() ? v.get<double>()
+                                                   : std::numeric_limits<double>::quiet_NaN());
+      if (ep.contains("matrices") && ep["matrices"].is_object()) {
+        for (const auto& [k, mj] : ep["matrices"].items()) {
+          eval::EvalMatrix em;
+          if (mj.contains("rownames") && mj["rownames"].is_array())
+            em.rownames = mj["rownames"].get<std::vector<std::string>>();
+          if (mj.contains("colnames") && mj["colnames"].is_array())
+            em.colnames = mj["colnames"].get<std::vector<std::string>>();
+          if (mj.contains("data") && mj["data"].is_array()) {
+            for (const auto& row : mj["data"]) {
+              std::vector<double> r;
+              if (row.is_array())
+                for (const auto& c : row)
+                  r.push_back(c.is_number() ? c.get<double>()
+                                            : std::numeric_limits<double>::quiet_NaN());
+              em.data.push_back(std::move(r));
+            }
+          }
+          session.eval.eMatrices.emplace_back(k, std::move(em));
+        }
+      }
+    }
   }
   if (doc.contains("est_block") && doc["est_block"].is_object()) {
     session.lastEstBlock = doc["est_block"];
@@ -614,23 +901,25 @@ ojson runEststoManage(const std::string& sub, const std::optional<std::string>& 
     // and it was being looked up as a literal store NAME, so it always missed.
     // `_all` means every stored estimate, which is what `clear` already does.
     if (*name == "_all") {
+      esampleDropStoreVars(session.estimatesNames(), session);  // e(sample) T3
       session.estimatesClear();
       ojson out;
       out["type"] = "display";
       out["text"] = "(dropped all stored estimates)";
       return out;
     }
-    // W2 esttabnames (BUG-552): the operand is a NAMELIST (estimates.ado Drop ->
-    // est_expand): `estimates drop A_*` / `estimates drop m1 m2` drop every
+    // W2 esttabnames (BUG-552): the operand is a NAMELIST:
+    // `estimates drop A_*` / `estimates drop m1 m2` drop every
     // match, `.` is skipped, and a token matching nothing is r(111)
     // "estimation result NAME not found" -- also for a plain misspelt name,
     // which BUG-149 had answered at rc 1 with a message of its own. Nothing is
-    // dropped when any token misses (est_expand fails before Drop's loop).
+    // dropped when any token misses (the expansion fails first).
     std::vector<std::string> toks;
     std::istringstream tss(*name);
     for (std::string t; tss >> t;) toks.push_back(t);
     SessionState::EstNamelist ex = session.expandEstimatesNamelist(toks);
     if (ex.rc != 0) return estNamelistError(ex);
+    esampleDropStoreVars(ex.names, session);  // e(sample) T3: G8b r(111)
     std::string dropped;
     for (const auto& n : ex.names) {
       if (n == "." || !session.estimatesDrop(n)) continue;
@@ -642,13 +931,234 @@ ojson runEststoManage(const std::string& sub, const std::optional<std::string>& 
     return out;
   }
   if (sub == "clear") {
-    session.estimatesClear();
+    // e(sample) T3: `_est_*` go with the stores (G9b r(111)); the active
+    // e(sample) stays (w2_esample.log:1621 G10 `0|28|28|`).
+    clearStoredEstimates(session);
     ojson out;
     out["type"] = "display";
     out["text"] = "(estimates cleared)";
     return out;
   }
   return engineErrorBlockEt("eststo: unknown subcommand '" + sub + "'");
+}
+
+// ===========================================================================
+// e(sample) T3: estimates restore NAME (the namelist is expanded by the
+// dispatcher's restore arm, which owns the namelist's r(111)/r(198)). See
+// the T3 note above esampleStoreVar for the Stata rules this follows.
+ojson runEstimatesRestore(const std::string& name, SessionState& session) {
+  // estimates.ado Restore: NAME already the active results -> nothing happens,
+  // so the live e(sample) keeps following the rows (G3/G4/G4b). Decided BEFORE
+  // the re-activation below, which renames the active results.
+  const bool wasActive = session.activeStoredName() == name;
+  const std::optional<LastModel> live = session.lastModel();
+  if (!session.estimatesRestore(name)) {
+    return ojson(eval::errorBlock(
+        "unsupported_option",
+        "estimates restore: " + name + " was stored from results this version of PIET "
+        "cannot make active again (no fitted model and no estimation table behind "
+        "them); nothing was changed"));
+  }
+  ojson note;
+  note["type"] = "display";
+  note["text"] = "(results " + name + " are active now)";
+  const auto it = session.estimatesModels.find(name);
+  if (it == session.estimatesModels.end() || !it->second || !it->second->lastModel.has_value() ||
+      !session.lastModel().has_value())
+    return note;
+  const LastModel lm = *session.lastModel();  // the restored model (kUnavailable)
+  if (wasActive && live.has_value()) {
+    session.setLastModelEsample(live->esample, live->esampleSerial, live->esampleInstallPath,
+                                lm.dataPath);
+    return note;
+  }
+  if (!it->second->esampleVar) return note;  // stored without a sample: the named r(198)
+  const std::string var = estVarName(name);
+  if (!dataHasVar(session, var)) {
+    session.setLastModelEsample(LastModel::EsampleState::kStale, 0, std::string(), lm.dataPath);
+    return note;
+  }
+  const bool changed = session.datasetChanged;
+  // est_unhold drops `_est_NAME`, est_hold writes it anew: it ends up last.
+  {
+    eval::OptValue on;
+    on.isBool = true;
+    on.boolValue = true;
+    (void)runOrder({var}, {{"last", on}}, session);
+  }
+  // The restored rows: `_est_NAME` nonzero and nonmissing (est_hold: `replace
+  // touse = 0 if missing(touse)`, then `ereturn repost, esample(touse)`). They
+  // are written under the model's own serial, so a frame that still carries
+  // this model's original marker (a `preserve` taken before the store) reads
+  // the same results' sample.
+  std::vector<double> cells;
+  unsigned long long serial = lm.esampleSerial;
+  bool read = false;
+  try {
+    Datastore* ds = session.datastore();
+    if (ds != nullptr && ds->has(var) && ds->col(var).dtype == cecon::DType::F64) {
+      if (serial == 0) serial = ++session.esampleColumnInstalls;
+      const cecon::Column& c = ds->col(var);
+      const double* v = c.f64();
+      cells.resize(static_cast<size_t>(ds->nRows()));
+      for (int64_t i = 0; i < ds->nRows(); ++i)
+        cells[static_cast<size_t>(i)] =
+            (!std::isnan(v[i]) && v[i] != 0.0) ? static_cast<double>(serial) : 0.0;
+      read = true;
+    }
+  } catch (const std::exception&) {
+    read = false;
+  }
+  if (!read || !esampleRewriteHeadMask(session, cells)) {
+    session.datasetChanged = changed;
+    return note;  // kUnavailable: the named r(198), never another model's rows
+  }
+  session.datasetChanged = changed;
+  session.setLastModelEsample(LastModel::EsampleState::kColumn, serial, lm.esampleInstallPath,
+                              lm.dataPath);
+  return note;
+}
+
+// e(sample) T3: `estimates esample` (report) and `estimates esample: [varlist]
+// [if] [in] [, replace]` (set) -- Stata's estimates_sample.ado, read for this
+// port. The set form marks the rows that satisfy if/in with every variable of
+// varlist nonmissing (marksample), refuses r(322) "no; e(sample) already set"
+// when the active results carry one and `replace` is absent, posts the rows as
+// e(sample) and sets e(_estimates_sample) "user" (w2_esample.log:1542 G7
+// `0|28|` after `estimates use`, whose results carry none). Weights,
+// stringvars() and zeroweight are not implemented: refused by name.
+ojson runEstimatesEsample(bool colon, const std::vector<std::string>& varlistIn,
+                          const std::optional<std::string>& ifExpr,
+                          const std::optional<std::string>& inRange, bool hasWeight, bool replace,
+                          SessionState& session) {
+  const SessionState::EsampleReading r = session.esampleReading();
+  // BUG-1211: an `ereturn post` result takes an e(sample) too (estimates_sample.ado
+  // reposts it), on the posting's own marker serial.
+  const bool posting = !session.lastModel().has_value() && session.ePostedLive;
+  const bool userSet = (session.lastModel().has_value() || posting) &&
+                       session.eval.eStrings.get("_estimates_sample", "") == "user";
+  const bool hasSample = (session.lastModel().has_value() || posting) &&
+                         r.kind != SessionState::EsampleReading::Kind::kZero;
+  // The varlist as Stata's marksample reads it: wildcards, ranges and unique
+  // abbreviations (`x*`, `x1-x2`, `longn`; BUG-1211).
+  std::vector<std::string> varlist = varlistIn;
+  if (colon) {
+    if (auto err = resolveByKeyNames(session, varlist)) return *err;
+  }
+  if (!colon) {
+    if (!varlist.empty() || ifExpr.has_value() || inRange.has_value() || hasWeight)
+      return ojson(eval::engineError("estimates esample: `estimates esample` takes nothing "
+                                     "without the colon (`estimates esample: [varlist] [if] [in]`)",
+                                     "syntax_error"));
+    std::string who, text;
+    if (userSet && hasSample) {
+      who = "user";
+      text = "e(sample) set by user";
+    } else if (hasSample) {
+      who = "cmd";
+      text = "e(sample) set by estimation command";
+    } else {
+      who = "zero'd";
+      text = "e(sample) not set (0 assumed)";
+    }
+    session.eval.rValues = eval::OrderedFloatDict();
+    session.eval.rStrings.clear();
+    session.eval.rStrings.set("who", who);
+    ojson out;
+    out["type"] = "display";
+    out["text"] = text;
+    return out;
+  }
+  if (hasWeight)
+    return ojson(eval::errorBlock(
+        "unsupported_option",
+        "estimates esample: weights are not supported in this version of PIET; nothing was set.",
+        std::nullopt, std::nullopt, std::nullopt, std::string("r(198)")));
+  if (!session.lastModel().has_value() && !posting)
+    return ojson(eval::errorBlock("engine_error", "last estimates not found", std::nullopt,
+                                  std::nullopt, std::nullopt, std::string("r(301)")));
+  if (!replace && hasSample)
+    return ojson(eval::errorBlock("engine_error", "no; e(sample) already set", std::nullopt,
+                                  std::nullopt, std::nullopt, std::string("r(322)")));
+  if (!session.hasData()) return ojson(eval::noDataLoaded());
+  Datastore* ds = session.datastore();
+  if (ds == nullptr) return ojson(eval::noDataLoaded());
+  for (const auto& v : varlist) {
+    if (!ds->has(v) || isHiddenColumn(v))
+      return ojson(eval::errorBlock("engine_error", "variable " + v + " not found", std::nullopt,
+                                    std::nullopt, std::nullopt, std::string("r(111)")));
+    if (ds->col(v).dtype != cecon::DType::F64)
+      return ojson(eval::errorBlock(
+          "unsupported_option",
+          "estimates esample: string variable " + v + " in the varlist (stringvars()) is not "
+          "supported in this version of PIET; nothing was set.",
+          std::nullopt, std::nullopt, std::nullopt, std::string("r(198)")));
+  }
+  const bool changed = session.datasetChanged;
+  // The if/in rows, marked by `generate` itself so the condition goes through
+  // the one row rewrite every `if` takes (an `if e(sample)` reads the CURRENT
+  // mask). A missing condition is true, as in Stata: `1 if .` is 1.
+  // A scratch name no variable holds (BUG-1211: a user's `__piet_esw__` was dropped).
+  std::string tmp = "__piet_esw__";
+  for (int k = 1; ds->has(tmp); ++k) tmp = "__piet_esw" + std::to_string(k) + "__";
+  std::string line = "quietly generate byte " + tmp + " = 1";
+  if (ifExpr.has_value() && !ifExpr->empty()) line += " if " + *ifExpr;
+  if (inRange.has_value() && !inRange->empty()) line += " in " + *inRange;
+  const ojson gen = piet::dispatch(line, session);
+  if (gen.is_array()) {
+    for (const auto& b : gen) {
+      if (b.is_object() && b.value("type", std::string()) == "error") {
+        if (dataHasVar(session, tmp)) (void)runDrop({tmp}, session);
+        session.datasetChanged = changed;
+        return b;
+      }
+    }
+  }
+  std::vector<double> cells;
+  const unsigned long long serial = session.esampleColumnInstalls + 1;
+  bool marked = false;
+  try {
+    ds = session.datastore();
+    if (ds != nullptr && ds->has(tmp)) {
+      const int64_t n = ds->nRows();
+      cells.assign(static_cast<size_t>(n), 0.0);
+      const double* m = ds->col(tmp).f64();
+      std::vector<const double*> cols;
+      for (const auto& v : varlist) cols.push_back(ds->col(v).f64());
+      for (int64_t i = 0; i < n; ++i) {
+        bool in = m[i] == 1.0;
+        for (const double* c : cols) in = in && !std::isnan(c[i]);
+        if (in) cells[static_cast<size_t>(i)] = static_cast<double>(serial);
+      }
+      marked = true;
+    }
+  } catch (const std::exception&) {
+    marked = false;
+  }
+  if (dataHasVar(session, tmp)) (void)runDrop({tmp}, session);
+  if (!marked || !esampleRewriteHeadMask(session, cells)) {
+    session.datasetChanged = changed;
+    return engineErrorBlockEt(
+        "estimates esample: the estimation-sample marker could not be written; nothing was set.");
+  }
+  session.esampleColumnInstalls = serial;
+  session.datasetChanged = changed;
+  if (posting) {
+    session.ePostedEsampleSerial = serial;  // esampleReading's posting branch reads it
+  } else {
+    const LastModel& lm = *session.lastModel();
+    session.setLastModelEsample(LastModel::EsampleState::kColumn, serial, lm.esampleInstallPath,
+                                lm.dataPath);
+  }
+  // `ereturn repost` takes e(_estimates_name) away; estimates_sample.ado then
+  // posts e(_estimates_sample) "user", which the next fit drops.
+  session.activeEstimatesName.clear();
+  session.eval.setEString("_estimates_sample", "user");
+  session.noteEOnFit("_estimates_sample");
+  ojson out;
+  out["type"] = "echo";
+  out["text"] = "";
+  return out;
 }
 
 // ===========================================================================
@@ -732,7 +1242,7 @@ std::string fmtB(const ojson& val, const std::string& fmt) {
 ojson runEsttab(const std::vector<std::string>& modelNamesIn,
                 const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                 SessionState& session) {
-  // W2 esttabnames (BUG-552): a written namelist is EXPANDED (est_expand
+  // W2 esttabnames (BUG-552): a written namelist is EXPANDED (namelist
   // semantics: `A_*`, `A_?`, `*`, `_all`, `.`), in store order, before any
   // lookup -- w2_smalls.log section G. Every name the expansion returns is
   // stored except the literal ".", which is the active results when they carry
@@ -776,6 +1286,11 @@ ojson runEsttab(const std::vector<std::string>& modelNamesIn,
   }
 
   if (modelNames.empty()) {
+    // BUG-1248: nothing stored and no active estimates is estout's `.` not found,
+    // r(301) (StataBE 19.5 `clear all` / `esttab`); it was rc 1.
+    if (!session.eval.eLive())
+      return ojson(eval::errorBlock("engine_error", "last estimates (.) not found", std::nullopt,
+                                    std::nullopt, std::nullopt, std::string("r(301)")));
     return engineErrorBlockEt(
         "esttab: no models specified and no stored estimates. "
         "Run a regression, then `eststo m1` first.");
@@ -1076,7 +1591,7 @@ ojson runCoefplot(const std::vector<std::string>& names,
   std::vector<std::pair<std::string, ojson>> selected;
   // W2 esttabnames (BUG-552): coefplot's model list is a namelist like every
   // other stored-estimates consumer -- `coefplot A_*` / `.` expand through
-  // the one est_expand port, in store order. The loop below then looks up
+  // the one shared expansion, in store order. The loop below then looks up
   // exact names (a "." is the active results, built from e()).
   std::vector<std::string> expandedNames;
   if (!names.empty() && !session.estimates.empty()) {
@@ -1301,7 +1816,7 @@ ojson runCoefplot(const std::vector<std::string>& names,
 // `estimates table [NAME...] [, b se]` — Stata's own model-comparison table.
 //
 // Layout is pinned to real Stata 19.5 (P4 answerbook,
-// tests/kitchensink/pangram/waves/_oracle/p4_stata.log): a 13-character label
+// internal capture p4_stata.log): a 13-character label
 // field ending in the `|` rule, then 13 characters per model. The numeric cell
 // is Stata's %9.0g, whose real rule — measured off that log rather than assumed
 // — is "as many significant digits as fit in 9 characters once the leading zero
@@ -1328,22 +1843,27 @@ std::string estFmt9(double v) {
   return std::string(buf);
 }
 
+// Widths count CHARACTERS (StataBE pads a Unicode name by characters:
+// scratch-r150/uni-v/p4.do), so a multi-byte name stays aligned.
 std::string padLeft(const std::string& s, size_t w) {
-  return s.size() >= w ? s : std::string(w - s.size(), ' ') + s;
+  const size_t n = cecon::ident::codePointCount(s);
+  return n >= w ? s : std::string(w - n, ' ') + s;
 }
 
 std::string padRight(const std::string& s, size_t w) {
-  return s.size() >= w ? s : s + std::string(w - s.size(), ' ');
+  const size_t n = cecon::ident::codePointCount(s);
+  return n >= w ? s : s + std::string(w - n, ' ');
 }
 
 std::string centerIn(const std::string& s, size_t w) {
-  if (s.size() >= w) return s;
+  const size_t n = cecon::ident::codePointCount(s);
+  if (n >= w) return s;
   // Odd leftovers go to the LEFT (W:P8: a 6-character model name in the
   // 11-wide header cell is `   p8_ols  `, not `  p8_ols   `). P4's names are
   // 5 characters, which splits evenly and so never discriminated the two
   // roundings — its header stays byte-identical either way.
-  const size_t left = (w - s.size() + 1) / 2;
-  return std::string(left, ' ') + s + std::string(w - s.size() - left, ' ');
+  const size_t left = (w - n + 1) / 2;
+  return std::string(left, ' ') + s + std::string(w - n - left, ' ');
 }
 
 // W:P8. A coefficient named `<level>.<var>` is one level of factor variable
@@ -1358,9 +1878,10 @@ bool splitFactorLevel(const std::string& name, std::string& var, std::string& le
     if (!std::isdigit(static_cast<unsigned char>(name[i]))) return false;
   }
   const std::string rest = name.substr(dot + 1);
-  if (!(std::isalpha(static_cast<unsigned char>(rest[0])) || rest[0] == '_')) return false;
+  // A variable name: bytes >= 0x80 are name bytes (core/ident.h), so `2.قيمة` splits.
+  if (!cecon::ident::isIdentStartByte(rest[0])) return false;
   for (char c : rest) {
-    if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_')) return false;
+    if (!cecon::ident::isIdentByte(c)) return false;
   }
   var = rest;
   level = name.substr(0, dot);
@@ -1427,20 +1948,20 @@ ojson runEstimatesTable(const std::vector<std::string>& modelNamesIn,
   }
 
   // W2 esttabnames (BUG-552): a written namelist goes through the one
-  // est_expand port (est_table.ado calls est_expand): `A_*`, `_all`, `.`; a
+  // shared expansion: `A_*`, `_all`, `.`; a
   // token matching nothing is r(111) "estimation result NAME not found".
-  std::vector<std::string> names;
-  if (!modelNamesIn.empty()) {
-    SessionState::EstNamelist ex = session.expandEstimatesNamelist(modelNamesIn);
-    if (ex.rc != 0) return estNamelistError(ex);
-    names = std::move(ex.names);
-  } else {
-    names = session.estimatesNames();
-  }
+  // With no namelist Stata tables `.`, the active results alone, whatever
+  // is stored (StataBE 19.5: `estimates store m1`, a second fit, `estimates table`
+  // -> one "Active" column), and with no active results that is r(301) "last
+  // estimates (.) not found" (BUG-1248; it was rc 1, "no stored estimates").
+  SessionState::EstNamelist ex = session.expandEstimatesNamelist(
+      modelNamesIn.empty() ? std::vector<std::string>{"."} : modelNamesIn);
+  if (ex.rc != 0) return estNamelistError(ex);
+  const std::vector<std::string> names = std::move(ex.names);
   // The active, unstored results (`.`): snapshotted locally, as a read must not
   // store anything. std::deque so the pointers taken below stay valid.
   std::deque<ojson> liveSnaps;
-  if (names.empty()) {
+  if (names.empty()) {  // `_all` over an empty store
     return engineErrorBlockEt("estimates table: no stored estimates. Use `estimates store NAME` "
                               "after fitting a model.");
   }
@@ -1528,7 +2049,10 @@ ojson runEstimatesTable(const std::vector<std::string>& modelNamesIn,
   lines.push_back(ruleFull);
   {
     std::string h = padLeft("Variable", labelW - 1) + " |";
-    for (const auto& n : names) h += centerIn(n, cellW - 2) + "  ";
+    // The unstored active results head their column "Active" (StataBE 19.5,
+    // `estimates table` after a fit).
+    for (const auto& n : names)
+      h += centerIn(n == "." ? std::string("Active") : n, cellW - 2) + "  ";
     lines.push_back(h);
   }
   lines.push_back(ruleSplit);

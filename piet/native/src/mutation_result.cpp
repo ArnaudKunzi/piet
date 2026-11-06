@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Shared `mutationResult` builder — see piet/mutation_result.h for the
 // three-parameter contract and why this was consolidated from four per-TU
 // copies (handlers.cpp, handlers_m3.cpp, handlers_data_verbs.cpp,

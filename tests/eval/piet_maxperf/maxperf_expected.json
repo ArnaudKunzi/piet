@@ -1,0 +1,147 @@
+{
+  "_meta": {
+    "purpose": "MSG-MI-237 items 1-3 (<private-coordination-tree>/messenger/eval-harness/inbox.md) — gate-① golden set for the incoming piet B.2.2 fix wave (MI-236). Authored golden-FIRST: every case here is EXPECTED to be RED against today's piet_native (silent-wrong-answer / control-flow bugs found by the MAXPERF audit) and must turn GREEN once the corresponding B.2.2 fix lands. Per Art 10 these pinned values/tolerances are Eval's own judgment and do not change to chase engine behavior.",
+    "source_docs": {
+      "request": "<private-coordination-tree>/messenger/eval-harness/inbox.md MSG-MI-237 (2026-07-17)",
+      "incident": "internal note GATE23-analysis-do-audit-20260716.md (findings F1/F2/F3)",
+      "design": "internal note GATE23-MAXPERF-design-20260717.md §5"
+    },
+    "baseline_binary": {
+      "path_at_capture": "piet/native/build/piet_native",
+      "copied_to_scratch": "/private/tmp/eval-goldens-scratch/piet_native_baseline_B21 (sha256 fec4d39844029e242c3935506fb171c2d03f6d46fc6956c941a718962f490a48)",
+      "version": {"piet_version": "B.2.1", "contract_a": "1.13.0", "contract_b": "2.4.0"},
+      "op_piet_commit": "6904f8e [B.2.1] stamp piet B.2.1 (PATCH, piet-axis only)",
+      "engine_pin": "engine/current 0.27.0 (pinned automatically by the binary, Art 7)"
+    },
+    "fixtures": "All 3 cases are fully self-contained synthetic fixtures built inline via `set obs`/`gen`/`replace` — no dependency on the soccer corpus or any external file (per task instructions, synthetic-and-exact preferred over a Stata oracle where the true value is derivable first-principles).",
+    "isolation_note": "Each case runs as its own ISOLATED `piet_native --do` invocation (same rationale as tests/eval/piet_d1/README.md: --do halts the whole file at the first uncaptured error, so a monolithic multi-case script would make an already-fixed case falsely report FAIL merely because a still-unfixed case's OWN do-file halted first — not applicable to case mp3's internal capture, but very much applicable to keeping mp1/mp2/mp3 from interfering with each other as B.2.2 lands its fixes in some partial order).",
+    "cases": {
+      "mp1_merge_highprecision_key": {
+        "mi237_item": 1,
+        "bug_citation": "piet/native/src/handlers_data_verbs.cpp:2010 (findDupKey) — composite dup-key built via `keyOss << \"n:\" << v` with default ostream precision (6 significant digits). game_id-class f64 keys that agree on their first 6 significant digits collide in the `seen` map even though they are genuinely distinct, producing a false 'dataset is not unique' merge error. Fix tracked as MI-236 (findDupKey should use eval::pythonFloatRepr, mirroring joinbyRowKeys in the same file).",
+        "kind": "merge_success",
+        "oracle_kind": "first_principles",
+        "fixture_design": "using-side key set deliberately collides at 6 sig figs under two independent classes: (a) 7-digit integers 1005938 vs 1005942 (both format to the identical '1.00594e+06' under default ostream precision — verified live against the baseline, the false-error message cites exactly 'id=1005942.0'); (b) a fractional pair 3141.59261 vs 3141.59264 (both format to the identical '3141.59'). All 4 keys are genuinely UNIQUE on the using side (this is what makes the merge error FALSE). The master side repeats each of the 4 keys exactly twice (m:1 shape, 8 master rows total) so a correct merge must attach the right using-side payout to every master row — not just avoid erroring.",
+        "do_body": [
+          "clear",
+          "set obs 4",
+          "gen id = .",
+          "replace id = 1005938 in 1",
+          "replace id = 1005942 in 2",
+          "replace id = 3141.59261 in 3",
+          "replace id = 3141.59264 in 4",
+          "gen payout = .",
+          "replace payout = 11 in 1",
+          "replace payout = 22 in 2",
+          "replace payout = 33 in 3",
+          "replace payout = 44 in 4",
+          "save \"__USING_HBIN__\", replace",
+          "clear",
+          "set obs 8",
+          "gen id = .",
+          "replace id = 1005938 in 1",
+          "replace id = 1005938 in 2",
+          "replace id = 1005942 in 3",
+          "replace id = 1005942 in 4",
+          "replace id = 3141.59261 in 5",
+          "replace id = 3141.59261 in 6",
+          "replace id = 3141.59264 in 7",
+          "replace id = 3141.59264 in 8",
+          "merge m:1 id using \"__USING_HBIN__\"",
+          "display \"MERGE_LIST_BEGIN\"",
+          "list id payout, clean noobs",
+          "display \"MERGE_LIST_END\""
+        ],
+        "using_placeholder": "__USING_HBIN__",
+        "using_placeholder_note": "Substituted by the driver at run time with a fresh tempdir path (`save`/`use` both need a real filesystem path; the golden JSON itself stays environment-independent).",
+        "expected_stopped_at_reason": null,
+        "expected_merge_counts": {"matched": 8, "master_only": 0, "using_only": 0},
+        "expected_pairs": [
+          [1005938.0, 11.0],
+          [1005942.0, 22.0],
+          [3141.59261, 33.0],
+          [3141.59264, 44.0]
+        ],
+        "expected_count_per_id": 2,
+        "expected_total_rows": 8,
+        "match_atol": 1e-6,
+        "match_atol_rationale": "id/payout are literal, untransformed inputs carried through a pure lookup-join (no arithmetic) — a correct engine reproduces them bit-exact. 1e-6 is pure JSON float round-trip safety margin, not a real tolerance budget.",
+        "red_baseline_observed": {
+          "stopped_at_line": 25,
+          "stopped_at_reason": "merge m:1: using dataset is not unique on key(s) ['id'] — duplicate found: {id=1005942.0}. Verify the using file or change merge type to 1:m.",
+          "captured_live": "2026-07-17 against the B.2.1 baseline binary described above"
+        }
+      },
+      "mp2_collapse_factorby_precision": {
+        "mi237_item": 2,
+        "bug_citation": "piet/native/src/handlers_data_verbs.cpp:771 (pre-convert CSV write) and :1001 (post-collapse restore CSV write) — both write f64 cell values via `csv << v` (default ostream precision, 6 significant digits) whenever ANY by()-var is a factor (string) column, forcing the whole dataset through a CSV round-trip. The COMPUTED STATISTIC itself (not just the by-var proxy code) is written at line 1001 and silently truncated. A numeric-only by() rides cobra's native fast path and never touches this code — which is why the existing collapse goldens (numeric-by only) missed this class entirely.",
+        "kind": "collapse_precision",
+        "oracle_kind": "first_principles_dyadic",
+        "fixture_design": "2 groups (string by-var `grp`, forcing the buggy CSV-shim path), 2 obs/group. Every input value is k + m/1024 (dyadic rational, exactly representable in float64 with room to spare in the 52-bit mantissa) so the TRUE mean is representable with ZERO floating-point rounding error — no Stata run needed, the oracle is exact arithmetic. Verified live: mean_alpha*2048 and mean_beta*2048 are both exact integers (2048004 and 4096014 respectively), confirming dyadic exactness.",
+        "do_body": [
+          "clear",
+          "set obs 4",
+          "gen str10 grp = \"alpha\" in 1/2",
+          "replace grp = \"beta\" in 3/4",
+          "gen val = .",
+          "replace val = 1000 + 1/1024 in 1",
+          "replace val = 1000 + 3/1024 in 2",
+          "replace val = 2000 + 5/1024 in 3",
+          "replace val = 2000 + 9/1024 in 4",
+          "collapse (mean) val, by(grp)",
+          "display \"COLLAPSE_BEGIN\"",
+          "list grp val, clean noobs",
+          "display \"COLLAPSE_END\""
+        ],
+        "expected_stopped_at_reason": null,
+        "expected_group_means": {"alpha": 1000.001953125, "beta": 2000.0068359375},
+        "true_value_derivation": "alpha: (1000 + 1/1024 + 1000 + 3/1024) / 2 = 1000 + 2/1024 = 1000.001953125 (13 significant digits). beta: (2000 + 5/1024 + 2000 + 9/1024) / 2 = 2000 + 7/1024 = 2000.0068359375 (14 significant digits). Both exact in binary float64 (first-principles, not display-rounded).",
+        "tolerance_policy": {
+          "rtol": 1e-9,
+          "atol": 1e-9,
+          "rationale": "Ratified per MSG-MI-237 item 2's own suggestion. The bug truncates to EXACTLY 6 significant digits, i.e. a relative error of order 1e-6 to 1e-7 on these magnitudes (empirically observed on the baseline: alpha true=1000.001953125 vs got=1000.0 -> rel err ~1.95e-6; beta true=2000.0068359375 vs got=2000.01 -> rel err ~1.58e-6) — 1e-9 sits >1000x below the smallest observed miss, comfortable margin against false-RED on a correct engine (whose only error source is double rounding, ~1e-16) while still >1000x tighter than the bug's signature."
+        },
+        "red_baseline_observed": {
+          "stopped_at_reason": null,
+          "got_group_means": {"alpha": 1000.0, "beta": 2000.01},
+          "captured_live": "2026-07-17 against the B.2.1 baseline binary described above — note this case does NOT halt/error, it silently returns wrong numbers (the exact 'silent-wrong-answer' class MI-237 is closing)"
+        }
+      },
+      "mp3_foreach_continue_capture": {
+        "mi237_item": 3,
+        "bug_citation": "piet/native/src/loops.cpp runBody() (~line 534-552, used internally by runForeach/runWhile) checks `b.value(\"type\",\"\")==\"error\"` with NO exemption for a captured error, unlike doexec.cpp's own top-level halt-check (~line 508/537) which correctly skips `captured:true` blocks (BS-127: 'capture-forwarded errors ... are display-only ... must not HALT a running do-file'). Net effect: the FIRST captured, noisily-shown error inside ANY foreach/while iteration's body silently breaks the iteration loop after that iteration, even though the SAME error would not have halted a non-looped top-level do-file. The do-file itself does not halt (doexec.cpp's own check IS captured-aware) — only the loop's internal iteration advancement does, which is what makes this a control-flow bug rather than a halted-script bug: iterations 2..N are silently skipped and everything AFTER the loop still runs, masking the skip.",
+        "kind": "display_sequence",
+        "oracle_kind": "structural",
+        "fixture_design": "Exact repro shape verified live by the maintainer before dispatch (MSG-MI-237) and independently re-verified here byte-for-byte against the baseline: `failprog` is a user program whose body runs an unconditional error; `foreach v in a b c` calls it via `capture noisily` each iteration. IMPORTANT PROVENANCE NOTE (so this case is never mysterious later): the do-file never loads a dataset, so `error 111` itself never actually dispatches as Stata's `error N` command (that command is not implemented in this build at all — verified: with a dataset loaded, the SAME line instead falls through to an `unsupported_command` block with rc=199). Without a dataset, PIET's own `session.currentHbin()` pre-dispatch guard fires FIRST and returns a `no_data_loaded` block — whose rc, per piet/native/include/piet/eval/errors.h's documented `coarseRc` map (`no_data_loaded -> \"111\"`), is a STABLE, INTENTIONAL 111, not a coincidence tied to the literal text 'error 111'. This is precisely why the given repro's rc reads as 111 'correctly' even though no `error` command ever actually ran — documented here so a future reader does not go looking for a nonexistent `error N` dispatch path. The bug being gated (loop-breaks-on-captured-error) is completely independent of which specific error code/class fires; this fixture is simply the minimal, dataset-free, already-verified vehicle for it.",
+        "do_body": [
+          "program define failprog",
+          "    display \"inside-failprog\"",
+          "    error 111",
+          "end",
+          "",
+          "foreach v in a b c {",
+          "    display \"ITER-`v'-START\"",
+          "    capture noisily failprog",
+          "    display \"ITER-`v'-RC=\" _rc",
+          "}",
+          "",
+          "display \"POSTLOOP-MARKER\""
+        ],
+        "caution_honored": "Per MSG-MI-237's own caution, the inner display string 'inside-failprog' does NOT begin with the word 'in ' (it begins with the single hyphenated token 'inside-failprog') — empirically re-confirmed live to NOT trip the unrelated `in`-range parser bug.",
+        "expected_display_sequence": [
+          "ITER-a-START", "inside-failprog", "ITER-a-RC=111",
+          "ITER-b-START", "inside-failprog", "ITER-b-RC=111",
+          "ITER-c-START", "inside-failprog", "ITER-c-RC=111",
+          "POSTLOOP-MARKER"
+        ],
+        "expected_captured_error_count": 3,
+        "red_baseline_observed": {
+          "got_display_sequence": ["ITER-a-START", "inside-failprog", "ITER-a-RC=111", "POSTLOOP-MARKER"],
+          "got_captured_error_count": 1,
+          "note": "Iterations b and c never ran (no ITER-b-START/ITER-c-START at all) — the loop silently stopped after iteration a's captured error, yet the post-loop marker still printed (doexec.cpp's own top-level halt-check correctly let the captured error pass; only loops.cpp's runBody() did not). Matches the maintainer's MSG-MI-237 description exactly: 'baseline runs ONLY iter a (rc=111 IS correctly set), b/c skipped, marker prints.'",
+          "captured_live": "2026-07-17 against the B.2.1 baseline binary described above"
+        }
+      }
+    }
+  }
+}

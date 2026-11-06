@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Loop interpreter — C++ port of piet/backend/piet/router/loops.py:
 // foreach / forvalues / while / if-else block execution.
 //
@@ -11,6 +13,7 @@
 #define PIET_NATIVE_LOOPS_H
 
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -83,6 +86,17 @@ struct VarlistExpandResult {
   std::vector<std::string> tokens;
 };
 VarlistExpandResult expandVarlist(const std::string& spec, SessionState& session);
+// expandVarlist passes a literal name through unchecked; this is the check that
+// every one is a variable, an unambiguous abbreviation (rewritten in place to its
+// full name) or else r(111) "variable NAME not found" / "NAME ambiguous
+// abbreviation" (foreach's own, checkKnownVarTokens).
+std::optional<nlohmann::ordered_json> checkKnownVarlist(std::vector<std::string>& tokens,
+                                                        SessionState& session);
+
+// The numlist expander forvalues/foreach-of-numlist use, for a command option
+// that takes a numlist: blank-separated numbers, `a(s)b` and `a/b` ranges. Each
+// element comes back as its %15.0g text; false on a malformed element.
+bool expandNumlist(const std::string& spec, std::vector<std::string>* elements);
 
 // EXPRLAYER DRIFT GUARD (P2-PERF). evalBoolExpr collects the referenced-name
 // set of a rewritten condition with a hand-written left-to-right scan instead
@@ -99,14 +113,12 @@ bool selftestBoolIdentScanMatchesRegex(std::string* firstDisagreement);
 ojson runOneLineIf(const std::string& condition, const std::string& bodyLine,
                    SessionState& session, const DispatchFn& dispatchFn);
 
-// R3 CMD triage (BUG-547): stock Stata's legacy `for` command (for.ado ships
-// in ado/base/f; foreach/forvalues are its modern replacements, but `for`
-// itself is still valid Stata and 34 corpus lines across 5 papers use it).
-// Syntax: `for [NAME in] TYPE list [\ [NAME in] TYPE list ...] [, options]:
-// body [\ body ...]`, where TYPE is a >=3-char prefix of varlist/numlist/
-// newlist or exactly `any`, and the default placeholder is X Y Z A B C D E F
-// by list position (max 9 lists). See loops.cpp for the full contract; the
-// oracle is tests/eval/golden/aer_w2/w2_cmdtriage.log's `for_*` arms.
+// BUG-547: Stata's legacy `for` command (the pre-version-8 loop that foreach
+// and forvalues replaced; still valid Stata, and 34 corpus lines across 5
+// papers use it). isLegacyForLine says whether a console/do line is a `for`
+// statement; runLegacyFor runs one and returns its output blocks.
+// Behaviour as measured on StataBE 19.5; oracle
+// tests/eval/golden/aer_w2/w2_cmdtriage.log's `for_*` arms.
 bool isLegacyForLine(const std::string& line);
 
 ojson runLegacyFor(const std::string& rawLine, SessionState& session,
@@ -133,6 +145,21 @@ ojson runLegacyFor(const std::string& rawLine, SessionState& session,
 // TOP-LEVEL `if` block is still r(119)) and `quietly` in the other (a loop
 // inside `quietly` still takes its `continue` — 3 of 4 iterations).
 int loopBodyDepth();
+
+// BUG-1434: what a quiet scope (`quietly`, or a `capture` no `noisily` follows)
+// keeps of the output under it: command echoes, errors, control markers, and
+// the output of a `noisily` nested inside it. StataBE 19.5: `quietly {
+// noisily display "a5" }` and `capture { noisily display "a4" }` both print
+// their line; `quietly pn`, where the program pn says `noisily display`, does
+// not -- the nested noisily reaches no further than its own program.
+//
+// markNoisily tags such output ("noisily": true) when a quiet scope encloses
+// it; keptWhenQuiet is the filter every quiet scope applies; settleNoisily
+// drops the tag once no quiet scope is left around the blocks (or at a program
+// boundary), so it never reaches the transcript.
+void markNoisily(ojson& blocks, const SessionState& session);
+bool keptWhenQuiet(const ojson& block);
+void settleNoisily(ojson& blocks, const SessionState& session, bool force = false);
 
 // RAII, and thread_local behind it: a parallel worker is its own process, but
 // nothing here promises the loop interpreter is only ever entered from one

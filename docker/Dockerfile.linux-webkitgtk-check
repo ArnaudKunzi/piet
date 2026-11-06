@@ -1,0 +1,26 @@
+# Compile-ONLY check for piet/native's WEBVIEW_GTK backend (WebKitGTK), used
+# to de-risk the Phase D Linux port early per the M0 directive
+# (docs/piet/ROADMAP.md, "2.0.0 — C++ core", milestone M0: "compile-check
+# on WebView2/WebKitGTK to de-risk Phase D early"). This is NOT a runtime
+# image (no display server, cannot actually open a window) — it only proves
+# the translation units compile against real webkit2gtk-4.1 + gtk3 headers
+# on a throwaway Debian 12 image. See piet/native/vendor/VENDOR.md and
+# piet/native/CMakeLists.txt's UNIX branch for the corresponding build rule.
+#
+# Usage:
+#   docker build -f docker/Dockerfile.linux-webkitgtk-check \
+#     -t piet-native-webkitgtk-check piet/native
+#   (build context = piet/native/, matching the standalone CMake subproject)
+FROM debian:12-slim
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential cmake pkg-config \
+      libwebkit2gtk-4.1-dev libgtk-3-dev \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . /src
+
+RUN cmake -S . -B /build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /build -j"$(nproc)" --target piet_native

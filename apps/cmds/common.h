@@ -1,8 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #pragma once
 
 // Shared surface for the apps/cmds/*.cpp command-handler translation units.
 // This file was factored out of the former monolithic apps/cecon_cli.cpp
-// (pure code motion — project Step-1 W0 / WP-00): the top-of-file includes, the
+// (pure code motion — internal Step-1 W0 / WP-00): the top-of-file includes, the
 // json alias, and declarations for the ~35 helpers (plus a handful of
 // cross-file estimator loaders) that used to live in one big anonymous
 // namespace. Splitting the command bodies across multiple .cpp files means
@@ -58,9 +60,9 @@ using namespace cecon;
 
 // Boundary A contract version (plain semver, User-decided scheme). Owned by CoBrA Op as
 // pen-holder — bumps when CONTRACT-engine.md changes, independently of the engine release
-// version (COBRA_VERSION). Source of truth mirrored in plans/piet/CONTRACT-engine.md header.
+// version (COBRA_VERSION). Source of truth mirrored in internal note CONTRACT-engine.md header.
 #ifndef CONTRACT_VERSION
-#define CONTRACT_VERSION "1.25.0"
+#define CONTRACT_VERSION "1.26.0"
 #endif
 
 namespace cecon {
@@ -150,6 +152,22 @@ struct PostestModel {
     // the fitting path by construction, the same argument `vcov_matrix` above
     // makes for BS-098/BS-013.
     bool asymptotic = false;
+    // FU-439: lincom's reference dof after `regress ..., vce(cluster a b ...)` is the
+    // residual dof N - k (w2s_multiway_class.log:158 r(df) 177), not e(df_r) = G-1
+    // (:116 df_r 6), while test keeps G-1 (:174 r(df_r) 6). areg and xtreg,fe post
+    // through ereturn and lincom reads e(df_r) there (:372 r(df) 6). Set by the
+    // least-squares refit for a multiway fit under --multiway-subset-factors with no
+    // absorbed effect; read only by lincom (postest_lincom_dof).
+    bool lincom_resid_dof = false;
+    // BUG-1231: s^2 when the covariance is the classic V = s^2 (X'X)^-1 of a
+    // least-squares fit (regress/areg/xtreg,fe), whose `test` judges a constraint
+    // negligible on R V R' / s^2; -1 for every other covariance (R V R' itself).
+    // Set by the least-squares refit; read only by test (cmds_postest.cpp).
+    double ls_scale = -1.0;
+    // BUG-1276: the least-squares refit of a `regress` exact fit (V = 0) carries the
+    // bread inv(X'X) (FeolsResult::exact_fit_bread), under which Stata's `test`
+    // still drops the constraints that depend on the others. Empty otherwise.
+    std::vector<double> exact_fit_bread;
 };
 
 // Non-null ONLY during a §31 `postest` frame dispatch: the stored model that request
@@ -447,12 +465,23 @@ struct GlmInputs {
 // pass as y/x). Every existing caller passes none of them and gets the exact
 // prior behavior — build_model is invoked with the exact same trailing defaults
 // ("", false, nullptr, nullptr, "", WeightKind::None) it always was.
+// ts / row_mask (BUG-1484): the --xtset/--tsset metadata and plan_keepif's `if`
+// mask, threaded to build_model exactly as cmd_feols passes them, so an L./F./D./S.
+// token materializes against the FULL series before the `if` applies. nullptr (the
+// default) keeps every existing caller byte-identical.
 GlmInputs load_glm(const Dataset& ds, const char* cmd, const std::string& y,
                    const std::vector<std::string>& xs,
                    const std::vector<std::string>& cluster_names = {},
                    const std::string& weight_var = "",
                    cecon::WeightKind weight_kind = cecon::WeightKind::None,
-                   const std::string& offset_var = "");
+                   const std::string& offset_var = "",
+                   const cecon::TsMeta* ts = nullptr,
+                   const std::vector<char>* row_mask = nullptr);
+
+// Stata `noconstant` on a load_glm design: drops the trailing intercept column
+// and its name; throws bad_input when no regressor would remain. Callers span
+// cmds_mle.cpp (logit/probit fits) and cmds_postest.cpp (postest/margins refit).
+void drop_glm_intercept(GlmInputs& g, const char* cmd);
 
 // Callers span cmds_mle.cpp (logit/probit) and cmds_postest.cpp (margins).
 bool check_binary(const std::vector<double>& y, const char* cmd, const std::string& nm);
@@ -462,6 +491,21 @@ bool check_binary(const std::vector<double>& y, const char* cmd, const std::stri
 // keep_nested_fe_dof (BUG-568) is feols_fit's switch of the same name: Stata
 // areg's clustered dof, which charges an FE nested in the cluster (cmd_feols
 // `--keep-nested-fe-dof`). Default false = reghdfe/xtreg,fe.
+// multiway_subset_factors (FU-365) is feols_fit's switch of the same name: Stata
+// regress/areg's built-in multiway cluster convention (cmd_feols
+// `--multiway-subset-factors`). Default false = reghdfe's Gmin convention. Under it
+// the reply gains `vcov_rank` (e(rank)) and `kcluster` (e(kcluster) / e(cluster#)).
+// regress_exact_fit (cmd_feols `--regress-exact-fit`): Stata `regress`'s exact-fit
+// rule (feols_fit). When it fires the reply's tstat/pvalue/ci_lo/ci_hi are null for
+// every coefficient with se 0 (Stata's r(table) prints `.`; StataBE `regress yx x`
+// on an exact line). Default false.
+// collinear_forward (BUG-1067, cmd_feols `--collinear-forward`): ModelData's switch
+// of the same name -- the earlier term of a collinear set is kept (reghdfe, areg,
+// xtreg,fe) instead of the norm-pivoted basis (regress). Default false.
+// fe_nested_in_clusters (FU-401, cmd_feols `--fe-nested-in-clusters`): xtreg,fe's
+// nesting rule -- every cluster variable must be constant within each level
+// of the first absorbed effect on the estimation sample, else EngineError bad_input
+// with detail "panels_not_nested" (Stata r(498)). Default false: no check.
 json run_feols(const std::string& data, const std::string& y,
                const std::vector<std::string>& xs, const std::vector<std::string>& fes,
                const std::string& vcov_type, const std::vector<std::string>& clusters,
@@ -471,7 +515,9 @@ json run_feols(const std::string& data, const std::string& y,
                const std::string& weight_var = "",
                cecon::WeightKind weight_kind = cecon::WeightKind::None,
                EsampleRows* esample = nullptr,
-               bool keep_nested_fe_dof = false, bool emit_v = false);
+               bool keep_nested_fe_dof = false, bool emit_v = false,
+               bool multiway_subset_factors = false, bool fe_nested_in_clusters = false,
+               bool regress_exact_fit = false, bool collinear_forward = false);
 
 // P7 — `svy: regress`. Same WLS point estimates as the pweighted feols path; what
 // differs is the variance and the reference distribution: a stratified linearized
@@ -488,6 +534,10 @@ json run_feols_svy(const std::string& data, const std::string& y,
 
 // Shared core for iv / run. Callers span cmds_linear.cpp (cmd_iv) and
 // cmds_data.cpp (cmd_run / grid_run_group).
+// multiway_subset_factors (FU-387, cmd_iv `--multiway-subset-factors`, with --small
+// only): Stata ivregress's `small` multiway variance, the built-in convention's
+// per-combination factors. Under any
+// multiway VCE the reply gains `vcov_rank` and `kcluster`.
 json run_iv(const std::string& data, const std::string& y,
             const std::vector<std::string>& exog, const std::vector<std::string>& endog,
             const std::vector<std::string>& instruments,
@@ -496,7 +546,11 @@ json run_iv(const std::string& data, const std::string& y,
             const cecon::TsMeta* ts = nullptr, bool drop_singleton = true,
             const std::vector<char>* if_mask = nullptr, bool small = false,
             bool savefirst = false, const std::string& savefprefix = "",
-            EsampleRows* esample = nullptr, bool emit_v = false);
+            EsampleRows* esample = nullptr, bool emit_v = false,
+            bool multiway_subset_factors = false, bool no_intercept = false,
+            const std::string& weight_var = "",
+            cecon::WeightKind weight_kind = cecon::WeightKind::None,
+            bool multiway_no_psd_fix = false, bool dofminus_fe = false);
 
 // Multi-outcome 2SLS batch. Callers span cmds_linear.cpp (cmd_iv) and
 // cmds_data.cpp (grid_run_group).
@@ -508,7 +562,8 @@ json run_iv_multi(const std::string& data, const std::vector<std::string>& ys,
                   const cecon::TsMeta* ts = nullptr, bool drop_singleton = true,
                   const std::vector<char>* if_mask = nullptr, bool small = false,
                   bool savefirst = false, const std::string& savefprefix = "",
-                  EsampleRows* esample = nullptr);
+                  EsampleRows* esample = nullptr, const std::string& weight_var = "",
+                  cecon::WeightKind weight_kind = cecon::WeightKind::None);
 
 // Multi-outcome FE-OLS batch. Callers span cmds_linear.cpp (cmd_feols) and
 // cmds_data.cpp (grid_run_group).
@@ -518,7 +573,7 @@ json run_feols_multi(const std::string& data, const std::vector<std::string>& ys
                      bool drop_singleton, const cecon::TsMeta* ts = nullptr,
                      const std::vector<char>* if_mask = nullptr,
                      bool no_intercept = false, double level = 95.0, bool level_set = false,
-                     EsampleRows* esample = nullptr);
+                     EsampleRows* esample = nullptr, bool collinear_forward = false);
 
 // Shared core for fepois / run. Callers span cmds_linear.cpp (cmd_fepois) and
 // cmds_data.cpp (cmd_run / grid_run_group).

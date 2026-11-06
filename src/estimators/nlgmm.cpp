@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "nlgmm.h"
 
 #include "core/threads.h"
@@ -7,6 +9,7 @@
 #include <limits>
 
 #include "core/linalg.h"
+#include "vcov/vcov.h"
 
 namespace cecon {
 
@@ -93,8 +96,9 @@ void nl_jacobian(const NlResidFn& resid, const std::vector<double>& b, int64_t n
 // nl
 // ---------------------------------------------------------------------------
 
-NlResult nl_fit(const NlResidFn& resid, const double* y, int64_t n, const std::vector<double>& b0,
-                const std::vector<std::string>& names) {
+NlResult nl_fit(const NlResidFn& resid_in, const double* y, int64_t n,
+                const std::vector<double>& b0, const std::vector<std::string>& names,
+                const double* w, bool robust) {
     NlResult r;
     r.names = names;
     r.n = n;
@@ -102,6 +106,18 @@ NlResult nl_fit(const NlResidFn& resid, const double* y, int64_t n, const std::v
     const int k = r.k;
     if (k == 0) { r.err = "nl: the model has no parameters"; return r; }
     if (n <= k) { r.err = "nl: need more observations than parameters"; return r; }
+
+    // Weighted (BUG-1283): sqrt(w) * e_i(b) turns every sum below into its weighted
+    // form -- the SS, J'J = J'WJ, and the robust meat's w e J.
+    std::vector<double> sw;
+    if (w) {
+        sw.resize(static_cast<size_t>(n));
+        for (int64_t i = 0; i < n; ++i) sw[static_cast<size_t>(i)] = std::sqrt(w[i]);
+    }
+    const NlResidFn resid = w ? NlResidFn([&](const std::vector<double>& bb, int64_t i) {
+                                    return sw[static_cast<size_t>(i)] * resid_in(bb, i);
+                                })
+                              : resid_in;
 
     std::vector<double> b = b0, e(static_cast<size_t>(n));
     auto eval_rss = [&](const std::vector<double>& bb, std::vector<double>* out) {
@@ -197,17 +213,21 @@ NlResult nl_fit(const NlResidFn& resid, const double* y, int64_t n, const std::v
     for (int j = 0; j < k && r.cons_param < 0; ++j) {
         const double* col = J.data() + static_cast<size_t>(j) * static_cast<size_t>(n);
         bool constant = true;
-        for (int64_t i = 0; i < n && constant; ++i) constant = std::fabs(col[i] + 1.0) <= kConsTol;
+        for (int64_t i = 0; i < n && constant; ++i)
+            constant = std::fabs((w ? col[i] / sw[static_cast<size_t>(i)] : col[i]) + 1.0) <= kConsTol;
         if (constant) r.cons_param = j;
     }
 
-    double ybar = 0;
-    for (int64_t i = 0; i < n; ++i) ybar += y[i];
-    ybar /= static_cast<double>(n);
+    double ybar = 0, sumw = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        ybar += w ? w[i] * y[i] : y[i];
+        sumw += w ? w[i] : 1.0;
+    }
+    ybar /= sumw;
     r.tss = 0;
     for (int64_t i = 0; i < n; ++i) {
         const double d = (r.cons_param >= 0) ? (y[i] - ybar) : y[i];
-        r.tss += d * d;
+        r.tss += w ? w[i] * d * d : d * d;
     }
     r.df_t = (r.cons_param >= 0) ? static_cast<double>(n - 1) : static_cast<double>(n);
     r.df_m = (r.cons_param >= 0) ? static_cast<double>(k - 1) : static_cast<double>(k);
@@ -218,9 +238,23 @@ NlResult nl_fit(const NlResidFn& resid, const double* y, int64_t n, const std::v
     // "Res. dev." = -2 lnL of the Gaussian NLS model at its ML variance rss/n.
     r.res_dev = static_cast<double>(n) *
                 (1.0 + std::log(2.0 * kPi) + std::log(r.rss / static_cast<double>(n)));
+    if (w) {
+        // Stata's nl: e(dev) = n*(1 + ln(2*pi*rss/n) - mean(ln w)), w normalized.
+        double sum_lnw = 0;  // n * mean(ln w)
+        for (int64_t i = 0; i < n; ++i) sum_lnw += std::log(w[i]);
+        r.res_dev -= sum_lnw;
+    }
 
     r.vcov.assign(static_cast<size_t>(k) * k, 0.0);
-    for (size_t idx = 0; idx < r.vcov.size(); ++idx) r.vcov[idx] = r.sigma2 * A[idx];
+    if (robust) {
+        // e is sqrt(w)*e and J sqrt(w)*J here, so e_i J_i is the pweighted score.
+        std::vector<double> meat(static_cast<size_t>(k) * k);
+        hc_meat(J.data(), n, k, e.data(), meat.data());
+        la::sandwich(A.data(), meat.data(), k,
+                     static_cast<double>(n) / static_cast<double>(n - k), r.vcov.data());
+    } else {
+        for (size_t idx = 0; idx < r.vcov.size(); ++idx) r.vcov[idx] = r.sigma2 * A[idx];
+    }
     r.se.assign(static_cast<size_t>(k), 0.0);
     for (int j = 0; j < k; ++j)
         r.se[static_cast<size_t>(j)] = std::sqrt(std::max(0.0, r.vcov[static_cast<size_t>(j) * k + j]));

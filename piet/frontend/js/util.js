@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // util.js — number formatting and string padding helpers
 // All formatters approximate Stata output conventions.
 

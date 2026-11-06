@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // M2 vertical-slice command handlers — C++ ports of the corresponding
 // native_handler branches in piet/backend/piet/dispatcher.py's _run_native()
 // plus the cobra-estimator path (dispatch()'s "4b. Cobra estimator" section)
@@ -16,6 +18,7 @@
 #ifndef PIET_NATIVE_HANDLERS_H
 #define PIET_NATIVE_HANDLERS_H
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -27,13 +30,16 @@
 
 namespace piet::handlers {
 
+// Bounded, expression-compiled generic lf likelihoods; no evaluator execution.
+nlohmann::ordered_json runMl(const eval::ParsedCommand& parsed, SessionState& session);
+
 // `use FILEPATH [, clear]` — load a dataset (dta/csv/hbin) into the session.
 // M3b: .dta loads via cobra 0.18.0's native `import-dta` (formats 115/117/
 // 118) — value-labeled numerics stay f64 raw codes, genuine strings become
 // factor columns; labels/formats/value-labels applied to SessionState from
 // the --out-meta sidecar (mirrors routes_data.py's _convert_to_hbin +
 // _apply_dta_var_labels).
-// BUG-023 (bug-for-bug, frozen 1.16.0 oracle, tests/kitchensink/BUGLOG.md):
+// BUG-023 (bug-for-bug, frozen 1.16.0 oracle, the internal bug ledger):
 // unconditionally rewrites session.cwd to the loaded file's directory. Fixing
 // this is an explicit 2.0-scope decision deferred to M3/M4 adjudication +
 // Eval corpus regeneration — NOT this milestone's call.
@@ -71,7 +77,7 @@ nlohmann::ordered_json runDescribe(const std::optional<std::vector<std::string>>
 // so the numeric path (cobra --summarize) and the factor/fallback path both
 // see the restricted sample uniformly (Doctrine ①: the qualifier reaches the
 // engine, never silently dropped).
-// `weightVar` (project Step-1 D3): when set (tokenizer only lets this through for
+// `weightVar` (Step-1 D3): when set (tokenizer only lets this through for
 // `[fw=]`/`[fweight=]`), forwarded as `--fweight weightVar` to the cobra call.
 // gate-①: if a weight is set and the cobra call fails, the native numpyStats
 // fallback is skipped and the cobra error is returned instead — an unweighted
@@ -129,26 +135,41 @@ nlohmann::ordered_json runRegress(const eval::ParsedCommand& parsed, SessionStat
 
 // -- M3a: handler-surface expansion (ROADMAP M3a item 4) ---------------------
 
-// `xtset ivar [tvar] [, delta(#)]` — stores panel/time context; needs NO
-// data loaded. `delta` (BS-030) is forwarded un-validated (no per-panel
-// minimum-gap check — see handlers_m3.cpp's own comment).
+// One tsset/xtset declaration (`tsset [panelvar] timevar` and the two-variable
+// `xtset`). Validates the variables, the format, the time values and delta,
+// sorts by (panelvar) timevar, installs session.panelvar/timevar/delta + the
+// _dta chars and posts the declaration's r() set under `rCmd`. BUG-896.
+struct TsDeclare {
+  std::optional<std::string> panelvar;  // nullopt = time series only
+  std::string timevar;
+  std::optional<double> delta;          // delta(#); nullopt = 1
+  std::string period;                   // "yearly", ... ("" = none)
+  std::string format;                   // format(%fmt) ("" = none)
+  // The display options tsset and xtset take: panelname()
+  // relabels the panel line and displayindent() indents every line, each label
+  // right-aligned to the longest; noblank and mi change nothing this build draws
+  // (it draws no blank line). `display` = one was typed.
+  std::string panelLabel = "Panel";
+  int indent = 0;
+  bool display = false;
+};
+// Every declaration answers with the panel/time/delta report lines (BUG-1161).
+nlohmann::ordered_json runTsDeclare(const TsDeclare& d, SessionState& session,
+                                     const std::string& rCmd);
+// Bare `tsset` / `xtset`: re-run the live declaration (Stata's echo and r()).
+// `given` carries the options typed with the bare command; `anyOption` = some
+// period/format/delta option was typed (then only those are used, as in Stata).
+nlohmann::ordered_json runTsRedisplay(SessionState& session, const std::string& rCmd,
+                                       const TsDeclare& given, bool anyOption);
+// The panel-only form: `xtset ivar` (declare) or its bare re-display. `look`
+// carries the display options (TsDeclare's last three fields).
+nlohmann::ordered_json runXtsetPanelOnly(const std::string& ivar, SessionState& session,
+                                          bool declare, const TsDeclare& look = TsDeclare{});
+
+// `xtset ivar [tvar] [, delta(#)]` — the two-variable form is runTsDeclare
+// (validated like tsset since BUG-896); one variable is runXtsetPanelOnly.
 nlohmann::ordered_json runXtset(const std::string& ivar, const std::optional<std::string>& tvar,
                                  SessionState& session, std::optional<double> delta = std::nullopt);
-
-// `tsset tvar [, delta(#)]` — stores time-only context (clears panelvar);
-// needs data loaded when `delta` is given (BS-030: validates delta against
-// the actual minimum gap between sorted distinct time values, honest-
-// rejecting — and leaving the ts context UNSET — when delta is narrower
-// than the true data spacing, matching real Stata).
-// B4-W3b: `tsFmt` is the PERIOD option's display format (`tsset t, quarterly`
-// -> "%tq"). Measured (StataBE 19.5, private_oracle_g.log:257-273, `clear` +
-// `set obs 8` + `gen t = _n` + `tsset t, quarterly`): rc 0, r(tsfmt) "%tq",
-// AND `describe t` shows the format on the VARIABLE — the period option is not
-// only an r()-class fact, it formats the column, which is why this reaches
-// varMeta and not just the return store.
-nlohmann::ordered_json runTsset(const std::string& tvar, SessionState& session,
-                                 std::optional<double> delta = std::nullopt,
-                                 const std::string& tsFmt = std::string());
 
 // `drop VARLIST` / `keep VARLIST` (no `if`) — mutate.py's run_drop/run_keep.
 nlohmann::ordered_json runDrop(const std::vector<std::string>& varlist, SessionState& session);
@@ -257,14 +278,26 @@ nlohmann::ordered_json runList(const std::optional<std::vector<std::string>>& va
 nlohmann::ordered_json runScalarList(const std::vector<std::string>& names, SessionState& session);
 
 // `ereturn list` (BS-039) — display-only dump of the e() values PIET
-// actually stores after an estimation (session.lastModel()). Bare form
-// only; ereturn scalar/post/eclass creation stay OUT (BS-109).
+// actually stores after an estimation (session.lastModel()). The other
+// sub-verbs are runEreturn's (below).
 nlohmann::ordered_json runEreturnList(SessionState& session);
+
+// W2D-T01 (handlers_ereturn.cpp): every `ereturn` sub-verb except `list` --
+// `clear` (empties every e() store), `post [b [V]] [, obs() depname() dof()
+// properties()]` (a NEW e(); esample() is refused by name until PIET keeps an
+// e(sample) mask), `local NAME ...`, and a named refusal for the rest. Returns
+// one error block, or an empty array on silent success.
+nlohmann::ordered_json runEreturn(const eval::ParsedCommand& parsed, SessionState& session);
 
 // `matrix NAME = e(b)` / `matrix NAME = e(V)` — capture the last estimation's
 // coefficient vector / diagonal se^2 matrix into session.eval.matrices. Silent
 // on success; other matrix forms return an explicit unsupported error.
 nlohmann::ordered_json runMatrixDef(const std::string& raw, SessionState& session);
+
+// A row or column name as `matrix list` and `matlist` print it: a factor
+// level's `bn` marker is not shown (StataBE lists `2bn.g` as `2.g`, while
+// `: colnames` keeps `2bn.g`).
+std::string matrixNameAsListed(const std::string& name);
 
 // `label variable VAR "text"` / `label values VAR [LBLNAME]` — session
 // var-editor metadata (label.py's run_label / label_define.py's
@@ -273,7 +306,7 @@ nlohmann::ordered_json runLabelVariable(const std::string& varname, const std::s
                                          SessionState& session);
 nlohmann::ordered_json runLabelValues(const std::string& varname,
                                        const std::optional<std::string>& lblname,
-                                       SessionState& session);
+                                       SessionState& session, bool nofix = false);
 
 // `format VARLIST %fmt` — BS-005/D6 (BETA B-data): sets a display-layer
 // session attribute (varMeta[name].format) honored by browse/list; NOT
@@ -282,6 +315,11 @@ nlohmann::ordered_json runLabelValues(const std::string& varname,
 // grammar (numeric/string/date families — not a full typed-format engine).
 nlohmann::ordered_json runFormat(const std::vector<std::string>& varlist, const std::string& fmt,
                                   SessionState& session);
+// The %fmt grammar `format` accepts (anything else is r(120) "invalid
+// %format"), and whether a valid one is a string format (%#s, %-#s, %~#s).
+// `file write` reads the same two rules.
+bool isValidDisplayFormat(const std::string& fmt);
+bool isStringDisplayFormat(const std::string& fmt);
 
 // `label define LBLNAME # "text" ... [, add|modify]` / `label list
 // [LBLNAME...]` / `label dir` / `label drop LBLNAME...` — M3b, C++ port of
@@ -290,6 +328,10 @@ nlohmann::ordered_json runLabelDefine(const std::string& rawLine, SessionState& 
 nlohmann::ordered_json runLabelList(const std::vector<std::string>& lblnames, SessionState& session);
 nlohmann::ordered_json runLabelDir(SessionState& session);
 nlohmann::ordered_json runLabelDrop(const std::vector<std::string>& lblnames, SessionState& session);
+// `label language [NAME] [, new copy delete rename]` (LBL-LANGUAGE).
+nlohmann::ordered_json runLabelLanguage(const std::vector<std::string>& args,
+                                         const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                                         SessionState& session);
 
 // `labelbook [LBLNAME...]` — P1-W2-0: direct-read report over
 // session.labelDefs/valueLabels/varLblname (no engine change — the data
@@ -307,6 +349,11 @@ nlohmann::ordered_json runLabelbook(const std::vector<std::string>& lblnames, Se
 // format-insensitive) — see src/data/datasignature.h's Q9 ruling. The reported
 // string is the engine's own; do not present it as a Stata cross-check.
 nlohmann::ordered_json runDatasignature(SessionState& session);
+// BUG-1461: `datasignature set [, reset]`, `confirm [, strict]` and `clear`, the
+// signature kept in the dataset's _dta[datasignature_*] characteristics.
+nlohmann::ordered_json runDatasignatureSub(
+    const std::string& sub, const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+    SessionState& session);
 
 // `preserve` / `restore` — preserve_restore.py's LIFO hbin-snapshot stack.
 // `restore, preserve` (B5-D14, BUG-454): `rearm` restores AND re-snapshots,
@@ -479,6 +526,17 @@ nlohmann::ordered_json writeEsttabFile(const nlohmann::ordered_json& esttabBlock
                                         const std::string& path,
                                         const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                         SessionState& session);
+// The factor base levels of a fit's coefficient table, as estout shows them
+// (`0.clinic` 0 / (.)): [{var, level, name, before, after}], read from the
+// data and the live e(sample). Empty when there is none or no data.
+nlohmann::ordered_json factorBaseLevels(const nlohmann::ordered_json& coeftable,
+                                        SessionState& session);
+// The screen form of `esttab` (no `using`): the same translation and writer run
+// without a file, so the options are validated exactly as the file form does
+// (mode exclusivity, keep() patterns) and r() is posted. Null on success.
+nlohmann::ordered_json esttabScreen(const nlohmann::ordered_json& esttabBlock,
+                                     const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                                     SessionState& session);
 
 // ---- AER-SCOPE1 bundle F (RESHAPE, 2026-09-04) -----------------------------
 // Seventeen shape/sample verbs on top of the established read/write pair:
@@ -529,6 +587,10 @@ nlohmann::ordered_json runCompare(const eval::ParsedCommand& parsed, SessionStat
 // `cumul v, gen(c) [equal freq]`.
 nlohmann::ordered_json runCumul(const eval::ParsedCommand& parsed, SessionState& session);
 // `bsample [#] [, cluster() idcluster()]`.
+// Whether `bsample` takes bsample.ado's fast method (no #, no cluster/strata/
+// idcluster/weight): Stata's own rows from the session stream, with e(sample)
+// kept on the drawn originals and cleared on the copies.
+bool bsampleIsStataFastPath(const eval::ParsedCommand& parsed);
 nlohmann::ordered_json runBsample(const eval::ParsedCommand& parsed, SessionState& session);
 // `pctile new = v, nq()|percentiles() [genp()]` and the r-class `_pctile` form.
 // Both use the SAME percentile rule as `xtile`/`winsor2` (transcribed from the
@@ -632,6 +694,19 @@ nlohmann::ordered_json runCarryforward(const eval::ParsedCommand& parsed, Sessio
 nlohmann::ordered_json runRangestat(const eval::ParsedCommand& parsed, SessionState& session);
 // `tsspell [varname | , cond()] [, spell() seq() end()]` -- needs tsset.
 nlohmann::ordered_json runTsspell(const eval::ParsedCommand& parsed, SessionState& session);
+// Package-007 unblock (T7). `lookfor word [word ...]` -- variables whose name or
+// label contains a word (case-insensitive); describes them and sets r(varlist).
+nlohmann::ordered_json runLookfor(const eval::ParsedCommand& parsed, SessionState& session);
+// `ihstrans varlist [if] [in] [, keepusing() prefix() casewise]` (SSC) -- new
+// ihs_<var> columns = log(v+sqrt(v^2+1)).
+nlohmann::ordered_json runIhstrans(const eval::ParsedCommand& parsed, SessionState& session);
+// `sctorezone shift, force [only() exclude()]` (SSC scto) -- shift %tc variables
+// by a fixed number of hours.
+nlohmann::ordered_json runSctorezone(const eval::ParsedCommand& parsed, SessionState& session);
+// Package-007 lane LB. `leebounds depvar treatvar [if] [in] [, select() level()
+// vce(analytic)]` (SSC, Harald Tauchmann) -- Lee (2009) treatment-effect bounds,
+// e(b) striped treatvar:lower treatvar:upper. Returns an ARRAY of blocks.
+nlohmann::ordered_json runLeebounds(const eval::ParsedCommand& parsed, SessionState& session);
 
 // AER scope-2 B2-3: `bcal create|describe|load|dir|check` (Stata business
 // calendars). The reader/writer/index arithmetic are in piet/bcal.h; this is
@@ -688,6 +763,52 @@ nlohmann::ordered_json runLowess(const eval::ParsedCommand& parsed, SessionState
 nlohmann::ordered_json runPca(const eval::ParsedCommand& parsed, SessionState& session);
 // AER scope-2 B2: `oaxaca ..., by(g) pooled` (Jann), twofold with robust suest V.
 nlohmann::ordered_json runOaxaca(const eval::ParsedCommand& parsed, SessionState& session);
+// X2-GLM (estimation_glm.cpp): `glm` fitted in-process through the engine's
+// cecon::glm_fit, Stata's default ML lifecycle (oracle w2_glm_lifecycle). Returns
+// an ARRAY of blocks (weight note, iteration log, header, estimation, warning);
+// the caller pushes each element. runGlmMargins answers `margins, dydx() [post]`
+// when the model in memory is a glm -- the engine's margins cannot (it would
+// answer a logit AME), so the dispatcher routes here instead.
+nlohmann::ordered_json runGlm(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runGlmMargins(const eval::ParsedCommand& parsed, SessionState& session);
+// E3 scaffold stubs (handlers_e3_<cmd>.cpp): each returns an ARRAY holding the
+// block `refused:e3_deferred` (rc 199) until its native task replaces the body.
+// runLasso answers both `lasso` and `rlasso` (it reads the typed word from
+// parsed.cmd). `honestdid` has no handler: its refusal stays in the dispatcher.
+nlohmann::ordered_json runSwindex(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runQreg2(const eval::ParsedCommand& parsed, SessionState& session);
+// `margins, dydx(varlist) [post]` while the model in memory is a qreg2 (its
+// linear-index dy/dx from the posted e(b)/e(V); handlers_e3_qreg2.cpp).
+nlohmann::ordered_json runQreg2Margins(const eval::ParsedCommand& parsed, SessionState& session);
+// Stata `qreg` with its default vce(iid) (fitted/hsheather), fitted natively with
+// the exact LP vertex (handlers_e3_qreg2.cpp). A null reply means "not this
+// path's form" (vce(robust), weights, other options): runQreg answers those.
+nlohmann::ordered_json runQregNative(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runLasso(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runLassoPredict(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runLassoCoef(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runSuest(const eval::ParsedCommand& parsed, SessionState& session);
+nlohmann::ordered_json runRitest(const eval::ParsedCommand& parsed, SessionState& session);
+// `ritest` from its raw line (dispatcher step 0a-ter): REST is the text after the
+// command word, unexpanded -- the exp_list's e()/r()/_b[] are per replicate.
+nlohmann::ordered_json runRitestLine(const std::string& rest, SessionState& session);
+nlohmann::ordered_json runAcreg(const eval::ParsedCommand& parsed, SessionState& session);
+// glm's e(rank): rowsof(V) - diag0cnt(invsym(V)) on the k x k row-major V,
+// with invsym's measured drop rule (comment at the definition).
+int64_t glmVceRank(const std::vector<double>& V, size_t k);
+// The e() entries glm posts that no other estimator clears (e(b) e(V) e(ilog)
+// e(gradient), e(varfunct) e(linkt) e(opt) e(technique) e(a)). The dispatcher
+// snapshots them while the model in memory is a glm (or its posted margins)
+// and, once a command replaces that model, drops each entry that is STILL
+// exactly what glm posted -- so `glm` then `regress` then `matrix V = e(V)`
+// cannot read the glm's V. An entry the new command wrote itself differs and
+// is kept.
+struct GlmEStores {
+  std::vector<std::pair<std::string, eval::EvalMatrix>> matrices;
+  std::vector<std::pair<std::string, std::string>> strings;
+};
+std::optional<GlmEStores> glmOwnedEStores(const SessionState& session);
+void dropStaleGlmEStores(SessionState& session, const GlmEStores& before);
 // AER scope-2 B2-4: `teffects nnmatch (ovar mvarlist) (tvar) [if] [in], [gen() ...]`
 // (StataCorp [CAUSAL]). `sub` is the sub-command word the dispatcher stripped.
 nlohmann::ordered_json runTeffects(const std::string& sub, const eval::ParsedCommand& parsed,
@@ -735,7 +856,9 @@ nlohmann::ordered_json runType(const std::string& raw, const std::vector<std::st
 nlohmann::ordered_json runDir(const std::string& raw, const std::vector<std::string>& varlist,
                                const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                SessionState& session);
-nlohmann::ordered_json runNet(const std::string& raw, const std::vector<std::string>& varlist);
+nlohmann::ordered_json runNet(const std::string& raw, const std::vector<std::string>& varlist,
+                               const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                               SessionState& session);
 nlohmann::ordered_json runAdo(const std::string& raw, const std::vector<std::string>& varlist);
 nlohmann::ordered_json runAdopath(const std::string& raw, const std::vector<std::string>& varlist,
                                    SessionState& session);
@@ -744,6 +867,10 @@ nlohmann::ordered_json runSysdir(const std::string& raw, const std::vector<std::
 nlohmann::ordered_json runFindfile(const std::string& raw, const std::vector<std::string>& varlist,
                                     const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                     SessionState& session);
+// The first FNAME on the session adopath, searched as findfile searches it
+// (each entry, then its letter subdirectory); nullopt when none. The
+// dispatcher's ado autoload reads it.
+std::optional<std::string> findOnAdopath(SessionState& session, const std::string& fname);
 nlohmann::ordered_json runSleep(const std::vector<std::string>& varlist);
 nlohmann::ordered_json runErrorCode(const std::vector<std::string>& varlist);
 nlohmann::ordered_json runFramesReset(SessionState& session);
@@ -768,16 +895,22 @@ nlohmann::ordered_json runTimer(const std::string& sub, const std::optional<int>
 // for the if-merge-back key (see the .cpp comment).
 // `storeType` (BUG-471 T2): the resolved result type; withheld from tag()/
 // seq()/mode(), whose ados ignore it.
-// `seqTypeOut` (BUG-471 T2 fix-up F3): for seq(), the type Stata's widening
-// replace leaves (_gseq.ado:42 `gen byte`, :45-49 replace), chosen from the
-// stored min/max the computing call itself summarizes; untouched otherwise.
+// `fixedTypeOut`: the result's type where the function, not the declaration,
+// decides it -- for seq() the type Stata's widening replace leaves (BUG-471 T2
+// fix-up F3: egen seq() generates a byte, then widens, chosen from the stored
+// min/max the computing call itself summarizes); for mode() of a string the
+// str# its compress leaves (BUG-1109); for cut() and the rest of
+// runEgenAdoFunction the type they recorded for the result (BUG-1108). Untouched
+// otherwise.
+// `gtools`: the line was gtools' gegen, whose own total()/sum()/mean() sum in
+// data order where official egen reads summarize's exact sum.
 nlohmann::ordered_json runEgen(const std::string& expr, const std::string& by,
                                 const std::optional<std::string>& ifExpr,
                                 const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                 SessionState& session,
                                 const std::optional<std::string>& inRange = std::nullopt,
                                 const std::string& storeType = "",
-                                std::string* seqTypeOut = nullptr);
+                                std::string* fixedTypeOut = nullptr, bool gtools = false);
 
 // `[bysort VARLIST:] gen/replace newvar = expr` — C++ port of bysort.py's
 // run_bysort_gen (cobra eval --bygen, native _n/_N group-context support).
@@ -793,6 +926,13 @@ nlohmann::ordered_json runEgen(const std::string& expr, const std::string& by,
 // `sortVars` (default nullopt = preserve the old sortFirst-driven default)
 // is BS-002's explicit parenthetical sort key (`bysort byvar (sortvar):`) —
 // only the bysort/by-prefix call site ever passes a non-empty value.
+// BUG-532: `bysort KEYS (SORT):`'s in-place sort for generate/replace, in
+// Stata's order and with Stata's marker; skipped when KEYS SORT already lead
+// the marker. Returns the error block, or nullopt.
+std::optional<nlohmann::ordered_json> sortForBysort(
+    SessionState& session, const std::vector<std::string>& byVars,
+    const std::optional<std::vector<std::string>>& sortVars);
+
 nlohmann::ordered_json runBysortGen(
     SessionState& session, const std::string& expr, const std::vector<std::string>& byVars,
     const std::optional<std::string>& ifExpr, bool sortFirst, bool isReplace,
@@ -815,32 +955,40 @@ nlohmann::ordered_json runPost(const std::string& rawLine, SessionState& session
 nlohmann::ordered_json runPostclose(const std::string& handle, SessionState& session);
 
 // `save FILE [, replace]` — persist the current dataset to FILE.
+// `dtaRelease` > 0 writes a genuine Stata .dta of that release (115/117/118)
+// whatever FILE's extension is (`saveold`'s target; a `.tmp` tempfile included).
 nlohmann::ordered_json runSaveData(const std::string& filepath, bool replace,
-                                    SessionState& session);
+                                    SessionState& session, int dtaRelease = 0);
 
 // `rename OLDVAR NEWVAR` — two-arg form only.
 nlohmann::ordered_json runRename(const std::string& oldvar, const std::string& newvar,
                                   SessionState& session);
 
-// `clonevar NEWVAR = OLDVAR [if COND]` — value copy + metadata clone
-// (BUG-003; `if` per BS-031(c) — numeric source only, see .cpp comment).
+// `clonevar NEWVAR = OLDVAR [if COND] [in RANGE]` — value copy + metadata clone
+// (BUG-003; `if` per BS-031(c), `in` per BUG-1096 — see the .cpp comment).
 nlohmann::ordered_json runClonevar(const std::string& newvar, const std::string& oldvar,
                                     SessionState& session,
-                                    const std::optional<std::string>& ifExpr = std::nullopt);
+                                    const std::optional<std::string>& ifExpr = std::nullopt,
+                                    const std::optional<std::string>& inRange = std::nullopt);
 
 // `collapse (stat) varlist [(stat) varlist...] [, by(g1 g2)] [if COND] [in RANGE]`.
-// `weightVar` (project Step-1 D3): when set (tokenizer only admits this for
+// `weightVar` (Step-1 D3): when set (tokenizer only admits this for
 // `[fw=]`/`[fweight=]`), forwarded as `--fweight weightVar` to cobra's
 // `collapse` alongside `--by` — cobra does the actual Σw math and rejects
 // unsupported combinations (e.g. weighted median/p##) itself. `inRange`
 // (BS-090, BETA Phase G): `in a/b`, composed with `ifExpr` via AND
 // (piet::handlers::applyIfAndInFilter) BEFORE cobra's collapse call, rather
 // than forwarded as a raw `--keepif` (see the .cpp for why).
+// `opts`: the line's options as the dispatcher resolved them; the option words
+// (cw, clabel, nocompress, append, smart, fast) are read off their keys.
 nlohmann::ordered_json runCollapse(const std::string& rawLine,
                                     const std::optional<std::string>& ifExpr,
                                     SessionState& session,
+                                    const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                     const std::optional<std::string>& weightVar = std::nullopt,
-                                    const std::optional<std::string>& inRange = std::nullopt);
+                                    const std::optional<std::string>& inRange = std::nullopt,
+                                    const std::string& flavor = "collapse",
+                                    const std::optional<std::string>& weightType = std::nullopt);
 
 // `gsort [-]VAR ...` — generalised per-key ascending/descending sort.
 nlohmann::ordered_json runGsort(const std::vector<std::string>& tokens, SessionState& session);
@@ -874,7 +1022,8 @@ nlohmann::ordered_json runRecode(const std::string& rawLine, SessionState& sessi
 // decode reads session.valueLabels and writes ONE column via `cobra setcol`, and
 // inspect is arithmetic over an mmap'd column, the same reason `isid` is native.
 nlohmann::ordered_json runDecode(const std::string& varname,
-                                 const std::optional<std::string>& genVar, SessionState& session);
+                                 const std::optional<std::string>& genVar, SessionState& session,
+                                 size_t maxLength = 32000);
 nlohmann::ordered_json runInspect(const std::vector<std::string>& varlist, SessionState& session);
 // BUG-371 — panel summaries. Both PIET-native (no engine verb exists), and both
 // require xtset: the whole content of xtsum is the BETWEEN/WITHIN split, which is
@@ -884,7 +1033,14 @@ nlohmann::ordered_json runXttab(const std::vector<std::string>& varlist, Session
 
 nlohmann::ordered_json runXtile(const std::string& newvar, const std::string& srcvar,
                                 const std::vector<std::pair<std::string, eval::OptValue>>& opts,
-                                const std::optional<std::string>& ifExpr, SessionState& session);
+                                const std::optional<std::string>& ifExpr, SessionState& session,
+                                const std::optional<std::string>& weightType = std::nullopt,
+                                const std::optional<std::string>& weightVar = std::nullopt);
+// xtile's weighted form (handlers_aer_reshape.cpp, beside the weighted
+// percentile rule it shares with pctile/_pctile).
+nlohmann::ordered_json runXtileWeighted(const std::string& newvar, const std::string& srcvar,
+                                        int nq, const std::string& weightVar,
+                                        const std::string& weightType, SessionState& session);
 nlohmann::ordered_json runIpolate(const std::vector<std::string>& varlist,
                                   const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                   const std::optional<std::string>& ifExpr, SessionState& session);
@@ -892,8 +1048,9 @@ nlohmann::ordered_json runTssmoothMa(const std::string& newvar, const std::strin
                                      const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                      SessionState& session);
 
-nlohmann::ordered_json runTsfill(const std::vector<std::pair<std::string, eval::OptValue>>& opts,
-                                  SessionState& session);
+// `tsfill [, full]` (BUG-897: varlist/if/in are tsfill.ado's r(101); `full`
+// forwards cobra tsfill --full).
+nlohmann::ordered_json runTsfill(const eval::ParsedCommand& parsed, SessionState& session);
 
 // `duplicates report|drop|tag|list [VARLIST] [if COND] [in RANGE] [, gen(NEWVAR)]`.
 // `ifExpr` (BUG-042, BS-031(a)): report/tag/list all honor `if` (tag/list
@@ -924,16 +1081,32 @@ nlohmann::ordered_json runReshape(const std::vector<std::string>& stubs,
 // A variable numeric on one side and string on the other is r(106) unless
 // `force` (BUG-550), which takes the using cells as missing of the master's type.
 // A .dta using's value-label definitions are copied unless `nolabel` (BUG-551).
+// The using file's notes are appended after the master's unless `nonotes`.
+// Each master variable the using data widen adds Stata's "(variable x was float,
+// now double to accommodate using data's values)" line to `typeNotes` (BUG-1092).
 nlohmann::ordered_json runAppend(const std::string& filepath, SessionState& session,
                                   const std::optional<std::string>& genVar = std::nullopt,
                                   const std::optional<std::string>& keepSpec = std::nullopt,
-                                  bool force = false, bool nolabel = false);
+                                  bool force = false, bool nolabel = false, bool nonotes = false,
+                                  std::vector<std::string>* typeNotes = nullptr);
 
-// `merge 1:1|m:1|1:m KEYLIST using FILE [, opts]`.
+// `append using FILE [FILE ...] [, ...]` — append.ado's loop: every file
+// described first (r(601)), r(N) = the last file's _N, generate() codes 1..k,
+// and an empty master takes the first file whole.
+nlohmann::ordered_json runAppendFiles(const std::vector<std::string>& files, SessionState& session,
+                                       const std::optional<std::string>& genVar = std::nullopt,
+                                       const std::optional<std::string>& keepSpec = std::nullopt,
+                                       bool force = false, bool nolabel = false,
+                                       bool nonotes = false,
+                                       std::vector<std::string>* typeNotes = nullptr);
+
+// `merge 1:1|m:1|1:m|m:m KEYLIST using FILE [, opts]` (mergeType already mapped by
+// map_mtype); `sequential` = `merge 1:1 _n` (keylist empty).
 nlohmann::ordered_json runMerge(const std::string& mergeType, const std::vector<std::string>& keylist,
                                  const std::string& usingPath,
                                  const std::vector<std::pair<std::string, eval::OptValue>>& opts,
-                                 SessionState& session);
+                                 SessionState& session, bool sequential = false,
+                                 bool oldSyntax = false, bool oldSort = false);
 
 // `encode STRVAR, gen(NEWVAR) [label(LBLNAME)]` — string(factor)->numeric
 // (1..K, alphabetical) with a value-label set registered + attached. C++
@@ -948,23 +1121,32 @@ nlohmann::ordered_json runMerge(const std::string& mergeType, const std::vector<
 // mapping and the per-row gating are legitimately different scopes).
 nlohmann::ordered_json runEncode(const std::string& strvar, const std::string& newvar,
                                   const std::optional<std::string>& lblname, SessionState& session,
-                                  const std::optional<std::string>& ifExpr = std::nullopt);
+                                  const std::optional<std::string>& ifExpr = std::nullopt,
+                                  bool noExtend = false);
 
-// `destring VAR, {replace | gen(NEWVAR)} [ignore("chars") force]` — BS-003/D4
-// (BETA B-data): PIET-NATIVE string(factor)->numeric conversion (no cobra
-// verb, no hbin-v2 dependency — rides the existing factor-column machinery,
-// same CSV+`cobra convert` round-trip runEncode/strmutate.cpp already use).
-// `ignoreChars` (nullopt = none) strips every occurrence of any of its
-// characters from each value before parsing; a value that still isn't
-// cleanly numeric after that is missing under `force`, else the WHOLE
-// command is an honest reject (D4). Already-numeric VAR is a Stata-faithful
-// benign no-op/copy, not an error. Scoped to exactly ONE variable per call
-// (every analysis.do site is single-var) — a multi-var varlist is an
-// honest reject naming the limitation, not a silent partial application.
+// `destring VAR, {replace | gen(NEWVAR)} [ignore("chars") force float percent
+// dpcomma]` -- BS-003/D4 (BETA B-data): PIET-native string(factor)->numeric
+// conversion of ONE variable; the dispatcher's `destring`/`tostring` arm runs
+// the varlist loop and the option checks, and calls this once per variable.
+// Behaviour as measured on StataBE 19.5. In short: an
+// already-numeric VAR, or one holding a value that does not read as a number
+// (without `force`), is declined with a `display` note at rc 0 and nothing is
+// created; otherwise the parsed f64 column replaces VAR or is added as NEWVAR
+// right after VAR, and VarMeta records the storage type Stata's destring
+// reports (byte/int/long when every value is integral and in range, else
+// double, or float under `float`). `opts` carries the three options beyond
+// replace/generate/ignore/force: float (create as float instead of double),
+// dpcomma (comma as the decimal separator) and percent (ignore `%` and divide
+// by 100).
+struct DestringOpts {
+  bool asFloat = false;
+  bool dpcomma = false;
+  bool percent = false;
+};
 nlohmann::ordered_json runDestring(const std::string& varname, bool doReplace,
                                     const std::optional<std::string>& genVar,
                                     const std::optional<std::string>& ignoreChars, bool force,
-                                    SessionState& session);
+                                    SessionState& session, const DestringOpts& opts = {});
 
 // `tostring VAR, {gen(NEWVAR) | replace} [usedisplayformat]` — BS-003/D4
 // (BETA B-data): PIET-NATIVE numeric->string(factor) conversion, the mirror
@@ -978,9 +1160,29 @@ nlohmann::ordered_json runDestring(const std::string& varname, bool doReplace,
 // (a pre-existing limitation of that shared helper, not newly introduced
 // here). Scoped to exactly ONE variable per call, same rationale as
 // runDestring.
+//
+// BUG-665: `opts.stataGate` (set by the `tostring` command arm; left off by
+// import excel's allstring, which converts unconditionally) switches on
+// tostring's own rules: the rendering format is format() when
+// given, the variable's display format under usedisplayformat, else %12.0g;
+// the value rendered is the STORED value (a float-typed variable is rounded
+// to float first -- w2b_dataio.log tostring_gen_force renders float 7.01 as
+// "7.010000229"); a variable any of whose rendered values does not read back
+// equal is left as is with "VAR cannot be converted reversibly; no
+// replace|generate" (rc 0) unless `force`; an already-string variable is a
+// note, not an error; `replace` on a value-labelled variable is refused by
+// note unless `force`. `forcedLoss`, when given, says whether a conversion
+// went through only because of `force` (some value does not read back), for
+// the ado's "VAR was forced to string; some loss of information" line.
+struct TostringOpts {
+  bool stataGate = false;
+  std::optional<std::string> format;
+  bool force = false;
+};
 nlohmann::ordered_json runTostring(const std::string& varname, bool doReplace,
                                     const std::optional<std::string>& genVar, bool useDisplayFormat,
-                                    SessionState& session);
+                                    SessionState& session, const TostringOpts& opts = {},
+                                    bool* forcedLoss = nullptr);
 
 // `joinby key1 [key2 ...] using FILE` (bare form only) — BS-004/D5 (BETA
 // B-data): PIET-NATIVE inner key-join (the analysis.do:451 shape). For
@@ -1000,8 +1202,12 @@ nlohmann::ordered_json runTostring(const std::string& varname, bool doReplace,
 // pre-validation (keys present on both sides, non-key column-name
 // overlap) so the established PIET-side error messages still fire before
 // the engine is reached.
+// `unmatched` is joinby.ado's UnMatch value (none|master|using|both);
+// `mergeVar` its _merge() name (the marker exists when either asks for it).
 nlohmann::ordered_json runJoinby(const std::vector<std::string>& keylist,
-                                  const std::string& usingPathArg, SessionState& session);
+                                  const std::string& usingPathArg, SessionState& session,
+                                  const std::string& unmatched = "none",
+                                  const std::optional<std::string>& mergeVar = std::nullopt);
 
 // -- resampling prefixes (P6 wave, handlers_resample.cpp) -------------------
 // `bootstrap:` / `jackknife:` / `permute:` — the loop runs PIET-side and the
@@ -1020,6 +1226,11 @@ nlohmann::ordered_json runResample(const std::string& method, const std::string&
 // tsset time variable in place of a resample, so the inner command stays
 // general. Requires a prior tsset/xtset.
 nlohmann::ordered_json runRolling(const std::string& expListRaw, const std::string& optsRaw,
+                                  const std::string& innerCmd, SessionState& session);
+
+// `statsby _b _se, clear [double]: command` — the ungrouped form only (no by());
+// see handlers_resample.cpp for the naming and storage rules it follows.
+nlohmann::ordered_json runStatsby(const std::string& expListRaw, const std::string& optsRaw,
                                   const std::string& innerCmd, SessionState& session);
 
 // -- frames (P6 wave, handlers_frames.cpp) ----------------------------------
@@ -1056,7 +1267,8 @@ nlohmann::ordered_json runFrget(const std::vector<std::pair<std::string, std::st
 // uniquely identify the observations" + r(459), `isid nosuchvar` → r(111).
 // PIET-native (the engine has no isid verb): a single pass over the key
 // columns' mmap'd payloads, no scratch file written.
-nlohmann::ordered_json runIsid(const std::vector<std::string>& varlist, SessionState& session);
+nlohmann::ordered_json runIsid(const std::vector<std::string>& varlist, SessionState& session,
+                                bool missok = false, bool sort = false);
 
 // P1 wave data verbs — thin forwarders onto the engine subcommands of the same
 // name (the joinby/tsfill shape: PIET validates and resolves the `using` file,
@@ -1066,7 +1278,7 @@ nlohmann::ordered_json runIsid(const std::vector<std::string>& varlist, SessionS
 //   `cross using FILE`       — Cartesian product (master wins a shared name)
 //   `contract varlist`       — distinct combinations + `_freq`
 // B4-W3b: `generate(newvar)` marks each row 0 (an original) or 1 (a copy the
-// expansion added). Measured (StataBE 19.5, private_oracle_g.log:227-233,
+// expansion added). Measured (StataBE 19.5, pins_oracle_g.log:227-233,
 // `sysuse auto` + `expand 2, generate(dupflag)`): _N 74 -> 148, dupflag[1]==0,
 // and `tabulate dupflag` is 74 "Original observation" / 74 "Duplicated
 // observation" — i.e. the copies are APPENDED, which cobra's own expand does
@@ -1092,7 +1304,58 @@ nlohmann::ordered_json runExportDelimited(const std::vector<std::string>& varlis
                                           const std::string& pathArg,
                                           const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                           SessionState& session);
+// The same with `[if] [in]` (export delimited takes [if] [in]; w2ar dx_exd_ifin log:746).
+nlohmann::ordered_json runExportDelimited(const std::vector<std::string>& varlist,
+                                          const std::string& pathArg,
+                                          const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                                          const std::optional<std::string>& ifExpr,
+                                          const std::optional<std::string>& inRange,
+                                          SessionState& session);
+
+// One writer for export delimited and outsheet: the two differ only in these
+// switches (w2ar log:453-929). `quote`:
+//   kMinimal     quote a string only when it holds the delimiter, `"`, CR or
+//                LF; double an inner quote (export delimited's default)
+//   kAll         quote every string and value-label text, doubling inner
+//                quotes (export delimited, quote)
+//   kAllVerbatim quote every string and label text, inner quotes NOT doubled
+//                (outsheet's default: `"q"r"`, log:815)
+//   kNone        never quote (outsheet, noquote)
+// `dataFmt` writes every numeric through its display format (export
+// delimited, datafmt; outsheet always). Dates are written formatted either
+// way.
+struct DelimWriteSpec {
+  enum class Quote { kMinimal, kAll, kAllVerbatim, kNone };
+  char delim = ',';
+  bool header = true;
+  bool noLabel = false;
+  bool dataFmt = false;
+  Quote quote = Quote::kMinimal;
+  std::string verb = "export delimited";
+  // The file as the user typed it, suffix included: every message names it, never
+  // the resolved path, which would put this machine's working directory into each
+  // captured transcript (BUG-410). Empty = the path itself.
+  std::string shown;
+};
+// Writes `resolvedPath` (already resolved; the caller owns the exists/replace
+// decision) from the rows `ifExpr`/`inRange` select.
+nlohmann::ordered_json writeDelimitedFile(const std::vector<std::string>& varlist,
+                                          const std::string& resolvedPath,
+                                          const DelimWriteSpec& spec,
+                                          const std::optional<std::string>& ifExpr,
+                                          const std::optional<std::string>& inRange,
+                                          SessionState& session);
+// A block whose text or message names the RESOLVED path (the xlsx writer's
+// exceptions), re-spoken with the file as the user typed it in that place
+// (BUG-410). A miss leaves the block as it was.
+nlohmann::ordered_json reEchoPath(nlohmann::ordered_json block, const std::string& resolved,
+                                  const std::string& shown);
 nlohmann::ordered_json runImportDelimited(const std::string& pathArg,
+                                          const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                                          SessionState& session);
+// `import delimited [namelist] using FILE [, options]`.
+nlohmann::ordered_json runImportDelimited(const std::vector<std::string>& varlist,
+                                          const std::string& pathArg,
                                           const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                           SessionState& session);
 
@@ -1103,9 +1366,19 @@ nlohmann::ordered_json runExportExcel(const std::vector<std::string>& varlist,
                                       const std::string& pathArg,
                                       const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                       SessionState& session);
+nlohmann::ordered_json runExportExcel(const std::vector<std::string>& varlist,
+                                      const std::string& pathArg,
+                                      const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                                      const std::optional<std::string>& ifExpr,
+                                      const std::optional<std::string>& inRange,
+                                      SessionState& session);
 nlohmann::ordered_json runImportExcel(const std::string& pathArg,
                                       const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                       SessionState& session);
+// The file `import delimited` (excel=false) or `import excel` (excel=true)
+// reads for `pathArg`, with the suffix a stem takes. The dispatcher's r(4)
+// check asks it too: a missing file is answered first, r(601).
+std::string importSourcePath(SessionState& session, const std::string& pathArg, bool excel);
 
 // -- M4a: output-completion surface (ROADMAP M4a) ----------------------------
 
@@ -1118,7 +1391,7 @@ nlohmann::ordered_json runWinsor2(SessionState& session, const std::vector<std::
 // `tabulate`/`tab`/`tab1`/`tab2` VARLIST [, chi2 sum(V)|summarize(V)] — C++
 // port of tabulate.py's run_tabulate (oneway/twoway freq, tab1/tab2, the
 // summarize()-mode per-category mean/sd/N table).
-// `weightVar` (project Step-1 D3): when set (tokenizer only admits this for
+// `weightVar` (Step-1 D3): when set (tokenizer only admits this for
 // `[fw=]`/`[fweight=]` on tabulate/tab/tab1/tab2), PIET reads/validates it
 // itself (no cobra call underlies native tabulate) and weights every cell
 // freq by Σw; missing-weight rows are dropped, non-integer weights error.
@@ -1136,7 +1409,21 @@ nlohmann::ordered_json runTabulate(Datastore& ds, const std::vector<std::string>
                                    // B5-D-TAB-SORT: one-way `, sort` — rows by DESCENDING
                                    // frequency instead of ascending category value. Defaulted
                                    // so every pre-existing call site is byte-identical.
-                                   bool sortByFreq = false);
+                                   bool sortByFreq = false,
+                                   // The typed weight (fw/aw/iw and their long names);
+                                   // nullopt reads `weightVar` as an fweight.
+                                   const std::optional<std::string>& weightType = std::nullopt,
+                                   // BUG-1514: the two-way statistics beyond chi2, a mask of
+                                   // the kTab* bits below. 0 keeps every call site byte-identical.
+                                   unsigned twoWayStats = 0);
+
+// BUG-1514: tabulate_twoway's lrchi2, V, gamma and taub ([R] tabulate twoway,
+// Methods and formulas), the bits of runTabulate's `twoWayStats`.
+constexpr unsigned kTabLrchi2 = 1u;
+constexpr unsigned kTabCramersV = 2u;
+constexpr unsigned kTabGamma = 4u;
+constexpr unsigned kTabTaub = 8u;
+constexpr unsigned kTabExact = 16u;  // Fisher's exact, served on 2 x 2 tables
 
 // `table ROWVAR [COLVAR] [, statistic(STAT VAR)]` — C++ port of table.py's
 // run_table (aggregate statistic by cross-classification).
@@ -1316,7 +1603,10 @@ nlohmann::ordered_json runIvRegress(const std::string& method, const eval::Parse
 // Stata's own default is 3SLS (`sure` opts into SUR); cobra's reg3 CLI
 // default is the OPPOSITE (SUR unless --method 3sls), so this always sends
 // --method explicitly rather than relying on either side's default.
-nlohmann::ordered_json runReg3(const eval::ParsedCommand& parsed, SessionState& session);
+// `sureg (y1 x1 x2) (y2 x3)` is the same SUR fit (stataCmd "sureg": SUR always,
+// e(cmd) `sureg`; sureg.ado's default is two-step FGLS, no dfk/small).
+nlohmann::ordered_json runReg3(const eval::ParsedCommand& parsed, SessionState& session,
+                               const std::string& stataCmd = "reg3");
 
 // `boottest paramname [, reps(#) seed(#) weights(rademacher|webb) null(#)]`
 // — wild cluster bootstrap post-estimation (BS-066), requires a preceding
@@ -1399,7 +1689,7 @@ nlohmann::ordered_json runXtLogitFe(const eval::ParsedCommand& parsed, SessionSt
 // ONLY the tests/validate/drdid2x2.do fixture's exact invocation surface
 // (the sole oracle-covered form; other method()s and the bare/no-`dripw`
 // form honest-reject). Routes through the SAME engine csdid --method dripw
-// machinery `csdid`/`estat` already use — CSDID_CLEANROOM_WALL-compliant:
+// machinery `csdid`/`estat` already use:
 // zero cobra-side csdid code touched, only a PIET-side synthesized `gvar`
 // column (treatment()!=0 -> gvar=max(time), the post period; ==0 -> gvar=0,
 // CS21's never-treated sentinel) built via cobra's GENERIC `eval --gen`
@@ -1413,6 +1703,10 @@ nlohmann::ordered_json runDrdid(const eval::ParsedCommand& parsed, SessionState&
 // EXPR` — all reconstruct the cobra call from session.lastModel(). Returns
 // "No previous estimation result" if lastModel is unset.
 nlohmann::ordered_json runTestCmd(const std::string& expr, SessionState& session);
+// `test ..., accumulate`: the restrictions of the previous `test` on the SAME
+// estimation are tested jointly with these (session state; see runTestCmd).
+nlohmann::ordered_json runTestCmd(const std::string& expr, SessionState& session,
+                                  bool accumulate);
 // BUG-367: Stata `testparm varlist` — the joint zero test written the way a
 // researcher writes it. It is `test`'s varlist form, not a second estimator: the
 // only thing it adds is expanding wildcards and `i.var` against the LAST MODEL's
@@ -1425,12 +1719,84 @@ nlohmann::ordered_json runLincom(const std::string& expr, SessionState& session,
 nlohmann::ordered_json runNlcom(const std::string& expr, SessionState& session,
                                 const std::vector<std::pair<std::string, eval::OptValue>>& opts = {});
 
-// `margins[, dydx(VAR...) | at(...)]` — predictive margins (at()) work after
-// any model; dydx AME requires a non-linear lastModel (logit/probit/poisson)
-// and is rejected after a linear model (matches the oracle's explicit
-// engine_error, not a silent wrong answer).
-nlohmann::ordered_json runMargins(const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+// r(table) (w2c_postest family 1) — handlers_aer_estim.cpp. ONE builder for every
+// estimation block: rows `b se t|z pvalue ll ul df crit eform`, columns in Stata's
+// e(b) order including a factor's base-level column. `level` is the DECLARED
+// confidence level (the command's level(#), else `set level`). Returns false (and
+// builds nothing) when Stata's table cannot be reproduced exactly — including a
+// block whose p-values/intervals disagree with that level and reference.
+bool buildRTableFromBlock(SessionState& session, const nlohmann::ordered_json& block,
+                          double level, eval::EvalMatrix& out);
+// Build and post r(table) from `block`, recording it (with the live e() identity)
+// as the estimation machinery's own. False when nothing could be built (nothing
+// is posted).
+bool postRTableFromBlock(SessionState& session, const nlohmann::ordered_json& block,
+                         double level);
+// Identity of the live e() block (0 = none). Changes whenever e() is replaced;
+// O(1), so dispatch() can take it on every entry.
+std::uintptr_t liveEstimationIdentity(const SessionState& session);
+// The r-class replacement for every handler that MERGES its keys into r(): if r()
+// was written since `mark` (a store generation moved, or an r() matrix was posted
+// or erased), erase every r() scalar, user r() macro and r() matrix last written
+// at or before it. Reserved \x01 keys (s(), test's accumulate set) stay. True if
+// r() was written. See eval/session.h nextStoreGeneration.
+bool replaceStaleRClass(eval::EvalSession& ev, const eval::RStoreMark& mark);
+// dispatcher.cpp's dispatch() calls this after every command with the e() identity
+// and the r() mark it took on entry, and whether the command was a LEAF (no
+// dispatch() ran inside it): r() written by the command replaces all of r()
+// (replaceStaleRClass; a container is judged from its last inner command on); a
+// leaf that replaced e() replaces r() and posts the table of the block it returned;
+// a container that replaced e() keeps only a table posted for the e() now live;
+// `margins` retires it.
+void rTableAfterCommand(SessionState& session, const nlohmann::ordered_json& result,
+                        const std::string& rawCmd, std::uintptr_t eIdAtEntry, bool leaf,
+                        const eval::RStoreMark& markAtEntry);
+
+// `margins [marginlist] [, dydx(VAR...) | at(...) atmeans post]`. `marginlist` is
+// the command's positional terms (the dispatcher's parsed.varlist): one factor
+// variable of a least-squares fit gives the predictive margin at each of its
+// levels (FU-94). Every served form replaces r() with r(b)/r(V)/r(N) (FU-179).
+nlohmann::ordered_json runMargins(const std::vector<std::string>& marginlist,
+                                   const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                    SessionState& session);
+
+// What margins needs from a fit to answer over at() points, a marginlist factor
+// or atmeans from the fit's own e(b)/e(V) (cecon::margins_grid, posthest.h):
+// built by runMargins for a least-squares or logit/probit fit and by
+// runGlmMargins for a glm. `names` are e(b)'s column names (no equation prefix,
+// the engine's spelling or Stata's), `data` every variable a name's atoms read,
+// over the e(sample) rows. `dfR` is e(df_r) when the fit's margins table is
+// t-referenced (regress, areg), NaN for z (xtreg, reghdfe, logit, glm).
+struct MarginsGridFit {
+  std::vector<std::string> names;
+  std::vector<double> b, V;  // k, k*k
+  int link = 0;              // cecon::GlmLinkFn
+  int64_t n = 0;
+  std::map<std::string, std::vector<double>> data;
+  std::vector<double> weights;  // n fit weights, or empty
+  bool fweight = false;         // r(N) is the weight sum
+  double dfR = 0.0;
+  bool tRef = false;
+  bool cluster = false;
+  std::string depvar, dataPath;
+};
+
+// Serves `margins [factor] [, at() atmeans dydx() post]` through the grid. nullopt
+// = a form the grid does not take (dydx(*), a marginlist with at(), several
+// marginlist terms); the caller decides whether that is a refusal.
+std::optional<nlohmann::ordered_json> runMarginsGrid(
+    SessionState& session, const MarginsGridFit& fit, const std::vector<std::string>& marginlist,
+    const std::vector<std::pair<std::string, eval::OptValue>>& opts);
+
+// margins' r() for `margins, dydx() [post]` after a glm without an interaction
+// (runGlmMargins' own path): r(N) = the block's n_obs, r(b)/r(V) over `names`
+// (a factor's base level included, 0 with variance 0), r(table) from
+// `tableRows` (one row per name; a base row's se/t/p/ci null), and the
+// declared set of the runMargins grid (w2v_margins_siblings C8_gamif_dydx_x).
+void postGlmDydxRClass(SessionState& session, const nlohmann::ordered_json& block,
+                       const std::vector<std::string>& names, const std::vector<double>& b,
+                       const std::vector<std::vector<double>>& V, const nlohmann::ordered_json& tableRows,
+                       const std::string& xvars, bool cluster);
 
 // `predict [NEWVAR] [, xb|resid|residuals|fe]` — reconstructs the last model
 // and calls cobra predict; unsupported statistics (cooksd/leverage/hat/...)
@@ -1457,7 +1823,7 @@ nlohmann::ordered_json runEstat(const std::string& subcmd,
 
 // -- BETA campaign Phase D batch D4/D5: time-series + post-estimation/diag/
 // misc wirings (BS-077/078/079/080/081/085/021/082/086/083/084/087). Oracle:
-// private-notes/plans/BETA-20260712-campaign/probes/d45-oracle-stata.log
+// internal capture d45-oracle-stata.log
 // (StataBE 19.5 on piet/packaging/sample/fatalities.csv, `gen high=(beertax
 // >.5)` + `encode state, gen(snum)` + `gen t=_n` + `tsset t`; sections
 // D4a-D4f, D5a-D5g). See each handler's own .cpp header comment
@@ -1561,6 +1927,12 @@ nlohmann::ordered_json runEstimatesUse(const std::string& fileArg, SessionState&
 
 // `eststo dir` / `est dir` / `estimates dir` — list stored estimate names.
 nlohmann::ordered_json runEststoDir(SessionState& session);
+// Every stored estimate and the `_est_NAME` variables written for them, as
+// `estimates clear` and `clear matrix` (its `_est drop _all`) drop them (BUG-1212).
+void clearStoredEstimates(SessionState& session);
+// Empty every e() store a later reader can see: `ereturn clear`, and permute and
+// jackknife before what they post (handlers_ereturn.cpp).
+void clearEResults(SessionState& session);
 
 // `eststo drop|clear [NAME]` / `est drop|clear [NAME]` / `estimates
 // drop|clear [NAME]`.
@@ -1589,6 +1961,14 @@ nlohmann::ordered_json runEstimatesTable(const std::vector<std::string>& modelNa
 // ytitle()]` — coefficient-plot graph block from the stored estimates (or
 // session.lastModel() as a single-model "last" fallback when the store is
 // empty). C++ port of coefplot.py's run_coefplot.
+// coefplot-family AN-1..AN-4 (handlers_coefplot.cpp): coefplot 1.8.8's data
+// pipeline -- the subgraph/plot/model grammar, keep/drop/order/rename/levels/
+// ci()/matrix(), generate(), r(). Returns the blocks to emit before the graph
+// (notes, the generate() mutation) or a refusal; `drawRows` receives the
+// plotted rows (empty when there is nothing to plot).
+nlohmann::ordered_json runCoefplotJann(SessionState& session, const eval::ParsedCommand& parsed,
+                                       nlohmann::ordered_json* drawRows);
+
 nlohmann::ordered_json runCoefplot(const std::vector<std::string>& names,
                                     const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                     SessionState& session);
@@ -1605,11 +1985,133 @@ nlohmann::ordered_json runCoefplot(const std::vector<std::string>& names,
 nlohmann::ordered_json runScatter(Datastore& ds, const std::vector<std::string>& varlist,
                                    const std::vector<std::pair<std::string, eval::OptValue>>& opts);
 
-nlohmann::ordered_json runHistogram(Datastore& ds, const std::vector<std::string>& varlist,
-                                     const std::vector<std::pair<std::string, eval::OptValue>>& opts);
+// gfx-histogram-kdensity-family (oracle aer_w2 w2aq_histogram_family): ONE
+// binning rule ([R] histogram) and ONE density rule ([R] kdensity, Methods and
+// formulas). histogram/hist, twoway__histogram_gen and kdensity read them; the
+// twoway histogram/kdensity layers read the same.
+struct HistGenSpec {
+  std::string varname;            // for start()'s message
+  bool discrete = false;
+  std::optional<int64_t> bins;    // bins()/bin(), integer > 0
+  std::optional<double> width;    // width(), > 0
+  std::optional<double> start;    // start()
+  std::string type = "density";   // density | fraction | frequency | percent
+  bool genFloat = true;           // generated values are stored as c(type) (float by default)
+};
+struct HistGenResult {
+  int rc = 0;                     // 198: start() above the minimum
+  std::string message;
+  bool empty = false;             // r(N) == 0: Stata's empty-sample results
+  double area = 0, max = 0, min = 0, start = 0, width = 0, N = 0;
+  int64_t bin = 1;
+  int64_t nx = 0;                 // r(n_x): rows of the generated centre
+  bool userStart = false;
+  bool closingRow = false;        // the extra (x = start, y = .) row
+  std::string type;
+  // generate(): one entry per OCCUPIED bin, ascending; values as stored
+  // (float-rounded under c(type) float). `centre` may carry one more entry,
+  // the closing row.
+  std::vector<double> binIndex, count, centre, height;
+};
+HistGenResult histogramGen(const std::vector<double>& v, const std::vector<double>* w,
+                           const HistGenSpec& spec, int64_t nDataRows, bool wantGenerate);
 
-nlohmann::ordered_json runKdensity(Datastore& ds, const std::vector<std::string>& varlist,
-                                    const std::vector<std::pair<std::string, eval::OptValue>>& opts);
+struct KdensitySpec {
+  std::string kernel = "epanechnikov";
+  double width = 0.0;   // 0 = the default bandwidth
+  int64_t n = 50;
+  std::string wtype;    // "" | fweight | aweight | iweight
+};
+struct KdensityResult {
+  std::string kernel;
+  double bwidth = 0, scale = 0, mean = 0, sd = 0;
+  int64_t n = 0;
+  bool nCapped = false;            // n() > _N: "(n() set to #)"
+  std::vector<double> grid, density;  // grid mode: n points; at(): one per row
+};
+// The kernel K(z) by its full name; NaN for an unknown name.
+double kdeKernel(const std::string& kernel, double z);
+// The kernel a typed kernel() word names (Stata's abbreviations), nullopt when invalid.
+std::optional<std::string> kdensityKernelName(const std::string& typed);
+// The kernel density estimate at each point of `at` (NaN points stay NaN).
+std::vector<double> kdensityAt(const std::vector<double>& x, const std::vector<double>& w,
+                               const std::string& wtype, const std::string& kernel, double h,
+                               const std::vector<double>& at);
+// kdensity's default bandwidth ([R] kdensity), with the summarize min/max/mean/sd it reads.
+double kdensityDefaultWidth(const std::vector<double>& x, const std::vector<double>& w,
+                            const std::string& wtype, double* outMin, double* outMax,
+                            double* outMean, double* outSd);
+KdensityResult kdensityEstimate(const std::vector<double>& x, const std::vector<double>& w,
+                                const KdensitySpec& spec, int64_t nDataRows,
+                                const std::vector<double>* at);
+
+// `histogram`/`hist`: `ds` is the (if-filtered) frame. Returns the graph block
+// or an error block; `pre` receives the blocks Stata prints before the graph
+// (the `(bin=#, start=#, width=#)` note).
+// serset-twoway HIST-1: `sersets`, when given, receives the graph's sersets in
+// plot order (histogram or by-panels, kdensity overlay, normal overlay).
+nlohmann::ordered_json runHistogram(SessionState& session, Datastore& ds,
+                                     const std::vector<std::string>& varlist,
+                                     const eval::ParsedCommand& parsed,
+                                     std::vector<nlohmann::ordered_json>* pre,
+                                     std::vector<serset::Serset>* sersets = nullptr);
+
+// `kdensity`: the graph block (empty object under nograph; *graphDrawn says
+// which) or an error block; posts r() and writes generate(). `pre` receives
+// the `(n() set to #)` note and the generate() mutation block.
+// serset-twoway HIST-1: `sersets` receives the drawn graph's sersets (the
+// density line, then the normal overlay); none under nograph.
+nlohmann::ordered_json runKdensity(SessionState& session, Datastore& ds,
+                                    const std::vector<std::string>& varlist,
+                                    const eval::ParsedCommand& parsed,
+                                    std::vector<nlohmann::ordered_json>* pre, bool* graphDrawn,
+                                    std::vector<serset::Serset>* sersets = nullptr);
+
+// A graph command's saving(filename[, replace]): writes the block as `graph
+// save` does, without registering a name. Null on success, else an error block.
+// serset-twoway GST: `sersets`, when given, are written beside the block
+// (doc["sersets"]) so `graph use` can restore them. BUG-1529: on success
+// `savedNote` (when given) receives the `file ... saved` note to print after the
+// graph.
+nlohmann::ordered_json saveGraphOption(const nlohmann::ordered_json& block, const std::string& savingText,
+                                       SessionState& session,
+                                       const std::vector<serset::Serset>* sersets = nullptr,
+                                       nlohmann::ordered_json* savedNote = nullptr);
+
+// graph-family AI-1/AI-2 (graph_bar.cpp): `graph bar|hbar|box|hbox` over `ds`
+// (the if/in-filtered frame), `args` = the words after the subcommand (the
+// statlist). `sets` holds the graph's one serset (`serset use`), `block` the
+// graph block or the refusal.
+struct BarGraphResult {
+  nlohmann::ordered_json block;
+  std::vector<serset::Serset> sets;
+  bool ok = false;
+};
+BarGraphResult runGraphBarBox(SessionState& session, Datastore& ds, const std::string& kind,
+                              const std::vector<std::string>& args, const eval::ParsedCommand& parsed);
+
+// graph-family AI-4/AI-6/AI-7 (graph_store.cpp): `graph describe [name |
+// "file.gph"]` (argText = the text after the subcommand, before the comma),
+// `graph copy|rename [old] new [, replace]`, `graph display|draw [name] [,
+// xsize() ysize() ...]`. Each returns the blocks to emit.
+nlohmann::ordered_json runGraphDescribe(SessionState& session, const std::string& argText);
+nlohmann::ordered_json runGraphCopyRename(SessionState& session, bool rename,
+                                          const std::vector<std::string>& names, bool replace);
+nlohmann::ordered_json runGraphDisplay(SessionState& session, const std::string& nameArg,
+                                       const std::vector<std::pair<std::string, eval::OptValue>>& opts);
+
+// serset-twoway GST: `graph use filename [, name(nm[, replace]) nodraw ...]`
+// (gr_use.ado): opens filename (.gph appended to a name without a suffix;
+// r(601) `file <path> not found`), registers the graph under name() or the
+// file's base name and restores its sersets (w2al tf_st_use_sc `2|1|0 1|`,
+// log:5100-5118). Returns the blocks to emit.
+nlohmann::ordered_json runGraphUse(const std::string& fileArg,
+                                   const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                                   SessionState& session);
+
+// `twoway__histogram_gen` (Stata's internal program histogram calls): an ARRAY
+// of blocks (the display note, the generate() mutation) or one error object.
+nlohmann::ordered_json runTwowayHistogramGen(const eval::ParsedCommand& parsed, SessionState& session);
 
 nlohmann::ordered_json runGraphLine(Datastore& ds, const std::vector<std::string>& varlist,
                                      const std::vector<std::pair<std::string, eval::OptValue>>& opts);
@@ -1632,10 +2134,16 @@ nlohmann::ordered_json runTsline(Datastore& ds, const std::vector<std::string>& 
 // `dsPtr == nullptr` -> no_data_loaded. Returns a `kind:"twoway"` graph block
 // (or an error block) — same shape buildSvgTwoway() (graph_m4.cpp's SVG
 // structural builder) already renders.
+// serset-twoway SS: `sersetPlots`, when given, receives one serset::PlotSpec per
+// drawn layer, in layer order (the input of serset::buildPlotSersets).
+// serset-twoway IN: `globalIn` is the `in` range after the last group; it
+// intersects each layer's own `in` and `if`.
 nlohmann::ordered_json runTwowayLayers(
     Datastore* dsPtr, SessionState& session, const std::vector<twoway::LayerSpec>& layers,
     const std::vector<std::pair<std::string, eval::OptValue>>& globalOpts,
-    const std::optional<std::string>& globalIf);
+    const std::optional<std::string>& globalIf,
+    std::vector<serset::PlotSpec>* sersetPlots = nullptr,
+    const std::optional<std::string>& globalIn = std::nullopt);
 
 // `marginsplot` — reads session.lastMargins (cached by runMargins), plots one
 // dot + 95% CI whisker per AME. C++ port of dispatcher.py's _run_marginsplot.
@@ -1681,6 +2189,12 @@ nlohmann::ordered_json runGraphExport(const std::string& filepathArg,
                                        const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                        SessionState& session);
 
+// graph-family AI-13 (graph_export_formats.cpp): the structural SVG of a graph
+// replayed as `fmt` ("png" | "pdf" | "eps"/"ps"); width/height in pixels for a
+// png (0 = derived). False for any other format.
+bool graphSvgToFormat(const std::string& svg, const std::string& fmt, int widthPx, int heightPx,
+                      std::string* out);
+
 // Builds the structural SVG string for one graph block (dispatches on
 // block["kind"]). Exposed for runGraphExport and (if ever needed) direct
 // testing; matches graph_export.py's `_build_svg` dispatcher exactly.
@@ -1707,6 +2221,15 @@ nlohmann::ordered_json runRdrobust(const eval::ParsedCommand& parsed, SessionSta
 nlohmann::ordered_json runRddensity(const eval::ParsedCommand& parsed, SessionState& session);
 nlohmann::ordered_json runRdplot(const eval::ParsedCommand& parsed, SessionState& session);
 nlohmann::ordered_json runBinscatter(const eval::ParsedCommand& parsed, SessionState& session);
+
+// THE varlist-name resolution of the by/bysort keys (dispatcher.cpp, BUG-532):
+// wildcards and ranges expand through loops::expandVarlist, an exact name
+// stays, a unique prefix stands for its variable, several prefix matches are
+// r(111) "<tok> ambiguous abbreviation"; a token that matches nothing is left
+// as typed. `names` is rewritten in place; the return is an error block or
+// nullopt. binscatter's by()/controls()/absorb() use it too (FU-1088).
+std::optional<nlohmann::ordered_json> resolveByKeyNames(SessionState& session,
+                                                        std::vector<std::string>& names);
 nlohmann::ordered_json runEventstudyinteract(const eval::ParsedCommand& parsed,
                                               SessionState& session);
 nlohmann::ordered_json runDidImputation(const eval::ParsedCommand& parsed, SessionState& session);
@@ -1800,7 +2323,7 @@ inline std::string unimplementedVceType(const std::string& raw) {
 // BUG-496 is what a rule implemented twice in exactly that shape costs. One
 // semantics, two call sites, both pinned by selftest arms.
 //
-// The grammar is estout.ado:3426 `_TransformCoefs`, read before implementing and
+// The grammar is estout `_TransformCoefs`, read before implementing and
 // then measured: the value is a flat whitespace-separated list taken as TRIPLES
 // (pattern, f, df), and a trailing group of two is (f, df) with no pattern -- so
 // a one- or two-token list applies to every row.
@@ -1845,6 +2368,79 @@ TransformCell transformOneCell(const TransformSpec& spec, size_t modelIdx,
                                const std::string& coefName, double b,
                                const nlohmann::ordered_json& snap, SessionState& session);
 
+// ---- AER tier-1 (2026-10-28), handlers_t1_*.cpp ----------------------------
+// The difficulty-1 bundle: every command below is wiring over pieces that
+// already existed. Answers: tests/eval/golden/aer_w2/w2ax_t1_official.log and
+// w2ax_t1_community.log. One TU per lane, each lane writing only its own file.
+//
+// handlers_t1_zip.cpp -- the ZIP verbs over zip_io.h.
+// `unzipfile zipfile[.zip] [, replace]`; existing files are skipped without
+// replace (rc 0, "can't overwrite ... skipping").
+nlohmann::ordered_json runUnzipfile(const eval::ParsedCommand& parsed, SessionState& session);
+// `zipfile file [file ...], saving(name[, replace])` -- stored, not deflated.
+nlohmann::ordered_json runZipfile(const eval::ParsedCommand& parsed, SessionState& session);
+// `zipuse [varlist] using file | zipuse file [, clear]` (zipsave package).
+nlohmann::ordered_json runZipuse(const eval::ParsedCommand& parsed, SessionState& session);
+// `zipsave file [, replace]` (zipsave package) -- writes <file>.dta.zip.
+nlohmann::ordered_json runZipsave(const eval::ParsedCommand& parsed, SessionState& session);
+//
+// handlers_t1_env.cpp -- macro and program-environment verbs.
+// `macro drop|define|shift|list|dir ...`, consumed as a raw line before the
+// tokenizer (whose unsupported_macro net names `macro`). Called twice, like
+// tryTempDeclIntercept: on the raw line (`expanded` false, which defers any
+// line still holding `$` or a backtick) and on the macro-expanded line.
+// Returns true when it consumed the line, with the reply in `out`.
+bool tryMacroVerbIntercept(const std::string& line, SessionState& session,
+                           const nlohmann::ordered_json& echo, nlohmann::ordered_json& out,
+                           bool expanded);
+// `require pkg[op version] ... [, install strict]` (Correia/Seay) -- accept-note.
+nlohmann::ordered_json runRequire(const eval::ParsedCommand& parsed, SessionState& session);
+// `_dots 0, title() reps()` header and `_dots # rc` progress marks.
+nlohmann::ordered_json runDots(const eval::ParsedCommand& parsed, SessionState& session);
+// `postutil clear | dir`.
+nlohmann::ordered_json runPostutil(const eval::ParsedCommand& parsed, SessionState& session);
+// `markout markvar [varlist] [, strok]`.
+nlohmann::ordered_json runMarkout(const eval::ParsedCommand& parsed, SessionState& session);
+// `lrtest name1 [name2] [, df() force]` -- sets r(chi2) r(df) r(p).
+nlohmann::ordered_json runLrtest(const eval::ParsedCommand& parsed, SessionState& session);
+//
+// handlers_t1_meta.cpp -- verbs that read or rename, never compute.
+// `findname [varlist] [, varlabeltext()]` (Cox) -- sets r(varlist).
+nlohmann::ordered_json runFindname(const eval::ParsedCommand& parsed, SessionState& session);
+// `xtdescribe [if] [in] [, patterns()]` -- r() are summarize, detail of T_i.
+nlohmann::ordered_json runXtdescribe(const eval::ParsedCommand& parsed, SessionState& session);
+// tsset's delta phrase ("1 unit", "2 quarters", the %tc breakdown); defined in
+// handlers_m3.cpp beside the tsset/xtset arm that prints it too.
+std::string tsDeltaText(double delta, const std::string& fmt);
+// `cf varlist using file [, verbose]` -- rc 9 on any difference.
+nlohmann::ordered_json runCf(const eval::ParsedCommand& parsed, SessionState& session);
+// `fvunab lmacname : varlist` -- operator prefixes kept, canonical case.
+nlohmann::ordered_json runFvunab(const eval::ParsedCommand& parsed, SessionState& session);
+// `numlabel [lblnames], add|remove [mask() force]`.
+nlohmann::ordered_json runNumlabel(const eval::ParsedCommand& parsed, SessionState& session);
+// `labvars varlist "label" ... [, remove]` (Klein).
+nlohmann::ordered_json runLabvars(const eval::ParsedCommand& parsed, SessionState& session);
+// `renpfix old [new]` -- renames in order, stopping at the first clash.
+nlohmann::ordered_json runRenpfix(const eval::ParsedCommand& parsed, SessionState& session);
+//
+// handlers_t1_gen.cpp -- verbs that write a column.
+// `mvdecode varlist, mv(numlist[=.] [\ numlist[=.]])`.
+nlohmann::ordered_json runMvdecode(const eval::ParsedCommand& parsed, SessionState& session);
+// `integ yvar xvar [if] [in] [, generate() trapezoid]` -- sets r(integral).
+nlohmann::ordered_json runInteg(const eval::ParsedCommand& parsed, SessionState& session);
+// `sencode strvar [if] [in], generate()|replace [label() gsort()]` (Newson).
+nlohmann::ordered_json runSencode(const eval::ParsedCommand& parsed, SessionState& session);
+// `fillmissing varlist [if] [in] [, with()]` (Shah); the by-prefix arrives as by().
+nlohmann::ordered_json runFillmissing(const eval::ParsedCommand& parsed, SessionState& session);
+// `astile newvar = var [if] [in] [, nq() by()]` (Shah); the by-prefix arrives as by().
+nlohmann::ordered_json runAstile(const eval::ParsedCommand& parsed, SessionState& session);
+//
+// handlers_t1_matrix.cpp -- the matrix store.
+// `matsort matname [col] [up|down]` (Millar).
+nlohmann::ordered_json runMatsort(const eval::ParsedCommand& parsed, SessionState& session);
+// `matselrc m1 m2 [, row() col() names]` (Cox, STB-56 dm79).
+nlohmann::ordered_json runMatselrc(const eval::ParsedCommand& parsed, SessionState& session);
+
 }  // namespace piet::handlers
 
 // Canonical Stata-style user-supplied-path resolver (native-paths
@@ -1864,6 +2460,11 @@ TransformCell transformOneCell(const TransformSpec& spec, size_t modelIdx,
 // need re-declaring there); one shared symbol replaces both forks.
 namespace piet {
 std::string resolveUserPath(const SessionState& session, const std::string& rawPath);
+// The same path as a message names it: step 1 above and nothing else. Stata's
+// "file X not found" names the file as typed (`file sub/nofile.txt not found`),
+// never the resolved absolute path, which would put this machine's working
+// directory into every captured transcript (BUG-410).
+std::string typedUserPath(const std::string& rawPath);
 }  // namespace piet
 
 #endif  // PIET_NATIVE_HANDLERS_H

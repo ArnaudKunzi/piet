@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — random-intercept multilevel (mixed-effects) regression by MAXIMUM
 // LIKELIHOOD, matching Stata `mixed y x1 x2 || GROUP:,` (Stata's `mixed` default
 // is ML; REML is a different objective and moves var(_cons) in the third digit,

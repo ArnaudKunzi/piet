@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "estimators/xtreg.h"
 
 #include <algorithm>
@@ -249,6 +251,72 @@ XtregReResult xtreg_re(const double* X_in, int64_t n_obs, int k,
         R.se[static_cast<size_t>(c)] = std::sqrt(std::max(0.0,
             R.vcov_matrix[static_cast<size_t>(c) * (k + 1) + c]));
 
+    return R;
+}
+
+XtregBeResult xtreg_be(const double* X, int64_t n_obs, int k,
+                       const double* y, const double* ivar) {
+    XtregBeResult R;
+    R.k = k;
+    R.n_obs = n_obs;
+    // Panel means of y and X, panels in first-appearance order (the caller has
+    // already dropped rows with a missing value).
+    std::unordered_map<double, int64_t> idx_of;
+    std::vector<double> ybar, Xsum;  // Xsum: n_g rows of k
+    std::vector<int64_t> T;
+    for (int64_t r = 0; r < n_obs; ++r) {
+        auto it = idx_of.find(ivar[r]);
+        int64_t g;
+        if (it == idx_of.end()) {
+            g = static_cast<int64_t>(T.size());
+            idx_of.emplace(ivar[r], g);
+            ybar.push_back(0.0);
+            Xsum.resize(Xsum.size() + static_cast<size_t>(k), 0.0);
+            T.push_back(0);
+        } else {
+            g = it->second;
+        }
+        ybar[static_cast<size_t>(g)] += y[r];
+        for (int c = 0; c < k; ++c)
+            Xsum[static_cast<size_t>(g) * k + static_cast<size_t>(c)] += X[static_cast<int64_t>(c) * n_obs + r];
+        ++T[static_cast<size_t>(g)];
+    }
+    const int64_t n_g = static_cast<int64_t>(T.size());
+    R.n_groups = n_g;
+    const int kk = k + 1;
+    if (n_g <= kk) return R;
+    std::vector<double> Xb(static_cast<size_t>(n_g) * kk);  // [X̄ | 1], col-major
+    for (int64_t g = 0; g < n_g; ++g) {
+        const double Tg = static_cast<double>(T[static_cast<size_t>(g)]);
+        ybar[static_cast<size_t>(g)] /= Tg;
+        for (int c = 0; c < k; ++c)
+            Xb[static_cast<size_t>(c) * n_g + g] = Xsum[static_cast<size_t>(g) * k + static_cast<size_t>(c)] / Tg;
+        Xb[static_cast<size_t>(k) * n_g + g] = 1.0;
+    }
+    std::vector<double> beta, XtXi;
+    if (ols_solve(Xb.data(), n_g, kk, ybar.data(), beta, XtXi) != 0) return R;
+    double ymean = 0;
+    for (int64_t g = 0; g < n_g; ++g) ymean += ybar[static_cast<size_t>(g)];
+    ymean /= static_cast<double>(n_g);
+    double rss = 0, tss = 0;
+    for (int64_t g = 0; g < n_g; ++g) {
+        double fit = 0;
+        for (int c = 0; c < kk; ++c) fit += Xb[static_cast<size_t>(c) * n_g + g] * beta[static_cast<size_t>(c)];
+        const double e = ybar[static_cast<size_t>(g)] - fit, d = ybar[static_cast<size_t>(g)] - ymean;
+        rss += e * e;
+        tss += d * d;
+    }
+    R.rss = rss;
+    R.mss = tss - rss;
+    R.df_r = static_cast<double>(n_g - kk);
+    const double s2 = rss / R.df_r;
+    R.beta = beta;
+    R.vcov_matrix.assign(XtXi.size(), 0.0);
+    for (size_t i = 0; i < XtXi.size(); ++i) R.vcov_matrix[i] = s2 * XtXi[i];
+    R.se.assign(static_cast<size_t>(kk), 0.0);
+    for (int c = 0; c < kk; ++c)
+        R.se[static_cast<size_t>(c)] = std::sqrt(std::max(0.0, R.vcov_matrix[static_cast<size_t>(c) * kk + c]));
+    R.ok = true;
     return R;
 }
 

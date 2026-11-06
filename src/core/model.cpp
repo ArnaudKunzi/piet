@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "core/model.h"
 #include "core/error.h"
 #include "data/ts_operators.h"
@@ -84,6 +86,49 @@ Factor make_factor(const std::string& name, const KeyCol& kc,
     f.n_levels = next;
     f.count.assign(f.n_levels, 0.0);
     for (int32_t c : f.codes) f.count[c] += 1.0;
+    return f;
+}
+
+// An absorbed interaction `a#b` (reghdfe/ppmlhdfe absorb(a#b), `i.a#i.b` too):
+// the parts, each a plain key column. A `c.` part (heterogeneous slopes) is not a
+// grouping and is refused by name.
+// BUG-1180: `a##b` of grouping variables expands to a, b and a#b, whose span is a#b's
+// alone, and reghdfe absorbs exactly that one group (StataBE 19.5: `reghdfe y x,
+// absorb(a##b)` posts e(extended_absvars) "a#b", N_hdfe 1, e(df_a) 12 and the fit of
+// absorb(a#b) to the digit), so `##` is read as `#` here; mixed forms likewise span
+// the full interaction.
+std::vector<std::string> fe_interaction_parts(const std::string& name_in) {
+    if (name_in.find('#') == std::string::npos) return {name_in};
+    std::string name = name_in;
+    for (size_t h = name.find("##"); h != std::string::npos; h = name.find("##", h + 1))
+        name.erase(h, 1);
+    std::vector<std::string> parts;
+    size_t start = 0;
+    while (true) {
+        const size_t h = name.find('#', start);
+        std::string p = name.substr(start, h == std::string::npos ? std::string::npos : h - start);
+        if (p.size() > 2 && (p[0] == 'i' || p[0] == 'I') && p[1] == '.') p = p.substr(2);
+        if (p.empty() || p.find('.') != std::string::npos)
+            throw EngineError("unsupported",
+                              "absorb(" + name_in + "): only interactions of grouping variables "
+                              "are supported", name_in);
+        parts.push_back(p);
+        if (h == std::string::npos) break;
+        start = h + 1;
+    }
+    return parts;
+}
+
+// The grouping of an absorbed interaction: one level per observed combination of
+// the parts' levels (each part keyed exactly as make_factor keys it).
+Factor make_interaction_factor(const std::string& name, const std::vector<KeyCol>& kcs,
+                               const std::vector<int64_t>& keep) {
+    Factor f = make_factor(name, kcs.front(), keep);
+    // Compress after each pair so the key stays within int64 even for many
+    // high-cardinality parts (each factor's codes are int32).
+    for (size_t j = 1; j < kcs.size(); ++j)
+        f = intersect_factors(f, make_factor(name, kcs[j], keep));
+    f.name = name;
     return f;
 }
 
@@ -359,7 +404,43 @@ std::vector<FvTerm> parse_fvterms(const Dataset& ds, const std::vector<std::stri
             terms.push_back(std::move(t));
         }
     }
-    return terms;
+    // A factor-variable term repeated across the varlist is ONE term at its first
+    // position, which implements Stata's varlist expansion per StataBE probes
+    // (scratch-r150/c1067/m2.do, m3.do; regress, reghdfe, areg and xtreg,fe alike):
+    // `c.x##i.t s##i.t` carries i.t once (`x 0b.t 1.t 2.t ... 0b.s 1.s ...`),
+    // `i.t x i.t` is `0b.t 1.t 2.t x`, and `i.t##i.s i.s##i.t` collapses s#t into
+    // t#s. A term of continuous parts only is NOT collapsed: `c.x c.x` and the c.x
+    // of `c.x##i.t c.x##i.s` repeat as an omitted `o.x`. Without this the repeated
+    // column was a second, collinear copy under the SAME name, and the reply's
+    // omitted entry overwrote the kept coefficient with 0 (package 007's
+    // `a##treatment b##treatment ...`: _b[1.treatment] reported 0). Parts are
+    // compared as a set (operand order does not matter) together with their base
+    // and level selection, so `i.t ib1.t` stays two terms.
+    std::vector<FvTerm> unique;
+    std::vector<std::string> seen;
+    unique.reserve(terms.size());
+    for (auto& t : terms) {
+        bool any_factor = false;
+        std::vector<std::string> keys;
+        for (const auto& p : t.parts) {
+            any_factor = any_factor || p.factor;
+            std::string k = (p.factor ? "i:" : "c:") + p.name + "|" +
+                            std::to_string(static_cast<int>(p.base_mode)) + ":" +
+                            fmt_level(p.base_value) + "|" + (p.omit ? "o" : "") + "|";
+            if (p.has_sel)
+                for (double v : p.sel) k += fmt_level(v) + ",";
+            keys.push_back(std::move(k));
+        }
+        if (any_factor) {
+            std::sort(keys.begin(), keys.end());
+            std::string sig = t.pure_interaction ? "#|" : "##|";
+            for (const auto& k : keys) sig += k + "&";
+            if (std::find(seen.begin(), seen.end(), sig) != seen.end()) continue;
+            seen.push_back(std::move(sig));
+        }
+        unique.push_back(std::move(t));
+    }
+    return unique;
 }
 
 // All source columns referenced by the terms (for listwise NaN deletion).
@@ -472,6 +553,19 @@ int fvterm_ncols(const std::vector<FvTerm>& terms, const std::vector<int64_t>& k
             for (int64_t r : keep) vals.push_back(terms[t].parts[p].src[r]);
             std::sort(vals.begin(), vals.end());
             vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
+            // Stata r(452) on the estimation sample, the first offending variable in
+            // varlist order, noninteger checked before negative (StataBE: x = k/4 in i.x,
+            // x#z or c.(x#z): "x:  factor variables may not contain noninteger values";
+            // -2..2: "... negative values"; a variable with both: noninteger; fine under
+            // `if x == floor(x)`).
+            const std::string& pn = terms[t].parts[p].name;
+            for (double v : vals)
+                if (v != std::floor(v))
+                    throw EngineError("factor_values",
+                                      pn + ":  factor variables may not contain noninteger values", pn);
+            if (!vals.empty() && vals.front() < 0)
+                throw EngineError("factor_values",
+                                  pn + ":  factor variables may not contain negative values", pn);
             LevelPlan lp = resolve_levels(terms[t].parts[p], vals);
             // o. omit, or a selection/level set that yields no emittable level,
             // collapses the whole term to zero columns (Stata "(omitted)").
@@ -495,7 +589,8 @@ int fvterm_ncols(const std::vector<FvTerm>& terms, const std::vector<int64_t>& k
 // and both passes accumulate into the same sink.
 std::vector<std::pair<std::string, std::vector<double>>>
 fvterm_columns(const std::vector<FvTerm>& terms, const std::vector<int64_t>& keep,
-               std::vector<std::string>* warnings = nullptr) {
+               std::vector<std::string>* warnings = nullptr,
+               std::vector<size_t>* base_cells = nullptr) {
     std::vector<std::vector<std::vector<double>>> levels;
     std::vector<std::vector<LevelPlan>> plans;
     fvterm_ncols(terms, keep, levels, plans);  // levels + per-part emit/base plan
@@ -515,6 +610,25 @@ fvterm_columns(const std::vector<FvTerm>& terms, const std::vector<int64_t>& kee
             }
     }
     const int64_t n = static_cast<int64_t>(keep.size());
+    // BUG-1476: every term of the model as its set of atoms (`i:a`, `c:x`), for the
+    // base-cell rule of a standalone '#' below.
+    auto atom = [](const FvPart& p) { return std::string(p.factor ? "i:" : "c:") + p.name; };
+    auto atoms_sig = [](std::vector<std::string> a) {
+        std::sort(a.begin(), a.end());
+        std::string s;
+        for (const auto& x : a) s += x + "#";
+        return s;
+    };
+    std::vector<std::string> model_terms;
+    for (const auto& term : terms) {
+        bool o = false;
+        std::vector<std::string> a;
+        for (const auto& p : term.parts) {
+            o = o || (p.factor && p.omit);
+            a.push_back(atom(p));
+        }
+        if (!o) model_terms.push_back(atoms_sig(std::move(a)));
+    }
     std::vector<std::pair<std::string, std::vector<double>>> out;
     for (size_t t = 0; t < terms.size(); ++t) {
         const auto& parts = terms[t].parts;
@@ -526,7 +640,8 @@ fvterm_columns(const std::vector<FvTerm>& terms, const std::vector<int64_t>& kee
         for (const auto& p : parts) if (p.factor && p.omit) omitted = true;
         if (omitted) continue;
         // Per factor part, the level indices to materialize. A standalone '#'
-        // (pure) crosses ALL data levels and later omits the single all-base cell;
+        // (pure) crosses ALL data levels and later omits the base cells the rule
+        // below names (at least the all-base cell of a pure-factor '#');
         // otherwise we emit exactly the resolved non-base / in-selection levels.
         std::vector<size_t> fp;                 // positions of the factor parts
         std::vector<std::vector<int>> lidx;     // chosen level indices per factor part
@@ -550,13 +665,32 @@ fvterm_columns(const std::vector<FvTerm>& terms, const std::vector<int64_t>& kee
         if (dead) continue;
         std::vector<int> sel(fp.size(), 0);
         for (long long cmb = 0; cmb < combos; ++cmb) {
-            // standalone pure-factor '#': omit the single all-base combination
-            // (each part at its own resolved base level, not necessarily index 0).
-            bool all_base = pure && !has_cont && !fp.empty();
-            if (all_base)
+            // standalone '#': a cell with some factor parts at their own resolved base
+            // level is omitted when the term left after dropping some of those parts is
+            // in the model anywhere in the varlist -- or is empty (the constant), which
+            // is the single all-base cell of a pure-factor '#'. BUG-1476, StataBE
+            // fvexpand: `c.x#i.g c.x` -> `0b.g#co.x 1.g#c.x x`; `i.a i.a#i.g` ->
+            // `... 0b.a#0b.g 0b.a#1.g 1o.a#0b.g 1.a#1.g 2o.a#0b.g 2.a#1.g`; `c.x#i.g`
+            // alone keeps both cells.
+            bool omit_cell = false;
+            if (pure && !fp.empty()) {
+                std::vector<size_t> at_base;  // indices into fp
                 for (size_t k = 0; k < fp.size(); ++k)
-                    if (lidx[k][sel[k]] != base_of[k]) { all_base = false; break; }
-            if (!all_base) {
+                    if (lidx[k][sel[k]] == base_of[k]) at_base.push_back(k);
+                for (unsigned m = 1; m < (1u << at_base.size()) && !omit_cell; ++m) {
+                    std::vector<std::string> rest;
+                    for (size_t p = 0; p < parts.size(); ++p) {
+                        bool dropped = false;
+                        for (size_t b = 0; b < at_base.size(); ++b)
+                            if (((m >> b) & 1u) && fp[at_base[b]] == p) dropped = true;
+                        if (!dropped) rest.push_back(atom(parts[p]));
+                    }
+                    omit_cell = rest.empty() ||
+                                std::find(model_terms.begin(), model_terms.end(),
+                                          atoms_sig(rest)) != model_terms.end();
+                }
+            }
+            if (!omit_cell) {
                 std::string nm;
                 for (size_t p = 0; p < parts.size(); ++p) {
                     if (!nm.empty()) nm += "#";
@@ -586,7 +720,13 @@ fvterm_columns(const std::vector<FvTerm>& terms, const std::vector<int64_t>& kee
                     colv[static_cast<size_t>(r)] = v;
                     if (v != 0.0) allzero = false;
                 }
-                if (!allzero) out.emplace_back(std::move(nm), std::move(colv));
+                if (!allzero) {
+                    // A pure cell holding some factor's base level (ModelData::late_cells).
+                    if (base_cells != nullptr && pure && !has_cont)
+                        for (size_t k = 0; k < fp.size(); ++k)
+                            if (lidx[k][sel[k]] == base_of[k]) { base_cells->push_back(out.size()); break; }
+                    out.emplace_back(std::move(nm), std::move(colv));
+                }
             }
             for (int k = static_cast<int>(fp.size()) - 1; k >= 0; --k) {
                 if (++sel[k] < static_cast<int>(lidx[k].size())) break;
@@ -648,6 +788,26 @@ std::vector<std::string> ts_prepass(const Dataset& ds, const std::vector<std::st
         std::string err;
         if (!ts_apply(base, n, tvar, pvar, ts ? ts->delta : 1.0, spec, out, err))
             throw EngineError("ts_apply", "time-series operator '" + tok + "': " + err, tok);
+        // BUG-1277: Stata holds an operated variable in a FLOAT temporary when its
+        // source is byte, int or float (StataBE tsrevar: D./S./D2./F. of a float and
+        // D. of a byte or int are float, of a long or double double), the operator
+        // evaluated in double and rounded once (D2.yf == float(yf - 2*L.yf + L2.yf),
+        // DS2.yf alike). The .hbin carries no storage type, so a source whose every
+        // value is a float is taken for one. Only a difference can leave float; a lag
+        // or lead of float values stays float as is.
+        if (spec.d_count > 0 || !spec.s_lags.empty()) {
+            auto is_float = [](double v) {
+                return std::fabs(v) <= 3.4028234663852886e38 &&
+                       static_cast<double>(static_cast<float>(v)) == v;
+            };
+            bool float_src = true;
+            for (int64_t i = 0; i < n && float_src; ++i)
+                if (!std::isnan(base[i]) && !is_float(base[i])) float_src = false;
+            if (float_src)
+                for (double& v : out)
+                    if (!std::isnan(v) && std::fabs(v) <= 3.4028234663852886e38)
+                        v = static_cast<double>(static_cast<float>(v));
+        }
         std::string synth = "__ts" + std::to_string(ts_counter++) + "_" + sp.ts_token;
         storage.push_back(std::move(out));
         extra[synth] = storage.back().data();
@@ -989,14 +1149,17 @@ ModelData build_model(const Dataset& ds, const std::string& yname,
                       const TsMeta* ts, const std::vector<char>* row_mask,
                       const std::string& weight_name, WeightKind weight_kind) {
     const int64_t N = ds.n_rows();
-    const double* yp = require_f64(ds, yname);
-    const double* op = offset_name.empty() ? nullptr : require_f64(ds, offset_name);
-    const double* wp = weight_name.empty() ? nullptr : require_f64(ds, weight_name);
     // Time-series pre-pass: materialize any L./F./D./S. tokens (panel/time-aware)
     // into a side-table, rewriting them to plain names the factor expander resolves.
     std::vector<std::vector<double>> ts_storage;
     ExtraCols extra;
     std::vector<std::pair<std::string, std::string>> synth_to_real;
+    // BUG-1277: the depvar takes the same pre-pass (StataBE `regress D.y x1 x2 if t>=3`
+    // after tsset: e(N) 48, e(depvar) D.y), then resolves from the side-table.
+    const std::vector<std::string> yn = ts_prepass(ds, {yname}, ts, ts_storage, extra, synth_to_real);
+    const double* yp = require_f64(ds, yn[0], &extra);
+    const double* op = offset_name.empty() ? nullptr : require_f64(ds, offset_name);
+    const double* wp = weight_name.empty() ? nullptr : require_f64(ds, weight_name);
     std::vector<std::string> xn = ts_prepass(ds, xnames, ts, ts_storage, extra, synth_to_real);
     // Regressors are factor-variable terms: plain numeric, `i(col)` indicators,
     // or `#`/`##` interactions (Stata i./c./#/## — see parse_fvterms).
@@ -1008,7 +1171,13 @@ ModelData build_model(const Dataset& ds, const std::string& yname,
         const Column& c = ds.col(nm);
         keys.push_back({&c, c.dtype == DType::Factor});
     };
-    for (const auto& nm : fenames) add_key(nm);
+    // Per absorbed term, how many key columns it reads (2+ for `a#b`).
+    std::vector<size_t> fe_nparts;
+    for (const auto& nm : fenames) {
+        const std::vector<std::string> parts = fe_interaction_parts(nm);
+        for (const auto& p : parts) add_key(p);
+        fe_nparts.push_back(parts.size());
+    }
     for (const auto& nm : clusternames) add_key(nm);
 
     // Single listwise deletion across y, X, fe, cluster. row_mask (E1), when given,
@@ -1054,7 +1223,8 @@ ModelData build_model(const Dataset& ds, const std::string& yname,
 
     // Expand factor-variable terms into concrete design columns (levels enumerated
     // over kept rows, base = smallest dropped; empty interaction cells omitted).
-    auto xcols = fvterm_columns(xterms, keep, &md.warnings);
+    std::vector<size_t> base_cells;
+    auto xcols = fvterm_columns(xterms, keep, &md.warnings, &base_cells);
     int n_cols = static_cast<int>(xcols.size());
     dm.k = n_cols + (md.has_intercept ? 1 : 0);
     dm.X.resize(static_cast<size_t>(dm.n) * dm.k);
@@ -1067,10 +1237,13 @@ ModelData build_model(const Dataset& ds, const std::string& yname,
         for (int64_t r = 0; r < dm.n; ++r) c0[r] = 1.0;
         dm.xnames.push_back("(intercept)");
     }
-    for (auto& nc : xcols) {
+    for (size_t xi = 0; xi < xcols.size(); ++xi) {
+        auto& nc = xcols[xi];
         double* cj = dm.col(col++);
         std::copy(nc.second.begin(), nc.second.end(), cj);
         restore_ts_names(nc.first, synth_to_real);
+        if (std::find(base_cells.begin(), base_cells.end(), xi) != base_cells.end())
+            md.late_cells.push_back(nc.first);
         dm.xnames.push_back(std::move(nc.first));
         // C3-F3: release this column's own buffer now that its values are
         // copied into dm.X. xcols is never read again before it goes out of
@@ -1095,7 +1268,16 @@ ModelData build_model(const Dataset& ds, const std::string& yname,
     }
 
     size_t ki = 0;
-    for (const auto& nm : fenames) md.fe.push_back(make_factor(nm, keys[ki++], keep));
+    for (size_t f = 0; f < fenames.size(); ++f) {
+        if (fe_nparts[f] == 1) {
+            md.fe.push_back(make_factor(fenames[f], keys[ki++], keep));
+        } else {
+            const std::vector<KeyCol> kcs(keys.begin() + static_cast<std::ptrdiff_t>(ki),
+                                          keys.begin() + static_cast<std::ptrdiff_t>(ki + fe_nparts[f]));
+            md.fe.push_back(make_interaction_factor(fenames[f], kcs, keep));
+            ki += fe_nparts[f];
+        }
+    }
     for (const auto& nm : clusternames)
         md.cluster.push_back(make_factor(nm, keys[ki++], keep));
 
@@ -1111,14 +1293,16 @@ IvModelData build_iv_model(const Dataset& ds, const std::string& yname,
                            const std::vector<std::string>& fenames,
                            const std::vector<std::string>& clusternames,
                            const TsMeta* ts, bool drop_singleton,
-                           const std::vector<char>* row_mask) {
+                           const std::vector<char>* row_mask, bool no_intercept) {
     const int64_t N = ds.n_rows();
-    const double* yp = require_f64(ds, yname);
     // TS pre-pass over exog, endog, instruments (shared side-table so a var lagged
     // in more than one list materializes once per token).
     std::vector<std::vector<double>> ts_storage;
     ExtraCols extra;
     std::vector<std::pair<std::string, std::string>> synth_to_real;
+    // BUG-1277: and over the depvar, as build_model does.
+    const std::vector<std::string> yn = ts_prepass(ds, {yname}, ts, ts_storage, extra, synth_to_real);
+    const double* yp = require_f64(ds, yn[0], &extra);
     std::vector<std::string> exn = ts_prepass(ds, exog, ts, ts_storage, extra, synth_to_real);
     std::vector<std::string> zin = ts_prepass(ds, instruments, ts, ts_storage, extra, synth_to_real);
     std::vector<std::string> enn = ts_prepass(ds, endog, ts, ts_storage, extra, synth_to_real);
@@ -1158,7 +1342,8 @@ IvModelData build_iv_model(const Dataset& ds, const std::string& yname,
     IvModelData md;
     md.n = static_cast<int64_t>(keep.size());
     md.n_dropped = N - md.n;
-    md.has_intercept = fenames.empty();
+    md.has_intercept = fenames.empty() && !no_intercept;
+    md.no_constant = fenames.empty() && no_intercept;
     const int64_t n = md.n;
 
     // Expand exog & instrument terms into concrete columns (empty cells omitted).

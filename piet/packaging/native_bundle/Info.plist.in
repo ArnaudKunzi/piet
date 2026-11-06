@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>PIET</string>
+	<key>CFBundleExecutable</key>
+	<string>piet_native</string>
+	<key>CFBundleIconFile</key>
+	<string>CoBrA.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.piet.app</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>PIET</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@PIET_BUNDLE_VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@PIET_BUNDLE_VERSION@</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSRequiresAquaSystemAppearance</key>
+	<false/>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>PIETReleaseTuple</key>
+	<dict>
+		<key>piet_version</key>
+		<string>@PIET_BUNDLE_VERSION@</string>
+		<key>cobra_version</key>
+		<string>@PIET_BUNDLE_COBRA_VERSION@</string>
+		<key>contract_version_A</key>
+		<string>@PIET_BUNDLE_CONTRACT_A@</string>
+		<key>contract_version_B</key>
+		<string>@PIET_BUNDLE_CONTRACT_B@</string>
+	</dict>
+</dict>
+</plist>

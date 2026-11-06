@@ -1,5 +1,7 @@
-// Callaway–Sant'Anna staggered difference-in-differences — clean-room
-// implementation from the published methodology papers:
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
+// Callaway–Sant'Anna staggered difference-in-differences —
+// implemented from the published methodology papers:
 //
 //   [CS21] Callaway, B. and P.H.C. Sant'Anna (2021), "Difference-in-Differences
 //          with multiple time periods", Journal of Econometrics 225(2), 200-230.
@@ -32,7 +34,6 @@
 // exact-zero cells from aggregations, the long2 filled grid) are pinned by this
 // project's committed behavioral goldens and unit tests:
 //   tests/eval/golden/csdid*.csv, tests/unit/test_csdid*.cpp.
-// Provenance wall record: docs/legal/CSDID_CLEANROOM_WALL.md.
 
 #include "estimators/csdid.h"
 
@@ -327,6 +328,82 @@ DrdidCell drdid_dripw_cell(const double* dy, const double* X, int64_t n, int p,
 }
 
 // ---------------------------------------------------------------------------
+// One 2x2 outcome-regression cell — SZ20 §2 (panel): the regression-adjustment
+// DiD estimator τ = Ê[D (ΔY − X'β̂)] / Ê[D], β̂ least squares of ΔY on X over
+// the comparison units (constant appended as the last column of X).
+//
+// Influence function (delta method over β̂). With ê = ΔY − X'β̂, m1 = Ê[D],
+// M1 = Ê[D X]/m1 and Â = Ê[(1−D) X X'] (the OLS bread):
+//   ψ_i = D_i (ê_i − τ)/m1 − M1' Â⁻¹ X_i (1−D_i) ê_i.
+// The first term is mean-zero by τ's definition, the second by the OLS normal
+// equations, so inf_i = τ + ψ_i has mean τ; SE = sqrt(Σψ²)/n.
+// With no covariate (X = 1) τ is the difference of mean ΔY between treated and
+// comparison units, the same estimand and influence function as
+// drdid_dripw_cell with a constant-only propensity and outcome model.
+DrdidCell drdid_reg_cell(const double* dy, const double* X, int64_t n, int p,
+                         const double* trt) {
+    DrdidCell out;
+    out.n = n;
+    const int k = p + 1;
+    if (n < k + 1) { out.ok = false; return out; }
+
+    std::vector<double> Xc(static_cast<size_t>(n) * k);
+    if (p > 0) std::memcpy(Xc.data(), X, sizeof(double) * static_cast<size_t>(n) * p);
+    std::fill(Xc.begin() + static_cast<size_t>(n) * p, Xc.end(), 1.0);
+
+    // Outcome model on the comparison group.
+    std::vector<double> A(static_cast<size_t>(k) * k, 0.0), xy(static_cast<size_t>(k), 0.0);
+    std::vector<double> beta;
+    int64_t n1 = 0, n0 = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        if (trt[i] != 0.0) { ++n1; continue; }
+        ++n0;
+        for (int a = 0; a < k; ++a) {
+            const double xa = Xc[static_cast<int64_t>(a) * n + i];
+            xy[a] += xa * dy[i];
+            for (int b = 0; b <= a; ++b)
+                A[a * k + b] += xa * Xc[static_cast<int64_t>(b) * n + i];
+        }
+    }
+    for (int a = 0; a < k; ++a)
+        for (int b = a + 1; b < k; ++b) A[a * k + b] = A[b * k + a];
+    if (n1 < 1 || n0 < 1 || !spd_solve(A, xy.data(), k, beta)) { out.ok = false; return out; }
+
+    std::vector<double> ehat(static_cast<size_t>(n));
+    std::vector<double> M1(static_cast<size_t>(k), 0.0);
+    double sw1 = 0, sw1e = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        double xb = 0;
+        for (int j = 0; j < k; ++j) xb += Xc[static_cast<int64_t>(j) * n + i] * beta[j];
+        ehat[i] = dy[i] - xb;
+        sw1 += trt[i];
+        sw1e += trt[i] * ehat[i];
+        for (int j = 0; j < k; ++j) M1[j] += trt[i] * Xc[static_cast<int64_t>(j) * n + i];
+    }
+    if (!(sw1 > 0)) { out.ok = false; return out; }
+    out.att = sw1e / sw1;
+    for (int j = 0; j < k; ++j) M1[j] /= sw1;
+
+    // c_or' = M1'Â⁻¹ with Â a per-observation mean (A above is a sum).
+    std::vector<double> c_or;
+    if (!spd_solve(A, M1.data(), k, c_or)) { out.ok = false; return out; }
+    for (int j = 0; j < k; ++j) c_or[j] *= static_cast<double>(n);
+
+    out.inf.resize(static_cast<size_t>(n));
+    const double m1 = sw1 / static_cast<double>(n);
+    double ssq = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        double xor_ = 0;
+        for (int j = 0; j < k; ++j) xor_ += Xc[static_cast<int64_t>(j) * n + i] * c_or[j];
+        const double psi_i = trt[i] * (ehat[i] - out.att) / m1 - xor_ * (1.0 - trt[i]) * ehat[i];
+        out.inf[i] = out.att + psi_i;
+        ssq += psi_i * psi_i;
+    }
+    out.se = std::sqrt(ssq) / static_cast<double>(n);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // CS21 driver.
 
 namespace {
@@ -336,6 +413,16 @@ namespace {
 // aggregation, and event times with no contributing cell are not enumerated).
 inline bool cell_contributes(const CsdidCellEstimate& ce) {
     return ce.ok && ce.att != 0.0;
+}
+
+// A period or cohort value as it is spelled inside csdid's column names
+// (`g2004:t_2003_2004`, `wgt:w2004_2005`): an integer value in plain digits.
+std::string name_num(double v) {
+    if (std::isfinite(v) && v == std::floor(v) && std::fabs(v) < 1e15)
+        return std::to_string(static_cast<long long>(v));
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.9g", v);
+    return buf;
 }
 
 }  // namespace
@@ -434,6 +521,7 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
         n_clusters = static_cast<int>(N);
     }
     const double Nd = static_cast<double>(N);
+    R.n_clusters = n_clusters;
 
     // ---- (unit, level) -> row lookup.
     std::unordered_map<double, int> lev_ix;
@@ -461,33 +549,35 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
         return R;
     }
 
-    // ---- Target periods.
-    // Default: every observed period except the first. long2: the regular
-    // gdelta-spaced grid from min to max observed time (gap periods included as
-    // empty targets), with time0 itself an eligible long-difference target.
-    std::vector<double> targets;
-    if (cfg.long2) {
-        const int64_t J = llround((levels.back() - levels.front()) / gdelta);
-        targets.reserve(static_cast<size_t>(J) + 1);
-        for (int64_t j = 0; j <= J; ++j)
-            targets.push_back(levels.front() + static_cast<double>(j) * gdelta);
-    } else {
-        targets.assign(levels.begin() + 1, levels.end());
-    }
-    R.tlev = targets;
-
-    // Observed-level lookup with tolerance (long2 grid values are arithmetic).
+    // Observed-level lookup with tolerance (grid values are arithmetic).
     auto find_level = [&](double v) -> int {
         auto it = std::lower_bound(levels.begin(), levels.end(), v - ttol);
         if (it != levels.end() && std::fabs(*it - v) <= ttol)
             return static_cast<int>(it - levels.begin());
         return -1;
     };
-    // Largest observed level strictly below v.
-    auto pred_level = [&](double v) -> int {
-        auto it = std::lower_bound(levels.begin(), levels.end(), v - ttol);
-        return static_cast<int>(it - levels.begin()) - 1;
+    // A grid period as the observed level it meets, if any (so a panel with no
+    // gap keeps its observed period values bit for bit).
+    auto on_level = [&](double v) -> double {
+        const int ix = find_level(v);
+        return ix >= 0 ? levels[static_cast<size_t>(ix)] : v;
     };
+
+    // ---- Target periods: the regular gdelta-spaced grid from min to max
+    // observed time, gap periods included as empty targets (csdid 1.81's
+    // data check: range(min, max, min gap)). Default: every grid period after
+    // time0 (BUG-1187: with no t == 4, StataBE posts g3's t_2_4 and g5's t_3_4
+    // as empty cells). long2: time0 itself is an eligible long-difference target.
+    std::vector<double> targets;
+    {
+        const int64_t J = llround((levels.back() - levels.front()) / gdelta);
+        targets.reserve(static_cast<size_t>(J) + 1);
+        for (int64_t j = cfg.long2 ? 0 : 1; j <= J; ++j) {
+            const double v = levels.front() + static_cast<double>(j) * gdelta;
+            targets.push_back(cfg.long2 ? v : on_level(v));
+        }
+    }
+    R.tlev = targets;
 
     // ---- Per-cell estimation.
     const size_t K = G * targets.size();
@@ -515,17 +605,22 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
             ce.ok = false;
 
             // Base period [CS21 §2-3]: long2 uses the fixed pre-treatment
-            // period g - gdelta; otherwise the varying base (period preceding
-            // t for pre-treatment cells, period preceding g for post).
+            // period g - gdelta; otherwise the varying base: csdid.ado's loop
+            // starts it at time0 and moves it to each grid period j < g once
+            // j's cell is done, so it is the grid period preceding t for a
+            // pre-treatment cell and the last grid period preceding g for a
+            // post one, observed or not (BUG-1187: g = 5 with no t == 4 posts
+            // t_4_5 and t_4_6 as empty cells, not t_3_5 / t_3_6 off period 3).
             double base = 0;
             bool base_defined = false;
             if (cfg.long2) {
                 base = g - gdelta;
                 base_defined = true;
             } else {
-                const int bix0 = (t < g) ? pred_level(t) : pred_level(g);
-                if (bix0 >= 0) {
-                    base = levels[static_cast<size_t>(bix0)];
+                const double ref = (t < g) ? t : g;
+                const double jb = std::ceil((ref - levels.front()) / gdelta - 1e-9) - 1.0;
+                if (jb >= 0.0) {
+                    base = on_level(levels.front() + jb * gdelta);
                     base_defined = true;
                 }
             }
@@ -551,8 +646,11 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
                 const double gu = gvar_u[static_cast<size_t>(u)];
                 const bool treated = (gu == g);
                 bool control = (gu == 0.0);
+                // Not-yet-treated as csdid 1.81 selects it (long2 likewise):
+                // gvar > g AND gvar > t, so a cohort treated before g is never a
+                // comparison, also in g's pre-period cells (BUG-956).
                 if (!control && cfg.comparison == CsdidComparison::Notyet)
-                    control = (gu > t + ttol) && (gu != g);  // not yet treated by t
+                    control = gu > std::max(g, t) + ttol;
                 if (!treated && !control) continue;
                 const int64_t rb = row_at[static_cast<size_t>(u) * L + bix];
                 const int64_t rt = row_at[static_cast<size_t>(u) * L + tix];
@@ -579,8 +677,11 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
                         X[static_cast<int64_t>(c) * n_obs + memb_rb[static_cast<size_t>(m)]];
             }
 
-            DrdidCell cell = drdid_dripw_cell(dyv.data(), p > 0 ? Xcell.data() : nullptr,
-                                              n, p, trtv.data(), cfg.pscoretrim);
+            DrdidCell cell =
+                cfg.method == CsdidMethod::Reg
+                    ? drdid_reg_cell(dyv.data(), p > 0 ? Xcell.data() : nullptr, n, p, trtv.data())
+                    : drdid_dripw_cell(dyv.data(), p > 0 ? Xcell.data() : nullptr, n, p,
+                                       trtv.data(), cfg.pscoretrim);
             if (!cell.ok) {
                 R.cells.push_back(ce);
                 continue;
@@ -645,10 +746,21 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
         for (double s : S) v += s * s;
         return std::sqrt(v) / Nd;
     };
-    // Joint covariance of m influence-function columns (returns m×m, row-major
-    // == col-major by symmetry).
-    auto folded_cov = [&](const std::vector<const std::vector<double>*>& cols)
-        -> std::vector<double> {
+    // THE covariance builder: every V this driver reports (the per-cell and
+    // aggregate SEs, the pre-trends Wald V, the attgt/agg postings, estat
+    // event's V) is the joint covariance of m influence-function columns,
+    //   V = Σ_c S_c S_c' / N²,  S_c = per-cluster sums of the columns
+    // (returns m×m, row-major == col-major by symmetry). A column may carry a
+    // constant shift h (the attgt wgt columns are an indicator minus its mean):
+    // its value at unit u is ψ(u) + h, its cluster sum Σ_{u∈c} ψ(u) + h·n_c.
+    // When every folded column is dense and none is shifted, the gram is one
+    // la::xtx; otherwise each entry is the compensated dot over the sparser
+    // column's nonzero clusters (exact zeros contribute nothing), plus the
+    // shift terms h_j (S_i·n) + h_i (S_j·n) + h_i h_j (n·n).
+    std::vector<double> clu_n(static_cast<size_t>(n_clusters), 0.0);
+    for (int64_t u = 0; u < N; ++u) clu_n[static_cast<size_t>(clu_u[static_cast<size_t>(u)])] += 1.0;
+    auto folded_cov_shifted = [&](const std::vector<const std::vector<double>*>& cols,
+                                  const std::vector<double>& shift) -> std::vector<double> {
         const int m = static_cast<int>(cols.size());
         std::vector<double> C(static_cast<size_t>(n_clusters) * m, 0.0);
         for (int j = 0; j < m; ++j) {
@@ -657,15 +769,128 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
             for (int64_t u = 0; u < N; ++u) cj[clu_u[static_cast<size_t>(u)]] += pj[static_cast<size_t>(u)];
         }
         std::vector<double> V(static_cast<size_t>(m) * m, 0.0);
-        la::xtx(C.data(), n_clusters, m, V.data());
         const double inv = 1.0 / (Nd * Nd);
-        for (double& v : V) v *= inv;
+        std::vector<std::vector<int>> nz(static_cast<size_t>(m));
+        bool all_dense = true;
+        for (int j = 0; j < m; ++j) {
+            const double* cj = C.data() + static_cast<size_t>(j) * n_clusters;
+            for (int c = 0; c < n_clusters; ++c)
+                if (cj[c] != 0.0) nz[static_cast<size_t>(j)].push_back(c);
+            if (nz[static_cast<size_t>(j)].size() * 2 < static_cast<size_t>(n_clusters)) all_dense = false;
+        }
+        const bool shifted = !shift.empty();
+        if (all_dense && !shifted) {
+            la::xtx(C.data(), n_clusters, m, V.data());
+            for (double& v : V) v *= inv;
+            return V;
+        }
+        std::vector<double> cn(static_cast<size_t>(m), 0.0);  // S_j · n
+        double nn = 0;
+        if (shifted) {
+            for (int j = 0; j < m; ++j)
+                cn[static_cast<size_t>(j)] =
+                    la::dot(C.data() + static_cast<size_t>(j) * n_clusters, clu_n.data(), n_clusters);
+            nn = la::dot(clu_n.data(), clu_n.data(), n_clusters);
+        }
+        std::vector<double> ga, gb;
+        for (int j = 0; j < m; ++j) {
+            const double* cj = C.data() + static_cast<size_t>(j) * n_clusters;
+            for (int i = 0; i <= j; ++i) {
+                const double* ci = C.data() + static_cast<size_t>(i) * n_clusters;
+                const std::vector<int>& sp =
+                    nz[static_cast<size_t>(i)].size() <= nz[static_cast<size_t>(j)].size()
+                        ? nz[static_cast<size_t>(i)] : nz[static_cast<size_t>(j)];
+                double v;
+                if (sp.size() * 2 < static_cast<size_t>(n_clusters)) {
+                    ga.resize(sp.size());
+                    gb.resize(sp.size());
+                    for (size_t q = 0; q < sp.size(); ++q) {
+                        ga[q] = ci[sp[q]];
+                        gb[q] = cj[sp[q]];
+                    }
+                    v = sp.empty() ? 0.0 : la::dot(ga.data(), gb.data(), static_cast<int64_t>(sp.size()));
+                } else {
+                    v = la::dot(ci, cj, n_clusters);
+                }
+                if (shifted) {
+                    const double hi = shift[static_cast<size_t>(i)], hj = shift[static_cast<size_t>(j)];
+                    v += hj * cn[static_cast<size_t>(i)] + hi * cn[static_cast<size_t>(j)] + hi * hj * nn;
+                }
+                V[static_cast<size_t>(i) + static_cast<size_t>(j) * m] = v * inv;
+                V[static_cast<size_t>(j) + static_cast<size_t>(i) * m] = v * inv;
+            }
+        }
         return V;
+    };
+    auto folded_cov = [&](const std::vector<const std::vector<double>*>& cols) {
+        return folded_cov_shifted(cols, {});
     };
 
     // Per-cell SEs (cluster-folded; reduces to the IID formula without cluster).
     for (size_t kc = 0; kc < K; ++kc)
         if (R.cells[kc].ok) R.cells[kc].se = folded_se(cell_psi[kc]);
+
+    // ---- csdid's e(b)/e(V), agg(attgt) layout (csdid-drdid LAYOUT.md 0, 1.1).
+    // One column per cell, cohort-major, named `g<g>:t_<a>_<b>` (a < b the two
+    // window endpoints), then one `wgt:w<g>_<t>` column per cell, t running over
+    // the target periods without time0 (positionally: the k-th wgt column
+    // belongs to the k-th cell, also under long2 where the cells' own periods
+    // include time0). The wgt column of cell k is its share of treated units,
+    // n1_k/N, normalised by the sum S of those shares over all posted cells;
+    // its influence function is (1{u ∈ T_k} − n1_k/N)/S. A cell that could not
+    // be estimated posts zero columns. long2 posts no column for the cohort's
+    // t == base cell. V is the joint covariance of all columns' influence
+    // functions (the same folded_cov as every aggregate below).
+    const std::vector<double> zero_psi(static_cast<size_t>(N), 0.0);
+    {
+        std::vector<size_t> post_ix;
+        post_ix.reserve(K);
+        for (size_t kc = 0; kc < K; ++kc) {
+            const CsdidCellEstimate& ce = R.cells[kc];
+            if (cfg.long2 && std::fabs(ce.t - ce.base) <= ttol) continue;
+            post_ix.push_back(kc);
+        }
+        const size_t P = post_ix.size();
+        const std::vector<double> wnames(targets.begin() + (cfg.long2 ? 1 : 0), targets.end());
+        double S = 0;
+        for (size_t kc : post_ix) S += static_cast<double>(cell_trt[kc].size()) / Nd;
+        CsdidPosting& A = R.attgt;
+        A.names.reserve(2 * P);
+        A.b.reserve(2 * P);
+        std::vector<const std::vector<double>*> cols;
+        cols.reserve(2 * P);
+        for (size_t kc : post_ix) {
+            const CsdidCellEstimate& ce = R.cells[kc];
+            A.names.push_back("g" + name_num(ce.g) + ":t_" + name_num(std::min(ce.base, ce.t)) +
+                              "_" + name_num(std::max(ce.base, ce.t)));
+            A.b.push_back(ce.ok ? ce.att : 0.0);
+            cols.push_back(cell_psi[kc].empty() ? &zero_psi : &cell_psi[kc]);
+        }
+        std::vector<std::vector<double>> wpsi(P);
+        std::vector<double> shift(P, 0.0);  // the cells' columns are not shifted
+        size_t jg = 0;
+        for (size_t j = 0; j < P; ++j) {
+            const size_t kc = post_ix[j];
+            const CsdidCellEstimate& ce = R.cells[kc];
+            if (j == 0 || ce.g != R.cells[post_ix[j - 1]].g) jg = 0;
+            const double tw = jg < wnames.size() ? wnames[jg] : ce.t;
+            ++jg;
+            A.names.push_back("wgt:w" + name_num(ce.g) + "_" + name_num(tw));
+            const double share = static_cast<double>(cell_trt[kc].size()) / Nd;
+            std::vector<double>& w = wpsi[j];
+            w.assign(static_cast<size_t>(N), 0.0);
+            if (S > 0) {
+                A.b.push_back(share / S);
+                for (int64_t u : cell_trt[kc]) w[static_cast<size_t>(u)] = 1.0 / S;
+                shift.push_back(-share / S);
+            } else {
+                A.b.push_back(0.0);
+                shift.push_back(0.0);
+            }
+            cols.push_back(&w);
+        }
+        A.V = folded_cov_shifted(cols, shift);
+    }
 
     // ---- CS21 §3-4 aggregation: θ = Σ_k w_k a_k with w_k ∝ P̂_k, where
     // P̂_k = n1_k / N is the sample share of cohort-g_k units usable in cell
@@ -721,9 +946,15 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
         for (size_t kc = 0; kc < K; ++kc)
             if (cell_contributes(R.cells[kc]) && cell_ev[kc] >= 0) post_ix.push_back(kc);
         Agg s = combine(post_ix);
+        R.agg_simple.names = {"ATT"};
         if (s.any) {
             R.simple_att = s.att;
             R.simple_se = folded_se(s.psi);
+            R.agg_simple.b = {s.att};
+            R.agg_simple.V = folded_cov({&s.psi});
+        } else {
+            R.agg_simple.b = {0.0};
+            R.agg_simple.V = {0.0};
         }
     }
 
@@ -733,7 +964,12 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
     for (size_t kc = 0; kc < K; ++kc) {
         if (!cell_contributes(R.cells[kc])) continue;
         const int e = cell_ev[kc];
-        if (!win_all && (e < event_lo || e > event_hi)) continue;
+        // The window is read on the event list estat builds from (cohort,
+        // target) POSITIONS over the target grid without time0 (LAYOUT.md 1.4):
+        // under long2 a pre-period cell sits one step later there (its base,
+        // e == -1, takes no position), so its window coordinate is e + 1.
+        const int ew = (cfg.long2 && e < 0) ? e + 1 : e;
+        if (!win_all && (ew < event_lo || ew > event_hi)) continue;
         bins[e].push_back(kc);
     }
     std::vector<std::vector<double>> bin_psi;
@@ -788,6 +1024,7 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
         std::map<double, std::vector<size_t>> byt;
         for (size_t kc = 0; kc < K; ++kc)
             if (cell_contributes(R.cells[kc]) && cell_ev[kc] >= 0) byt[R.cells[kc].t].push_back(kc);
+        std::vector<std::vector<double>> cal_psi;
         for (const auto& kv : byt) {
             Agg c = combine(kv.second);
             if (!c.any) continue;
@@ -796,7 +1033,27 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
             cb.att = c.att;
             cb.se = folded_se(c.psi);
             R.calendar.push_back(cb);
+            cal_psi.push_back(std::move(c.psi));
         }
+        // agg(calendar): CAverage (the unweighted mean of the periods) then T#.
+        CsdidPosting& P = R.agg_calendar;
+        const size_t C = R.calendar.size();
+        std::vector<double> avg(static_cast<size_t>(N), 0.0);
+        double ab = 0;
+        for (size_t j = 0; j < C; ++j) {
+            ab += R.calendar[j].att / static_cast<double>(C);
+            for (int64_t u = 0; u < N; ++u)
+                avg[static_cast<size_t>(u)] += cal_psi[j][static_cast<size_t>(u)] / static_cast<double>(C);
+        }
+        P.names.push_back("CAverage");
+        P.b.push_back(ab);
+        std::vector<const std::vector<double>*> cols{&avg};
+        for (size_t j = 0; j < C; ++j) {
+            P.names.push_back("T" + name_num(R.calendar[j].t));
+            P.b.push_back(R.calendar[j].att);
+            cols.push_back(&cal_psi[j]);
+        }
+        P.V = folded_cov(cols);
     }
 
     // ---- Group (cohort) effects [CS21 §3.1]: contributing post cells grouped
@@ -808,6 +1065,8 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
         std::map<double, std::vector<size_t>> byg;
         for (size_t kc = 0; kc < K; ++kc)
             if (cell_contributes(R.cells[kc]) && cell_ev[kc] >= 0) byg[R.cells[kc].g].push_back(kc);
+        std::vector<std::vector<double>> grp_psi;
+        std::vector<double> grp_w;  // mean treated count over the cohort's post cells
         for (const auto& kv : byg) {
             Agg a = combine(kv.second);
             if (!a.any) continue;
@@ -816,7 +1075,35 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
             gb.att = a.att;
             gb.se = folded_se(a.psi);
             R.groups.push_back(gb);
+            grp_psi.push_back(std::move(a.psi));
+            double sn1 = 0;
+            for (size_t kc : kv.second) sn1 += static_cast<double>(cell_trt[kc].size());
+            grp_w.push_back(sn1 / static_cast<double>(kv.second.size()));
         }
+        // agg(group): GAverage then G#. GAverage weights each cohort by the
+        // mean treated count of its post cells, held FIXED (no share-estimation
+        // term), as `estat group` does from the posted wgt columns.
+        CsdidPosting& P = R.agg_group;
+        const size_t Gn = R.groups.size();
+        double sw = 0;
+        for (double v : grp_w) sw += v;
+        std::vector<double> avg(static_cast<size_t>(N), 0.0);
+        double ab = 0;
+        for (size_t j = 0; j < Gn; ++j) {
+            const double wj = sw > 0 ? grp_w[j] / sw : 0.0;
+            ab += wj * R.groups[j].att;
+            for (int64_t u = 0; u < N; ++u)
+                avg[static_cast<size_t>(u)] += wj * grp_psi[j][static_cast<size_t>(u)];
+        }
+        P.names.push_back("GAverage");
+        P.b.push_back(ab);
+        std::vector<const std::vector<double>*> cols{&avg};
+        for (size_t j = 0; j < Gn; ++j) {
+            P.names.push_back("G" + name_num(R.groups[j].g));
+            P.b.push_back(R.groups[j].att);
+            cols.push_back(&grp_psi[j]);
+        }
+        P.V = folded_cov(cols);
     }
 
     // ---- Pre-trends joint Wald test: H0: att(g,t) = 0 for all contributing
@@ -846,9 +1133,10 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
         }
     }
 
-    // ---- e(b)/e(V) for `estat event, post`: [Pre_avg, Post_avg, Tm#…Tp#] with
-    // the block-diagonal covariance (aggregate 2×2 block and event-bin block;
-    // exact zeros across the two blocks).
+    // ---- [Pre_avg, Post_avg, Tm#…Tp#]: agg(event)'s e(b)/e(V) with the full
+    // covariance of the 2+E influence functions, and the `estat event, post`
+    // e(V), which is the same matrix with the averages-by-bins blocks zeroed
+    // (estat event posts the two blocks block-diagonally; LAYOUT.md 1.6, 1.8).
     {
         const size_t E = R.events.size();
         R.event_names.reserve(2 + E);
@@ -864,25 +1152,15 @@ CsdidRunResult csdid_dripw_run(const double* ivar, const double* time,
             R.event_b.push_back(R.events[j].att);
         }
         const size_t m = 2 + E;
-        R.event_V.assign(m * m, 0.0);
-        // aggregate block
-        {
-            std::vector<const std::vector<double>*> cols{&psi_pre, &psi_post};
-            std::vector<double> V2 = folded_cov(cols);
-            R.event_V[0 * m + 0] = V2[0];
-            R.event_V[0 * m + 1] = V2[1];
-            R.event_V[1 * m + 0] = V2[2];
-            R.event_V[1 * m + 1] = V2[3];
-        }
-        // event-bin block
-        if (E > 0) {
-            std::vector<const std::vector<double>*> cols(E);
-            for (size_t j = 0; j < E; ++j) cols[j] = &bin_psi[j];
-            std::vector<double> VE = folded_cov(cols);
-            for (size_t r = 0; r < E; ++r)
-                for (size_t c = 0; c < E; ++c)
-                    R.event_V[(2 + r) * m + (2 + c)] = VE[r * E + c];
-        }
+        std::vector<const std::vector<double>*> cols{&psi_pre, &psi_post};
+        for (size_t j = 0; j < E; ++j) cols.push_back(&bin_psi[j]);
+        R.agg_event.names = R.event_names;
+        R.agg_event.b = R.event_b;
+        R.agg_event.V = folded_cov(cols);
+        R.event_V = R.agg_event.V;
+        for (size_t r = 0; r < m; ++r)
+            for (size_t c = 0; c < m; ++c)
+                if ((r < 2) != (c < 2)) R.event_V[r * m + c] = 0.0;
     }
 
     // ---- e(N): union of endpoint rows over all estimated cell samples.

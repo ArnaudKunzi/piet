@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #pragma once
 // Fetch just the columns an expression names, instead of flushing the whole
 // resident frame to disk to read them (contract_A §38 `getcols`).

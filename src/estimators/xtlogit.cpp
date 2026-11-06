@@ -1,12 +1,17 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "estimators/xtlogit.h"
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
 #include "core/linalg.h"
 #include "core/threads.h"
+#include "estimators/logit.h"  // binary_ml_fit, binary_perfect_screen
 
 namespace cecon {
 
@@ -224,6 +229,53 @@ bool panel_moments(const double* xb, int T, int K, int k,
     return true;
 }
 
+// The slopes of an ordinary logit of y on X plus a constant over the usable rows, the
+// point Stata's clogit starts from, identified from its ado. That logit stops early, on
+// logit's undocumented doopt option (tolerance 1e-4 on the coefficients, no
+// log-likelihood or nrtolerance check, 20 iterations, halving only), so its reported
+// vector is not the logit MLE, and the distance reaches e(ic) and the last digits of the
+// conditional fit. Empty when the logit cannot give every regressor a coefficient.
+std::vector<double> pooled_logit_slopes(const double* X, int64_t N, int k, const double* y) {
+    const size_t rows = static_cast<size_t>(N);
+    const size_t slopes = static_cast<size_t>(k);
+    std::vector<double> design(rows * (slopes + 1), 1.0);  // the trailing column stays 1
+    std::copy_n(X, rows * slopes, design.begin());
+
+    const BinaryPerfectScreen screen = binary_perfect_screen(design.data(), N, k + 1, k, y);
+    const auto dropped_col = screen.omit_col.begin();
+    if (screen.inestimable ||
+        std::any_of(dropped_col, dropped_col + k, [](char omitted) { return omitted != 0; }))
+        return {};
+
+    MlMaxOptions early;
+    early.tol = 1e-4;
+    early.ltol = 0.0;
+    early.maxiter = 20;
+    early.doopt = true;
+    early.step_forward = false;
+    early.ignore_nrtol = true;
+    BinaryMlResult fit = binary_ml_fit(BinaryLink::Logit, design.data(), N, k + 1, y, nullptr, nullptr,
+                                       /*has_constant=*/true, early);
+    if (fit.singular || fit.beta.size() != slopes + 1) return {};
+    fit.beta.pop_back();  // the constant is not a parameter of the conditional model
+    return std::move(fit.beta);
+}
+
+// Where xtlogit_fe's Newton iteration starts. X: N x k column-major over the usable panels
+// (packed group by group), y: their 0/1 outcomes, ll_at: the conditional log likelihood
+// at a coefficient vector. The zero vector stands in whenever the pooled logit has no
+// answer or its answer gives a log likelihood the iteration could not work from.
+std::vector<double> xtlogit_fe_start(const double* X, int64_t N, int k, const double* y,
+                                     const std::function<double(const std::vector<double>&)>& ll_at) {
+    const std::vector<double> zeros(static_cast<size_t>(k), 0.0);
+    if (N <= 0) return zeros;
+    const std::vector<double> slopes = pooled_logit_slopes(X, N, k, y);
+    if (slopes.empty() || !std::all_of(slopes.begin(), slopes.end(), [](double v) { return std::isfinite(v); }))
+        return zeros;
+    constexpr double kLargestWorkableLl = 1e50;
+    return std::fabs(ll_at(slopes)) <= kLargestWorkableLl ? slopes : zeros;
+}
+
 }  // namespace
 
 int xtlogit_fanout_threads(int ng, int Tmax, int k) {
@@ -243,7 +295,7 @@ int xtlogit_fanout_threads(int ng, int Tmax, int k) {
 
 XtlogitFeResult xtlogit_fe(const double* X_in, int64_t n_obs, int k,
                            const double* y_in, const double* ivar_in,
-                           int maxit, double tol) {
+                           int maxit) {
     XtlogitFeResult R;
     R.k = k;
 
@@ -275,6 +327,17 @@ XtlogitFeResult xtlogit_fe(const double* X_in, int64_t n_obs, int k,
         usable.push_back(rs);
     }
     R.n_groups = static_cast<int64_t>(usable.size());
+    if (!usable.empty()) {
+        int64_t tot = 0;
+        R.g_min = -1;
+        for (const auto& rs : usable) {
+            const int64_t T = static_cast<int64_t>(rs.size());
+            R.g_min = R.g_min < 0 ? T : std::min(R.g_min, T);
+            R.g_max = std::max(R.g_max, T);
+            tot += T;
+        }
+        R.g_avg = static_cast<double>(tot) / static_cast<double>(usable.size());
+    }
 
     // Pack working arrays group-contiguous.
     int64_t N = 0;
@@ -309,10 +372,14 @@ XtlogitFeResult xtlogit_fe(const double* X_in, int64_t n_obs, int k,
     // pairwise `q_g`, the O(T²) allocation this rewrite exists to remove) are all gone.
     std::vector<double> per_grp_score;
 
-    double prev_ll = -1e300;
-    bool conv = false;
-    int iter;
-    for (iter = 0; iter < maxit; ++iter) {
+    // ---- 3. The optimizer ------------------------------------------------------------
+    // Newton-Raphson on the conditional log likelihood with the analytic Hessian, from the
+    // start xtlogit_fe_start chooses: a full step, halved while it does not improve ll,
+    // else extended while each extension improves; stop when (max relative change in b
+    // <= 1e-6 or relative change in ll <= 1e-7) and g inv(-H) g' < 1e-5 ([R] maximize
+    // defaults). V = inv(-H) at the final b. `maxit` is iterate(), 300 by default.
+    // Moment pass at R.beta: fills ll, score and negH. Returns false when a panel fails.
+    auto full_eval = [&](double& ll_out) -> bool {
         // Recompute xb under current β.
         for (int64_t i = 0; i < N; ++i) {
             double s = 0;
@@ -414,7 +481,7 @@ XtlogitFeResult xtlogit_fe(const double* X_in, int64_t n_obs, int k,
         }, xtlogit_threads);
         double ll = 0;
         for (int gi = 0; gi < ng; ++gi)
-            if (!ok_g[static_cast<size_t>(gi)]) { R.converged = false; R.iters = iter; return R; }
+            if (!ok_g[static_cast<size_t>(gi)]) return false;
         for (int gi = 0; gi < ng; ++gi) {
             ll += ll_g[static_cast<size_t>(gi)];
             const double* sc = &score_g[static_cast<size_t>(gi) * static_cast<size_t>(k)];
@@ -426,24 +493,99 @@ XtlogitFeResult xtlogit_fe(const double* X_in, int64_t n_obs, int k,
                         hh[static_cast<size_t>(c) * static_cast<size_t>(k) + rr];
             }
         }
+        ll_out = ll;
+        return true;
+    };
+    // ll only (the line-search evaluations): the same forward recursion and the same
+    // per-panel sum order as full_eval, so a point's ll has the same bits either way.
+    auto ll_only = [&](const std::vector<double>& b) -> double {
+        const int ng = static_cast<int>(groups.size());
+        std::vector<double> ll_g(static_cast<size_t>(ng), 0.0);
+        const int xtlogit_threads = xtlogit_fanout_threads(ng, Tmax, k);
+        parallel_for(ng, [&](int64_t gi) {
+            const Group& g = groups[static_cast<size_t>(gi)];
+            const int T = static_cast<int>(g.end - g.start);
+            thread_local std::vector<double> xb_l, p_l, f_l, g_l;
+            if (xb_l.size() < static_cast<size_t>(Tmax)) {
+                xb_l.resize(static_cast<size_t>(Tmax));
+                p_l.resize(static_cast<size_t>(Tmax));
+            }
+            const size_t wneed = static_cast<size_t>(Tmax + 1) * static_cast<size_t>(Tmax + 1);
+            if (f_l.size() < wneed) { f_l.resize(wneed); g_l.resize(wneed); }
+            int K = 0;
+            double yb_sum_xb = 0;
+            for (int t = 0; t < T; ++t) {
+                double s = 0;
+                for (int c = 0; c < k; ++c)
+                    s += X[static_cast<size_t>(c) * N + g.start + t] * b[static_cast<size_t>(c)];
+                xb_l[static_cast<size_t>(t)] = s;
+                K += static_cast<int>(y[static_cast<size_t>(g.start + t)]);
+                yb_sum_xb += y[static_cast<size_t>(g.start + t)] * s;
+            }
+            double log_B;
+            panel_logB_p(xb_l.data(), T, K, log_B, p_l, f_l, g_l);
+            ll_g[static_cast<size_t>(gi)] = yb_sum_xb - log_B;
+        }, xtlogit_threads);
+        double ll = 0;
+        for (int gi = 0; gi < ng; ++gi) ll += ll_g[static_cast<size_t>(gi)];
+        return ll;
+    };
 
+    R.beta = xtlogit_fe_start(X.data(), N, k, y.data(), ll_only);
+
+    double ll = 0.0;
+    if (!full_eval(ll)) { R.converged = false; R.iters = 0; return R; }
+    bool conv = false;
+    int ic = 0;
+    while (ic < maxit && !conv) {
         std::copy(negH.begin(), negH.end(), negH_inv.begin());
         if (la::spd_inverse(negH_inv.data(), k) != 0) {
-            R.converged = false; R.iters = iter; R.loglik = ll; return R;
+            R.converged = false; R.iters = ic; R.loglik = ll; return R;
         }
         la::matvec(negH_inv.data(), k, score.data(), step.data());
-        double smag = 0;
-        for (int c = 0; c < k; ++c) {
-            R.beta[static_cast<size_t>(c)] += step[static_cast<size_t>(c)];
-            smag += std::fabs(step[static_cast<size_t>(c)]);
+        const std::vector<double> b0 = R.beta;
+        std::vector<double> cand(static_cast<size_t>(k));
+        for (int c = 0; c < k; ++c) cand[static_cast<size_t>(c)] = b0[static_cast<size_t>(c)] + step[static_cast<size_t>(c)];
+        double f1 = ll_only(cand);
+        if (!(f1 >= ll)) {
+            for (int nh = 0; nh < 60 && !(f1 >= ll); ++nh) {
+                for (int c = 0; c < k; ++c)
+                    cand[static_cast<size_t>(c)] = (cand[static_cast<size_t>(c)] + b0[static_cast<size_t>(c)]) / 2.0;
+                f1 = ll_only(cand);
+            }
+        } else {
+            std::vector<double> dd(static_cast<size_t>(k)), tryb(static_cast<size_t>(k));
+            for (int c = 0; c < k; ++c) dd[static_cast<size_t>(c)] = 0.125 * step[static_cast<size_t>(c)];
+            double f0 = f1;
+            for (int nf = 0; nf < 100; ++nf) {
+                for (int c = 0; c < k; ++c) tryb[static_cast<size_t>(c)] = cand[static_cast<size_t>(c)] + dd[static_cast<size_t>(c)];
+                const double fc = ll_only(tryb);
+                if (!(fc > f0)) break;
+                cand = tryb;
+                f0 = fc;
+                for (int c = 0; c < k; ++c) dd[static_cast<size_t>(c)] *= 2.0;
+            }
         }
-        R.iters = iter + 1;
-        R.loglik = ll;
-        if (std::fabs(ll - prev_ll) < tol * (std::fabs(ll) + 1.0) && smag < tol) {
-            conv = true; break;
+        R.beta = cand;
+        const double ll_old = ll;
+        if (!full_eval(ll)) { R.converged = false; R.iters = ic + 1; return R; }
+        ++ic;
+        std::copy(negH.begin(), negH.end(), negH_inv.begin());
+        double nr = std::numeric_limits<double>::infinity();
+        if (la::spd_inverse(negH_inv.data(), k) == 0) {
+            la::matvec(negH_inv.data(), k, score.data(), step.data());
+            nr = 0.0;
+            for (int c = 0; c < k; ++c) nr += score[static_cast<size_t>(c)] * step[static_cast<size_t>(c)];
         }
-        prev_ll = ll;
+        double pconv = 0.0;
+        for (int c = 0; c < k; ++c)
+            pconv = std::max(pconv, std::fabs(cand[static_cast<size_t>(c)] - b0[static_cast<size_t>(c)]) /
+                                        (std::fabs(b0[static_cast<size_t>(c)]) + 1.0));
+        const double rl = std::fabs(ll - ll_old) / (std::fabs(ll_old) + 1.0);
+        conv = (pconv <= 1e-6 || rl <= 1e-7) && nr < 1e-5;
     }
+    R.iters = ic;
+    R.loglik = ll;
     R.converged = conv;
 
     // ---- Final pass: per-group score for cluster-robust SE.
@@ -538,6 +680,7 @@ XtlogitFeResult xtlogit_fe(const double* X_in, int64_t n_obs, int k,
         R.converged = false; return R;
     }
     R.se_iid.assign(static_cast<size_t>(k), 0.0);
+    R.V_iid = negH_inv;
     for (int c = 0; c < k; ++c)
         R.se_iid[static_cast<size_t>(c)] =
             std::sqrt(std::max(0.0, negH_inv[static_cast<size_t>(c) * k + c]));
@@ -567,6 +710,7 @@ XtlogitFeResult xtlogit_fe(const double* X_in, int64_t n_obs, int k,
             Vr[static_cast<size_t>(c) * k + rr] = s;     // q=1 (Stata's xtlogit, fe)
         }
     R.se_robust.assign(static_cast<size_t>(k), 0.0);
+    R.V_robust = Vr;
     for (int c = 0; c < k; ++c)
         R.se_robust[static_cast<size_t>(c)] =
             std::sqrt(std::max(0.0, Vr[static_cast<size_t>(c) * k + c]));

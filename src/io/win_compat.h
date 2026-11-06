@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #pragma once
 // Windows file-I/O portability shims for the cobra engine (and reused by
 // piet/native, which has src/ on its include path). Header-only and written so

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // translate — C++ port of piet/backend/piet/router/translate.py's
 // time-series operator detection + context injection (MI-083,
 // CONTRACT-engine §16). M3a scope: ONLY the TS-token/_inject_ts_context
@@ -54,12 +56,30 @@ std::vector<std::string> injectTsContextForExpr(const std::vector<std::string>& 
                                                 const std::string& expr,
                                                 const SessionState& session);
 
-// B3(c): the draw coordinates (`set seed` + a per-call stream), appended only
-// when the expression contains runiform()/runiformint(). Takes a NON-const
-// session because it advances the stream counter.
+// B3(c): the session's Stata RNG stream (SessionState::seed.stream(), mt64) as
+// `--rng-mt64 <c(rngstate)>`, appended only when the expression takes a draw
+// (runiform/runiformint/rnormal/uniform). The engine draws from that state in
+// Stata's order and reports the raw draws it took as `rng_draws`; the caller
+// passes the response to absorbRngDraws, which advances the session stream past
+// them. A read-only probe that must see the same draws as the store simply does
+// not absorb. (The legacy `rngStream` counter still advances: other Philox
+// consumers key on it.)
 std::vector<std::string> injectRngContextForExpr(const std::vector<std::string>& argv,
                                                  const std::string& expr,
                                                  SessionState& session);
+
+// Whether the expression calls a draw function (runiform/runiformint/rnormal/
+// uniform) outside a string literal -- the test injectRngContextForExpr keys on.
+bool exprHasDrawToken(const std::string& expr);
+
+// Advance the session stream by the engine's reported `rng_draws` (absent = 0).
+void absorbRngDraws(const nlohmann::json& engineResponse, SessionState& session);
+
+// BUG-1123: a generate's engine response may report `store_overflow`, the values
+// its --store-type could not hold and stored as missing. Copied onto the
+// data_mutation block, where the dispatcher's "(N missing values generated)" note
+// leaves them out of its count, as Stata's does, and drops the field again.
+void carryStoreOverflow(const nlohmann::json& engineResponse, nlohmann::ordered_json& block);
 
 // _inject_ts_context: appends --xtset/--tsset to `argv` per session's
 // panelvar/timevar (CONTRACT-engine §16):

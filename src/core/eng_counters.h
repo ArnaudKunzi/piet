@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #ifndef CECON_CORE_ENG_COUNTERS_H
 #define CECON_CORE_ENG_COUNTERS_H
 

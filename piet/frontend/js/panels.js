@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // panels.js — Variable Editor grid + History panel + Properties sub-panel.
 // Variable grid: 3 display columns (glyph | Name | Label) with inline editing.
 // Edits dispatch 'piet:var-edit' CustomEvents — app.js listens and calls the API.

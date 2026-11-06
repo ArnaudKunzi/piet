@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // MAXPERF Stage 3 — morsel-parallel determinism gate (①-gate proof obligation).
 //
 // The Stage-3 kernels (Frame::collapse aggregation loop; merge_frames column

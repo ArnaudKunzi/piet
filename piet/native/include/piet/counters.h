@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #ifndef PIET_NATIVE_COUNTERS_H
 #define PIET_NATIVE_COUNTERS_H
 
@@ -77,7 +79,7 @@ inline int64_t g_useStashHits = 0;    // resident-stash restore (useStashRestore
 //
 // It was introduced as B5-③'s acceptance witness (a memo that made the next
 // `use` of a just-saved file a 0-reload restore drove it 12 → 0 on a save→use
-// loop). That memo was measured at −0.2% wall and REVERTED (2026-08-06 project
+// loop). That memo was measured at −0.2% wall and REVERTED (2026-08-06 maintainer
 // adjudication, precedent A4): a native .hbin open is an mmap + header parse
 // with no whole-file hash, so the work it removed was already cheap. The
 // counter outlived the rung on its own merit — "how often does a session

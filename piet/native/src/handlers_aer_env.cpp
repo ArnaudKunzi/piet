@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // AER-SCOPE1 bundle D (ENV, 2026-09-03) -- the environment verbs the ninety-
 // paper AER corpus opens with, split out of handlers_m3.cpp so that file's
 // diff stays about data verbs (same reason handlers_data_verbs*.cpp and
@@ -30,8 +32,6 @@
 #include <vector>
 
 #include "piet/bundle_paths.h"
-#include "piet/bcal.h"
-#include "piet/calendar_paths.h"
 #include "piet/eval/errors.h"
 #include "piet/strutil.h"
 #include "io/win_compat.h"  // cecon::to_native_path / env_utf8 (BUG-050/051)
@@ -55,7 +55,7 @@ const eval::OptVocab& kVocabType =
 // abbreviation is ACCEPTED by rejectUnknownOptions and then dropped by this
 // handler's `k == "wide"' compare -- the exact BUG-233 shape.
 const eval::OptVocab& kVocabDir = eval::registerOptVocab({"dir", "ls"}, {{"wide"}, {}});
-const eval::OptVocab& kVocabFindfile = eval::registerOptVocab({"findfile"}, {{"path", "all"}, {}});
+const eval::OptVocab& kVocabFindfile = eval::registerOptVocab({"findfile"}, {{"path", "all", "nodescend"}, {}});
 
 std::string trim(const std::string& s) { return strutil::trim(s); }
 std::string lower(std::string s) { return strutil::lower(std::move(s)); }
@@ -185,30 +185,10 @@ std::string unquotedOperator(const std::string& s) {
   return "";
 }
 
-// Iterative `*`/`?` matcher (no character classes, no `**`). Linear in the
-// worst case that matters here; a recursive one would be shorter but a
-// pathological pattern in a do-file would then cost exponential time.
+// Iterative `*`/`?` matcher (no character classes, no `**`): the shared one,
+// where `?` is one character (a UTF-8 sequence), not one byte.
 bool globMatch(const std::string& pat, const std::string& name) {
-  size_t p = 0;
-  size_t n = 0;
-  size_t star = std::string::npos;
-  size_t mark = 0;
-  while (n < name.size()) {
-    if (p < pat.size() && (pat[p] == '?' || pat[p] == name[n])) {
-      ++p;
-      ++n;
-    } else if (p < pat.size() && pat[p] == '*') {
-      star = p++;
-      mark = n;
-    } else if (star != std::string::npos) {
-      p = star + 1;
-      n = ++mark;
-    } else {
-      return false;
-    }
-  }
-  while (p < pat.size() && pat[p] == '*') ++p;
-  return p == pat.size();
+  return strutil::globMatch(pat, name);
 }
 
 // Resolves one user-written path and expands `*`/`?` in its LAST component by
@@ -308,13 +288,27 @@ bool isSysdirName(const std::string& name) {
 // expands `~` at lookup time, so findfile still finds them, and bare `sysdir`
 // prints the short form a Stata user recognises rather than this machine's
 // home directory.
+// PLUS is Stata's platform default ([P] sysdir): on macOS
+// ~/Library/Application Support/Stata/ado/plus/ (the oracle machine's `sysdir`,
+// stata_probe6 of the g07 diagnosis: PLUS ~/Library/Application
+// Support/Stata/ado/plus/), where installed community ados live -- findfile
+// boottest.ado answers .../plus/b/boottest.ado (w2t_boottest_family.log:131);
+// ~/ado/plus/ is the Unix default. PERSONAL stays ~/ado/personal/ on every
+// platform although macOS Stata's is ~/Documents/Stata/ado/personal/: findfile
+// searches PERSONAL before PLUS, and a stat inside ~/Documents asks macOS for
+// Documents-folder access (TCC) on every headless run. Known gap: `sysdir`
+// prints PERSONAL differently from macOS Stata.
 void seedSysdir(SessionState& session) {
   if (!session.sysdir.empty()) return;
   const std::string bin = binaryDir();
   session.sysdir["STATA"] = bin;
   session.sysdir["BASE"] = bin;
   session.sysdir["SITE"] = bin;
+#ifdef __APPLE__
+  session.sysdir["PLUS"] = "~/Library/Application Support/Stata/ado/plus/";
+#else
   session.sysdir["PLUS"] = "~/ado/plus/";
+#endif
   session.sysdir["PERSONAL"] = "~/ado/personal/";
   session.sysdir["OLDPLACE"] = "~/ado/";
 }
@@ -346,6 +340,7 @@ void ensureAdopath(SessionState& session) {
 std::string errorCodeMessage(long long code) {
   switch (code) {
     case 1: return "You pressed Break";
+    case 4: return "no; dataset in memory has changed since last saved";
     case 100: return "varlist required";
     case 102: return "too few variables specified";
     case 109: return "type mismatch";
@@ -392,12 +387,6 @@ const char* const kShellAllowlistText =
     "to PIET file operations.";
 
 }  // namespace
-
-void configureCalendarSearch(SessionState& session) {
-  seedSysdir(session);
-  bcal::setSearchDir(bcal::searchDirFor(session.cwd.value_or(std::string())));
-  bcal::setPersonalDir(resolveUserPath(session, session.sysdir.at("PERSONAL")));
-}
 
 // ---------------------------------------------------------------------------
 // shell
@@ -724,10 +713,10 @@ nlohmann::ordered_json runType(const std::string& raw, const std::vector<std::st
   const std::string path = resolveUserPath(session, arg);
   const fs::path np = cecon::to_native_path(path);
   std::error_code ec;
-  if (!fs::exists(np, ec) || ec) return errBlockRc("file " + path + " not found", "r(601)");
+  if (!fs::exists(np, ec) || ec) return errBlockRc("file " + typedUserPath(arg) + " not found", "r(601)");
 
   std::ifstream in(np, std::ios::binary);
-  if (!in) return errBlockRc("file " + path + " could not be opened", "r(603)");
+  if (!in) return errBlockRc("file " + typedUserPath(arg) + " could not be opened", "r(603)");
 
   // 4 MiB + 1: reading one byte past the cap is what distinguishes "the file
   // ended" from "we stopped", without a second stat that could race the read.
@@ -878,12 +867,189 @@ nlohmann::ordered_json runDir(const std::string& raw, const std::vector<std::str
 // packages that use them, so a refusal costs the whole do-file, while an
 // honest note costs one line and leaves the analysis to run against whatever
 // is already on disk.
-nlohmann::ordered_json runNet(const std::string& raw, const std::vector<std::string>& varlist) {
+//
+// BUG-1461: `net install NAME, from(DIR)` naming a LOCAL directory does what
+// Stata does, because there the answer is knowable offline: a relative DIR is
+// r(198) "DIR/ is not an absolute path or a URL" (a leading ~ is the home
+// directory), a directory with no stata.toc is r(601), one whose NAME.pkg is
+// absent is r(601) "could not load NAME.pkg from DIR/", and otherwise the
+// package's `f'/`F' files are copied into the `net set ado' directory (PLUS by
+// default) under their first letter, `_' for a leading underscore. A file the
+// package lists but DIR lacks is r(601) and copies nothing; one already there
+// with other content is r(602) unless `replace'; identical ones are "up to date"
+// (StataBE 19.5, 2026-11-03). Stata's stata.trk installation record is not kept,
+// as PIET's `ado' keeps no package list. A URL keeps the offline note.
+//
+// `net from DIR' on a local DIR lists its stata.toc and makes DIR the site a
+// later `net install NAME' (no from()) installs from; a refused `net from'
+// keeps the previous site ("current site is still ..."). A URL site, or none,
+// keeps the offline note.
+namespace {
+// `net set ado` target and the current `net from` site, kept beside the sysdir
+// names; the lower-case keys never collide with Stata's upper-case ones.
+constexpr const char* kNetAdoKey = "net_ado";
+constexpr const char* kNetFromKey = "net_from";
+
+std::string withSlash(std::string d) {
+  if (d.empty() || d.back() != '/') d += '/';
+  return d;
+}
+
+std::string readWhole(const std::string& path) {
+  std::ifstream in(cecon::to_native_path(path), std::ios::binary);
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  return ss.str();
+}
+
+// A local site's directory with its trailing slash, or the r(198)/r(601)
+// refusal `net from`/`net install, from()` give when it is not one.
+std::optional<nlohmann::ordered_json> localSite(const std::string& from, SessionState& session,
+                                                std::string& dir) {
+  namespace fs = std::filesystem;
+  const std::string src = (!from.empty() && from[0] == '~') ? resolveUserPath(session, from) : from;
+  dir = withSlash(src);
+  if (!fs::path(cecon::to_native_path(src)).is_absolute())
+    return errBlockRc(dir + " is not an absolute path or a URL", "r(198)");
+  std::error_code ec;
+  if (!fs::is_regular_file(cecon::to_native_path(dir + "stata.toc"), ec)) {
+    std::string text = "file " + dir + "stata.toc not found\n" + dir +
+                       " either\n  1)  does not exist or\n  2)  is not a Stata download "
+                       "directory (has no stata.toc file).";
+    if (session.sysdir.count(kNetFromKey))
+      text += "\n\ncurrent site is still " + session.sysdir[kNetFromKey];
+    return errBlockRc(text, "r(601)");
+  }
+  return std::nullopt;
+}
+
+// `net from DIR`: the toc's `d' lines between rules, then its `p' packages.
+nlohmann::ordered_json netFromLocal(const std::string& from, SessionState& session) {
+  std::string dir;
+  if (auto refused = localSite(from, session, dir)) return *refused;
+  session.sysdir[kNetFromKey] = dir;
+  const std::string rule(78, '-');
+  std::string text = rule + "\n" + dir, packages;
+  std::istringstream toc(readWhole(dir + "stata.toc"));
+  for (std::string line; std::getline(toc, line);) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.size() < 2 || (line[1] != ' ' && line[1] != '\t')) continue;
+    const std::string rest = trim(line.substr(2));
+    if (line[0] == 'd') {
+      text += "\n" + rest;
+    } else if (line[0] == 'p') {
+      const std::string pkg = firstWord(rest);
+      std::string desc = trim(rest.substr(pkg.size()));
+      std::string padded = pkg;
+      if (padded.size() < 18) padded.resize(18, ' ');
+      packages += "\n    " + padded + desc;
+    }
+  }
+  text += "\n" + rule;
+  if (!packages.empty()) text += "\n\nPACKAGES you could -net describe-:" + packages + "\n" + rule;
+  return displayBlock(text);
+}
+
+nlohmann::ordered_json netInstallLocal(const std::string& name, const std::string& from,
+                                       bool replace, SessionState& session) {
+  namespace fs = std::filesystem;
+  std::string dir;
+  if (auto refused = localSite(from, session, dir)) return *refused;
+  std::error_code ec;
+  if (!fs::is_regular_file(cecon::to_native_path(dir + name + ".pkg"), ec))
+    return errBlockRc("file " + dir + name + ".pkg not found\ncould not load " + name +
+                          ".pkg from " + dir,
+                      "r(601)");
+
+  std::vector<std::string> files;
+  {
+    std::istringstream pkg(readWhole(dir + name + ".pkg"));
+    for (std::string line; std::getline(pkg, line);) {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (line.size() > 2 && (line[0] == 'f' || line[0] == 'F') && (line[1] == ' ' || line[1] == '\t'))
+        files.push_back(trim(line.substr(2)));
+    }
+  }
+  seedSysdir(session);
+  std::string target = session.sysdir.count(kNetAdoKey) ? session.sysdir[kNetAdoKey] : "PLUS";
+  if (session.sysdir.count(target)) target = session.sysdir[target];
+  target = withSlash(resolveUserPath(session, target));
+
+  std::string text = "checking " + name + " consistency and verifying not already installed...";
+  struct Copy {
+    std::string from, to;
+    bool exists;
+  };
+  std::vector<Copy> copies;
+  std::vector<std::string> differ;
+  for (const auto& f : files) {
+    const std::string from1 = dir + f;
+    if (!fs::is_regular_file(cecon::to_native_path(from1), ec))
+      return errBlockRc(text + "\nfile " + from1 + " not found\ncould not copy " + from1 +
+                            "\n(no action taken)",
+                        "r(601)");
+    const std::string base = fs::path(cecon::to_native_path(f)).filename().u8string();
+    const std::string letter = base.empty() || base[0] == '_'
+                                   ? std::string("_")
+                                   : std::string(1, static_cast<char>(std::tolower(
+                                                        static_cast<unsigned char>(base[0]))));
+    const std::string to = target + letter + "/" + base;
+    const bool exists = fs::is_regular_file(cecon::to_native_path(to), ec);
+    if (exists && readWhole(to) == readWhole(from1)) continue;
+    if (exists) differ.push_back(to);
+    copies.push_back({from1, to, exists});
+  }
+  if (!differ.empty() && !replace) {
+    text += "\nthe following files already exist and are different:";
+    for (const auto& d : differ) text += "\n    " + d;
+    return errBlockRc(text + "\nno files installed or copied\n(no action taken)", "r(602)");
+  }
+  if (copies.empty()) return displayBlock(text + "\nall files already exist and are up to date.");
+  if (!differ.empty()) {
+    text += "\nthe following files will be replaced:";
+    for (const auto& d : differ) text += "\n    " + d;
+  }
+  text += "\ninstalling into " + target + "...";
+  for (const auto& c : copies) {
+    const fs::path to = cecon::to_native_path(c.to);
+    fs::create_directories(to.parent_path(), ec);
+    fs::copy_file(cecon::to_native_path(c.from), to, fs::copy_options::overwrite_existing, ec);
+    if (ec) return errBlockRc(text + "\ncould not copy " + c.from, "r(603)");
+  }
+  return displayBlock(text + "\ninstallation complete.");
+}
+}  // namespace
+
+nlohmann::ordered_json runNet(const std::string& raw, const std::vector<std::string>& varlist,
+                              const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                              SessionState& session) {
   const std::string sub =
       varlist.empty() ? lower(firstWord(argAfterCommand(raw))) : lower(varlist[0]);
   if (sub == "install") {
     const std::string name = varlist.size() > 1 ? dequote(varlist[1]) : "";
+    std::string from;
+    bool replace = false;
+    for (const auto& [k, v] : opts) {
+      if (k == "from" && !v.isBool) from = dequote(trim(v.strValue));
+      if (k == "replace") replace = true;
+    }
+    if (from.empty() && session.sysdir.count(kNetFromKey)) from = session.sysdir[kNetFromKey];
+    if (!from.empty() && from.find("://") == std::string::npos)
+      return netInstallLocal(name, from, replace, session);
     return displayBlock("(net install " + name + ": PIET is offline -- skipped)");
+  }
+  if (sub == "from" && varlist.size() > 1) {
+    const std::string where = dequote(varlist[1]);
+    if (where.find("://") == std::string::npos) return netFromLocal(where, session);
+    session.sysdir.erase(kNetFromKey);  // a URL site: later installs are offline notes
+  }
+  // `net set ado DIR|SYSDIRNAME`: where a local install copies to; silent, as in Stata.
+  if (sub == "set" && varlist.size() > 2 && lower(varlist[1]) == "ado") {
+    seedSysdir(session);  // a first entry would otherwise stop the seeding
+    const std::string where = dequote(varlist[2]);
+    const std::string up = upper(where);
+    session.sysdir[kNetAdoKey] = isSysdirName(up) ? up : resolveUserPath(session, where);
+    return nlohmann::ordered_json::array();
   }
   if (sub.empty()) return displayBlock("(net: PIET is offline -- skipped)");
   return displayBlock("(net " + sub + ": PIET is offline -- skipped)");
@@ -908,10 +1074,10 @@ nlohmann::ordered_json runAdo(const std::string& raw, const std::vector<std::str
 // ---------------------------------------------------------------------------
 // adopath [+|++|- PATH]
 //
-// PIET runs no ado-files, so this can never change what EXECUTES. What it can
-// do is record where the package believed its own files live, which is the one
-// thing a later `findfile` actually reads back -- an accept-and-remember note
-// instead of an accept-and-forget one.
+// Records where the package believed its own files live. A later `findfile`
+// reads the list back, and so does the dispatcher's ado autoload (BUG-442):
+// a command the package ships as `NAME.ado` in a directory it added here is
+// found and run, as in Stata.
 nlohmann::ordered_json runAdopath(const std::string& raw, const std::vector<std::string>& varlist,
                                   SessionState& session) {
   ensureAdopath(session);
@@ -963,11 +1129,11 @@ nlohmann::ordered_json runAdopath(const std::string& raw, const std::vector<std:
   }
   // The note names the path AS WRITTEN; the list holds the RESOLVED one. A note
   // that echoed the resolution would bake the capture machine's cwd into every
-  // golden that pins it (`adopath + "ado"` prints /Volumes/.../ado on one
+  // golden that pins it (`adopath + "ado"` prints /mnt/.../ado on one
   // machine and /home/... on the next), and the resolved form is not lost -- a
   // bare `adopath` prints exactly what was recorded.
   return displayBlock("(adopath " + op + " " + pathArg +
-                      ": recorded for findfile -- PIET runs no ado-files)");
+                      ": recorded for findfile and ado autoload)");
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,28 +1196,80 @@ nlohmann::ordered_json runSysdir(const std::string& raw, const std::vector<std::
   // are deliberately left unexpanded.
   const std::string resolved = resolveUserPath(session, pathArg);
   session.sysdir[name] = resolved;
-  if (name == "PERSONAL") configureCalendarSearch(session);
   // As written, not as resolved -- same reproducible-golden reason as adopath
   // above; bare `sysdir` reports the resolved directory that was recorded.
   return displayBlock("(sysdir set " + name + " " + pathArg +
-                      ": recorded for findfile -- PIET runs no ado-files)");
+                      ": recorded for findfile)");
 }
+
+namespace {
+
+// The directories findfile searches, in order, for NAME: each entry itself and
+// then its letter subdirectory. Shared with the dispatcher's ado autoload, so
+// a command is found exactly where findfile would report it.
+std::vector<std::string> searchAdoDirs(const SessionState& session,
+                                       const std::vector<std::string>& searchList,
+                                       const std::string& name, bool nodescend, bool all) {
+  // Each directory is searched itself and then its letter subdirectory ([P]
+  // findfile, p.pdf pp.246-247: "nodescend specifies that findfile not follow
+  // Stata's normal practice of searching in letter subdirectories of
+  // directories in the path, as well as in the directories themselves"); the
+  // letter is the file name's first character, lower-cased ([P] macro, adosubdir:
+  // "Typically, the directory name would be the first letter of filename").
+  // An installed ado lives there: findfile boottest.ado is
+  // .../ado/plus/b/boottest.ado on the oracle machine (w2t_boottest_family.log:131).
+  namespace fs = std::filesystem;
+  std::string letter;
+  if (!nodescend) {
+    const std::string base = fs::path(cecon::to_native_path(name)).filename().u8string();
+    if (!base.empty() && base.size() == name.size()) {
+      const unsigned char c0 = static_cast<unsigned char>(base[0]);
+      if (std::isalnum(c0) || c0 == '_') letter = std::string(1, static_cast<char>(std::tolower(c0)));
+    }
+  }
+  std::vector<std::string> hits;
+  for (const auto& entry : searchList) {
+    // "." is resolved HERE, not when it was recorded: cwd moves, and an entry
+    // frozen at record time would search a directory the do-file has left.
+    const std::string dir = (entry == ".") ? sessionCwd(session) : resolveUserPath(session, entry);
+    std::vector<fs::path> cands = {cecon::to_native_path(dir) / cecon::to_native_path(name)};
+    if (!letter.empty())
+      cands.push_back(cecon::to_native_path(dir) / letter / cecon::to_native_path(name));
+    bool stop = false;
+    for (const auto& cand : cands) {
+      std::error_code ec;
+      if (fs::is_regular_file(cand, ec) && !ec) {
+        hits.push_back(cand.u8string());
+        if (!all) {
+          stop = true;
+          break;
+        }
+      }
+    }
+    if (stop) break;
+  }
+
+  return hits;
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // findfile FNAME [, path(dirlist) all]
 nlohmann::ordered_json runFindfile(const std::string& raw, const std::vector<std::string>& varlist,
                                    const std::vector<std::pair<std::string, eval::OptValue>>& opts,
                                    SessionState& session) {
-  namespace fs = std::filesystem;
   if (auto err = eval::rejectUnknownOptions(opts, kVocabFindfile.known)) return ojson(*err);
 
   const std::string name = varlist.empty() ? argAfterCommand(raw) : dequote(varlist[0]);
   if (name.empty()) return errBlock("findfile: filename required", "syntax_error");
 
   bool all = false;
+  bool nodescend = false;
   std::string pathOpt;
   for (const auto& [k, v] : opts) {
     if (k == "all" && v.isBool) all = v.boolValue;
+    else if (k == "nodescend" && v.isBool) nodescend = v.boolValue;
     else if (k == "path") pathOpt = v.strValue;
   }
 
@@ -1074,18 +1292,7 @@ nlohmann::ordered_json runFindfile(const std::string& raw, const std::vector<std
     searchList = session.adopath;
   }
 
-  std::vector<std::string> hits;
-  for (const auto& entry : searchList) {
-    // "." is resolved HERE, not when it was recorded: cwd moves, and an entry
-    // frozen at record time would search a directory the do-file has left.
-    const std::string dir = (entry == ".") ? sessionCwd(session) : resolveUserPath(session, entry);
-    const fs::path cand = cecon::to_native_path(dir) / cecon::to_native_path(name);
-    std::error_code ec;
-    if (fs::is_regular_file(cand, ec) && !ec) {
-      hits.push_back(cand.u8string());
-      if (!all) break;
-    }
-  }
+  const std::vector<std::string> hits = searchAdoDirs(session, searchList, name, nodescend, all);
 
   if (hits.empty()) return errBlockRc("file \"" + name + "\" not found", "r(601)");
 
@@ -1108,6 +1315,25 @@ nlohmann::ordered_json runFindfile(const std::string& raw, const std::vector<std
     text += hits[i];
   }
   return displayBlock(text);
+}
+
+std::optional<std::string> findOnAdopath(SessionState& session, const std::string& fname) {
+  ensureAdopath(session);
+  // The seeded system entries (BASE/SITE are PIET's own binary directory, the
+  // rest the `~` defaults) are left out: they hold this machine's installed
+  // community packages, and what PIET runs must not depend on what happens to
+  // be installed where it runs. A package's own code is found -- beside the
+  // do-file (".") or in a directory the do-file put on the path.
+  const std::string bin = binaryDir();
+  std::vector<std::string> searchList;
+  for (const auto& entry : session.adopath) {
+    if (entry == bin || entry.rfind("~", 0) == 0) continue;
+    searchList.push_back(entry);
+  }
+  const std::vector<std::string> hits =
+      searchAdoDirs(session, searchList, fname, /*nodescend=*/false, /*all=*/false);
+  if (hits.empty()) return std::nullopt;
+  return hits[0];
 }
 
 // ---------------------------------------------------------------------------

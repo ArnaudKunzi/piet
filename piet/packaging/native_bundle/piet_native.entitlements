@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Hardened-runtime entitlements for the M5 GA .app. The frozen 1.16.0
+	     PyInstaller bundle (piet/packaging/piet.spec) ad-hoc codesigned with
+	     NO entitlements file at all (codesign_identity=None,
+	     entitlements_file=None) — that worked because a plain ad-hoc
+	     signature does not opt into the hardened runtime, so none of these
+	     restrictions applied. piet_native's ad-hoc build (this file, see
+	     package_native_app.sh) follows the SAME ad-hoc-signed, no-hardened-
+	     runtime path by default; this entitlements file is kept ready for
+	     the day a real Developer ID identity is available (`codesign -s
+	     "Developer ID Application: ..." --options runtime --entitlements
+	     piet_native.entitlements`), since hardened-runtime + Developer ID
+	     go together and WKWebView (WebKit's process-per-tab model, forks a
+	     helper "com.apple.WebKit.WebContent" process) needs the JIT +
+	     unsigned-executable-memory entitlements below to run under a
+	     hardened runtime — WITHOUT them, WKWebView's JS JIT silently falls
+	     back to the interpreter (functional but slow) or, on some macOS
+	     versions, refuses to load content at all. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<key>com.apple.security.network.server</key>
+	<false/>
+</dict>
+</plist>

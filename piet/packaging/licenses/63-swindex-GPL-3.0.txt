@@ -1,0 +1,27 @@
+swindex (SSC s458912; Stata Journal 20-4 st0622) — GPL-3.0
+Adopted at: piet/native/src/handlers_e3_swindex.cpp (the `swindex` command: the
+Anderson (2008) inverse-covariance-weighted index, derived from swindex.ado;
+line citations in that file, ADO:line, refer to the upstream ado)
+
+Project:  swindex — Stata module to create a standardized weighted index of
+          multiple indicator variables
+Authors:  Benjamin Schwab (Kansas State University), Sarah Janzen (Kansas State
+          University), Nicholas P. Magnan (University of Georgia),
+          William M. Thompson (IDInsight)
+Version:  the SSC distribution (version 14 ado, 273 lines); the SSC listing
+          revision is dated 2021-02-24. Stata Journal 20(4), st0622.
+Source:   Statistical Software Components (SSC / RePEc),
+          https://ideas.repec.org/c/boc/bocode/s458912.html
+          (install from Stata: ssc install swindex)
+Licence:  GNU General Public License version 3. The SSC listing states:
+          "The module is made available under terms of the GPL v3
+          (https://www.gnu.org/licenses/gpl-3.0.txt)."
+
+No upstream LICENSE text ships with the package; the licence is stated in its
+SSC listing. The ado file carries authors and contact details but no licence
+line. The GPL-3.0 text is available at the URL above, and the full text of the
+GNU General Public License version 3 or later, under which this project is
+distributed, ships beside this application as LICENSE.txt.
+
+Copyright remains with the swindex authors for the portions derived from their
+code.

@@ -1,9 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "piet/session_state.h"
 #include <execinfo.h>
 #include <dlfcn.h>
 #include "io/win_compat.h"  // cecon::to_native_path (BUG-050 wide open)
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>   // C4-L1 window trace (stderr fprintf, env-gated)
@@ -17,8 +21,13 @@
 #include <unordered_set>
 
 #include "piet/bcal.h"  // bcal::clearCache (resetProcessCaches)
+#include "piet/cclass.h"  // BUG-1006: resolveCValue (macroCValue)
 #include "piet/counters.h"
+#include "piet/eval/errors.h"  // eval::coarseRc (the r(N) of a logged error)
+#include "piet/eval/macros.h"  // eScalarKey (eNameOrderFor)
+#include "piet/display_hardening.h"  // BUG-718: readVarObservation (macroVarObs)
 #include "piet/scratch_seq.h"  // BUG-389: scratchMintSeq (sweep throttle)
+#include "piet/storage_type.h"  // stataDefaultFormat (displayFormat)
 
 namespace piet {
 
@@ -80,7 +89,14 @@ void SessionState::progressStart(int totalLines, std::optional<std::string> doPa
 void SessionState::progressUpdate(int currentLine, const std::string& currentCmd, int blocksReady) {
   std::lock_guard<std::mutex> lock(progressMutex_);
   progress_.currentLine = currentLine;
-  progress_.currentCmd = currentCmd.size() > 120 ? currentCmd.substr(0, 120) : currentCmd;
+  // Cut at 120 bytes, but never inside a UTF-8 character: a Korean statement
+  // cut mid-codepoint is not valid UTF-8, and the snapshot is JSON (BUG-1131).
+  size_t cut = currentCmd.size();
+  if (cut > 120) {
+    cut = 120;
+    while (cut > 0 && (static_cast<unsigned char>(currentCmd[cut]) & 0xC0) == 0x80) --cut;
+  }
+  progress_.currentCmd = currentCmd.substr(0, cut);
   progress_.blocksReady = blocksReady;
 }
 
@@ -116,7 +132,12 @@ bool SessionState::progressRequestCancel() {
 
 bool SessionState::progressCancelRequested() const {
   std::lock_guard<std::mutex> lock(progressMutex_);
-  return progress_.cancelRequested;
+  // BUG-1068: a cancel belongs to the run it was asked of. The flag outlives
+  // that run (the final tick reports it), and read bare it stopped the next
+  // block executed on this session without owning a run -- at its first line,
+  // "run cancelled" -- until some later run reset it. That happened whenever a
+  // cancel landed after the run's last poll, or was the one that stopped it.
+  return progress_.running && progress_.cancelRequested;
 }
 
 nlohmann::ordered_json SessionState::progressSnapshot() const {
@@ -166,7 +187,9 @@ std::optional<std::string> SessionState::requestUserInput(
     evt["choices"] = arr;
   }
   for (auto it = extra.begin(); it != extra.end(); ++it) evt[it.key()] = it.value();
-  requestPostEvent_(evt.dump());
+  // The prompt is the do-file's own text, which can hold a byte that is not
+  // UTF-8: it goes out as U+FFFD, as every other block does (BUG-1131).
+  requestPostEvent_(evt.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace));
 
   std::unique_lock<std::mutex> lock(requestMutex_);
   bool cancelled = false;
@@ -218,22 +241,360 @@ nlohmann::ordered_json SessionState::historyJson() const {
   return out;
 }
 
+namespace {
+// ---------------------------------------------------------------------------
+// SMCL log writer (`log using FILE.smcl`, or `log using FILE, smcl`).
+//
+// Implements the SMCL log format per the log help file. Everything byte-level
+// below was identified against StataBE 19.5 captures of `log using x.smcl`
+// (scratch-r150/t7-l5/stata/cap1..cap8), not guessed:
+//
+//  * A fresh file starts "{smcl}\n{txt}{sf}{ul off}{.-}\n" and four label
+//    lines (name / log / log type / opened on); the label values are in {res}.
+//    Appending to a file that already has content, and `log on`, start with
+//    "{smcl}\n{com}{sf}{ul off}{txt}{.-}\n" instead (the closing marker of the
+//    previous segment has no newline, so the two run together).
+//  * Stata writes a mode tag ({txt} {res} {com} {err}) only where the mode
+//    CHANGES. Each command is a blank line in {txt}, then "{com}. cmd"; a
+//    display line is {res}; an error is {err} followed by
+//    "{txt}{search r(N), local:r(N);}" unless the command was captured.
+//  * Literal braces in an echoed command line are escaped one for one as
+//    {c -(} and {c )-}. What `display` prints is NOT escaped: its text is SMCL
+//    already (the user typed the directives), and Stata copies it through.
+//    (Text any other command prints is plain; there the braces are escaped.)
+//  * `log off` / `log close` write the command line, then a footer of the
+//    same four labels (paused on / closed on), "{txt}{.-}\n{smcl}\n" and a
+//    final "{txt}{sf}{ul off}" with no newline. `log on` writes the
+//    "resumed on" header but not its own command line. A paused log is closed
+//    silently. A log left open at the end of the run gets no footer.
+//  * Under `quietly` / `capture` (without `noisily`) those banners and footers
+//    are suppressed output: the file gets only "{smcl}\n{com}{sf}{ul off}"
+//    (no newline) where each would stand. `cap log off X` / `cap log on X`,
+//    the 073 spelling, is that case.
+//
+// What differs from StataBE, by design: PIET's result blocks are not Stata's
+// rendered tables, so a non-display block is written as the same "key: value"
+// dump the text log uses (in {txt} mode, braces escaped) rather than as the
+// ado's SMCL table; the loop-body numbering ("  2. ...") and the "> " line
+// continuations of an echoed command are not reproduced; and the console-side
+// output of `log using` / `log off` (the "(file ... not found)" note and the
+// printed header) is not part of PIET's blocks, so the unnamed log never
+// contains another log's banner; and the OPENING banner is always the full one
+// -- a `quietly log using` gets the short marker in StataBE (the same rule as
+// above), but the banner is written when the log opens, before the command
+// line that says how it was spelled has reached the tee. The depth rule of LogState::depth is the text
+// log's own and is kept: a log opened under a prefix (`quietly log using ...`)
+// belongs to the prefix's inner frame and records only what that depth carries.
+// A frame that flattens a whole `do` file or loop is written when that frame
+// ends; the `log off` / `log on` / `log close` lines inside it take effect where
+// they stand in the frame.
+constexpr char kModeTxt = 't';
+constexpr char kModeRes = 'r';
+constexpr char kModeCom = 'c';
+constexpr char kModeErr = 'e';
+
+const char* smclModeTag(char mode) {
+  switch (mode) {
+    case kModeTxt: return "{txt}";
+    case kModeRes: return "{res}";
+    case kModeCom: return "{com}";
+    default: return "{err}";
+  }
+}
+
+// Moves the stream to `mode`, writing the tag only on a change.
+void smclSetMode(LogState& log, char mode) {
+  if (log.smclMode == mode) return;
+  log.stream << smclModeTag(mode);
+  log.smclMode = mode;
+}
+
+// Literal braces as SMCL spells them, one for one.
+std::string smclEscape(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  for (const char c : s) {
+    if (c == '{') {
+      out += "{c -(}";
+    } else if (c == '}') {
+      out += "{c )-}";
+    } else {
+      out.push_back(c);
+    }
+  }
+  return out;
+}
+
+// "28 Oct 2026, 02:46:04": the day is blank-padded like c(current_date)
+// (cclass.cpp), the clock zero-padded like c(current_time). The captures were
+// taken on a two-digit day, so the blank padding of 1-9 is c(current_date)'s
+// convention, not something a header capture showed.
+std::string smclStamp() {
+  static const char* const kMon[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  const std::time_t t = std::time(nullptr);
+  std::tm tmv{};
+#ifdef _WIN32
+  localtime_s(&tmv, &t);
+#else
+  localtime_r(&t, &tmv);
+#endif
+  const int mon = (tmv.tm_mon >= 0 && tmv.tm_mon < 12) ? tmv.tm_mon : 0;
+  char buf[48];
+  std::snprintf(buf, sizeof(buf), "%2d %s %04d, %02d:%02d:%02d", tmv.tm_mday, kMon[mon],
+                tmv.tm_year + 1900, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+  return std::string(buf);
+}
+
+// The name / log / log type lines. `nameLinePrefix` is what precedes "name:" --
+// the header's line follows the {txt} that ends its first line, the footers'
+// carries its own {txt}.
+void smclLabelLines(LogState& log, const char* nameLinePrefix) {
+  log.stream << nameLinePrefix << "name:  {res}"
+             << (log.name.empty() ? std::string("<unnamed>") : smclEscape(log.name)) << "\n"
+             << "       {txt}log:  {res}" << smclEscape(log.path) << "\n"
+             << "  {txt}log type:  {res}smcl\n";
+}
+
+// Under `quietly` / `capture` (no `noisily`) the banner and footer text are
+// output the command suppresses, and only the structural markers reach the
+// file: "{smcl}\n{com}{sf}{ul off}", with no newline after it.
+void smclWriteQuietMarker(LogState& log) {
+  log.stream << "{smcl}\n{com}{sf}{ul off}";
+  log.smclMode = kModeCom;
+  log.stream.flush();
+}
+
+// Opening banner. `continuation` = the file already holds a segment, or this
+// is the resume of a paused log.
+void smclWriteBanner(LogState& log, bool continuation, bool resumed, bool quiet = false) {
+  if (quiet) return smclWriteQuietMarker(log);
+  log.stream << "{smcl}\n"
+             << (continuation ? "{com}{sf}{ul off}{txt}{.-}\n" : "{txt}{sf}{ul off}{.-}\n");
+  smclLabelLines(log, "      ");
+  log.stream << (resumed ? "{txt}resumed on:  {res}" : " {txt}opened on:  {res}") << smclStamp()
+             << "\n";
+  log.smclMode = kModeRes;
+  log.stream.flush();
+}
+
+// Closing footer of a segment; `what` is "paused" or "closed".
+void smclWriteFooter(LogState& log, const char* what, bool quiet = false) {
+  if (quiet) return smclWriteQuietMarker(log);
+  smclLabelLines(log, "      {txt}");
+  log.stream << " {txt}" << what << " on:  {res}" << smclStamp() << "\n"
+             << "{txt}{.-}\n{smcl}\n{txt}{sf}{ul off}";
+  log.smclMode = kModeTxt;
+  log.stream.flush();
+}
+
+// Applies every request in `ops` at once, in order, to a log whose tee will
+// not meet their command lines (the frame already passed, or none of the log's
+// depth is coming). Returns true when the log was closed. A request that finds
+// the log already in the asked state (a second `log off`) writes nothing, as
+// Stata does.
+bool smclDrainOps(LogState& log) {
+  bool closed = false;
+  for (const LogOp op : log.ops) {
+    if (op == LogOp::Pause) {
+      if (!log.paused) {
+        smclWriteFooter(log, "paused");
+        log.paused = true;
+      }
+    } else if (op == LogOp::Resume) {
+      if (log.paused) {
+        smclWriteBanner(log, /*continuation=*/true, /*resumed=*/true);
+        log.paused = false;
+      }
+    } else {
+      if (!log.paused) smclWriteFooter(log, "closed");  // a paused log closes silently
+      closed = true;
+      break;
+    }
+  }
+  log.ops.clear();
+  return closed;
+}
+
+// The state `log` will be in once its queued requests are applied.
+bool smclWillBePaused(const LogState& log) {
+  bool paused = log.paused;
+  for (const LogOp op : log.ops) {
+    if (op == LogOp::Pause) paused = true;
+    if (op == LogOp::Resume) paused = false;
+  }
+  return paused;
+}
+
+// Is the echo text `echo` (".  cap log off Main_log") the command line of a
+// queued `op` aimed at `log`? The prefixes capture/quietly/noisily (and their
+// abbreviations) are skipped; a target that is a macro cannot be compared and
+// is taken to match. The tee uses this to put the footer after the right line
+// when a container frame (a `do` file, a loop) carries many commands. `quiet`
+// reports the prefixes' verdict on output: capture and quietly silence it,
+// a later noisily restores it.
+struct LogCommandEcho {
+  bool matches = false;
+  bool quiet = false;
+};
+
+// An echo line (".  cap noi display ...") split into words, with the command
+// prefixes consumed: `first` is the index of the command word, `quiet` the
+// prefixes' verdict (capture and quietly silence output, a later noisily
+// restores it). A trailing ';' (delimiter mode) is dropped from each word.
+struct EchoWords {
+  std::vector<std::string> tok;
+  size_t first = 0;
+  bool quiet = false;
+};
+EchoWords smclSplitEcho(const std::string& echo) {
+  EchoWords out;
+  std::istringstream words(echo.size() > 1 && echo[0] == '.' ? echo.substr(1) : echo);
+  for (std::string w; words >> w;) {
+    while (!w.empty() && w.back() == ';') w.pop_back();
+    out.tok.push_back(w);
+  }
+  auto abbrevOf = [](std::string w, const std::string& full, size_t minLen) {
+    while (!w.empty() && w.back() == ':') w.pop_back();
+    for (char& c : w) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return w.size() >= minLen && w.size() <= full.size() && full.compare(0, w.size(), w) == 0;
+  };
+  for (; out.first < out.tok.size(); ++out.first) {
+    const std::string& w = out.tok[out.first];
+    if (abbrevOf(w, "capture", 3) || abbrevOf(w, "quietly", 3)) {
+      out.quiet = true;
+    } else if (abbrevOf(w, "noisily", 2)) {
+      out.quiet = false;
+    } else {
+      break;
+    }
+  }
+  return out;
+}
+
+LogCommandEcho smclParseLogCommand(const std::string& echo, const LogState& log, LogOp op) {
+  const EchoWords e = smclSplitEcho(echo);
+  LogCommandEcho out;
+  out.quiet = e.quiet;
+  const size_t i = e.first;
+  if (i + 1 >= e.tok.size() || e.tok[i] != "log") return out;
+  const char* sub = op == LogOp::Pause ? "off" : op == LogOp::Resume ? "on" : "close";
+  if (e.tok[i + 1] != sub) return out;
+  if (i + 2 >= e.tok.size()) {
+    out.matches = log.name.empty();
+  } else {
+    const std::string& target = e.tok[i + 2];
+    out.matches = target == "_all" || target.find_first_of("`$") != std::string::npos ||
+                  target == log.name;
+  }
+  return out;
+}
+
+// Did this command line come from `display` (or an abbreviation, `di` up)? Its
+// output text is what the user typed, SMCL directives and all; the text any
+// other command prints is plain and has its braces escaped.
+bool smclEchoIsDisplay(const std::string& echo) {
+  if (echo.empty() || echo[0] != '.') return false;
+  const EchoWords e = smclSplitEcho(echo);
+  if (e.first >= e.tok.size()) return false;
+  const std::string& w = e.tok[e.first];
+  return w.size() >= 2 && std::string("display").compare(0, w.size(), w) == 0;
+}
+}  // namespace
+
 bool SessionState::openLog(const std::string& resolvedPath, bool appendMode,
-                           const std::string& name, int depth) {
+                           const std::string& name, int depth, bool smcl) {
   // Defensive only — handlers_m3.cpp's runLog already refuses reopening a log
   // under a name that is already open, matching real Stata, so in normal use
   // there is nothing to drop here. Dropping (rather than e.g. asserting) keeps
   // this a total function.
   closeLog(name);
+  // A `log close` of the same file that is still waiting for its footer must
+  // write it before this open can truncate or extend the file.
+  for (auto it = endingLogs_.begin(); it != endingLogs_.end();) {
+    if ((*it)->path == resolvedPath) {
+      smclDrainOps(**it);
+      it = endingLogs_.erase(it);
+    } else {
+      ++it;
+    }
+  }
   auto st = std::make_unique<LogState>();
   st->path = resolvedPath;
   st->name = name;
   st->depth = depth;
+  st->smcl = smcl;
+  bool continuation = false;
+  if (smcl && appendMode) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(cecon::to_native_path(resolvedPath), ec);
+    continuation = !ec && size > 0;
+  }
   st->stream.open(cecon::to_native_path(resolvedPath),
                    std::ios::out | (appendMode ? std::ios::app : std::ios::trunc));
   if (!st->stream.is_open()) return false;
+  if (smcl) {
+    smclWriteBanner(*st, continuation, /*resumed=*/false);
+    st->skipNextEcho = true;  // the `log using` line is not in the log
+  }
   logs_.push_back(std::move(st));
   return true;
+}
+
+bool SessionState::closeLog(const std::string& name) {
+  for (auto it = logs_.begin(); it != logs_.end(); ++it) {
+    if ((*it)->name != name) continue;
+    std::unique_ptr<LogState> log = std::move(*it);
+    logs_.erase(it);
+    if (!log->smcl) return true;  // ofstream's dtor flushes + closes
+    log->ops.push_back(LogOp::Close);
+    if (log->depth > dispatchDepth_) {
+      // Opened deeper than the frame closing it: no later frame of that depth
+      // will carry the command line, so the footer cannot wait for it.
+      smclDrainOps(*log);
+    } else {
+      endingLogs_.push_back(std::move(log));
+    }
+    return true;
+  }
+  return false;
+}
+
+void SessionState::closeAllLogs() {
+  for (const auto& n : logNames()) closeLog(n);
+}
+
+bool SessionState::pauseLog(const std::string& name) {
+  for (auto& l : logs_) {
+    if (l->name != name) continue;
+    if (!l->smcl) {
+      l->paused = true;
+    } else if (!smclWillBePaused(*l)) {
+      // The footer follows the `log off` command line, which logTee() writes
+      // after this handler has returned -- unless no later frame of this log's
+      // depth is coming (opened deeper than the frame pausing it).
+      l->ops.push_back(LogOp::Pause);
+      if (l->depth > dispatchDepth_) smclDrainOps(*l);
+    }
+    return true;
+  }
+  return false;
+}
+
+bool SessionState::resumeLog(const std::string& name) {
+  for (auto& l : logs_) {
+    if (l->name != name) continue;
+    if (!l->smcl) {
+      l->paused = false;
+    } else if (smclWillBePaused(*l)) {
+      // The resumed header stands where the `log on` line would (the line
+      // itself is not recorded: the log was off when it ran).
+      l->ops.push_back(LogOp::Resume);
+      if (l->depth > dispatchDepth_) smclDrainOps(*l);
+    }
+    return true;
+  }
+  return false;
 }
 
 namespace {
@@ -301,11 +662,120 @@ void jsonAsText(const nlohmann::ordered_json& v, std::ostream& out, const std::s
     out << prefix << jsonScalarToText(v) << "\n";
   }
 }
+
+// A command line: a blank line in {txt}, then "{com}. cmd". PIET's prompt is
+// ".  cmd" (two spaces); Stata's is ". cmd". An echo that does not start with
+// "." is a note PIET printed (not a command) and stays {txt} output.
+void smclWriteEcho(LogState& log, std::string t) {
+  smclSetMode(log, kModeTxt);
+  if (!t.empty() && t[0] == '.') {
+    log.stream << "\n";
+    if (t.compare(0, 3, ".  ") == 0) t.erase(1, 1);
+    smclSetMode(log, kModeCom);
+  }
+  log.stream << smclEscape(t) << "\n";
+}
+
+// One non-echo block. `fromDisplay` = the command line before it was `display`.
+void smclWriteBlock(LogState& log, const nlohmann::ordered_json& b, const std::string& type,
+                    bool fromDisplay, const std::string& tabstatText, bool& consumedTabstat) {
+  if (type == "display" && fromDisplay) {
+    // The text is SMCL already -- it is what the user typed to `display`. If it
+    // carries directives of its own it may have changed the mode, so forget it.
+    const std::string text = b.value("text", std::string());
+    smclSetMode(log, kModeRes);
+    log.stream << text << "\n";
+    if (text.find('{') != std::string::npos) log.smclMode = '?';
+  } else if (type == "display") {
+    // A line some other command printed (`type`, `macro list`, a note): plain
+    // text, so a literal brace in it is escaped.
+    smclSetMode(log, kModeRes);
+    log.stream << smclEscape(b.value("text", std::string())) << "\n";
+  } else if (type == "estimation" && b.value("estimator", std::string()) == "tabstat" &&
+             !tabstatText.empty()) {
+    smclSetMode(log, kModeTxt);
+    log.stream << smclEscape(tabstatText);
+    consumedTabstat = true;
+  } else if (type == "error") {
+    smclSetMode(log, kModeErr);
+    log.stream << smclEscape(b.value("message", std::string("(error)"))) << "\n";
+    if (!b.value("captured", false)) {
+      // An error nothing captured ends the command with its return code, which
+      // Stata links to the r() help; `capture noisily` prints none. "1" is the
+      // generic bucket coarseRc() falls back to, not a code anything named.
+      const std::string rc = eval::coarseRc(b);
+      if (rc != "1") {
+        smclSetMode(log, kModeTxt);
+        log.stream << "{search r(" << rc << "), local:r(" << rc << ");}\n";
+      }
+    }
+  } else {
+    std::ostringstream dump;
+    if (!type.empty()) dump << "[" << type << "]\n";
+    jsonAsText(b, dump, "    ");
+    smclSetMode(log, kModeTxt);
+    log.stream << smclEscape(dump.str());
+  }
+}
+
+// One dispatch frame's blocks into an SMCL log (the writer's layout is
+// described above openLog). The quiet filters are the text path's own. A
+// queued `log off` / `log on` / `log close` takes effect at the echo of its
+// own command line -- wherever that falls in the frame, so a `do` file that
+// pauses a log halfway pauses it halfway -- and at the frame's end if the
+// line never appears. Returns true when the log was closed.
+bool smclTeeFrame(LogState& log, const nlohmann::ordered_json& blocks, bool dropEcho,
+                  bool dropOutput, const std::string& tabstatText, bool& consumedTabstat) {
+  bool fromDisplay = false;  // is the command whose output this is `display`?
+  for (const auto& b : blocks) {
+    if (!b.is_object()) continue;
+    const std::string type = b.value("type", std::string());
+    if (type == "echo") fromDisplay = smclEchoIsDisplay(b.value("text", std::string()));
+    if (type == "echo" && !log.ops.empty()) {
+      const std::string t = b.value("text", std::string());
+      const LogOp op = log.ops.front();
+      const LogCommandEcho cmd = smclParseLogCommand(t, log, op);
+      if (cmd.matches) {
+        log.ops.erase(log.ops.begin());
+        const bool quiet = cmd.quiet || dropOutput;
+        if (op == LogOp::Resume) {
+          if (log.paused) {  // the `log on` line itself is not recorded
+            smclWriteBanner(log, /*continuation=*/true, /*resumed=*/true, quiet);
+            log.paused = false;
+          }
+          continue;
+        }
+        if (!log.paused && !dropEcho) smclWriteEcho(log, t);
+        if (!log.paused) smclWriteFooter(log, op == LogOp::Pause ? "paused" : "closed", quiet);
+        if (op == LogOp::Close) return true;  // later blocks belong to someone else
+        log.paused = true;
+        continue;
+      }
+    }
+    if (log.paused) continue;
+    if (type == "echo" && log.skipNextEcho) {
+      log.skipNextEcho = false;
+      continue;
+    }
+    if (type == "echo" && dropEcho) continue;
+    if (type != "echo" && type != "error" && dropOutput) continue;
+    if (type == "echo") {
+      smclWriteEcho(log, b.value("text", std::string()));
+    } else {
+      smclWriteBlock(log, b, type, fromDisplay, tabstatText, consumedTabstat);
+    }
+  }
+  const bool closed = smclDrainOps(log);
+  log.stream.flush();
+  return closed;
+}
 }  // namespace
 
 void SessionState::logTee(const nlohmann::ordered_json& blocks, int depth) {
-  if (logs_.empty()) return;
-  if (!blocks.is_array()) return;
+  if ((logs_.empty() && endingLogs_.empty()) || !blocks.is_array()) {
+    pendingTabstatLogText.clear();
+    return;
+  }
   // W:P8: every open, unpaused log whose depth matches this frame gets the
   // same transcript — Stata tees to all open logs, so a `name()`d log opened
   // mid-session records the commands that run while it is open without
@@ -319,16 +789,31 @@ void SessionState::logTee(const nlohmann::ordered_json& blocks, int depth) {
   // noisy one.
   const bool dropEcho = logEchoSuppressed();
   const bool dropOutput = logOutputSuppressed();
+  bool consumedTabstat = false;
   for (const auto& log : logs_) {
-    if (log->paused) continue;
+    // A paused SMCL log still reads the frame when a `log on` is waiting in it.
+    if (log->paused && !(log->smcl && !log->ops.empty())) continue;
     if (log->depth != depth) continue;
+    if (log->smcl) {
+      smclTeeFrame(*log, blocks, dropEcho, dropOutput, pendingTabstatLogText, consumedTabstat);
+      continue;
+    }
     for (const auto& b : blocks) {
       if (!b.is_object()) continue;
       std::string type = b.value("type", std::string());
       if (type == "echo" && dropEcho) continue;
       if (type != "echo" && type != "error" && dropOutput) continue;
       if (type == "echo" || type == "display") {
-        log->stream << b.value("text", std::string()) << "\n";
+        // A command echo stands after a blank line, as in Stata's own text
+        // log (". cmd" lines are separated from the previous output by one;
+        // the first line of a `quietly log using` log is that blank).
+        const std::string t = b.value("text", std::string());
+        if (type == "echo" && !t.empty() && t[0] == '.') log->stream << "\n";
+        log->stream << t << "\n";
+      } else if (type == "estimation" && b.value("estimator", std::string()) == "tabstat" &&
+                 !pendingTabstatLogText.empty()) {
+        log->stream << pendingTabstatLogText;
+        consumedTabstat = true;
       } else if (type == "error") {
         log->stream << b.value("message", std::string("(error)")) << "\n";
         std::string code = b.value("code", std::string());
@@ -340,6 +825,20 @@ void SessionState::logTee(const nlohmann::ordered_json& blocks, int depth) {
     }
     log->stream.flush();
   }
+  // `log close`d SMCL logs: the frame at the log's own depth carries the
+  // command line; the closed-on footer follows it and the file is released.
+  for (auto it = endingLogs_.begin(); it != endingLogs_.end();) {
+    if ((*it)->depth != depth) {
+      ++it;
+      continue;
+    }
+    smclTeeFrame(**it, blocks, dropEcho, dropOutput, pendingTabstatLogText, consumedTabstat);
+    // The tee always finishes it: its request queue ends with the Close.
+    it = endingLogs_.erase(it);
+  }
+  // Consumed by the log that wrote it; a tee at a frame no open log belongs to
+  // (the dispatch wrapper's nested call) leaves it for the frame's own tee.
+  if (consumedTabstat) pendingTabstatLogText.clear();
 }
 
 namespace {
@@ -381,10 +880,10 @@ namespace {
 //    so even that sign is not quotable ([[iobound-storage-regime]]).
 //  - It cost 3.9 GiB of peak. 8.916 vs 5.009 GiB high-water; the delta IS the
 //    ceiling, to within rounding. Peak is what a user's free space must survive,
-//    and the product promise is 10 GiB (plans/GA-SWEEP-ADJ1-MEMO.md A1), so
+//    and the product promise is 10 GiB (internal note GA-SWEEP-ADJ1-MEMO.md A1), so
 //    retention was spending 39% of the promise on files nothing reads.
 //
-// Full attribution: plans/GA-SWEEP-CENSUS-20260822.md ADDENDUM 6 and 7.
+// Full attribution: internal note GA-SWEEP-CENSUS-20260822.md ADDENDUM 6 and 7.
 std::uintmax_t scratchBudgetBytes() {
   std::uintmax_t mb = 0;  // evict on supersede — retention buys nothing (above)
   if (const char* env = std::getenv("PIET_SCRATCH_BUDGET_MB"); env && *env) {
@@ -395,6 +894,17 @@ std::uintmax_t scratchBudgetBytes() {
   return mb * 1024ull * 1024ull;
 }
 }  // namespace
+
+// True when `canonicalPath` (weakly canonical) is the on-disk base frame of the live e(sample)
+// mask install: the head is still the install frame built from it. See exclusion
+// (6c) in reclaimSupersededScratch and the "esample_base" claim in scratchOwners.
+bool SessionState::isLiveEsampleBase(const std::string& canonicalPath) const {
+  if (!esampleHeadIsInstallOf(esampleLastInstallBase)) return false;
+  std::error_code ec;
+  const std::filesystem::path bp =
+      std::filesystem::weakly_canonical(cecon::to_native_path(esampleLastInstallBase), ec);
+  return !ec && bp.u8string() == canonicalPath;
+}
 
 // 2.2.0 item E (SPEC II-0 ladder rung b): bounded scratch-budget eviction.
 // REGISTER the superseded predecessor as reclaimable (subject to the safety
@@ -496,6 +1006,33 @@ void SessionState::reclaimSupersededScratch(const std::string& oldPath, bool aba
   for (const auto& pinned : scratchPins) {
     fs::path pp2 = fs::weakly_canonical(cecon::to_native_path(pinned), ec);
     if (!ec && pp2 == op) return;
+  }
+  // (6b) e(sample) T2: never a head an estimation's mask install has just
+  // moved off while the command that ran it may still hold the path
+  // (SessionState::pinPreInstallHead).
+  for (const auto& pinned : preInstallPins_) {
+    fs::path pp3 = fs::weakly_canonical(cecon::to_native_path(pinned), ec);
+    if (!ec && pp3 == op) return;
+    if (ec) ec.clear();
+  }
+  // (6c) e(sample) T2: never the on-disk BASE frame of the live mask install.
+  // While the head is still the install frame built from `esampleLastInstallBase`
+  // (esampleHeadIsInstallOf) the next fit and the read-only replays alias the
+  // base instead of writing the head to disk (handlers.cpp esampleInstallOnHead,
+  // handlers.cpp's `if` filter source, runViaCobraSession's esample aliases).
+  // The base is owned by the head, not by the model: `ereturn clear` (any
+  // lastModel_reset) releases the LastModel pin (7) while the head still IS the
+  // install of this base, and the crash-floor reclaim (flushDeferredReclaim, at
+  // the next materialization) then offers the file with nothing left to spare it;
+  // the detached unlink raced the next fit's `native_exists()` check into
+  // "[data_io] cannot open .../gen_*.hbin", rc 1 (330-370 of 900 fits in 30
+  // runs of a 30-fit `regress ... if ..., vce(...)` loop with an `ereturn clear`
+  // between each; 0 with PIET_NO_SCRATCH_GC=1). The
+  // entry is the pin: once the head moves (load()), esampleHeadIsInstallOf turns
+  // false and the orphan sweep takes the file at the next dispatch exit.
+  if (isLiveEsampleBase(op.u8string())) {
+    if (scratchTraceOn()) scratchTrace("SPARE(esample-base)", "reclaim", oldPath);
+    return;
   }
   // (7) BUG-381: never a file the LIVE estimation still names. `predict`,
   // `test`, `lincom`, `margins`, `boottest` and the resampling prefixes all
@@ -643,6 +1180,74 @@ void SessionState::seedVarMetaFromVirtualSave(const std::string& path) {
   }
 }
 
+void SessionState::adoptVirtualSaveFormats(const std::string& path,
+                                           const std::vector<std::string>& names) {
+  auto it = virtualSaveMeta_.find(path);
+  if (it == virtualSaveMeta_.end()) return;
+  const std::set<std::string> want(names.begin(), names.end());
+  for (const cecon::ColMetaPatch& p : it->second) {
+    if (!want.count(p.name) || !p.format.has_value() || p.format->empty()) continue;
+    VarMeta& vm = varMeta[p.name];
+    if (!vm.format.has_value() || vm.format->empty()) vm.format = *p.format;
+  }
+}
+
+// format-display-default-lifecycle: see the declaration (session_state.h).
+std::string SessionState::defaultDisplayFormat(const std::optional<std::string>& stataType,
+                                               bool isString) {
+  if (!isString) return storage::stataDefaultFormat(stataType);
+  // str# displays %#s with a minimum width of 9 (str1..str9 %9s, str10 %10s,
+  // str20 %20s in the captured describe blocks; str5 %9s,
+  // w2p_estim_ev.log:1827); strL and a width nothing recorded display %9s.
+  if (stataType.has_value() && stataType->size() > 3 && stataType->compare(0, 3, "str") == 0) {
+    const std::string digits = stataType->substr(3);
+    if (std::all_of(digits.begin(), digits.end(),
+                    [](unsigned char c) { return std::isdigit(c) != 0; })) {
+      const unsigned long w = std::stoul(digits);
+      return "%" + std::to_string(std::max<unsigned long>(9, w)) + "s";
+    }
+  }
+  return "%9s";
+}
+
+std::string SessionState::displayFormat(const VarInfo& v) const {
+  auto it = varMeta.find(v.name);
+  if (it != varMeta.end() && it->second.format.has_value() && !it->second.format->empty())
+    return *it->second.format;
+  if (v.formatStated) return v.format;
+  std::optional<std::string> type;
+  if (it != varMeta.end() && it->second.stataType.has_value() && !it->second.stataType->empty())
+    type = *it->second.stataType;
+  return defaultDisplayFormat(type, v.dtype == "factor");
+}
+
+std::vector<std::pair<std::string, std::string>> SessionState::displayFormatMap(
+    const std::vector<VarInfo>& card) const {
+  std::vector<std::pair<std::string, std::string>> out;
+  out.reserve(card.size());
+  for (const VarInfo& v : card) out.emplace_back(v.name, displayFormat(v));
+  return out;
+}
+
+void SessionState::pinDisplayFormat(const VarInfo& v) {
+  auto it = varMeta.find(v.name);
+  if (it != varMeta.end() && it->second.format.has_value() && !it->second.format->empty()) return;
+  varMeta[v.name].format = displayFormat(v);
+}
+
+void SessionState::prepareStorageChange(const VarInfo& v) {
+  if (v.dtype != "factor") {
+    pinDisplayFormat(v);
+    return;
+  }
+  auto it = varMeta.find(v.name);
+  if (it == varMeta.end() || !it->second.format.has_value()) return;
+  std::optional<std::string> type;
+  if (it->second.stataType.has_value() && !it->second.stataType->empty())
+    type = *it->second.stataType;
+  if (*it->second.format == defaultDisplayFormat(type, true)) it->second.format.reset();
+}
+
 std::vector<VarInfo> SessionState::varlistWithMeta(Datastore* ds) const {
   if (ds == nullptr) return {};
   return varlistWithMetaFrom(ds->varlist());
@@ -699,21 +1304,11 @@ void SessionState::syncEvalVarLabels() {
     // to tell that case apart from "no such variable", which Stata answers with
     // r(111). The marker supplies exactly that distinction and nothing else.
     eval.varLabels.set(std::string(kEvalVarExistsPrefix) + v.name, "1");
-    // Format: resolved with the SAME fallback chain `describe` uses —
-    // varMeta[name].format first, the card's own format second. NOT `v.format`
-    // alone: varlistWithMetaFrom overlays varMeta's LABEL onto the card but not
-    // its FORMAT, so the card still carries "%9.0g" after `format x %9.3f` and
-    // reading it directly answered %9.0g for a variable whose format the same
-    // session had just set. Caught by measurement, not by reading — the first
-    // build of this projection had exactly that bug, which is the BUG-208 defect
-    // shape (a reader pointed at a store the live writer does not reach) one
-    // layer along.
+    // Format: the one resolver (displayFormat). `resolved` came through
+    // varlistWithMetaFrom, which already overlays it; reading v.format is that
+    // answer, and it is the same one describe, codebook and list report.
     auto fmtIt = varMeta.find(v.name);
-    const std::string resolvedFmt =
-        (fmtIt != varMeta.end() && fmtIt->second.format.has_value() &&
-         !fmtIt->second.format->empty())
-            ? *fmtIt->second.format
-            : v.format;
+    const std::string& resolvedFmt = v.format;
     eval.varLabels.set(std::string(kEvalVarFormatPrefix) + v.name, resolvedFmt);
     // BUG-250: declared storage subtype, describe's own resolution order —
     // recorded declaration first (creation arms + .dta import), then the
@@ -746,6 +1341,9 @@ std::vector<VarInfo> SessionState::varlistWithMetaFrom(const std::vector<VarInfo
     if (it != varMeta.end() && it->second.label.has_value()) {
       entry.label = *it->second.label;
     }
+    // format-display-default-lifecycle: the card states the format every
+    // reader reports (displayFormat), not VarInfo's member default.
+    entry.format = displayFormat(v);
     auto lblIt = varLblname.find(v.name);
     if (lblIt != varLblname.end()) {
       auto defIt = labelDefs.find(lblIt->second);
@@ -906,6 +1504,171 @@ void SessionState::flushDeferredReclaim() {
   for (const auto& p : pending) reclaimSupersededScratch(p);
 }
 
+// e(sample) T2 -- see the declaration (session_state.h). The reading keys on
+// lastModel_, whose only producers of "no model" are a fresh session and
+// lastModel_reset() (`ereturn clear`, `clear all`/`clear results`/`clear
+// matrix`, and the clearEResults that opens `ereturn post`) -- the same events
+// that empty the e() stores. No model is 0 (w2_esample.log:95-129 A1-A5, :1634
+// G11), and so is a POSTED e(), which leaves eval.lastModelResult set with no
+// model behind it: a posted e() has no estimation sample (:1487 G5 |0|0|.|).
+// Why not the macro layer's absent-e() predicate (resolveEScalar,
+// eval/macros.cpp: `!session.lastModelResult`): the two agree on every event
+// that installs or clears e(), but NOT on a model installed without a result
+// JSON -- `pca` (handlers_aer_estim.cpp runPca: `LastModel lm; ...
+// setLastModel(lm)` with lm.result unset). There resolveEScalar reads "no e()"
+// while a model is live, and e(sample) = 0 would be a silent answer for a fit
+// whose sample PIET does not have; keyed on lastModel_, it is the named r(198)
+// of kUnavailable. The macro layer reads THIS function through
+// EvalSession::esampleObs1 and uses its own predicate only when no session is
+// attached.
+SessionState::EsampleReading SessionState::esampleReading() {
+  EsampleReading r;
+  if (!lastModel_.has_value()) {
+    // kZero: no model, or a posted e() without esample(). A posting WITH
+    // esample() (handlers_ereturn.cpp runPost) reads its own mask column, under
+    // the same cell checks a fit's mask gets below.
+    if (!ePostedLive || ePostedEsampleSerial == 0 || !hasData()) return r;
+    Datastore* ds = nullptr;
+    try {
+      ds = datastore();
+    } catch (const std::exception& e) {
+      r.kind = EsampleReading::Kind::kRefused;
+      r.refusal = std::string("e(sample) cannot be read: ") + e.what();
+      return r;
+    }
+    if (ds == nullptr || !ds->has(kEsampleColumn)) return r;  // the marker left with the data
+    const cecon::Column& c = ds->col(kEsampleColumn);
+    bool foreign = c.dtype != cecon::DType::F64;
+    if (!foreign) {
+      const double want = static_cast<double>(ePostedEsampleSerial);
+      const double* v = c.f64();
+      const int64_t n = ds->nRows();
+      for (int64_t i = 0; i < n && !foreign; ++i)
+        if (!std::isnan(v[i]) && v[i] != 0.0 && v[i] != want) foreign = true;
+    }
+    if (foreign) {
+      r.kind = EsampleReading::Kind::kRefused;
+      r.refusal = "e(sample) is not available in this version of PIET here: the "
+                  "estimation-sample marker on the data belongs to other results than the "
+                  "posted ones (`ereturn post ..., esample()`).";
+      return r;
+    }
+    r.kind = EsampleReading::Kind::kColumn;
+    r.serial = ePostedEsampleSerial;
+    return r;
+  }
+  const LastModel& lm = *lastModel_;
+  const std::string cmd = lm.stataCmd.empty() ? lm.cobraCmd : lm.stataCmd;
+  switch (lm.esample) {
+    case LastModel::EsampleState::kNone:
+      return r;
+    case LastModel::EsampleState::kColumn: {
+      // The column follows the rows through every row verb because it IS a
+      // column; a verb that replaces the data (use, clear, collapse, reshape,
+      // drop _all) takes it away, and Stata's marker goes with the data too.
+      if (!hasData()) return r;
+      Datastore* ds = nullptr;
+      try {
+        ds = datastore();
+      } catch (const std::exception& e) {
+        // A head that cannot be opened (BUG-124/BUG-384) is named, never read
+        // as "no column" -> 0, and never thrown past `capture`.
+        r.kind = EsampleReading::Kind::kRefused;
+        r.refusal = std::string("e(sample) cannot be read: ") + e.what();
+        return r;
+      }
+      if (ds == nullptr || !ds->has(kEsampleColumn)) return r;  // the marker left with the data
+      // The column on the rows may be another fit's (see LastModel::
+      // esampleSerial): a nonzero cell that is not this model's serial means
+      // the working frame came back from somewhere this model's rows never
+      // were. Named, never counted. One pass over an f64 column.
+      const cecon::Column& c = ds->col(kEsampleColumn);
+      const double want = static_cast<double>(lm.esampleSerial);
+      bool foreign = c.dtype != cecon::DType::F64 || lm.esampleSerial == 0;
+      double lost = 0.0;  // < 0: a row verb PIET does not follow (piet/datastore.h EsampleLostBy)
+      if (!foreign) {
+        const double* v = c.f64();
+        const int64_t n = ds->nRows();
+        for (int64_t i = 0; i < n; ++i) {
+          if (!std::isnan(v[i]) && v[i] < 0.0) {
+            lost = v[i];
+            break;
+          }
+          if (!std::isnan(v[i]) && v[i] != 0.0 && v[i] != want) foreign = true;
+        }
+      }
+      if (lost < 0.0) {
+        r.kind = EsampleReading::Kind::kRefused;
+        r.refusal = std::string("e(sample) is not available after `") + esampleLostByVerb(lost) +
+                    "` in this version of PIET: that command rebuilt the observations in a way "
+                    "whose estimation-sample marker PIET cannot reproduce (Stata keeps it on one "
+                    "row per group or per original observation, chosen by its own sort order).";
+        return r;
+      }
+      if (foreign) {
+        r.kind = EsampleReading::Kind::kRefused;
+        r.refusal = "e(sample) is not available after " + cmd +
+                    " in this version of PIET here: the estimation-sample marker on the data "
+                    "belongs to another estimation (the data in memory is not the data these "
+                    "results were fitted on, e.g. after a bootstrap/jackknife/permute prefix).";
+        return r;
+      }
+      r.kind = EsampleReading::Kind::kColumn;
+      r.serial = lm.esampleSerial;
+      return r;
+    }
+    case LastModel::EsampleState::kStale:
+      // T3: `estimates restore` reads e(sample) back from `_est_NAME`
+      // (eststo_esttab.cpp runEstimatesRestore); the variable is gone (dropped,
+      // or the data were replaced since the store).
+      r.kind = EsampleReading::Kind::kRefused;
+      r.refusal = "e(sample) is not available after `estimates restore` in this version of "
+                  "PIET: the variable " +
+                  (activeEstimatesName.empty() ? std::string("_est_<name>")
+                                               : "_est_" + activeEstimatesName) +
+                  " that holds these results' estimation sample is no longer in the data.";
+      return r;
+    case LastModel::EsampleState::kUnavailable:
+      break;
+  }
+  r.kind = EsampleReading::Kind::kRefused;
+  r.refusal = "e(sample) is not available after " + cmd +
+              " in this version of PIET: the estimation sample of these results was not "
+              "recorded (the engine does not report it for this command, or the results were "
+              "stored from such a model and brought back by `estimates restore`).";
+  return r;
+}
+
+std::optional<int> SessionState::esampleObs1(std::string* why) {
+  const EsampleReading r = esampleReading();
+  if (r.kind == EsampleReading::Kind::kRefused) {
+    if (why != nullptr) *why = r.refusal;
+    return std::nullopt;
+  }
+  if (r.kind == EsampleReading::Kind::kZero) return 0;
+  // esampleReading just opened the head and found the column on it.
+  Datastore* ds = datastore();
+  if (ds == nullptr || ds->nRows() < 1) return 0;  // B29-style read of an empty frame
+  const cecon::Column& c = ds->col(kEsampleColumn);
+  if (c.dtype != cecon::DType::F64) return 0;
+  // An admitted row holds the install's serial; 0 and missing (a row added
+  // after the fit) read 0.
+  return c.f64()[0] == static_cast<double>(r.serial) ? 1 : 0;
+}
+
+std::optional<eval::EvalSession::VarObsReading> SessionState::macroVarObs(
+    const std::string& name, long long idx) {
+  std::optional<VarObservation> o = readVarObservation(name, idx, *this);
+  if (!o) return std::nullopt;
+  return eval::EvalSession::VarObsReading{o->text, o->isString, o->inRange};
+}
+
+std::optional<std::string> SessionState::macroCValue(const std::string& name) {
+  std::optional<CValue> v = resolveCValue(name, *this);
+  if (!v) return std::nullopt;
+  return v->text;
+}
+
 void SessionState::seedShadowFromFrameVars(const CobraFrameMeta& meta) {
   const std::vector<CobraFrameVar>& vars = meta.vars;
   // BUG-190. The frame meta the worker sends back describes DATA — name, type,
@@ -954,6 +1717,7 @@ void SessionState::seedShadowFromFrameVars(const CobraFrameMeta& meta) {
     auto it = carried.find(fv.name);
     if (it != carried.end()) {
       vi.format = it->second->format;
+      vi.formatStated = it->second->formatStated;
       vi.label = it->second->label;
     } else {
       // BUG-365: a column with no carried entry is one PIET is meeting for the
@@ -966,7 +1730,10 @@ void SessionState::seedShadowFromFrameVars(const CobraFrameMeta& meta) {
       // overwriting VarInfo's own default with that emptiness blanked the format on
       // 1,357 columns across 45 fixtures the first time this was written. Absent
       // is not a value.
-      if (!fv.format.empty()) vi.format = fv.format;
+      if (!fv.format.empty()) {
+        vi.format = fv.format;
+        vi.formatStated = true;
+      }
       if (!fv.label.empty()) vi.label = fv.label;
     }
     next.push_back(std::move(vi));
@@ -1173,6 +1940,12 @@ bool SessionState::residentRestore(const std::string& stashName,
     if (scratchTraceOn()) scratchTrace("MINT", "restore-fallback", token);
   }
   datastore_.reset();
+  // BUG-916: the computed-column cache describes the chain this restore just
+  // abandoned (a tostring/destring made after the preserve, or the frame a
+  // cache `use` replaced). load() clears it on a real-file head; this path has
+  // no load(), so it must clear it itself, or the next setcol verb and every
+  // NAME[i] read are served the abandoned column (w2b_dataio.log:90-96).
+  residentComputedColClear();
   datasetChanged = true;  // restore replaces the in-memory data (matches load()).
   seedShadowFromFrameVars(meta);
   (void)cs->consumeRespawned();
@@ -1220,11 +1993,16 @@ std::map<std::string, std::string> SessionState::scratchOwners() const {
     if (!e) owner.emplace(c.u8string(), who);
   };
   claim(currentHbin_.value_or(std::string()), "head");
+  // e(sample) T2: the install head's on-disk base, owned for as long as the head
+  // is that install (reclaimSupersededScratch exclusion (6c)). Claimed right
+  // after the head so the orphan sweep and the census agree with the reclaim.
+  if (esampleHeadIsInstallOf(esampleLastInstallBase)) claim(esampleLastInstallBase, "esample_base");
   for (const auto& f : preserveStack) claim(f.hbinPath, "preserve");
   for (const auto& [k, e] : useConvCache_) { (void)k; claim(e.hbinPath, "use_conv_cache"); claim(e.metaPath, "use_conv_cache"); }
   for (const auto& [k, e] : useStashCache_) { (void)k; claim(e.hbinPath, "use_stash_cache"); claim(e.metaPath, "use_stash_cache"); }
   for (const auto& [n, fp] : frames) { (void)n; claim(fp, "frame"); }
   for (const auto& sp : scratchPins) claim(sp, "scratch_pin");
+  for (const auto& pp : preInstallPins_) claim(pp, "pre_install_pin");  // e(sample) T2
   for (const auto& [sp, sz] : supersededScratch_) { (void)sz; claim(sp, "superseded_pending"); }
   for (const auto& pp : projectionScratch_) claim(pp, "projection_pending");
   for (const auto& [d, tp] : mintedTempfiles) { (void)d; claim(tp, "tempfile_pending"); }
@@ -1235,8 +2013,48 @@ std::map<std::string, std::string> SessionState::scratchOwners() const {
   for (const auto& [n, ph] : postfiles) { (void)n; claim(ph.target, "postfile_open"); }
   for (const auto& [n, fh] : fileHandles) { (void)n; claim(fh.path, "file_handle_open"); }
   claim(currentFile_, "user_file");
+  // The crash-recovery floor of a virtual resident chain. When the head is a
+  // virtual token, the last snapshot written to disk (ensureMaterializedHead,
+  // or a real-file load) is what rollbackToFloor() re-adopts if the worker
+  // dies; load() parks it on deferredReclaim_ and flushDeferredReclaim()
+  // releases it at the NEXT materialization, when a newer floor replaces it.
+  // Until then the file is owned — but this table never said so, so: the exit
+  // census reported it ORPHAN (`gen str1 s = ""` materializes strmut_2 to read
+  // rows, its setcol --out goes virtual, and strmut_2 is left as the floor —
+  // probe_b4's ORPHAN n=1, ~65 KB), and for a REGISTERED mint (setobs_*, ...)
+  // the dispatch-exit sweep deleted the live floor, so a rollback would have
+  // re-adopted a file that no longer exists. Only the current floor is
+  // claimed: an older one is on deferredReclaim_ and gets its reclaim there.
+  // After user_file so a user's own file that is also the floor reads as the
+  // user's.
+  claim(lastMaterializedHead_, "crash_floor");
   claim(workdir_ + "/.piet_owner_pid", "owner_marker");
   return owner;
+}
+
+namespace {
+// Every SessionState alive in this process (see sweepOrphanScratch's header
+// note). Dispatch is single-threaded; the mutex only keeps a construct or
+// destruct on another thread (a worker harness) from tearing the vector.
+std::mutex& liveSessionsMu() {
+  static std::mutex mu;
+  return mu;
+}
+std::vector<const SessionState*>& liveSessions() {
+  static std::vector<const SessionState*> v;
+  return v;
+}
+}  // namespace
+
+void SessionState::registerLiveSession() {
+  std::lock_guard<std::mutex> lk(liveSessionsMu());
+  liveSessions().push_back(this);
+}
+
+SessionState::~SessionState() {
+  std::lock_guard<std::mutex> lk(liveSessionsMu());
+  auto& v = liveSessions();
+  v.erase(std::remove(v.begin(), v.end(), this), v.end());
 }
 
 int SessionState::sweepOrphanScratch(const char* site) {
@@ -1255,7 +2073,15 @@ int SessionState::sweepOrphanScratch(const char* site) {
   std::error_code ec;
   const fs::path wd = cecon::to_native_path(workdir_);
   if (!fs::is_directory(wd, ec) || ec) return 0;
-  const std::map<std::string, std::string> owner = scratchOwners();
+  std::map<std::string, std::string> owner = scratchOwners();
+  {
+    // e(sample) T2: a sibling session's files in the SAME workdir are owned.
+    std::lock_guard<std::mutex> lk(liveSessionsMu());
+    for (const SessionState* other : liveSessions()) {
+      if (other == this || other->workdir_ != workdir_) continue;
+      for (auto& kv : other->scratchOwners()) owner.emplace(kv.first, "live_session");
+    }
+  }
   int removed = 0;
   fs::recursive_directory_iterator it(wd, fs::directory_options::skip_permission_denied, ec), end;
   for (; !ec && it != end; it.increment(ec)) {
@@ -1387,7 +2213,21 @@ void SessionState::useStashCachePut(const std::string& src, const UseStashCacheE
 }
 
 // BUG-392: `clear all` beyond the dataset ─────────────────────────────────────
+void SessionState::discardTopPreserve() {
+  if (preserveStack.empty()) return;
+  const PreserveFrame& top = preserveStack.back();
+  if (!top.stashName.empty() && cobraSession_ && cobraSession_->hasWorker())
+    (void)cobraSession_->frameStashDrop(top.stashName);
+  preserveStack.pop_back();
+}
+
+const PreserveFrame* SessionState::ownPreserveFrame() const {
+  if (preserveStack.empty() || preserveStack.back().level != preserveLevel()) return nullptr;
+  return &preserveStack.back();
+}
+
 void SessionState::clearAllSessionObjects() {
+  eval.mlState.reset();
   estimatesClear();
   // AER-SCOPE1 bundle G: `clear all` closes the open workbook. A surviving cell
   // map would write the next `putexcel A1 = ...` into a file the PREVIOUS
@@ -1397,7 +2237,10 @@ void SessionState::clearAllSessionObjects() {
                     // `clear all` drops -- leaving it would attach one model's
                     // additions to the next regression after a `clear all`.
   namedGraphs.clear();
-  postfiles.clear();  // `postutil clear`: discarded, never written
+  graphMeta.clear();  // graph-family AI-4
+  currentGraph.clear();
+  sersets.clear();    // serset-twoway SS: `clear all` drops every serset (serset.sthlp)
+  postfiles.clear();  // runClear's `all` branch closed (wrote) each one first (BUG-1079)
   for (auto& [n, fh] : fileHandles) {
     (void)n;
     if (fh.fp) std::fclose(fh.fp);
@@ -1546,6 +2389,7 @@ bool SessionState::loadFromVirtual(const std::string& path) {
   residentDirty_ = true;  // no disk file yet; datastore() materializes on demand.
   if (scratchTraceOn()) scratchTrace("MINT", "resident-use", path);
   datastore_.reset();
+  residentComputedColClear();  // BUG-916: a new frame — the old chain's cache is over.
   datasetChanged = false;  // a fresh `use` leaves c(changed) false (matches load+setCurrentFile).
   seedShadowFromFrameVars(meta);
   (void)cs->consumeRespawned();
@@ -1817,6 +2661,7 @@ CobraRunResult SessionState::rollbackToFloor(const std::vector<std::string>& arg
   pendingDeltaValid_ = false;
   datastore_.reset();
   if (!lastMaterializedHead_.empty()) currentHbin_ = lastMaterializedHead_;
+  residentComputedColClear();  // BUG-916: the floor predates the cached column.
   CobraRunResult r;
   r.exit_code = 3;  // data_io convention — surfaces as an engine error, never a silent wrong result.
   r.ok = false;
@@ -1881,6 +2726,39 @@ CobraRunResult SessionState::runViaCobraSession(const std::vector<std::string>& 
     } else if (i + 1 < argv.size() && argv[i] == "--out") {
       outPath = argv[i + 1];
       outIdx = static_cast<int>(i);
+    }
+  }
+
+  // e(sample) T2: a read-only replay of the frame a fit read (LastModel::dataPath:
+  // test/lincom/margins/estat) while the head is still that fit's mask-install
+  // frame -- the same rows and values plus the hidden column -- reads the
+  // resident head instead. Without it the replay resynced the worker to the base
+  // file, writing the install frame to disk first ("resident-resync"), once per
+  // fit. A --keepif or a by-group read keeps its stateless route (both read the
+  // file); a mutation keeps its own --data.
+  if (dataIdx >= 0 && !outPath.has_value() && !hasKeepif && statelessRead_ == 0 &&
+      currentHbin_.has_value() && residentToken_ == *currentHbin_ &&
+      esampleHeadIsInstallOf(*dataPath)) {
+    std::vector<std::string> aliased = argv;
+    aliased[static_cast<size_t>(dataIdx) + 1] = *currentHbin_;
+    return runViaCobraSession(aliased);
+  }
+  // ... and the converse: a read-only call that will run STATELESS on that
+  // install frame (a --keepif fit -- iv, xtreg, newey, prais, a TS regress --
+  // or a by-group read) would write the whole frame to disk first
+  // ("stateless-data"); it reads the on-disk base instead. Not when an argument
+  // names the mask column, which only the install frame carries.
+  if (dataIdx >= 0 && !outPath.has_value() && (hasKeepif || statelessRead_ > 0) &&
+      currentHbin_.has_value() && *dataPath == *currentHbin_ && residentDirty_ &&
+      residentToken_ == *currentHbin_ && esampleHeadIsInstallOf(esampleLastInstallBase)) {
+    bool namesMask = false;
+    for (const auto& s : argv) namesMask = namesMask || namesHiddenColumn(s);
+    std::error_code bec;
+    if (!namesMask &&
+        std::filesystem::exists(cecon::to_native_path(esampleLastInstallBase), bec)) {
+      std::vector<std::string> aliased = argv;
+      aliased[static_cast<size_t>(dataIdx) + 1] = esampleLastInstallBase;
+      return runViaCobraSession(aliased);
     }
   }
 
@@ -2644,7 +3522,10 @@ std::optional<nlohmann::ordered_json> SessionState::tryResidentMutationCard(
         vi.nLevels = fv.nLevels;
         // BUG-365, and only when stated — see the sibling site above for why an
         // empty engine format must never overwrite the VarInfo default.
-        if (!fv.format.empty()) vi.format = fv.format;
+        if (!fv.format.empty()) {
+          vi.format = fv.format;
+          vi.formatStated = true;
+        }
         if (!fv.label.empty()) vi.label = fv.label;
         shadowCard_.push_back(std::move(vi));
       }
@@ -2676,6 +3557,63 @@ std::optional<nlohmann::ordered_json> SessionState::tryResidentMutationCard(
   if (!newVars.empty()) out["new_vars"] = newVars;
   if (!droppedVars.empty()) out["dropped_vars"] = droppedVars;
   return out;
+}
+
+// SessionState::eNameOrderFor (declared with ENameContract in session_state.h).
+std::optional<std::vector<std::string>> SessionState::eNameOrderFor(const std::string& kind) const {
+  if (!eNameContract.has_value() || ePostedLive || !lastModel_.has_value() ||
+      lastModel_->fitSerial != eNameContract->fitSerial ||
+      eval.eStrings.get("cmd") != eNameContract->cmd)
+    return std::nullopt;
+  const ENameContract& c = *eNameContract;
+  const std::optional<std::vector<std::string>>* list =
+      kind == "scalars" ? &c.scalars : kind == "macros" ? &c.macros
+                                    : kind == "matrices" ? &c.matrices : nullptr;
+  if (list == nullptr || !list->has_value()) return std::nullopt;
+  const std::vector<std::string>& names = **list;
+  const auto listed = [&names](const std::string& n) {
+    return std::find(names.begin(), names.end(), n) != names.end();
+  };
+  if (kind == "scalars") {
+    for (const auto& item : eval.eScalars.items())
+      if (!eval::isReservedStoreKey(item.first) && !listed(item.first)) return std::nullopt;
+    const nlohmann::ordered_json* result =
+        eval.lastModelResult.has_value() && eval.lastModelResult->is_object()
+            ? &*eval.lastModelResult
+            : nullptr;
+    for (const auto& n : names) {
+      if (std::find(c.missingScalars.begin(), c.missingScalars.end(), n) != c.missingScalars.end())
+        continue;
+      if (eval.eScalars.find(n) != nullptr) continue;
+      std::string key = n;
+      for (const auto& [k, v] : eval::eScalarKey())
+        if (k == n) {
+          key = v;
+          break;
+        }
+      if (result == nullptr || !result->contains(key) || !result->at(key).is_number())
+        return std::nullopt;
+    }
+  } else if (kind == "macros") {
+    for (const auto& item : eval.eStrings.items())
+      if (!eval::isReservedStoreKey(item.first) && !item.second.empty() && !listed(item.first))
+        return std::nullopt;
+    for (const auto& n : names) {
+      const std::string* v = eval.eStrings.find(n);
+      if (v == nullptr || v->empty()) return std::nullopt;
+    }
+  } else {
+    for (const auto& item : eval.eMatrices)
+      if (!listed(item.first)) return std::nullopt;
+    for (const auto& n : names) {
+      if (eval.findClassMatrix('e', n) != nullptr) continue;
+      // e(b)/e(V) and the block-derived e(beta)/e(V_modelbased) resolve lazily.
+      if (eval.resolveEMatrixFor(n, eval::EvalSession::EReader::kCopy).matrix.has_value())
+        continue;
+      return std::nullopt;
+    }
+  }
+  return names;
 }
 
 }  // namespace piet

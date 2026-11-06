@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // COBRA_VERB_DIAG — env-gated, per-request PHASE TIMING + SCRATCH-BYTE
 // instrumentation for a handful of verb paths (joinby, merge, the --keepif row
 // filter, preserve/restore), added for a performance-campaign attribution

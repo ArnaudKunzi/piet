@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — LIML / Fuller k-class IV estimator, matching Stata `ivregress liml`.
 // k-class: β_κ = {X'(I−κM_Z)X}^{-1} X'(I−κM_Z)y, X=[endog, exog incl const],
 // M_Z=I−Z(Z'Z)^{-1}Z' (Z=all instruments). κ_LIML = min generalized eigenvalue of
@@ -51,7 +53,9 @@ inline LimlResult liml_fit(const std::vector<double>& y, int64_t n,
                            const std::vector<double>& X1, int kx1,
                            const std::vector<double>& Z2, int m,
                            bool small, double fuller_alpha = 0.0,
-                           double kappa_override = -1.0) {
+                           double kappa_override = -1.0, int vce = 0,
+                           const std::vector<int32_t>* cluster_codes = nullptr,
+                           int n_clusters = 0) {
     LimlResult r;
     r.n = n;
     int kZ = kx1 + m;          // full instrument set Z = [X1, Z2]
@@ -167,6 +171,65 @@ inline LimlResult liml_fit(const std::vector<double>& y, int64_t n,
     r.sigma2 = small ? ess / r.dof_r : ess / static_cast<double>(n);
     r.vcov.assign(static_cast<size_t>(kx) * kx, 0.0);
     for (int i = 0; i < kx * kx; ++i) r.vcov[i] = r.sigma2 * Minv[i];
+    if (vce == 1 || vce == 2) {
+        // V = (N/rss) * V_classical = Minv, then
+        // V * ZPX' * ZPZi * Omega * ZPZi * ZPX * V with Omega = sum over
+        // observations (robust) or clusters (cluster) of (Z'u)(Z'u)'
+        // (no finite-sample factor), i.e.
+        // the sandwich of the score rows (P_Z X)_i u_i; symmetrised. `small`:
+        // robust * N/(N-k), cluster * (N-1)/(N-k) * G/(G-1).
+        if (vce == 2 && (cluster_codes == nullptr || n_clusters < 1 ||
+                         cluster_codes->size() != static_cast<size_t>(n)))
+            return r;
+        std::vector<double> C(static_cast<size_t>(kZ) * kx, 0.0);  // (Z'Z)^-1 Z'X, kZ x kx
+        for (int c = 0; c < kx; ++c)
+            for (int w = 0; w < kZ; ++w) {
+                double s = 0;
+                for (int m = 0; m < kZ; ++m) s += ZtZi[static_cast<size_t>(w) * kZ + m] * XtZ[static_cast<size_t>(c) * kZ + m];
+                C[w + static_cast<size_t>(c) * kZ] = s;
+            }
+        const int64_t G = vce == 2 ? n_clusters : n;
+        std::vector<double> S(static_cast<size_t>(G) * kx, 0.0);
+        for (int64_t i = 0; i < n; ++i) {
+            double f = 0;
+            for (int c = 0; c < kx; ++c) f += X[static_cast<int64_t>(c) * n + i] * r.beta[c];
+            const double e = y[i] - f;
+            const int64_t g = vce == 2 ? (*cluster_codes)[static_cast<size_t>(i)] : i;
+            for (int c = 0; c < kx; ++c) {
+                double xh = 0;
+                for (int w = 0; w < kZ; ++w) xh += Z[static_cast<int64_t>(w) * n + i] * C[w + static_cast<size_t>(c) * kZ];
+                S[static_cast<size_t>(g) * kx + c] += xh * e;
+            }
+        }
+        std::vector<double> meat(static_cast<size_t>(kx) * kx, 0.0);
+        for (int64_t g = 0; g < G; ++g)
+            for (int a = 0; a < kx; ++a)
+                for (int b = 0; b < kx; ++b)
+                    meat[static_cast<size_t>(a) * kx + b] += S[static_cast<size_t>(g) * kx + a] * S[static_cast<size_t>(g) * kx + b];
+        std::vector<double> T(static_cast<size_t>(kx) * kx, 0.0), V(static_cast<size_t>(kx) * kx, 0.0);
+        for (int a = 0; a < kx; ++a)
+            for (int b = 0; b < kx; ++b) {
+                double s = 0;
+                for (int c = 0; c < kx; ++c) s += Minv[static_cast<size_t>(a) * kx + c] * meat[static_cast<size_t>(c) * kx + b];
+                T[static_cast<size_t>(a) * kx + b] = s;
+            }
+        for (int a = 0; a < kx; ++a)
+            for (int b = 0; b < kx; ++b) {
+                double s = 0;
+                for (int c = 0; c < kx; ++c) s += T[static_cast<size_t>(a) * kx + c] * Minv[static_cast<size_t>(c) * kx + b];
+                V[static_cast<size_t>(a) * kx + b] = s;
+            }
+        double ssa = 1.0;
+        if (small) {
+            const double N = static_cast<double>(n), K = static_cast<double>(kx);
+            ssa = vce == 2 ? (N - 1.0) / (N - K) * static_cast<double>(G) / (static_cast<double>(G) - 1.0)
+                           : N / (N - K);
+        }
+        for (int a = 0; a < kx; ++a)
+            for (int b = 0; b < kx; ++b)
+                r.vcov[static_cast<size_t>(a) * kx + b] =
+                    ssa * 0.5 * (V[static_cast<size_t>(a) * kx + b] + V[static_cast<size_t>(b) * kx + a]);
+    }
     r.se.resize(kx);
     for (int c = 0; c < kx; ++c) r.se[c] = std::sqrt(std::max(0.0, r.vcov[static_cast<size_t>(c) * kx + c]));
     r.ok = true;

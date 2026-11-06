@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — high-dimensional fixed-effect demeaning via the Method of Alternating
 // Projections (within transformation), à la reghdfe / fixest / FixedEffectModels.
 #pragma once

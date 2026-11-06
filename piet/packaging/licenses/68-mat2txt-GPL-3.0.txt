@@ -1,0 +1,17 @@
+mat2txt 1.1.2 (Ben Jann, Michael Blasnik) — GPL-3.0
+Adopted at: piet/native/src/handlers_aer_tables.cpp (the `mat2txt` section)
+
+Project:  mat2txt — Stata module to write matrix to ASCII file
+Authors:  Ben Jann, Michael Blasnik (mat2txt.ado: "1.1.2 Ben Jann 24 Nov 2004; 1.1.1 M Blasnik 18 Feb 2004")
+Version:  1.1.2 (24 Nov 2004)
+Source:   Statistical Software Components (SSC / RePEc), https://ideas.repec.org/c/boc/bocode/s437601.html
+Evidence: The licence is the GNU General Public License version 3, as stated on the SSC/RePEc listing https://ideas.repec.org/c/boc/bocode/s437601.html: "The module is made available under terms of the GPL v3 (https://www.gnu.org/licenses/gpl-3.0.txt)."
+Licence:  GNU General Public License version 3.
+
+No upstream LICENSE text ships with the package; the licence is stated in its
+SSC listing. The ado carries no licence header.
+
+The full text of the GNU General Public License version 3 or later, under which this project is distributed, ships beside this application as LICENSE.txt.
+
+Copyright remains with the package authors for the portions derived from their
+code.

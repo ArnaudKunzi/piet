@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "registry.h"
 
 #include <algorithm>
@@ -35,6 +37,7 @@ std::string weightPolicyToString(WeightPolicy w) {
     case WeightPolicy::FweightOnly: return "fweight_only";
     case WeightPolicy::AweightFweight: return "aweight_fweight";
     case WeightPolicy::PweightOnly: return "pweight_only";
+    case WeightPolicy::AweightPweight: return "aweight_pweight";
     case WeightPolicy::AllWeights: return "all_weights";
   }
   return "unknown";
@@ -70,7 +73,7 @@ std::string weightPolicyToString(WeightPolicy w) {
 //                  `--keepif` predicate on that column). Every OTHER row
 //                  stays false: still-legal-but-unimplemented Stata forms
 //                  (BS-090's own scope cap) or genuinely out of scope.
-//   weight       = P3 weights wave (project-owned engine work taught cobra real
+//   weight       = P3 weights wave (engine work that taught cobra real
 //                  weighted estimation): per-command allow-set, no longer a
 //                  single blanket list. AllWeights on regress/reg/r/feols/
 //                  reghdfe (cobra's feols accepts all four types, honest-
@@ -106,10 +109,10 @@ std::string weightPolicyToString(WeightPolicy w) {
 //                  stays an empty (growth) field per the task brief.
 // BUG-105 (ONESHOT-PREP9 WS-K, 2026-08-07) — the `abbrev` lists below were
 // corrected against a LIVE StataBE oracle, not against a rule. The measured
-// table is plans/BUG105-ABBREV-SOURCING-20260731.md §3 (30 commands × every
+// table is internal note BUG105-ABBREV-SOURCING-20260731.md §3 (30 commands × every
 // prefix = 190 `capture noisily` attempts, plus 32 `which` identity calls to
 // separate "some command ran" from "THAT command ran"); the oracle scripts are
-// kept at private-notes/plans/instruments/bug105-abbrev-oracle/.
+// kept at internal capture.
 //
 // Three standing rules this table now encodes, all measurement-derived:
 //   1. NO computed prefix rule. Stata's accepted set is non-contiguous
@@ -201,7 +204,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // handlers.cpp's runSummarize/summarizeCoreStats stay fweight-only,
       // unchanged, for freeze-preservation — a sibling runSummarizeAweight
       // carries the new [aw=] path).
-      {"summarize", {"sum", "su", "summ", "summa", "summar", "summari", "summariz"}, Family::DataMgmt, true, true, WeightPolicy::AweightFweight, true,
+      {"summarize", {"sum", "su", "summ", "summa", "summar", "summari", "summariz"}, Family::DataMgmt, true, true, WeightPolicy::AllWeights, true,
        {"detail", "d", "meanonly"}, "runSummarize / runSummarizeAweight"},
 
       // ---- dispatcher.cpp:968 `save` ----
@@ -210,8 +213,8 @@ const std::vector<CommandSpec>& commandRegistry() {
       // ---- dispatcher.cpp:999 `rename`/`ren` ----
       {"rename", {"ren", "rena", "renam"}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runRename"},
 
-      // ---- dispatcher.cpp:1019 `clonevar` ----
-      {"clonevar", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runClonevar"},
+      // ---- dispatcher.cpp:1019 `clonevar` ---- `in` since BUG-1096 (runClonevar).
+      {"clonevar", {}, Family::DataMgmt, false, true, WeightPolicy::None, false, {}, "runClonevar"},
 
       // ---- dispatcher.cpp:1040 `generate`/`gen`/`g` — real by-prefix support. ----
       {"generate", {"gen", "g", "ge", "gene", "gener", "genera", "generat"}, Family::DataMgmt, true, true, WeightPolicy::None, true, {},
@@ -244,7 +247,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // through findByName() exactly as before, and the command ECHO prints
       // whatever the user typed, so no user-visible output moves. What DOES
       // move is the freeze fixture FILENAME (tools/freeze_matrix.py keys
-      // captures by canonical): tests/kitchensink/freeze/reghdfe.json is
+      // captures by canonical): internal capture reghdfe.json is
       // re-pinned to feols.json in this same change, TOLERANCE.md §4.1.
       // BS-090: allowInRange flipped true for regress/reghdfe — the
       // shared runRegress handler now pre-filters if/in into a materialized
@@ -263,7 +266,10 @@ const std::vector<CommandSpec>& commandRegistry() {
       // ---- dispatcher.cpp `ivregress` (BETA D1, BS-063): 2sls/gmm/liml
       // sub-estimator word is parsed.varlist[0] (own dispatch arm, not a
       // registry-modeled distinction — one row covers all three). ----
-      {"ivregress", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      // [aw=]/[pw=] are the engine's weighted 2SLS/GMM (BUG-1283: StataBE 19.5
+      // `ivregress 2sls y (x1 = z1) x2 [aw=w]` _b[x1] 1.8001190408021581); liml
+      // and fweight/iweight stay refused by name in runIvRegress / the gate.
+      {"ivregress", {}, Family::Estimation, true, false, WeightPolicy::AweightPweight, false, {},
        "runIvRegress (forwards parsed, method from varlist[0])"},
 
       // ---- dispatcher.cpp `ivreghdfe` (BETA D1, BS-063) — same handler as
@@ -271,7 +277,10 @@ const std::vector<CommandSpec>& commandRegistry() {
       // `reghdfe y (endog=instr), absorb(F)` paren form (routed from the
       // `reghdfe` arm above, not a separate registry row — that form is
       // still literally the command word `reghdfe`, not `ivreghdfe`). ----
-      {"ivreghdfe", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      // [aw=]/[pw=] with absorb(): the engine's weighted within transform, as
+      // xtivreg2's fe (BUG-1283: StataBE 19.5 `ivreghdfe y (x1 = z1) x2 [aw=w],
+      // absorb(id)` _b[x1] 1.7965772864578362, _se .19795319501932024).
+      {"ivreghdfe", {}, Family::Estimation, true, false, WeightPolicy::AweightPweight, false, {},
        "runIvRegress (forwards parsed, allowAbsorb=true)", false, {"ivreghdfe"}},
 
       // ---- dispatcher.cpp `reg3` (BETA D1, BS-065): `(y1 x1 x2) (y2 x3
@@ -279,6 +288,10 @@ const std::vector<CommandSpec>& commandRegistry() {
       // directly from varlist by the handler itself. ----
       {"reg3", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
        "runReg3 (forwards parsed)"},
+      // ---- dispatcher.cpp `sureg`: sureg.ado's `reg3 <eqns>, sure` (e(cmd)
+      // `sureg`), the same handler. ----
+      {"sureg", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+       "runReg3 (forwards parsed, stataCmd sureg)"},
 
       // ---- dispatcher.cpp `boottest` (BETA D1, BS-066): post-estimation
       // wild cluster bootstrap, session.lastModel()-driven like test/
@@ -289,7 +302,9 @@ const std::vector<CommandSpec>& commandRegistry() {
       // ---- dispatcher.cpp `tobit` (BETA D2, BS-069): censored-normal MLE,
       // ll()/ul() parsed directly by the handler (bare ll/ul computed from
       // the depvar's own observed min/max). ----
-      {"tobit", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      // BUG-1544: tobit takes aweights, fweights, iweights and pweights (tobit.sthlp;
+      // the engine fits them all).
+      {"tobit", {}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
        "runTobit (forwards parsed)"},
 
       {"var", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
@@ -302,8 +317,11 @@ const std::vector<CommandSpec>& commandRegistry() {
        "runMi (subcommand-multiplexed)"},
       {"xtabond", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
        "runXtabond (forwards parsed)"},
-      {"nl", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      // [aw=]/[pw=]: the engine's weighted NLS (BUG-1283).
+      {"nl", {}, Family::Estimation, true, false, WeightPolicy::AweightPweight, false, {},
        "runNlGmm (raw expression)"},
+      {"ml", {}, Family::Estimation, true, true, WeightPolicy::PweightOnly, false, {},
+       "runMl (compiled lf lifecycle)"},
       {"gmm", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
        "runNlGmm (raw expression)"},
       {"mixed", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
@@ -361,7 +379,7 @@ const std::vector<CommandSpec>& commandRegistry() {
 
       // ---- dispatcher.cpp `qreg` (BETA D2, BS-071): quantile regression,
       // quantile()/level() parsed directly by the handler. ----
-      {"qreg", {}, Family::Estimation, true, false, WeightPolicy::PweightOnly, false, {},
+      {"qreg", {}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
        "runQreg (forwards parsed)"},
 
       // ---- dispatcher.cpp `mediate` (BETA D2, BS-072): Stata 18 causal
@@ -376,7 +394,8 @@ const std::vector<CommandSpec>& commandRegistry() {
       {"xtset", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runXtset"},
 
       // ---- dispatcher.cpp:1195 `tsset` ----
-      {"tsset", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runTsset"},
+      {"tsset", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
+       "runTsDeclare / runTsRedisplay"},
 
       // ---- dispatcher.cpp:1217 `clear` (arity-capped to `clear [all]` by
       // kFixedArityCommands, not modeled here) ----
@@ -394,7 +413,9 @@ const std::vector<CommandSpec>& commandRegistry() {
       {"compress", {}, Family::Meta, false, false, WeightPolicy::None, false, {}, "noop_accept"},
 
       // ---- dispatcher.cpp:1249 `exit` ----
-      {"exit", {}, Family::Meta, false, false, WeightPolicy::None, false, {}, "exit_inline (engineError code=program_exit)"},
+      // BUG-1462: `e` is exit's minimal abbreviation (StataBE: a bare `e` line
+      // ends the do-file, rc 0).
+      {"exit", {"e", "ex", "exi"}, Family::Meta, false, false, WeightPolicy::None, false, {}, "exit_inline (engineError code=program_exit)"},
 
       // ---- dispatcher.cpp:1264 `cd` ----
       {"cd", {}, Family::IO, false, false, WeightPolicy::None, false, {}, "runCd"},
@@ -478,8 +499,9 @@ const std::vector<CommandSpec>& commandRegistry() {
       // ---- dispatcher.cpp:1370 `order` ----
       {"order", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runOrder"},
 
-      // ---- dispatcher.cpp:1375 `recode` ----
-      {"recode", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runRecode"},
+      // ---- dispatcher.cpp:1375 `recode` ---- `in` since BUG-1141: runRecode
+      // re-reads the line's qualifiers and hands both to its gen/replace/count.
+      {"recode", {}, Family::DataMgmt, false, true, WeightPolicy::None, false, {}, "runRecode"},
 
       // ---- dispatcher.cpp:1380 `collapse` ----
       // BS-090: allowInRange flipped true — runCollapse now pre-filters
@@ -488,7 +510,8 @@ const std::vector<CommandSpec>& commandRegistry() {
       // instead of forwarding a raw --keepif; the pre-comma raw-text strip
       // that protects the stat-varlist parse from a leaked `if` clause now
       // strips a leaked `in` clause the same way (see the .cpp comment).
-      {"collapse", {}, Family::DataMgmt, true, true, WeightPolicy::FweightOnly, false, {}, "runCollapse"},
+      // collapse `[aw fw iw pw]` (w2au_collapse_family.log cz_c_w_*).
+      {"collapse", {}, Family::DataMgmt, true, true, WeightPolicy::AllWeights, false, {}, "runCollapse"},
 
       // ---- dispatcher.cpp:1389 `encode` ----
       {"encode", {}, Family::DataMgmt, true, false, WeightPolicy::None, false, {}, "runEncode"},
@@ -499,9 +522,10 @@ const std::vector<CommandSpec>& commandRegistry() {
       // commands); no registry row existed before this phase (total
       // absence — audit-confirmed). ----
       {"destring", {}, Family::DataMgmt, false, false, WeightPolicy::None, false,
-       {"replace", "gen", "generate", "ignore", "force"}, "runDestring"},
+       {"replace", "gen", "generate", "ignore", "force", "float", "dpcomma", "percent"},
+       "runDestring"},
       {"tostring", {}, Family::DataMgmt, false, false, WeightPolicy::None, false,
-       {"replace", "gen", "generate", "usedisplayformat"}, "runTostring"},
+       {"replace", "gen", "generate", "usedisplayformat", "format", "force"}, "runTostring"},
 
       // ---- dispatcher.cpp:1411 `reshape` ----
       {"reshape", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runReshape"},
@@ -532,15 +556,16 @@ const std::vector<CommandSpec>& commandRegistry() {
       // (both narrow the rows the claim is checked over) and no options.
       {"assert", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {}, "runAssert"},
       // P1 wave data verbs (engine-backed). `expand` takes a constant count in
-      // this build; the others take a varlist / `using FILE`.
-      {"expand", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runExpand"},
+      // this build, and `in` since BUG-1115 (runExpandIf already filtered on it);
+      // the others take a varlist / `using FILE`.
+      {"expand", {}, Family::DataMgmt, false, true, WeightPolicy::None, false, {}, "runExpand"},
       {"fillin", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runFillin"},
       {"cross", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runCross"},
       {"contract", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runContract"},
       // `export delimited|excel` / `import delimited|excel` — two-word verbs;
       // the dispatcher routes on the sub-verb. Registered under the first word
       // so the command table recognizes the line at all.
-      {"export", {}, Family::IO, false, false, WeightPolicy::None, false,
+      {"export", {}, Family::IO, true, true, WeightPolicy::None, false,
        {"replace", "delimiter", "nolabel", "firstrow", "sheet", "sheetreplace"},
        "runExportDelimited/runExportExcel"},
       {"import", {}, Family::IO, false, false, WeightPolicy::None, false,
@@ -593,7 +618,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       // form since it isn't part of the routing table this phase transcribes. ----
       // AER-SCOPE1 bundle A (2026-09-03): five abbreviations, each sourced the way this
       // table requires -- the AER corpus EXECUTES the spelling, in the package counts
-      // recorded in plans/aer-scope1/gaps.csv (tw 14, gr 10, sca 2, eret 2, levels 2).
+      // recorded in internal fixture gaps.csv (tw 14, gr 10, sca 2, eret 2, levels 2).
       // Measured, not inferred: Stata's accepted set is non-contiguous, so a plausible
       // prefix is not evidence and none was added on that basis. `levels` is not a
       // truncation at all -- it is levelsof's own pre-Stata-11 name.
@@ -605,11 +630,12 @@ const std::vector<CommandSpec>& commandRegistry() {
       // above), landed in the C3 batch alongside BS-038's `scalar list`/
       // `dir` but never got a registry row — confirmed missing via
       // --dump-registry; backfilled this batch (BETA campaign C4) per this
-      // task's explicit instruction. Any OTHER `ereturn ...` form (scalar/
-      // post/eclass creation, BS-109) still falls through unchanged to the
-      // generic unsupported_command reject — not this row's concern. ----
+      // task's explicit instruction. W2D-T01: `clear`/`post`/`local` route to
+      // runEreturn (handlers_ereturn.cpp); every other sub-verb is refused by
+      // name there. `ereturn scalar NAME = EXP` inside an eclass program is
+      // still program.cpp's handleReturnStmt. ----
       {"ereturn", {"eret"}, Family::Estimation, false, false, WeightPolicy::None, false, {},
-       "runEreturnList (bare `ereturn list` only)"},
+       "runEreturnList (list) + runEreturn (clear|post|local)"},
 
       // ---- dispatcher.cpp:1549 `matrix`/`mat` ----
       {"matrix", {"mat", "matr", "matri"}, Family::Macro, false, false, WeightPolicy::None, false, {}, "runMatrixDef"},
@@ -660,10 +686,16 @@ const std::vector<CommandSpec>& commandRegistry() {
       // engine would derive them from every row — a wrong number, not a slow one.
       // `tssmooth` is registered under its FIRST WORD; the arm sub-dispatches on
       // `ma` (duplicates/estat convention). ----
-      {"xtile", {}, Family::DataMgmt, true, false, WeightPolicy::None, false, {},
-       "runXtile (nquantiles only; if honest-rejected)"},
-      {"ipolate", {}, Family::DataMgmt, true, false, WeightPolicy::None, false, {},
-       "runIpolate (generate()+epolate+by(); if honest-rejected)"},
+      // BUG-1015: xtile takes `if`, `in` and its weights -- runXtileStata
+      // evaluates exp over the marked sample (w2as sx_xtile_n_if, sx_xtile_n_aw).
+      // The weights are xtile's "aweight fweight pweight": the
+      // qualifier wave (f8413c27) served [pw=] as well, and the integration of the
+      // two branches keeps it; [iw=] is Stata's r(101), refused first by the
+      // tokenizer's kStataLegalWeights row, so AllWeights here admits exactly aw/fw/pw.
+      {"xtile", {}, Family::DataMgmt, true, true, WeightPolicy::AllWeights, false, {},
+       "runXtileStata (nquantiles/cutpoints; if/in, aw/fw/pw)"},
+      {"ipolate", {}, Family::DataMgmt, true, false, WeightPolicy::None, true, {},
+       "runIpolate (generate()+epolate+by(); by: prefix -> by(); if honest-rejected)"},
       {"tssmooth", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
        "runTssmoothMa (ma only; window(#l[ #c[ #f]]))"},
 
@@ -680,6 +712,11 @@ const std::vector<CommandSpec>& commandRegistry() {
        "dispatcher arm (sets r(varlist))"},
       {"unab", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
        "dispatcher arm (sets a local)"},
+      // Package-007 unblock (T7). StataCorp's own ado, so no community tag.
+      // byIllegalInStata=true: `bysort g: lookfor x` is r(190) in StataBE
+      // (T7 L1 probe), not the r(199) a by-prefix on an unknown name gives.
+      {"lookfor", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
+       "runLookfor (describes matches, sets r(varlist))", true},
       {"xtsum", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runXtsum"},
       {"xttab", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runXttab"},
 
@@ -692,8 +729,12 @@ const std::vector<CommandSpec>& commandRegistry() {
       // dispatcher.cpp's own if-prefilter block (runTabulate has no
       // ifExpr/inRange param of its own, being pure Datastore computation)
       // now composes if/in via piet::handlers::applyIfAndInFilter.
-      {"tabulate", {"tab", "ta", "tabu", "tabul", "tabula", "tabulat"}, Family::DataMgmt, true, true, WeightPolicy::FweightOnly, false, {}, "runTabulate"},
-      {"tab1", {}, Family::DataMgmt, true, true, WeightPolicy::FweightOnly, false, {},
+      // tabulate/tab1 serve [fw=], [aw=] and [iw=] (tabulate.cpp TabWeight;
+      // w2aj_qualifiers qf_tb_aw_sp, qf_tb_iw_sp). AllWeights is the policy
+      // that admits all three; the tokenizer's kStataLegalWeights row answers
+      // Stata's r(101) for the pweight it refuses, before this policy is read.
+      {"tabulate", {"tab", "ta", "tabu", "tabul", "tabula", "tabulat"}, Family::DataMgmt, true, true, WeightPolicy::AllWeights, false, {}, "runTabulate"},
+      {"tab1", {}, Family::DataMgmt, true, true, WeightPolicy::AllWeights, false, {},
        "runTabulate (real Stata tab1 batches per-var; not modeled distinctly here)"},
       {"tab2", {}, Family::DataMgmt, true, true, WeightPolicy::FweightOnly, false, {},
        "runTabulate (real Stata tab2 batches pairwise; not modeled distinctly here)"},
@@ -706,7 +747,9 @@ const std::vector<CommandSpec>& commandRegistry() {
        true},
 
       // ---- dispatcher.cpp:1796 `tabstat` (M4a item2 "estimation surface") ----
-      {"tabstat", {}, Family::Estimation, true, false, WeightPolicy::None, false, {}, "runTabstat"},
+      // BUG-1014: [aw=]/[fw=] flipped on -- tabstat.ado takes `[aw fw]` and hands
+      // them to summarize per group (w2as sx_tabstat_aw, sx_tabstat_fw).
+      {"tabstat", {}, Family::Estimation, true, false, WeightPolicy::AweightFweight, false, {}, "runTabstat"},
 
       // ---- dispatcher.cpp:1810 `corr`/`pwcorr`/`correlate` — ONE arm;
       // `correlate` is a genuine Stata alias of `corr`; `pwcorr` is a
@@ -719,8 +762,11 @@ const std::vector<CommandSpec>& commandRegistry() {
       // delegate to piet::handlers::applyIfAndInFilter). tabstat, sharing
       // the SAME helper, is deliberately left untouched (its call site
       // still passes no inRange argument) — not asked for by this phase.
-      {"corr", {"correlate", "cor", "corre", "correl", "correla", "correlat"}, Family::Estimation, true, true, WeightPolicy::None, false, {}, "runCorr"},
-      {"pwcorr", {}, Family::Estimation, true, true, WeightPolicy::None, false, {},
+      // BUG-1014: [aw=]/[fw=] flipped on for both -- correlate takes them
+      // (correlate.sthlp), pwcorr.ado's syntax line is `[aw fw]` (w2as
+      // sx_corr_aw, sx_corr_cov_aw, sx_corr_covariance_aw, sx_corr_fw).
+      {"corr", {"correlate", "cor", "corre", "correl", "correla", "correlat"}, Family::Estimation, true, true, WeightPolicy::AweightFweight, false, {}, "runCorr"},
+      {"pwcorr", {}, Family::Estimation, true, true, WeightPolicy::AweightFweight, false, {},
        "runCorr (pairwise forced true)"},
 
       // ---- dispatcher.cpp:1821 `ttest` ----
@@ -734,13 +780,17 @@ const std::vector<CommandSpec>& commandRegistry() {
       // (not implemented here, same boundary as ttest/tabstat above); if/in
       // real (same applyIfAndInFilter pre-materialize path runRegress uses).
       // Dispatcher arm added right after ttest's, mirroring this row order.
-      {"mean", {}, Family::Estimation, true, true, WeightPolicy::PweightOnly, false, {}, "runMean (forwards parsed)"},
-      {"proportion", {}, Family::Estimation, true, true, WeightPolicy::PweightOnly, false, {},
+      // mean's help: fweights, aweights, iweights and pweights are allowed;
+      // the engine serves pw and aw and refuses fw/iw by name.
+      {"mean", {}, Family::Estimation, true, true, WeightPolicy::AllWeights, false, {}, "runMean (forwards parsed)"},
+      // BUG-1541: proportion takes fweights and iweights too (the engine fits
+      // them); its aweight is Stata's r(101), the tokenizer's kStataLegalWeights row.
+      {"proportion", {}, Family::Estimation, true, true, WeightPolicy::AllWeights, false, {},
        "runProportion (forwards parsed)"},
 
       // ---- dispatcher.cpp:1826 `xtreg` ----
-      // FU-29: AllWeights, although Stata's xtreg takes no iweight. xtreg_fe.ado
-      // declares `[aw fw pw]` and xtreg_re.ado declares no weight at all, so the
+      // FU-29: AllWeights, although Stata's xtreg takes no iweight. xtreg,fe
+      // declares `[aw fw pw]` and xtreg,re declares no weight at all, so the
       // legal set depends on the MODEL, which the tokenizer gate cannot see. The
       // two refusals live in runXtreg with Stata's own text and rc
       // (w2_pweight.log X11_iw_fe r(101) "iweights not allowed", X12_pw_re
@@ -775,12 +825,23 @@ const std::vector<CommandSpec>& commandRegistry() {
       // keep their honest reject rather than being silently treated as pw,
       // which would report the wrong standard errors under a right-looking
       // command. Same reasoning for the count models below.
-      {"logit", {"logi"}, Family::Estimation, true, false, WeightPolicy::PweightOnly, false, {},
+      // FU-585 (margins-corpus-shapes): logit takes every weight past this gate;
+      // runLogitProbit answers pweight and fweight (099 tables_share_remote.do:58
+      // `logit ... [fweight=w], vce(cl region)`, served under vce(cluster)) and
+      // refuses the rest by name (aweight is Stata's own r(101)).
+      {"logit", {"logi"}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
        "runLogitProbit(\"logit\") (forwards parsed)"},
-      {"logistic", {}, Family::Estimation, true, false, WeightPolicy::PweightOnly, false, {},
+      // BUG-1286: logistic and probit take fweights and iweights too (the engine
+      // fits them); runLogitProbit answers aweight's r(101) and refuses the
+      // cluster forms the engine does not fit, by name.
+      {"logistic", {}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
        "runLogitProbit(\"logit\") + BS-022 odds-ratio display transform"},
-      {"probit", {"prob", "probi"}, Family::Estimation, true, false, WeightPolicy::PweightOnly, false, {},
+      {"probit", {"prob", "probi"}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
        "runLogitProbit(\"probit\") (forwards parsed)"},
+      // cloglog (BUG-1169/1170): cobra cloglog, the complementary log-log link on
+      // the binary ML path (screen, VCEs, fw/iw/pw as probit has them).
+      {"cloglog", {}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
+       "runLogitProbit(\"cloglog\") (forwards parsed)"},
 
       // ---- dispatcher.cpp `poisson`/`ppmlhdfe`/`fepois` (BETA D3, BS-073):
       // count-model wiring -> cobra fepois. Bare `poisson` omits --fe (D0
@@ -789,9 +850,12 @@ const std::vector<CommandSpec>& commandRegistry() {
       // absorb() -> --fe (real Stata's `poisson` itself has no absorb()
       // option). Three rows, one handler, mirroring the regress/feols/
       // reghdfe precedent above. ----
-      {"poisson", {}, Family::Estimation, true, false, WeightPolicy::PweightOnly, false, {},
+      // BUG-1538/1539: poisson takes fweights, iweights and pweights, ppmlhdfe
+      // fweights and pweights (the engine's fepois fits them all); the rest are
+      // Stata's own r(101), answered by the tokenizer's kStataLegalWeights rows.
+      {"poisson", {}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
        "runPoisson (forwards parsed; absorb() honest-rejects here)"},
-      {"ppmlhdfe", {}, Family::Estimation, true, false, WeightPolicy::PweightOnly, false, {},
+      {"ppmlhdfe", {}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
        "runPoisson (forwards parsed; absorb() -> --fe)", false, {"ppmlhdfe"}},
       {"fepois", {}, Family::Estimation, true, false, WeightPolicy::PweightOnly, false, {},
        "runPoisson (forwards parsed; absorb() -> --fe; engine-name convenience spelling)"},
@@ -802,7 +866,9 @@ const std::vector<CommandSpec>& commandRegistry() {
       // from zero (see runNbreg's header comment, estimation_m4.cpp) —
       // wiring is complete and correct; the gap is engine-side, out of this
       // batch's edit scope. ----
-      {"nbreg", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      // BUG-1537: fweights, iweights and pweights (the engine fits them); the
+      // aweight is Stata's r(101), the tokenizer's kStataLegalWeights row.
+      {"nbreg", {}, Family::Estimation, true, false, WeightPolicy::AllWeights, false, {},
        "runNbreg (forwards parsed)"},
 
       // ---- dispatcher.cpp `xtpoisson`/`xtlogit` (BETA D3, BS-075):
@@ -828,23 +894,24 @@ const std::vector<CommandSpec>& commandRegistry() {
        "runDrdid (forwards parsed)", false, {"drdid"}},
 
       // ---- Arc F (P3 wave) — the seven QE/RD commands (handlers_qe.cpp).
-      // allowIf is true for six of them (each forwards parsed.ifExpr as
-      // --keepif); binscatter is the one FALSE row, because cobra's
-      // binscatter has no row-restriction flag at all and the handler
-      // honestly refuses an `if` rather than binning the whole dataset
-      // under a restriction the user wrote. `rdplot` and `binscatter` are
+      // allowIf is true for all seven (each forwards parsed.ifExpr as
+      // --keepif). binscatter also takes `in` (forwarded as --inrange) and
+      // weights: binscatter declares [aweight fweight]; the row admits
+      // every type so that runBinscatter answers a pweight/iweight with
+      // Stata's own r(101) "pweights not allowed" (w2k_binscatter.log BS_pw)
+      // instead of the generic weight refusal. `rdplot` and `binscatter` are
       // classed Graph — their real deliverable is the plot (a sibling arc's
-      // GRAPH half); rdplot additionally prints a table, binscatter prints
-      // nothing at all, exactly as Stata does. ----
+      // GRAPH half); rdplot additionally prints a table. ----
       {"rdrobust", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
        "runRdrobust (forwards parsed)", false, {"rdrobust"}},
       {"rddensity", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
        "runRddensity (forwards parsed)", false, {"rddensity"}},
       {"rdplot", {}, Family::Graph, true, false, WeightPolicy::None, false, {},
        "runRdplot (forwards parsed)", false, {"rdplot"}},
-      {"binscatter", {}, Family::Graph, false, false, WeightPolicy::None, false, {},
+      {"binscatter", {}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {},
        "runBinscatter (forwards parsed)", false, {"binscatter"}},
-      {"eventstudyinteract", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      // [aw=]/[pw=]: the engine's weighted IW estimator (BUG-1283).
+      {"eventstudyinteract", {}, Family::Estimation, true, false, WeightPolicy::AweightPweight, false, {},
        "runEventstudyinteract (forwards parsed)", false, {"eventstudyinteract"}},
       {"did_imputation", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
        "runDidImputation (forwards parsed)", false, {"did_imputation"}},
@@ -915,7 +982,7 @@ const std::vector<CommandSpec>& commandRegistry() {
       {"margins", {}, Family::Estimation, false, false, WeightPolicy::None, false, {}, "runMargins"},
 
       // ---- dispatcher.cpp:1862 `predict` ----
-      {"predict", {}, Family::Estimation, false, false, WeightPolicy::None, false, {}, "runPredict"},
+      {"predict", {}, Family::Estimation, false, true, WeightPolicy::None, false, {}, "runPredict (lasso cached path supports in; other paths refuse in explicitly)"},
 
       // ---- dispatcher.cpp:1867 `estat` (sub-command multiplex: hettest/ovtest/vif/...) ----
       {"estat", {}, Family::Estimation, true, false, WeightPolicy::None, false, {}, "runEstat (sub-command multiplex)"},
@@ -973,13 +1040,22 @@ const std::vector<CommandSpec>& commandRegistry() {
       //     parenthesised layer group are now real closed-form OLS fits
       //     (BUG-099, graph_m4.cpp layerLfit/layerQfit) instead of being
       //     silently aliased to a raw connect-the-dots `line` layer. ----
-      {"scatter", {}, Family::Graph, true, false, WeightPolicy::None, false, {}, "runScatter"},
-      {"histogram", {"hist"}, Family::Graph, true, false, WeightPolicy::None, false, {}, "runHistogram"},
-      {"kdensity", {}, Family::Graph, true, false, WeightPolicy::None, false, {}, "runKdensity"},
-      {"line", {}, Family::Graph, true, false, WeightPolicy::None, false, {}, "runGraphLine"},
+      {"scatter", {}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {}, "runScatter"},
+      // gfx-histogram-kdensity-family: AllWeights forwards the clause to the
+      // handler, which keeps Stata's own legal set and refuses the rest with
+      // r(101) (histogram: fweights; kdensity: fweights, aweights, iweights;
+      // w2aq_histogram_family hk_r_h_pw/_aw, hk_r_kd_pw).
+      {"histogram", {"hist"}, Family::Graph, true, false, WeightPolicy::AllWeights, false, {},
+       "runHistogram"},
+      {"kdensity", {}, Family::Graph, true, false, WeightPolicy::AllWeights, false, {}, "runKdensity"},
+      // serset-twoway WT/IN (2026-10-21): scatter/line/tsline/twoway/graph take
+      // `in` and forward every weight clause; the twoway layer renderer keeps
+      // each plot type's own legal set (r(101) `iweights not allowed`, w2al
+      // tf_r_iw) and `[w=]` is aweight (tf_tw_072, log:305-307).
+      {"line", {}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {}, "runGraphLine"},
       {"xtline", {}, Family::Graph, true, false, WeightPolicy::None, false, {}, "runXtline"},
-      {"tsline", {}, Family::Graph, true, false, WeightPolicy::None, false, {}, "runTsline"},
-      {"twoway", {"tw"}, Family::Graph, true, false, WeightPolicy::None, false, {},
+      {"tsline", {}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {}, "runTsline"},
+      {"twoway", {"tw"}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {},
        "twoway_dispatch (runTwowayLayers for parenthesised/`||` multi-layer; else plot-type strip, "
        "now incl. kdensity/histogram)"},
       // `graph` itself: bare `graph varlist` degrades to scatter (dispatcher.cpp
@@ -993,8 +1069,13 @@ const std::vector<CommandSpec>& commandRegistry() {
       // mis-resolves its `.svg` fallback sibling under a TMPDIR/workdir
       // containing a dot in a directory component — export-path handling
       // only, not a namelist/option-surface change.
-      {"graph", {"gr"}, Family::Graph, true, false, WeightPolicy::None, false, {},
+      {"graph", {"gr"}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {},
        "graph_multiplex (export/save/combine/drop/twoway-recurse/else->scatter)"},
+      // serset-twoway SS (2026-10-21): the graph-owned serset store (serset.sthlp):
+      // `serset`, `serset [set] #`, `serset use [, clear]`, `serset clear`,
+      // `serset drop`, `serset dir` (w2al_twoway_family.log:177-188, :5418-5440).
+      {"serset", {}, Family::Graph, false, false, WeightPolicy::None, false, {},
+       "serset::runSerset (bare/set #/use/clear/drop/dir)"},
 
       // ---- AER-SCOPE1 bundle C (GTOOLS, 2026-09-03) -----------------------
       // gtools and ftools are drop-in fast replacements for commands PIET
@@ -1005,9 +1086,9 @@ const std::vector<CommandSpec>& commandRegistry() {
       // here, and this table's community names are attributed in NOTICE.txt as
       // a licence obligation. An unregistered name already answers r(199), so
       // waiting costs nothing while guessing costs an attribution.
-      {"gcollapse", {}, Family::DataMgmt, true, true, WeightPolicy::FweightOnly, false, {},
+      {"gcollapse", {}, Family::DataMgmt, true, true, WeightPolicy::AllWeights, false, {},
        "runCollapse via gtools shim", false, {"gcollapse"}},
-      {"fcollapse", {}, Family::DataMgmt, true, true, WeightPolicy::FweightOnly, false, {},
+      {"fcollapse", {}, Family::DataMgmt, true, true, WeightPolicy::AllWeights, false, {},
        "runCollapse via ftools shim", false, {"fcollapse"}},
       {"gegen", {}, Family::DataMgmt, true, true, WeightPolicy::None, true, {},
        "runEgen via gtools shim", false, {"gegen"}},
@@ -1070,8 +1151,8 @@ const std::vector<CommandSpec>& commandRegistry() {
 
       // ---- AER-SCOPE1 bundle D (ENV, 2026-09-03) --------------------------
       // The preamble verbs. Every one of these was measured in two or more of
-      // the ninety AER replication packages (plans/ONESHOT-AER-SCOPE1-PLAN.md,
-      // plans/aer-scope1/gaps.csv); none carries an abbreviation, because the
+      // the ninety AER replication packages (internal note ONESHOT-AER-SCOPE1-PLAN.md,
+      // internal fixture gaps.csv); none carries an abbreviation, because the
       // corpus only ever spells them in full and this table enumerates
       // measured spellings rather than plausible ones (see the note at the top
       // of this file). Every row here is in kNoDataCommands: an environment
@@ -1105,22 +1186,53 @@ const std::vector<CommandSpec>& commandRegistry() {
        "accept-note (graph-editor recording; appearance only)"},
       {"error", {}, Family::Meta, false, false, WeightPolicy::None, false, {},
        "runErrorCode (engineError carrying reason=r(#))"},
-      // Calendar creation accepts if/in; the handler rejects qualifiers on
-      // other subcommands and records generated business indices as long,
-      // with missing values outside the selected sample. Personal calendars
-      // use sysdir PERSONAL and can be found again in subsequent sessions.
-      {"bcal", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {}, "runBcal"},
-      {"twoway__histogram_gen", {}, Family::Graph, false, false, WeightPolicy::None, false, {},
-       "refused:stata_internal"},
+      // AER scope-2 B2-3. NAMED DIVERGENCE 1: Stata resolves a .stbcal over the
+      // whole adopath (BASE;SITE;.;PERSONAL;PLUS) and `bcal dir` walks it;
+      // PIET models no sysdir, so the search directory is the session cwd
+      // alone and `personal` is refused by name.
+      // NAMED DIVERGENCE 2 (allowInRange=false below): Stata accepts
+      // `bcal create NAME in 1/10, from(v)` (BUG-1872); PIET refuses it r(198)
+      // "bcal does not support the
+      // `in` row-range qualifier". The refusal is honest and is the engine-wide
+      // state for `in` (260 of 299 rows), not a bcal-specific gap.
+      // NAMED DIVERGENCE 3: `bcal create NAME if <expr>, from(v) generate(nv)`
+      // — the `if`+`generate()` COMBINATION — is refused r(198) where Stata is
+      // rc 0 and writes the new column with MISSING on the excluded rows
+      // (oracle i2_rc/i2_bz2_missing/i3_rc, bcal-20260908/capture.do:451-462;
+      // re-measured rc 0 this review). Filed BUG-465. Plain `if` without
+      // generate() IS wired, which is why allowIf is true below (measured:
+      // `bcal create ifcal if bd > td(15jan2020), from(bd) replace` rc 0,
+      // r(min_date_td)=21930). allowIf was false here until the 2026-09-09
+      // review: descriptive-only (BUGLOG:1404 — no enforcement site reads it),
+      // but `--dump-registry` does, and that export is what
+      // internal capture registry-*.json is built from.
+      // NAMED DIVERGENCE 4: `bcal create ..., generate(nv)` writes nv as f64
+      // where Stata makes it a `long` (oracle i_type = long, i_fmt = %tbi_gen;
+      // re-measured 2026-09-09, cap2.log `describe bz3` -> `long %tbg2`). This
+      // is the D1 class widened, NOT a bcal-specific gap: every writeColumn
+      // call site in handlers_aer_util.cpp writes "f64", because this build has
+      // no Stata storage types on the gen path. It is NOT in BUGLOG because
+      // there is no honest probe surface for it -- PIET's `confirm long
+      // variable x` answers rc 0 for an f64 column, so a probe asserting the
+      // type would be a false GREEN.
+      // (r(fn) used to be a fifth divergence -- `bcal describe`/`bcal dir` post
+      // an ABSOLUTE machine path where Stata posts `./NAME.stbcal`. FIXED in
+      // the 2026-09-09 review pass; see setDescribeR.)
+      {"bcal", {}, Family::DataMgmt, true, false, WeightPolicy::None, false, {}, "runBcal"},
+      // gfx-histogram-kdensity-family: served (was refused:stata_internal).
+      // twoway__histogram_gen takes fweights, if and in: AllWeights forwards the
+      // clause and the handler refuses every type but fweight with r(101)
+      // (hk_r_thg_pw); `in` stays unimplemented.
+      {"twoway__histogram_gen", {}, Family::Graph, true, false, WeightPolicy::AllWeights, false, {},
+       "runTwowayHistogramGen"},
       // `frames` is Stata's plural spelling of `frame`; `reset` is the one
       // sub-command that only exists in the plural form.
       {"frames", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
        "runFramesReset + rewrite-to-frame"},
-      // `tset` is the pre-Stata-7 spelling of tsset, and unlike tsset it takes
-      // the panel form `tset panelvar timevar` -- which is how the corpus uses
-      // it (three packages, all two-variable).
+      // `tset` is the pre-Stata-7 spelling of tsset: tset.ado is the one line
+      // `tsset `0'`, so the dispatcher runs it through the tsset arm (BUG-1163).
       {"tset", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
-       "runTsset / runXtset (pre-Stata-7 spelling)"},
+       "runTsDeclare / runTsRedisplay (the tsset arm)"},
 
       // ---- AER-SCOPE1 bundle E (TABLES, 2026-09-04) -----------------------
       // The table pipeline. Every row here is a community package (see
@@ -1179,7 +1291,8 @@ const std::vector<CommandSpec>& commandRegistry() {
       {"stack", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runStack"},
       {"separate", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
        "runSeparate"},
-      {"mvencode", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
+      // allowIf: mvencode.ado marks an `if` sample (007's Wave 2 cleaning uses it).
+      {"mvencode", {}, Family::DataMgmt, true, false, WeightPolicy::None, false, {},
        "runMvencode"},
       // The three sampling verbs. Philox keyed on session.seed -- `set seed 7`
       // then the same command twice gives the same rows.
@@ -1197,9 +1310,15 @@ const std::vector<CommandSpec>& commandRegistry() {
       // alias -- the same split-row shape as erase/rm and dir/ls.
       {"notes", {"note"}, Family::Meta, false, false, WeightPolicy::None, false, {}, "runNotes"},
       {"compare", {}, Family::Meta, false, false, WeightPolicy::None, false, {}, "runCompare"},
-      {"cumul", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runCumul"},
-      {"pctile", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {}, "runPctile"},
-      {"_pctile", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
+      // BUG-1015: cumul.ado takes `[fw aw/] [if] [in]` and is byable(onecall):
+      // if/in, both weights and the by: prefix flipped on (w2as sx_cumul_if,
+      // sx_cumul_aw_equal, sx_cumul_fw, sx_cumul_by).
+      {"cumul", {}, Family::DataMgmt, true, true, WeightPolicy::AweightFweight, true, {}, "runCumul"},
+      // pctile/_pctile take [aw=]/[fw=]/[pw=] (the weighted percentile rule in
+      // handlers_aer_reshape.cpp); the tokenizer's kStataLegalWeights row
+      // answers Stata's r(101) for iweight before this policy is read.
+      {"pctile", {}, Family::DataMgmt, false, false, WeightPolicy::AllWeights, false, {}, "runPctile"},
+      {"_pctile", {}, Family::DataMgmt, false, false, WeightPolicy::AllWeights, false, {},
        "runPctileR (r-class form)"},
 
       // ---- AER-SCOPE1 bundle G (IO-TEXT, 2026-09-04) ----------------------
@@ -1211,18 +1330,18 @@ const std::vector<CommandSpec>& commandRegistry() {
       // unregistered one answers a generic r(199) that reads like a typo.
       {"insheet", {}, Family::IO, false, false, WeightPolicy::None, false, {},
        "runInsheet -> runImportDelimited + Stata naming"},
-      // allowIf/allowInRange FALSE, corrected 2026-09-04 after implementation:
-      // the field means "the arm reads and forwards the qualifier", and neither
-      // writer can -- `runExportDelimited` writes the whole frame and `outfile`
-      // reads the same head. Leaving them true let the tokenizer hand a
-      // qualifier through to a handler that would write MORE rows than asked
-      // and report success. False makes the refusal happen at the one place
-      // that owns qualifier policy, and makes this row true.
-      {"outsheet", {}, Family::IO, false, false, WeightPolicy::None, false, {},
-       "runOutsheet -> runExportDelimited (tab default)"},
+      // allowIf/allowInRange TRUE (2026-10-21): runOutsheet now filters the
+      // rows it writes (writeDelimitedFile over applyIfAndInFilter; w2ar
+      // dx_outs_if log:838).
+      {"outsheet", {}, Family::IO, true, true, WeightPolicy::None, false, {},
+       "runOutsheet -> writeDelimitedFile (tab default)"},
       {"infile", {}, Family::IO, false, false, WeightPolicy::None, false, {}, "runInfile"},
-      {"infix", {}, Family::IO, false, false, WeightPolicy::None, false, {}, "runInfix"},
-      {"outfile", {}, Family::IO, false, false, WeightPolicy::None, false, {}, "runOutfile"},
+      // allowInRange TRUE: runInfix keeps the records `in` names (w2ar dx_rb
+      // `infix ... using f in 1`, log:2376).
+      {"infix", {}, Family::IO, false, true, WeightPolicy::None, false, {}, "runInfix"},
+      // allowIf/allowInRange TRUE: runOutfile writes the rows the qualifier
+      // selects (w2ar dx_outf_if `outfile s g if year == 2001 using f`, log:4990).
+      {"outfile", {}, Family::IO, true, true, WeightPolicy::None, false, {}, "runOutfile"},
       {"saveold", {}, Family::IO, false, false, WeightPolicy::None, false, {},
        "runSaveold -> runSaveData (format 118 + honest note)"},
       {"putexcel", {}, Family::IO, false, false, WeightPolicy::None, false, {},
@@ -1230,14 +1349,75 @@ const std::vector<CommandSpec>& commandRegistry() {
       {"filefilter", {}, Family::IO, false, false, WeightPolicy::None, false, {},
        "runFilefilter (sets r(occurrences))"},
       {"copy", {}, Family::IO, false, false, WeightPolicy::None, false, {}, "runCopy"},
+      // AER tier-1 (2026-10-28): the ZIP container code the .xlsx reader/writer
+      // always carried is now exposed (zip_io.h), so these two stop refusing.
       {"unzipfile", {}, Family::IO, false, false, WeightPolicy::None, false, {},
-       "refused:no_zip_library"},
+       "runUnzipfile (zipio::readEntries)"},
       {"zipfile", {}, Family::IO, false, false, WeightPolicy::None, false, {},
-       "refused:no_zip_library"},
+       "runZipfile (zipio::build, stored)"},
       {"odbc", {}, Family::IO, false, false, WeightPolicy::None, false, {},
        "refused:no_odbc_driver"},
       {"spshape2dta", {}, Family::IO, false, false, WeightPolicy::None, false, {},
        "refused:no_shapefile_reader"},
+
+      // ---- AER tier-1 (2026-10-28) ----------------------------------------
+      // The difficulty-1 bundle of the AER coverage report: commands whose every
+      // piece already existed (a handler, a store, an engine verb) and only
+      // needed wiring. Plan: internal note ONESHOT-AER-TIER1-PLAN-20261028.md;
+      // answers: tests/eval/golden/aer_w2/w2ax_t1_{official,community}.log.
+      // `lookfor`, `ihstrans` and the two mata housekeeping lines are the
+      // package-007 branch's and are not here.
+      //
+      // StataCorp's own (ado or built-in): no community tag.
+      {"macro", {}, Family::Macro, false, false, WeightPolicy::None, false, {},
+       "tryMacroVerbIntercept (drop|define|shift|list|dir; raw pre-pass)"},
+      {"xtdescribe", {"xtdes"}, Family::DataMgmt, true, true, WeightPolicy::None, false, {},
+       "runXtdescribe (T_i distribution, sets summarize-detail r())"},
+      {"mvdecode", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {},
+       "runMvdecode (values -> .)"},
+      {"lrtest", {}, Family::Estimation, false, false, WeightPolicy::None, false, {},
+       "runLrtest (two stored fits, or one and the current)"},
+      {"fvunab", {}, Family::Macro, false, false, WeightPolicy::None, false, {},
+       "runFvunab (ts/fv operator prefixes kept)"},
+      {"integ", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {},
+       "runInteg (trapezoid/cubic, sets r(integral))"},
+      {"numlabel", {}, Family::Meta, false, false, WeightPolicy::None, false, {},
+       "runNumlabel (add|remove)"},
+      {"_dots", {}, Family::Meta, false, false, WeightPolicy::None, false, {},
+       "runDots (progress display)"},
+      {"cf", {}, Family::IO, false, false, WeightPolicy::None, false, {},
+       "runCf (compare with a using file)"},
+      {"renpfix", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
+       "runRenpfix (sequential renames, stops at a clash)"},
+      {"markout", {}, Family::DataMgmt, false, false, WeightPolicy::None, false, {},
+       "runMarkout"},
+      {"postutil", {}, Family::IO, false, false, WeightPolicy::None, false, {},
+       "runPostutil (clear|dir)"},
+      // Community packages. Each author was read from the package's own `ssc
+      // describe` record on the oracle Mac, 2026-10-28
+      // (internal capture t1_ssc_install.log); matselrc is not
+      // on SSC and came from STB-56 dm79 (t1_matselrc_install.log). zipuse ships
+      // inside the zipsave package.
+      {"require", {}, Family::Meta, false, false, WeightPolicy::None, false, {},
+       "runRequire (accept-note)", false, {"require"}},
+      {"labvars", {}, Family::Meta, false, false, WeightPolicy::None, false, {}, "runLabvars",
+       false, {"labvars"}},
+      {"astile", {}, Family::DataMgmt, true, true, WeightPolicy::None, true, {},
+       "runAstile (quantile groups, by())", false, {"astile"}},
+      {"matsort", {}, Family::Macro, false, false, WeightPolicy::None, false, {}, "runMatsort",
+       false, {"matsort"}},
+      {"matselrc", {}, Family::Macro, false, false, WeightPolicy::None, false, {}, "runMatselrc",
+       false, {"matselrc"}},
+      {"fillmissing", {}, Family::DataMgmt, true, true, WeightPolicy::None, true, {},
+       "runFillmissing (with(); by-prefix injected)", false, {"fillmissing"}},
+      {"findname", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {},
+       "runFindname (sets r(varlist))", false, {"findname"}},
+      {"sencode", {}, Family::DataMgmt, true, true, WeightPolicy::None, false, {},
+       "runSencode (order of appearance)", false, {"sencode"}},
+      {"zipuse", {}, Family::IO, true, true, WeightPolicy::None, false, {}, "runZipuse",
+       false, {"zipuse"}},
+      {"zipsave", {}, Family::IO, false, false, WeightPolicy::None, false, {}, "runZipsave",
+       false, {"zipsave"}},
 
       // ---- AER-SCOPE1 bundle I (UTIL, 2026-09-04) -------------------------
       // Data-tidying utilities. Every community name below was read from the
@@ -1286,6 +1466,13 @@ const std::vector<CommandSpec>& commandRegistry() {
       // and the dispatcher injects the by() the same way it does for egen.
       {"carryforward", {}, Family::DataMgmt, false, false, WeightPolicy::None, true, {},
        "runCarryforward", false, {"carryforward"}},
+      // Package-007 unblock (T7). Community ados: ihstrans (SSC, Jan Helmdag) takes
+      // if/in; sctorezone (SSC scto) accepts and ignores them in Stata, so the row
+      // does not allow them.
+      {"ihstrans", {}, Family::DataMgmt, true, true, WeightPolicy::None, false,
+       {"keepusing", "prefix", "casewise"}, "runIhstrans", false, {"ihstrans"}},
+      {"sctorezone", {}, Family::DataMgmt, false, false, WeightPolicy::None, false,
+       {"force", "only", "exclude"}, "runSctorezone", false, {"sctorezone"}},
       // allowIf/allowInRange FALSE, corrected after implementation: rangestat
       // WRITES a column, and a written column must be frame-length and
       // row-aligned. `applyIfAndInFilter` returns a filtered FRAME, not a mask,
@@ -1396,9 +1583,14 @@ const std::vector<CommandSpec>& commandRegistry() {
       // spellings copy ivregress's (no `in`, no weights) for the same reason.
       {"areg", {}, Family::Estimation, true, true, WeightPolicy::AllWeights, false, {},
        "runAreg -> runRegress(\"areg\")"},
-      {"ivreg2", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      // ivreg2: [aw=]/[pw=] (ivreg2; the engine's weighted 2SLS,
+      // w2d_uncovered.log:1916 ivreg2_aw_ctl). fweight/iweight are not implemented.
+      {"ivreg2", {}, Family::Estimation, true, false, WeightPolicy::AweightPweight, false, {},
        "runIvreg2 -> runIvRegress", false, {"ivreg2"}},
-      {"xtivreg2", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      // xtivreg2, fe: [aw=]/[pw=] weight the within transform's group means and then
+      // ivreg2 (xtivreg2; w2d_uncovered_xtivreg2.log:2853
+      // xtivreg2_fe_pw_savefirst_034). fweight/iweight are not implemented.
+      {"xtivreg2", {}, Family::Estimation, true, false, WeightPolicy::AweightPweight, false, {},
        "runIvreg2 -> runIvRegress (fe -> absorb(panelvar))", false, {"xtivreg2"}},
 
       // E2 PIET-side -- closed-form statistics computed here, no engine call.
@@ -1414,19 +1606,33 @@ const std::vector<CommandSpec>& commandRegistry() {
        "runCentile (binomial-interpolated CI)"},
 
       // E2 engine-backed -- these forward to cobra subcommands. allowInRange is
-      // false on tsfilter/lpoly/lowess/pca: each either writes a frame-length
-      // column or consumes the whole sample, and `in` would have to mean a
-      // filtered FRAME rather than a mask (the same reason rangestat above
-      // refuses both) -- the honest answer until the engine grows a
-      // restricted-sample form.
+      // false on tsfilter/pca: each either writes a frame-length column or
+      // consumes the whole sample, and `in` would have to mean a filtered FRAME
+      // rather than a mask (the same reason rangestat above refuses both).
+      // lpoly and lowess now have that restricted-sample form: the engine takes
+      // the if/in sample as a MASK over the full frame (`--keepif`, `--inrange`)
+      // and writes generate() back by row (w2ae_lpoly_lowess lpl_in, lpl_lw_in).
+      // Their weight rows are AllWeights so that the HANDLER answers with
+      // Stata's own rc: lpoly takes [aw=] (lpoly's syntax `[fw aw]`; [fw=] is
+      // refused by name, unmeasured), [pw=]/[iw=] are r(101) "pweights not
+      // allowed" (lpl_pw); lowess.ado declares no weights at all, so every
+      // weight is r(101) "weights not allowed" (lpl_lw_aw). The tokenizer's own
+      // weight gate would answer r(198) for both.
       {"tsfilter", {}, Family::DataMgmt, true, false, WeightPolicy::None, false, {},
        "runTsfilterHp (subcommand `hp` only; others -> kUnknownSubcommand)"},
-      {"lpoly", {}, Family::Graph, true, false, WeightPolicy::None, false, {},
+      {"lpoly", {}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {},
        "runLpoly (local polynomial smooth + ROT bandwidth)"},
-      {"lowess", {}, Family::Graph, true, false, WeightPolicy::None, false, {},
+      {"lowess", {}, Family::Graph, true, true, WeightPolicy::AllWeights, false, {},
        "runLowess (tricube LOWESS, no robustness iterations)"},
       {"pca", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
        "runPca (correlation/covariance principal components)"},
+
+      // X2-GLM: `glm` left E3. Fitted in-process (estimation_glm.cpp over the
+      // engine's cecon::glm_fit). `if` is read; `in` has no oracle arm and stays
+      // off. AweightFweight lets [aw=] through (w2_glm_lifecycle pois_aw_cl_*);
+      // an [fw=] that gets past the tokenizer is refused by name in runGlm.
+      {"glm", {}, Family::Estimation, true, false, WeightPolicy::AweightFweight, false, {},
+       "runGlm (in-process, estimation_glm.cpp)"},
 
       // xi is BOTH a command (`xi i.region`) and a prefix (`xi: regress ...`);
       // the prefix half is its own row in prefixRegistry() below.
@@ -1441,39 +1647,40 @@ const std::vector<CommandSpec>& commandRegistry() {
       // extcompat gate and the NOTICE.txt attribution, and attribution is owed
       // for compatibility we SHIP, not for a name we decline. allowIf and
       // allowInRange are false throughout -- a refusal reads no qualifier.
+      // suest left E3 (w2j_e3_builtin S_*): handlers_e3_suest.cpp runSuest, stored
+      // regress fits (mean + lnvar equations, robust/cluster sandwich).
       {"suest", {}, Family::Estimation, false, false, WeightPolicy::None, false, {},
-       "refuse:kNotImplemented (E3-deferred; nearest native: regress)"},
-      {"glm", {}, Family::Estimation, false, false, WeightPolicy::None, false, {},
-       "refuse:kNotImplemented (E3-deferred; nearest native: poisson/logit)"},
+       "runSuest (stored regress fits: mean + lnvar scores, stacked sandwich V)"},
       // ---- AER scope 2, bundle B2-4 (2026-09-09): `teffects` leaves E3 -----
       // ONLY the `nnmatch` estimator: Abadie-Imbens nearest-neighbour matching
       // (StataCorp [CAUSAL]), the last statistical blocker of paper 076. Landed
       // after its match-set rule was measured AND the first candidate rule was
-      // refuted: private-notes/plans/teffects-nnmatch-20260908/{REPORT,REFUTE-0,
-      // REFUTE-1}.md (14 + 15 live-Stata runs, every gen() id in order).
+      // refuted: internal notes REPORT, REFUTE-0 and
+      // REFUTE-1 (14 + 15 live-Stata runs, every gen() id in order).
       // ra/ipw/ipwra/aipw/psmatch are DIFFERENT estimators and stay named
       // refusals in the handler (`refused:teffects_<sub>_unimplemented`).
       // allowIf: forwarded as a --keepif MASK so the gen() ids stay frame `_n`.
-      // allowInRange false is a WIRING GAP, not a measurement gap, and is filed
-      // as BUG-468: `in 1/40` HAS been measured against StataBE (rc 0, e(N) 40 --
-      // golden/aer_estim2_oracle.log INFO|nn_level|in_rc, in_N), so this row
-      // turns away a form the oracle runs. The refusal is honest (r(198), and it
-      // names `if` as the workaround) and paper 076 does not use `in`, so it
-      // stays false until the composition with the --keepif mask is landed
-      // rather than being restated here as intent ([[wiring-gap-vs-missing-
-      // feature]]). WeightPolicy::None is the un-measured half: Stata documents
-      // no weights on teffects nnmatch that this build has captured.
-      {"teffects", {}, Family::Estimation, true, false, WeightPolicy::None, false, {},
+      // allowInRange (BUG-468): `in a/b` joins that mask as `_n` bounds
+      // (runTeffects); StataBE `in 1/40` rc 0, e(N) 40 (golden/aer_estim2_oracle.log
+      // INFO|nn_level|in_rc, in_N). WeightPolicy::None is the un-measured half:
+      // Stata documents no weights on teffects nnmatch that this build has captured.
+      {"teffects", {}, Family::Estimation, true, true, WeightPolicy::None, false, {},
        "runTeffects (nnmatch only: ATE/ATET, AI robust V, gen(stub) ids; every other "
        "sub-command = refused:teffects_<sub>_unimplemented)"},
-      {"lasso", {}, Family::Estimation, false, false, WeightPolicy::None, false, {},
-       "refuse:kNotImplemented (E3-deferred; nearest native: regress)"},
-      {"rlasso", {}, Family::Estimation, false, false, WeightPolicy::None, false, {},
-       "refuse:kNotImplemented (E3-deferred; nearest native: regress)"},
+      {"lasso", {}, Family::Estimation, true, true, WeightPolicy::None, false, {},
+       "runLasso (linear CV/plugin/BIC, Poisson plugin/BIC; cached selected coefficients)"},
+      {"lassocoef", {}, Family::Estimation, false, false, WeightPolicy::None, false, {},
+       "runLassoCoef (current fit; display(x|coef), sort(none|names))"},
+      // rlasso left E3 (w2j_e3_rlasso): handlers_e3_lasso.cpp runRlasso, lassopack's
+      // rigorous lasso (rlasso.ado/MakeData/RLasso) with homoskedastic, robust and
+      // cluster penalty loadings, fe/noconstant; if/in are its marksample.
+      {"rlasso", {}, Family::Estimation, true, true, WeightPolicy::None, false, {},
+       "runRlasso (rlasso.ado: rigorous lasso + post-lasso OLS, e(b)/e(beta*)/e(Psi), "
+       "homoskedastic/robust/cluster loadings, fe)"},
       // ---- AER scope 2, bundle B2 (2026-09-08): `oaxaca` leaves E3 ----------
       // Ben Jann's Blinder-Oaxaca decomposition, `pooled` twofold ONLY (the
       // corpus form, paper 034). Landed after -- not before -- its inference was
-      // pinned: private-notes/plans/oaxaca-se-20260908/REPORT.md (12 live-Stata
+      // pinned: internal note oaxaca-se-20260908/REPORT.md (12 live-Stata
       // fixtures, all 120 SEs and every e(V)/e(V0) entry to 3.8e-14, 48 wrong
       // constructions rejected). The threefold default is a NAMED refusal in
       // the handler. allowIf: the handler forwards the qualifier as --keepif.
@@ -1484,14 +1691,37 @@ const std::vector<CommandSpec>& commandRegistry() {
        false, {"oaxaca"}},
       {"honestdid", {}, Family::Estimation, false, false, WeightPolicy::None, false, {},
        "refuse:kNotImplemented (E3-deferred; nearest native: csdid)"},
+      // ritest left E3 (w2j_e3_ritest): dispatcher step 0a-ter hands the raw line
+      // to handlers_e3_ritest.cpp runRitestLine (its exp_list is per replicate);
+      // its own if/in are parsed there, so the row's qualifier gates never see one.
       {"ritest", {}, Family::Estimation, false, false, WeightPolicy::None, false, {},
-       "refuse:kNotImplemented (E3-deferred; nearest native: permute)"},
-      {"acreg", {}, Family::Estimation, false, false, WeightPolicy::None, false, {},
-       "refuse:kNotImplemented (E3-deferred; nearest native: regress)"},
-      {"swindex", {}, Family::Estimation, false, false, WeightPolicy::None, false, {},
-       "refuse:kNotImplemented (E3-deferred; nearest native: egen)"},
-      {"qreg2", {}, Family::Estimation, false, false, WeightPolicy::None, false, {},
-       "refuse:kNotImplemented (E3-deferred; nearest native: qreg)"},
+       "runRitest (ritest.ado: permutation within strata x cluster cells, r(p)/r(c)/r(b), "
+       "saving(), seed(); exp_list evaluated per replicate)"},
+      // acreg left E3 (w2j_e3_acreg): handlers_e3_acreg.cpp runAcreg -- OLS/2SLS with
+      // the heteroskedastic / temporal / spatial lat-lon kernels, pfe1()/pfe2(); the
+      // other kernels refuse by name. if/in are its marksample (ado).
+      {"acreg", {}, Family::Estimation, true, true, WeightPolicy::None, false, {},
+       "runAcreg (acreg.ado: OLS/2SLS, Conley spatial + temporal HAC, pfe absorption, KP F)"},
+      // swindex left E3 (w2j_e3_swindex): handlers_e3_swindex.cpp runSwindex, the
+      // ado's syntax/refusals and Anderson index; if/in are its marksample.
+      {"swindex", {}, Family::Estimation, true, true, WeightPolicy::None, false, {},
+       "runSwindex (swindex.ado: inverse-covariance weighted index, r(wt)/r(pw))"},
+      // Package-007 lane LB: handlers_lb_leebounds.cpp runLeebounds, Lee (2009)
+      // bounds without tight() (leebounds.ado's leesbound), analytic V; if/in are its
+      // sample. AllWeights so a weight reaches the handler, which refuses pw/fw/iw BY
+      // NAME (the ado's own weighted path is not implemented) and gives aweights
+      // Stata's r(101) (StataBE p4 AW).
+      {"leebounds", {}, Family::Estimation, true, true, WeightPolicy::AllWeights, false, {},
+       "runLeebounds (leebounds.ado: Lee (2009) bounds, analytic V; tight/cieffect/"
+       "vce(bootstrap)/weights refused by name)",
+       false, {"leebounds"}},
+      // qreg2 left E3 (w2j_e3_qreg2): handlers_e3_qreg2.cpp runQreg2 fits it natively
+      // -- qreg's LP vertex under version 11 (e(f_r) as _qreg measures it), the
+      // Machado-Parente-Santos Silva sandwich, the MSS/PSS tests. FweightOnly is
+      // qreg2 `[fweight]` (aw/pw/iw r(101) via the tokenizer's
+      // kStataLegalWeights row); if/in are its marksample.
+      {"qreg2", {}, Family::Estimation, true, true, WeightPolicy::FweightOnly, false, {},
+       "runQreg2 (qreg2.ado: qreg vertex, kernel sandwich V (robust/cluster), MSS/PSS tests)"},
 
       // ---- AER-SCOPE2 bundle K1 (RENAME-UTIL, 2026-09-07) ------------------
       // Rename/reposition utilities + one loop wrapper. `tolower`'s author
@@ -1550,10 +1780,26 @@ const std::vector<CommandSpec>& commandRegistry() {
       // assumed silently. (`correlate` takes no factor-variable operators, so
       // the estimation-row caveat above does not apply to it.)
       "corr",     "levelsof",
+      // gfx-binscatter: binscatter `varlist(min=2 numeric)` takes no
+      // factor-variable or time-series operators, so `y*` / `a-b` are
+      // Stata's varlist rule (w2k_binscatter.log BS_069a: `binscatter y* x`
+      // posts e(y1_coefs) and e(y2_coefs), y and y2).
+      "binscatter",
+      // Package 007 (Stats_for_paper.do `tab edu_category`): tabulate, tab1 and
+      // tab2 take a varlist and nothing else in that position, so the shared
+      // wildcard/range/abbreviation rule applies (StataBE ec.do, ab3.do).
+      "tabulate", "tab1", "tab2",
   };
+  // BUG-1422: StataBE 19.5 `tsfill in 1/3`, `marginsplot in 1/3`, `tsset t in 1/3`,
+  // `xtset g t in 1/3` -> "in range not allowed" r(101); the same with [fw=w] or
+  // [aw=w] -> "weights not allowed" r(101); `marginsplot x1 in 1/3` -> "varlist
+  // not allowed" r(101).
+  static const std::set<std::string> kQualifiersRefusedByArm = {"tsfill", "marginsplot", "tsset",
+                                                                "xtset"};
   static const bool kMarked = [] {
     for (auto& row : kRegistry) {
       if (kPlainVarlist.count(row.canonical) != 0) row.varlistIsPlain = true;
+      if (kQualifiersRefusedByArm.count(row.canonical) != 0) row.qualifiersRefusedByArm = true;
     }
     return true;
   }();
@@ -1576,6 +1822,7 @@ const std::vector<PrefixSpec>& prefixRegistry() {
       {"jackknife", "jackknife mean=r(mean): summarize y", "handlers_resample.cpp"},
       {"permute", "permute y mean=r(mean), reps(2) seed(1): summarize y", "handlers_resample.cpp"},
       {"rolling", "rolling mean=r(mean), window(5): summarize y", "handlers_resample.cpp"},
+      {"statsby", "statsby _b _se, clear: regress y grp", "handlers_resample.cpp"},
       // Survey (P7).
       {"svy", "svy: mean y", "estimation_m4.cpp svy prefix"},
       // Frames (P6).
@@ -1753,6 +2000,11 @@ const std::vector<CommunityName>& communityNameTable() {
       {"splitvallabels", "Nicholas Winter, Ben Jann", ""},
       {"filelist", "Robert Picard", ""},
       {"carryforward", "David Kantor", ""},
+      {"ihstrans", "Jan Helmdag", ""},
+      {"sctorezone", "SurveyCTO (William Blackmon, IPA)", ""},
+      // Package-007 lane LB. leebounds.ado's `*!` lines: "version 1.5 2013-07-17"
+      // and "author Harald Tauchmann". Nearest native: none.
+      {"leebounds", "Harald Tauchmann", ""},
       {"rangestat", "Robert Picard, Nicholas J. Cox, Roberto Ferrer", ""},
       {"tsspell", "Nicholas J. Cox", ""},
       // AER-SCOPE1 bundle J (GRAPH-X, 2026-09-04). `grc1leg` was NOT here at
@@ -1784,13 +2036,13 @@ const std::vector<CommunityName>& communityNameTable() {
       {"renvars", "Nicholas J. Cox, Jeroen Weesie", ""},
       // Provenance differs between these two and the difference is recorded
       // rather than smoothed over. ivreg2 is VERIFIED against the shipped
-      // package on this machine: ivreg2.sthlp's own citation block reads
+      // package on this machine: the help file of ivreg2 (help ivreg2) has its own citation block, which reads
       // "Baum, C.F., Schaffer, M.E., Stillman, S. 2010." and lists all three
       // with affiliations. (ivreg2.ado's header shorthand "authors cfb & mes"
       // is a code comment, not the attribution -- taking it literally would
-      // have dropped Stillman.) xtivreg2 is NOT installed here, so its
-      // attribution rests on the published module citation rather than on
-      // local evidence; re-verify if the package ever lands on the box.
+      // have dropped Stillman.) xtivreg2 1.0.17 has been installed on the box
+      // since 2026-10-27 (User decision C); its header reads "author mes"
+      // (Mark E. Schaffer), which agrees with the published module citation.
       {"ivreg2", "Christopher F. Baum, Mark E. Schaffer, Steven Stillman", "ivregress"},
       {"xtivreg2", "Mark E. Schaffer", "ivregress"},
 
@@ -1812,6 +2064,25 @@ const std::vector<CommunityName>& communityNameTable() {
       // install record either. Left blank rather than invented; PIET's row
       // for it still ships (see the K1 CommandSpec block), it just carries no
       // attribution.
+
+      // AER tier-1 (2026-10-28). Read from each package's `ssc describe` record
+      // on the oracle Mac (internal capture t1_ssc_install.log);
+      // matselrc from the STB-56 dm79 package record (t1_matselrc_install.log);
+      // require from the Authors block of its installed help file
+      // (ado/plus/r/require.sthlp, version 1.3.1), which names both authors.
+      // `astile` names xtile as its native equivalent: astile's own help says its
+      // cut points are xtile's, and w2ax_t1_community.log arm astile_vs_xtile10
+      // measures 0 disagreements.
+      {"require", "Sergio Correia, Matthew P. Seay", ""},
+      {"labvars", "Daniel Klein", ""},
+      {"astile", "Attaullah Shah", "xtile"},
+      {"matsort", "Paul Millar", ""},
+      {"matselrc", "Nicholas J. Cox", ""},
+      {"fillmissing", "Attaullah Shah", ""},
+      {"findname", "Nicholas J. Cox", ""},
+      {"sencode", "Roger Newson", ""},
+      {"zipsave", "Henrik Stovring", ""},
+      {"zipuse", "Henrik Stovring", ""},
   };
   return kNames;
 }

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — runiform() / runiformint(), on top of the Philox counter RNG.
 //
 // AER scope 2, B3(c). Doctrine gate 1 has a named carve-out for this: a

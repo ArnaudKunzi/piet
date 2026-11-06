@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // R2 (giant-file split, 2026-09-01): continuation TU of frame.cpp — a
 // MOVE-ONLY cut at the Frame::tsfill boundary. Preamble = the original head
 // verbatim; the two shared helpers come from frame_internal.h.
@@ -44,17 +46,45 @@
 namespace cecon {
 using namespace frame_detail;
 
-Frame Frame::tsfill(const std::string& timevar, const std::string& panelvar, double delta) const {
+Frame Frame::tsfill(const std::string& timevar, const std::string& panelvar, double delta,
+                    bool full) const {
     const double* t = require_f64(timevar);
     const double* pid = panelvar.empty() ? nullptr : require_f64(panelvar);
+    if (!std::isfinite(delta) || delta <= 0.0)
+        throw std::runtime_error("tsfill: --delta must be a finite positive number");
+    // BUG-897: Stata's `==` holds between two missing values, and a missing panel
+    // id or time sorts last; both keys order that way here (a NaN in the old
+    // `<` comparator broke the strict weak ordering std::stable_sort needs).
+    auto keyLess = [](double a, double b) {
+        if (std::isnan(a)) return false;
+        if (std::isnan(b)) return true;
+        return a < b;
+    };
+    auto keyEq = [](double a, double b) { return (std::isnan(a) && std::isnan(b)) || a == b; };
     // order by (panel, time)
     std::vector<int64_t> order(n_);
     std::iota(order.begin(), order.end(), 0);
     std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
         double pa = pid ? pid[a] : 0.0, pb = pid ? pid[b] : 0.0;
-        if (pa != pb) return pa < pb;
-        return t[a] < t[b];
+        if (!keyEq(pa, pb)) return keyLess(pa, pb);
+        return keyLess(t[a], t[b]);
     });
+    // --full (Stata `tsfill, full`): every panel spans the OVERALL min..max of the
+    // time variable on the delta grid from that min; tsfill.ado refuses a missing
+    // time under full (r(451), w2w_tsset_tsfill.log:1662).
+    double gmin = 0.0, gmax = 0.0;
+    if (full) {
+        bool seen = false;
+        for (int64_t i = 0; i < n_; ++i) {
+            if (std::isnan(t[i]))
+                throw std::runtime_error(
+                    "tsfill: timevar (" + timevar +
+                    ") may not contain missing values when option full is specified");
+            if (!seen) { gmin = gmax = t[i]; seen = true; }
+            gmin = std::min(gmin, t[i]);
+            gmax = std::max(gmax, t[i]);
+        }
+    }
     // build output row plan: list of (origRow >=0) or (-1, panel, time) for filled
     struct OutRow { int64_t orig; double panel, time; };
     std::vector<OutRow> plan;
@@ -62,41 +92,45 @@ Frame Frame::tsfill(const std::string& timevar, const std::string& panelvar, dou
     while (g0 < n_) {
         int64_t g1 = g0 + 1;
         double pv = pid ? pid[order[g0]] : 0.0;
-        while (g1 < n_ && (pid ? pid[order[g1]] : 0.0) == pv) ++g1;
-        double tmin = t[order[g0]], tmax = t[order[g1 - 1]];
-        std::vector<char> present;  // keyed by integer step index from tmin
-        if (!std::isfinite(delta) || delta <= 0.0)
-            throw std::runtime_error("tsfill: --delta must be a finite positive number");
-        double dsteps = (tmax - tmin) / delta + 1.0;
-        if (!std::isfinite(dsteps) || dsteps > 2e8)
-            throw std::runtime_error("tsfill: implied fill row count exceeds 200M; check --delta and the time range");
-        int64_t steps = static_cast<int64_t>(std::llround((tmax - tmin) / delta)) + 1;
-        std::vector<int64_t> rowAt(std::max<int64_t>(steps, 0), -1);
-        for (int64_t q = g0; q < g1; ++q) {
-            double qd = (t[order[q]] - tmin) / delta;
-            int64_t k = static_cast<int64_t>(std::llround(qd));
-            // Stata: tsset requires regularly-spaced (on-grid) time values. An
-            // off-grid time (not an integer number of --delta steps from the panel
-            // min) is r(451); a value that collapses onto an already-occupied
-            // period is r(111). Reject rather than silently dropping the colliding
-            // row (C1-F17 / BUG-073-sib). Off-grid calendar arithmetic is out of
-            // scope — reject-only per the golden.
-            if (std::isfinite(qd) && std::fabs(qd - static_cast<double>(k)) > 1e-6)
-                throw std::runtime_error(
-                    "tsfill: time value not on the --delta grid (times must be "
-                    "regularly spaced by delta; off-grid value would collapse periods)");
-            if (k >= 0 && k < steps) {
-                if (rowAt[k] >= 0)
+        while (g1 < n_ && keyEq(pid ? pid[order[g1]] : 0.0, pv)) ++g1;
+        // rows [g0, gm) carry a time; [gm, g1) are the panel's missing times,
+        // kept as they are after the filled grid (tsfill.ado leaves them alone).
+        int64_t gm = g0;
+        while (gm < g1 && !std::isnan(t[order[gm]])) ++gm;
+        if (gm > g0) {
+            double tmin = full ? gmin : t[order[g0]], tmax = full ? gmax : t[order[gm - 1]];
+            double dsteps = (tmax - tmin) / delta + 1.0;
+            if (!std::isfinite(dsteps) || dsteps > 2e8)
+                throw std::runtime_error("tsfill: implied fill row count exceeds 200M; check --delta and the time range");
+            int64_t steps = static_cast<int64_t>(std::llround((tmax - tmin) / delta)) + 1;
+            std::vector<int64_t> rowAt(std::max<int64_t>(steps, 0), -1);
+            for (int64_t q = g0; q < gm; ++q) {
+                double qd = (t[order[q]] - tmin) / delta;
+                int64_t k = static_cast<int64_t>(std::llround(qd));
+                // Stata: tsset requires regularly-spaced (on-grid) time values. An
+                // off-grid time (not an integer number of --delta steps from the panel
+                // min) is r(451); a value that collapses onto an already-occupied
+                // period is r(111). Reject rather than silently dropping the colliding
+                // row (C1-F17 / BUG-073-sib). Off-grid calendar arithmetic is out of
+                // scope — reject-only per the golden.
+                if (std::isfinite(qd) && std::fabs(qd - static_cast<double>(k)) > 1e-6)
                     throw std::runtime_error(
-                        "tsfill: repeated time value within panel (two observations "
-                        "map to the same period)");
-                rowAt[k] = order[q];
+                        "tsfill: time value not on the --delta grid (times must be "
+                        "regularly spaced by delta; off-grid value would collapse periods)");
+                if (k >= 0 && k < steps) {
+                    if (rowAt[k] >= 0)
+                        throw std::runtime_error(
+                            "tsfill: repeated time value within panel (two observations "
+                            "map to the same period)");
+                    rowAt[k] = order[q];
+                }
+            }
+            for (int64_t k = 0; k < steps; ++k) {
+                if (rowAt[k] >= 0) plan.push_back({rowAt[k], pv, tmin + k * delta});
+                else plan.push_back({-1, pv, tmin + k * delta});
             }
         }
-        for (int64_t k = 0; k < steps; ++k) {
-            if (rowAt[k] >= 0) plan.push_back({rowAt[k], pv, tmin + k * delta});
-            else plan.push_back({-1, pv, tmin + k * delta});
-        }
+        for (int64_t q = gm; q < g1; ++q) plan.push_back({order[q], pv, t[order[q]]});
         g0 = g1;
     }
     int64_t N = static_cast<int64_t>(plan.size());
@@ -255,6 +289,19 @@ namespace {
 int64_t g_lvl_hit = 0, g_lvl_miss = 0;
 int64_t g_lvl_nosrc = 0, g_lvl_noname = 0, g_lvl_ident = 0, g_lvl_fill = 0;
 
+// A factor dictionary as the header's JSON array, each level as
+// hbin_level_needs_escape (io/columnar.h) says it is written.
+nlohmann::json levels_json(const std::vector<std::string>& levels) {
+    nlohmann::json arr = nlohmann::json::array();
+    auto& a = arr.get_ref<nlohmann::json::array_t&>();
+    a.reserve(levels.size());
+    for (const std::string& l : levels) {
+        if (hbin_level_needs_escape(l)) a.emplace_back(hbin_level_escape(l));
+        else a.emplace_back(l);
+    }
+    return arr;
+}
+
 // COBRA_LVLCARRY_VERIFY=1: prove the carry's byte claim ON THE REAL WORKLOAD.
 //
 // It has to be proved here, in-process, because nothing else can: the seeded-defect
@@ -269,7 +316,7 @@ void verify_carried_text(const std::vector<std::string>& src_levels,
         return e && *e;
     }();
     if (!on) return;
-    const std::string inlined = nlohmann::json(src_levels).dump();
+    const std::string inlined = levels_json(src_levels).dump();
     if (inlined != carried)
         throw std::runtime_error("levels carry: spliced text differs from inline dump ("
                                  + std::to_string(carried.size()) + " vs "
@@ -303,11 +350,7 @@ const std::string* carried_levels_text(const Dataset* src, const FrameColumn& c)
                 if (sc.levels[i] != p[i]) { ++g_lvl_ident; ++g_lvl_miss; return nullptr; }
         }
         if (sc.levels_text_n != static_cast<int64_t>(n)) {
-            nlohmann::json arr = nlohmann::json::array();
-            auto& a = arr.get_ref<nlohmann::json::array_t&>();
-            a.reserve(n);
-            for (std::size_t i = 0; i < n; ++i) a.emplace_back(sc.levels[i]);
-            sc.levels_text = arr.dump();
+            sc.levels_text = levels_json(sc.levels).dump();
             sc.levels_text_n = static_cast<int64_t>(n);
             ++g_lvl_fill; ++g_lvl_miss;
         } else {
@@ -414,7 +457,8 @@ void Frame::write_hbin_full(const std::string& path, bool reserve) const {
         // BUG-198: same conditional emit, same reason — a frame with no labels
         // dumps a byte-identical header to the pre-BUG-198 writer. Never write
         // `"label": ""`.
-        if (!c.label.empty()) jc["label"] = c.label;
+        // A label that is not UTF-8 is written escaped, as a level is (BUG-1372).
+        if (!c.label.empty()) jc["label"] = hbin_level_json_text(c.label);
         // NMISS-CARRY (2026-08-20): state the missing count the engine already has.
         // `n_missing` is lazily computed and mutation-invalidated (frame.h), and by
         // this point in a write it is warm for every column the mutation touched —
@@ -435,7 +479,7 @@ void Frame::write_hbin_full(const std::string& path, bool reserve) const {
                 jc["levels"] = levels_sentinel(lvl_text.size());  // spliced after dump()
                 lvl_text.push_back(lt);
             } else {
-                jc["levels"] = c.levels.ref();  // explicit: nlohmann needs the vector, not the proxy
+                jc["levels"] = levels_json(c.levels.ref());  // the vector, not the proxy
             }
             if (hdrlog_path()) g_hdr_full.levels += static_cast<int64_t>(c.levels.size());
             nbytes = static_cast<int64_t>(c.codes.size()) * 4;
@@ -648,7 +692,7 @@ void Frame::write_hbin_append(const Frame& usingf, const std::string& path) cons
             const FrameColumn* src = p.mc ? p.mc : p.uc;
             if (src) {
                 if (!src->format.empty()) jc["format"] = src->format;
-                if (!src->label.empty()) jc["label"] = src->label;
+                if (!src->label.empty()) jc["label"] = hbin_level_json_text(src->label);
             }
         }
         if (p.is_factor) {
@@ -658,7 +702,7 @@ void Frame::write_hbin_append(const Frame& usingf, const std::string& path) cons
                 jc["levels"] = levels_sentinel(lvl_text.size());  // spliced after dump() — BUG-394
                 lvl_text.push_back(lt);
             } else {
-                jc["levels"] = p.levels;
+                jc["levels"] = levels_json(p.levels);
             }
         } else { jc["dtype"] = "f64"; }
         // NMISS-CARRY: this writer's contract is byte-identity with
@@ -830,7 +874,7 @@ bool Frame::patch_hbin(const std::string& out_path) const {
                 jc["levels"] = levels_sentinel(lvl_text.size());  // spliced after dump()
                 lvl_text.push_back(lt);
             } else {
-                jc["levels"] = c.levels.ref();  // explicit vector for nlohmann (not the proxy)
+                jc["levels"] = levels_json(c.levels.ref());  // the vector, not the proxy
             }
         }
         if (c.is_factor && hdrlog_path()) g_hdr_patch.levels += static_cast<int64_t>(c.levels.size());
@@ -841,7 +885,7 @@ bool Frame::patch_hbin(const std::string& out_path) const {
         // reserved slack — that is already handled: the size check below falls back to
         // a full rewrite, which emits the same key.
         if (!c.format.empty()) jc["format"] = c.format;
-        if (!c.label.empty()) jc["label"] = c.label;  // BUG-198: same law as `format` above
+        if (!c.label.empty()) jc["label"] = hbin_level_json_text(c.label);  // BUG-198/BUG-1372
         if (const int64_t nm = c.n_missing_if_known(); nm >= 0) jc["n_missing"] = nm;  // NMISS-CARRY: warm-only
         jc["nbytes"] = nbytes;
         auto it = srccol.find(c.name);
@@ -1248,42 +1292,65 @@ Frame Frame::gsort(const std::vector<std::string>& keys, const std::vector<bool>
     if (!keys.empty()) {
         std::vector<std::vector<double>> K = key_cols(*this, keys);
         std::vector<char> asc(keys.size(), 1);
-        for (size_t i = 0; i < keys.size() && i < ascending.size(); ++i) asc[i] = ascending[i] ? 1 : 0;
-        // C2-F8: LSD radix over monotone-mapped uint64 keys — reproduces the
-        // former std::stable_sort comparator's permutation BIT-FOR-BIT (missing
-        // NaN sorts LAST both directions, stable ties, '-' key descending). The
-        // comparator's total order is encoded losslessly into gsort_radix_key;
-        // G13b (sort_permutation_identity) + the merged goldens are the guard.
-        // See radix_sort.h for the divergence/stability contract.
-        order = cecon::radixsort::gsort_radix_order(K, asc, n_);
+        bool stata_order = false;
+        for (size_t k = 0; k < keys.size(); ++k) {
+            if (k < ascending.size()) asc[k] = ascending[k] ? 1 : 0;
+            const FrameColumn& c = col(keys[k]);
+            if (c.is_factor) {
+                // Dictionary codes are first-seen, not lexical. Rank the level
+                // bytes once; blank and a missing string code are the same key.
+                std::vector<int32_t> levels(c.levels.size());
+                std::iota(levels.begin(), levels.end(), 0);
+                std::sort(levels.begin(), levels.end(), [&](int32_t a, int32_t b) {
+                    return c.levels[static_cast<size_t>(a)] < c.levels[static_cast<size_t>(b)];
+                });
+                std::vector<double> rank(c.levels.size(), 0.0);
+                double next = 0;
+                for (int32_t code : levels)
+                    if (!c.levels[static_cast<size_t>(code)].empty())
+                        rank[static_cast<size_t>(code)] = ++next;
+                for (int64_t r = 0; r < n_; ++r) {
+                    const int32_t code = c.codes[static_cast<size_t>(r)];
+                    K[k][static_cast<size_t>(r)] = code < 0 ? 0.0 : rank[static_cast<size_t>(code)];
+                }
+                stata_order = true;
+            } else {
+                for (double v : K[k])
+                    if (missing_kind(v) > 0) { stata_order = true; break; }
+            }
+        }
+        if (stata_order) {
+            // Stata orders extended missings by kind. gsort keeps all missing
+            // values after the finite values in both directions, reversing the
+            // missing kinds themselves for a descending key (w2c_functions
+            // sort_v_order / gsort_v_desc). Equal keys retain observation order.
+            std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+                for (size_t k = 0; k < K.size(); ++k) {
+                    const double x = K[k][static_cast<size_t>(a)];
+                    const double y = K[k][static_cast<size_t>(b)];
+                    const int mx = missing_kind(x), my = missing_kind(y);
+                    if (mx >= 0 || my >= 0) {
+                        if (mx < 0) return true;
+                        if (my < 0) return false;
+                        if (mx != my) return asc[k] ? mx < my : mx > my;
+                    } else if (x != y) {
+                        return asc[k] ? x < y : x > y;
+                    }
+                }
+                return false;
+            });
+        } else {
+            // Ordinary numeric keys retain the value-identical radix fast path.
+            order = cecon::radixsort::gsort_radix_order(K, asc, n_);
+        }
     }
     Frame out = take_rows(*this, order);
-    // BUG-272: MINT a sort claim on the result — but only when the claim would be
-    // TRUE in STATA's sort semantics, which are stricter than this engine's comparator
-    // on two counts, so both are gated:
-    //   1. Direction: Stata's <sortlist> cannot express a descending key (gsort's
-    //      `-var` has no .dta encoding), so ANY descending key means NO claim — the
-    //      "a descending gsort CLEARS the claim" rule, realized here as never minting.
-    //   2. Key type/content: this engine sorts a FACTOR key by its int32 dictionary
-    //      code (first-seen order), not by the level string — Stata sorts strings
-    //      lexicographically, so a factor-keyed claim would be a lie unless the
-    //      dictionary happens to be sorted; and the radix comparator collapses ALL
-    //      missing kinds to one NaN sentinel (contract §22 divergence) while Stata
-    //      orders them `. < .a < … < .z`, so a key column containing any EXTENDED
-    //      missing may come out of here in an order Stata would reject. Factor keys
-    //      and extended-missing-bearing keys therefore mint nothing.
-    // Over-refusing costs a blank "Sorted by:" (always legal); a minted lie never is.
-    bool mintable = !keys.empty();
-    for (size_t i = 0; mintable && i < keys.size(); ++i)
-        if (i < ascending.size() && !ascending[i]) mintable = false;
-    for (size_t i = 0; mintable && i < keys.size(); ++i) {
-        const FrameColumn& c = col(keys[i]);
-        if (c.is_factor) { mintable = false; break; }
-        const F64Reader v = c.f64.reader();   // LADDER: narrow-aware, no widening
-        for (int64_t r = 0; r < n_; ++r)
-            if (missing_kind(v[static_cast<std::size_t>(r)]) > 0) { mintable = false; break; }
-    }
-    if (mintable) out.set_sorted_by(keys);
+    // Stata's sortlist records the leading ascending prefix even when later
+    // keys descend (w2e_probes.log bo_gsort_marker: `gsort g -x` -> "g").
+    // A descending-first result has no representable ascending claim.
+    size_t prefix = 0;
+    while (prefix < keys.size() && (prefix >= ascending.size() || ascending[prefix])) ++prefix;
+    if (prefix) out.set_sorted_by(std::vector<std::string>(keys.begin(), keys.begin() + prefix));
     return out;
 }
 
@@ -1557,7 +1624,8 @@ Frame Frame::append(const Frame& usingf) const {
 
 // `joinby k1 [k2 ...] using FILE` — see frame.h's doc comment for the full
 // rule. Oracle: piet/native/src/handlers_data_verbs.cpp runJoinby (~2518+).
-Frame Frame::joinby(const Frame& usingf, const std::vector<std::string>& keys) const {
+Frame Frame::joinby(const Frame& usingf, const std::vector<std::string>& keys,
+                    const std::string& unmatched, const std::string& marker) const {
     if (keys.empty()) throw EngineError("bad_input", "joinby: key variable list required");
     for (const auto& k : keys)
         if (!has(k)) throw EngineError("bad_input", "joinby: variable '" + k + "' not found", k);
@@ -1646,6 +1714,104 @@ Frame Frame::joinby(const Frame& usingf, const std::vector<std::string>& keys) c
             if (it == u_by_key.end()) continue;
             for (int64_t ur : it->second) pairs.emplace_back(i, ur);
         }
+    }
+
+    const bool keepMaster = unmatched == "master" || unmatched == "both";
+    const bool keepUsing = unmatched == "using" || unmatched == "both";
+    if (keepMaster || keepUsing || !marker.empty()) {
+        // joinby.ado's two merges: a master row with no using match stays (code 1)
+        // under master/both; a using row whose key the master lacks comes in
+        // (code 2) under using/both, carrying only its keys and the using's own
+        // variables (a shared variable is the master's, missing there).
+        std::vector<std::pair<int64_t, int64_t>> all;
+        std::vector<double> codes;
+        std::vector<char> m_matched(static_cast<size_t>(nm), 0), u_matched(static_cast<size_t>(nu), 0);
+        for (const auto& p : pairs) { m_matched[static_cast<size_t>(p.first)] = 1; u_matched[static_cast<size_t>(p.second)] = 1; }
+        size_t pi = 0;
+        for (int64_t i = 0; i < nm; ++i) {
+            if (m_matched[static_cast<size_t>(i)]) {
+                while (pi < pairs.size() && pairs[pi].first == i) { all.push_back(pairs[pi]); codes.push_back(3.0); ++pi; }
+            } else if (keepMaster) {
+                all.emplace_back(i, -1);
+                codes.push_back(1.0);
+            }
+        }
+        if (keepUsing) {
+            std::unordered_set<RowKey, RowKeyHash> m_keys;
+            if (!any_dtype_mismatch)
+                for (int64_t i = 0; i < nm; ++i) m_keys.insert(make_key(MK, i));
+            for (int64_t j = 0; j < nu; ++j) {
+                if (u_matched[static_cast<size_t>(j)]) continue;
+                if (!any_dtype_mismatch && m_keys.count(make_key(UK, j))) continue;
+                all.emplace_back(-1, j);
+                codes.push_back(2.0);
+            }
+        }
+        const size_t n = all.size();
+        // One gather per column over (master row | using row): the value from the
+        // side that has the row, missing otherwise; a factor gets a fresh
+        // dictionary in first-seen order (joinby_gather_append's convention).
+        Frame out;
+        out.set_n_rows_hint(static_cast<int64_t>(n));
+        auto append_col = [&](const FrameColumn* mc, const FrameColumn* uc, bool usingSide) {
+            // mc: the master's column (or null); uc: the using's (or null).
+            // usingSide: a using-only column (value from the using row).
+            const FrameColumn& src = mc ? *mc : *uc;
+            int64_t miss = 0;
+            if (!src.is_factor) {
+                std::vector<double> vals(n, NAd);
+                for (size_t r = 0; r < n; ++r) {
+                    const int64_t mr = all[r].first, ur = all[r].second;
+                    if (usingSide) { if (ur >= 0) vals[r] = uc->f64[static_cast<size_t>(ur)]; }
+                    else if (mr >= 0) vals[r] = mc->f64[static_cast<size_t>(mr)];
+                    else if (uc && ur >= 0 && !uc->is_factor) vals[r] = uc->f64[static_cast<size_t>(ur)];
+                    if (std::isnan(vals[r])) ++miss;
+                }
+                out.append_f64_column(src.name, std::move(vals));
+            } else {
+                std::vector<int32_t> cc(n, -1);
+                std::vector<std::string> levels;
+                std::unordered_map<std::string, int32_t> dict;
+                for (size_t r = 0; r < n; ++r) {
+                    const int64_t mr = all[r].first, ur = all[r].second;
+                    const FrameColumn* from = nullptr;
+                    int64_t row = -1;
+                    if (usingSide) { from = uc; row = ur; }
+                    else if (mr >= 0) { from = mc; row = mr; }
+                    else if (uc && ur >= 0 && uc->is_factor) { from = uc; row = ur; }
+                    if (from == nullptr || row < 0) { ++miss; continue; }
+                    const int32_t code = from->codes[static_cast<size_t>(row)];
+                    if (code < 0) { ++miss; continue; }
+                    const std::string& lvl = from->levels[static_cast<size_t>(code)];
+                    auto it = dict.find(lvl);
+                    if (it == dict.end()) {
+                        const int32_t nc = static_cast<int32_t>(levels.size());
+                        dict.emplace(lvl, nc);
+                        levels.push_back(lvl);
+                        cc[r] = nc;
+                    } else {
+                        cc[r] = it->second;
+                    }
+                }
+                out.append_factor_column_coded(src.name, std::move(cc), std::move(levels));
+            }
+            out.columns().back().seed_n_missing(miss);
+            out.carry_identity_to_last(src);
+        };
+        for (const auto& c : cols_) {
+            // A key takes the using's value on a using-only row; any other master
+            // column is missing there.
+            const FrameColumn* uc = keySet.count(c.name) ? &usingf.col(c.name) : nullptr;
+            append_col(&c, uc, false);
+        }
+        if (!marker.empty()) {
+            out.append_f64_column(marker, std::vector<double>(codes));
+            out.columns().back().seed_n_missing(0);
+        }
+        for (const auto& c : usingf.cols_)
+            if (!keySet.count(c.name) && !has(c.name)) append_col(nullptr, &c, true);
+        out.finalize_after_bulk_load();
+        return out;
     }
 
     std::vector<int64_t> midx(pairs.size()), uidx(pairs.size());
@@ -1808,22 +1974,37 @@ Frame Frame::fillin(const std::vector<std::string>& varlist, int64_t* n_added_ou
 
 Frame Frame::cross(const Frame& usingf) const {
     const int64_t nm = n_, nu = usingf.n_rows();
-    const int64_t nOut = nm * nu;
-
-    // Master row index repeats each row nu times; using index cycles.
+    // cross.ado matches the expanded using data to the master on the master's row
+    // number with an old-style merge, which pairs each master row with using row 1
+    // in place and appends the other pairings after them, master by master: rows
+    // 1..nm are (m_i, u_1), then (m_1, u_2) .. (m_1, u_nu), (m_2, u_2), ... (BUG-1105,
+    // StataBE 19.5). With no master rows the merge keeps the using rows: the master's
+    // own variables are missing (index -1 below) and a variable both hold reads the
+    // using's values, as merge fills a using-only row. An empty using is the
+    // caller's r(111); here it gives no rows.
+    const int64_t nOut = nu == 0 ? 0 : nm == 0 ? nu : nm * nu;
     std::vector<int64_t> midx(static_cast<size_t>(nOut)), uidx(static_cast<size_t>(nOut));
-    for (int64_t i = 0, p = 0; i < nm; ++i)
-        for (int64_t j = 0; j < nu; ++j, ++p) { midx[static_cast<size_t>(p)] = i;
-                                                uidx[static_cast<size_t>(p)] = j; }
+    if (nm == 0) {
+        for (int64_t j = 0; j < nOut; ++j) { midx[static_cast<size_t>(j)] = -1;
+                                             uidx[static_cast<size_t>(j)] = j; }
+    } else if (nu > 0) {
+        int64_t p = 0;
+        for (int64_t i = 0; i < nm; ++i, ++p) { midx[static_cast<size_t>(p)] = i;
+                                                uidx[static_cast<size_t>(p)] = 0; }
+        for (int64_t i = 0; i < nm; ++i)
+            for (int64_t j = 1; j < nu; ++j, ++p) { midx[static_cast<size_t>(p)] = i;
+                                                    uidx[static_cast<size_t>(p)] = j; }
+    }
 
     auto gather = [&](Frame& dst, const FrameColumn& c, const std::vector<int64_t>& idx) {
         if (c.is_factor) {
             std::vector<int32_t> codes(idx.size());
-            for (size_t i = 0; i < idx.size(); ++i) codes[i] = c.codes[idx[i]];
+            for (size_t i = 0; i < idx.size(); ++i) codes[i] = idx[i] < 0 ? -1 : c.codes[idx[i]];
             dst.append_factor_column_coded(c.name, std::move(codes), c.levels.ref());
         } else {
             std::vector<double> vals(idx.size());
-            for (size_t i = 0; i < idx.size(); ++i) vals[i] = c.f64[idx[i]];
+            for (size_t i = 0; i < idx.size(); ++i)
+                vals[i] = idx[i] < 0 ? std::numeric_limits<double>::quiet_NaN() : c.f64[idx[i]];
             dst.append_f64_column(c.name, std::move(vals));
         }
         dst.carry_identity_to_last(c);  // BUG-363: identity metadata
@@ -1831,7 +2012,14 @@ Frame Frame::cross(const Frame& usingf) const {
 
     Frame out;
     out.set_n_rows_hint(nOut);
-    for (const auto& c : cols_) gather(out, c, midx);
+    for (const auto& c : cols_) {
+        if (nm == 0 && usingf.has(c.name) && usingf.col(c.name).is_factor == c.is_factor) {
+            gather(out, usingf.col(c.name), uidx);
+            out.carry_identity_to_last(c);  // the master's format and label stay
+        } else {
+            gather(out, c, midx);
+        }
+    }
     // A name the master already carries is taken from the MASTER: the using
     // copy is dropped, not renamed and not an error (oracle-pinned).
     for (const auto& c : usingf.cols_)
@@ -2227,6 +2415,334 @@ Frame::ReshapeResult Frame::reshape_wide(const std::vector<std::string>& stubs,
     return res;
 }
 
+namespace {
+// One output column gathered from (column, row) sources; row < 0 = missing. A
+// factor result gets a fresh dictionary in first-seen order. Every source of
+// one output column has the same kind (factor or f64).
+FrameColumn reshape_gather(const std::string& name, bool is_factor,
+                           const std::vector<std::pair<const FrameColumn*, int64_t>>& src) {
+    FrameColumn nc;
+    nc.name = name;
+    nc.is_factor = is_factor;
+    const size_t n = src.size();
+    if (!is_factor) {
+        std::vector<double> v(n, NAd);
+        for (size_t r = 0; r < n; ++r)
+            if (src[r].first != nullptr && src[r].second >= 0)
+                v[r] = src[r].first->f64[static_cast<size_t>(src[r].second)];
+        nc.f64 = std::move(v);
+        return nc;
+    }
+    std::vector<int32_t> codes(n, -1);
+    std::vector<std::string> levels;
+    std::unordered_map<std::string, int32_t> dict;
+    for (size_t r = 0; r < n; ++r) {
+        const FrameColumn* c = src[r].first;
+        if (c == nullptr || src[r].second < 0) continue;
+        const int32_t code = c->codes[static_cast<size_t>(src[r].second)];
+        if (code < 0) continue;
+        const std::string& lvl = c->levels[static_cast<size_t>(code)];
+        auto it = dict.find(lvl);
+        if (it == dict.end()) {
+            const int32_t k = static_cast<int32_t>(levels.size());
+            dict.emplace(lvl, k);
+            levels.push_back(lvl);
+            codes[r] = k;
+        } else {
+            codes[r] = it->second;
+        }
+    }
+    nc.codes = std::move(codes);
+    nc.levels = std::move(levels);
+    return nc;
+}
+
+// Stata's sort order of one cell: a string by its text ("" first), a number by
+// stata_cmp (reals, then . < .a < ... < .z).
+int reshape_cell_cmp(const FrameColumn& c, int64_t a, int64_t b) {
+    if (c.is_factor) {
+        static const std::string kEmpty;
+        const int32_t ca = c.codes[static_cast<size_t>(a)], cb = c.codes[static_cast<size_t>(b)];
+        const std::string& sa = ca < 0 ? kEmpty : c.levels[static_cast<size_t>(ca)];
+        const std::string& sb = cb < 0 ? kEmpty : c.levels[static_cast<size_t>(cb)];
+        const int r = sa.compare(sb);
+        return r < 0 ? -1 : (r > 0 ? 1 : 0);
+    }
+    return stata_cmp(c.f64[static_cast<size_t>(a)], c.f64[static_cast<size_t>(b)]);
+}
+
+bool reshape_cell_eq(const FrameColumn& c, int64_t a, int64_t b) {
+    if (c.is_factor) return reshape_cell_cmp(c, a, b) == 0;
+    const double x = c.f64[static_cast<size_t>(a)], y = c.f64[static_cast<size_t>(b)];
+    if (std::isnan(x) || std::isnan(y)) return std::isnan(x) && std::isnan(y) && missing_kind(x) == missing_kind(y);
+    return x == y;
+}
+
+std::string reshape_num_suffix(double v) {
+    double r = std::round(v);
+    if (std::fabs(v - r) < 1e-9) { std::ostringstream os; os << static_cast<int64_t>(r); return os.str(); }
+    std::ostringstream os; os << v; return os.str();
+}
+}  // namespace
+
+Frame::ReshapeResult Frame::reshape_long_stata(const std::vector<std::string>& stubs,
+                                               const std::vector<std::string>& i_vars,
+                                               const std::string& j_var, bool jstring) const {
+    for (const auto& v : i_vars)
+        if (!idx_.count(v)) throw EngineError("missing_column", "variable " + v + " not found", v);
+    // A column belongs to the LONGEST stub that prefixes it (see reshape_long).
+    std::vector<std::map<std::string, std::string>> stub_cols(stubs.size());  // suffix -> column
+    for (const auto& c : cols_) {
+        size_t best = stubs.size();
+        for (size_t si = 0; si < stubs.size(); ++si) {
+            if (c.name.size() > stubs[si].size() && c.name.compare(0, stubs[si].size(), stubs[si]) == 0 &&
+                (best == stubs.size() || stubs[si].size() > stubs[best].size()))
+                best = si;
+        }
+        if (best != stubs.size()) stub_cols[best][c.name.substr(stubs[best].size())] = c.name;
+    }
+    for (size_t si = 0; si < stubs.size(); ++si)
+        if (stub_cols[si].empty())
+            throw EngineError("missing_column", "variable " + stubs[si] + " not found", stubs[si]);
+    // j: the union of every stub's suffixes. Without `string` each must be a
+    // number (Stata: r(498)); with it they are text in byte order.
+    std::set<std::string> suf_set;
+    for (const auto& sc : stub_cols) for (const auto& kv : sc) suf_set.insert(kv.first);
+    std::vector<std::string> suffixes(suf_set.begin(), suf_set.end());
+    std::vector<double> jnum;
+    if (!jstring) {
+        for (const auto& sfx : suffixes) {
+            size_t used = 0;
+            double v = 0;
+            try { v = std::stod(sfx, &used); } catch (...) { used = 0; }
+            if (used != sfx.size() || sfx.empty())
+                throw EngineError("reshape_498", "variable " + j_var + " contains all missing values; "
+                                  "the suffix `" + sfx + "' is not numeric (specify string)", j_var);
+            jnum.push_back(v);
+        }
+        std::vector<size_t> ord(suffixes.size());
+        std::iota(ord.begin(), ord.end(), size_t{0});
+        std::stable_sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return jnum[a] < jnum[b]; });
+        std::vector<std::string> s2; std::vector<double> j2;
+        for (size_t k : ord) { s2.push_back(suffixes[k]); j2.push_back(jnum[k]); }
+        suffixes.swap(s2); jnum.swap(j2);
+    }
+    // i must identify the wide observations (Stata: r(9)).
+    std::vector<int64_t> order(static_cast<size_t>(n_));
+    std::iota(order.begin(), order.end(), int64_t{0});
+    std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+        for (const auto& iv : i_vars) {
+            const int c = reshape_cell_cmp(col(iv), a, b);
+            if (c != 0) return c < 0;
+        }
+        return false;
+    });
+    for (size_t k = 1; k < order.size(); ++k) {
+        bool same = true;
+        for (const auto& iv : i_vars)
+            if (!reshape_cell_eq(col(iv), order[k - 1], order[k])) { same = false; break; }
+        if (same)
+            throw EngineError("reshape_9", "variable " + i_vars[0] +
+                              " does not uniquely identify the observations", i_vars[0]);
+    }
+    std::unordered_map<std::string, char> is_stub_col, is_ivar;
+    for (const auto& sc : stub_cols) for (const auto& kv : sc) is_stub_col[kv.second] = 1;
+    for (const auto& v : i_vars) is_ivar[v] = 1;
+    std::vector<std::string> other_cols;
+    for (const auto& c : cols_)
+        if (!is_stub_col.count(c.name) && !is_ivar.count(c.name) && c.name != j_var) other_cols.push_back(c.name);
+
+    const size_t K = suffixes.size();
+    const size_t nlong = order.size() * K;
+    Frame out;
+    out.n_ = static_cast<int64_t>(nlong);
+    auto rows_of = [&](const FrameColumn* c) {
+        std::vector<std::pair<const FrameColumn*, int64_t>> src;
+        src.reserve(nlong);
+        for (int64_t r : order) for (size_t k = 0; k < K; ++k) src.emplace_back(c, r);
+        return src;
+    };
+    for (const auto& iv : i_vars) {
+        const FrameColumn& c = col(iv);
+        FrameColumn nc = reshape_gather(iv, c.is_factor, rows_of(&c));
+        nc.format = c.format; nc.label = c.label;
+        out.cols_.push_back(std::move(nc));
+    }
+    {
+        FrameColumn nc; nc.name = j_var;
+        if (!jstring) {
+            nc.is_factor = false;
+            nc.f64.resize(nlong);
+            for (size_t r = 0; r < order.size(); ++r)
+                for (size_t k = 0; k < K; ++k) nc.f64[r * K + k] = jnum[k];
+        } else {
+            nc.is_factor = true;
+            nc.codes.resize(nlong);
+            std::vector<std::string> lv;
+            for (const auto& sfx : suffixes) lv.push_back(sfx);
+            for (size_t r = 0; r < order.size(); ++r)
+                for (size_t k = 0; k < K; ++k) nc.codes[r * K + k] = static_cast<int32_t>(k);
+            nc.levels = std::move(lv);
+        }
+        out.cols_.push_back(std::move(nc));
+    }
+    for (size_t si = 0; si < stubs.size(); ++si) {
+        // A stub is a string only when every component it has is one.
+        bool all_factor = true;
+        for (const auto& kv : stub_cols[si]) if (!col(kv.second).is_factor) all_factor = false;
+        std::vector<std::pair<const FrameColumn*, int64_t>> src;
+        src.reserve(nlong);
+        for (int64_t r : order)
+            for (size_t k = 0; k < K; ++k) {
+                auto it = stub_cols[si].find(suffixes[k]);
+                const FrameColumn* c = it == stub_cols[si].end() ? nullptr : &col(it->second);
+                if (c != nullptr && c->is_factor != all_factor) c = nullptr;
+                src.emplace_back(c, r);
+            }
+        out.cols_.push_back(reshape_gather(stubs[si], all_factor, src));
+    }
+    for (const auto& oc : other_cols) {
+        const FrameColumn& c = col(oc);
+        FrameColumn nc = reshape_gather(oc, c.is_factor, rows_of(&c));
+        nc.format = c.format; nc.label = c.label;
+        out.cols_.push_back(std::move(nc));
+    }
+    out.reindex();
+    ReshapeResult res;
+    res.frame = std::move(out);
+    res.j_values = suffixes;
+    return res;
+}
+
+Frame::ReshapeResult Frame::reshape_wide_stata(const std::vector<std::string>& stubs,
+                                               const std::vector<std::string>& i_vars,
+                                               const std::string& j_var, bool jstring) const {
+    for (const auto& v : i_vars)
+        if (!idx_.count(v)) throw EngineError("missing_column", "variable " + v + " not found", v);
+    if (!idx_.count(j_var)) throw EngineError("missing_column", "variable " + j_var + " not found", j_var);
+    for (const auto& st : stubs)
+        if (!idx_.count(st)) throw EngineError("missing_column", "variable " + st + " not found", st);
+    const FrameColumn& jc = col(j_var);
+    if (jc.is_factor && !jstring)
+        throw EngineError("reshape_109", "variable " + j_var + " is string; specify string option", j_var);
+    if (!jc.is_factor && jstring)
+        throw EngineError("reshape_109", "variable " + j_var + " is not string", j_var);
+    auto j_missing = [&](int64_t r) {
+        if (jc.is_factor) {
+            const int32_t c = jc.codes[static_cast<size_t>(r)];
+            return c < 0 || jc.levels[static_cast<size_t>(c)].empty();
+        }
+        return std::isnan(jc.f64[static_cast<size_t>(r)]);
+    };
+    for (int64_t r = 0; r < n_; ++r)
+        if (j_missing(r))
+            throw EngineError("reshape_498", "variable " + j_var + " contains missing values", j_var);
+    // Rows in (i, j) order; i groups.
+    std::vector<int64_t> order(static_cast<size_t>(n_));
+    std::iota(order.begin(), order.end(), int64_t{0});
+    std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+        for (const auto& iv : i_vars) {
+            const int c = reshape_cell_cmp(col(iv), a, b);
+            if (c != 0) return c < 0;
+        }
+        return reshape_cell_cmp(jc, a, b) < 0;
+    });
+    auto same_i = [&](int64_t a, int64_t b) {
+        for (const auto& iv : i_vars) if (!reshape_cell_eq(col(iv), a, b)) return false;
+        return true;
+    };
+    std::vector<std::pair<size_t, size_t>> groups;
+    for (size_t k = 0; k < order.size();) {
+        size_t e = k + 1;
+        while (e < order.size() && same_i(order[k], order[e])) ++e;
+        groups.emplace_back(k, e);
+        k = e;
+    }
+    // (i, j) unique (Stata: r(9)).
+    for (const auto& g : groups)
+        for (size_t k = g.first + 1; k < g.second; ++k)
+            if (reshape_cell_eq(jc, order[k - 1], order[k])) {
+                // reshape.ado checks this on the data sorted by i j, and the
+                // refusal leaves them so (dc_r_wide_jdup_d): detail = the sort.
+                std::string keys;
+                for (const auto& iv : i_vars) keys += iv + " ";
+                throw EngineError("reshape_9", "values of variable " + j_var + " not unique within " +
+                                  i_vars[0], keys + j_var);
+            }
+    // The other variables must be constant within i (Stata: r(9)).
+    std::unordered_map<std::string, char> skip;
+    for (const auto& v : i_vars) skip[v] = 1;
+    for (const auto& st : stubs) skip[st] = 1;
+    skip[j_var] = 1;
+    std::vector<std::string> other_cols;
+    for (const auto& c : cols_) if (!skip.count(c.name)) other_cols.push_back(c.name);
+    for (const auto& oc : other_cols) {
+        const FrameColumn& c = col(oc);
+        for (const auto& g : groups)
+            for (size_t k = g.first + 1; k < g.second; ++k)
+                if (!reshape_cell_eq(c, order[g.first], order[k])) {
+                    // Checked on the data sorted by i and the variable, which the
+                    // refusal leaves (dc_r_wide_notconst_d): detail = that sort.
+                    std::string keys;
+                    for (const auto& iv : i_vars) keys += iv + " ";
+                    throw EngineError("reshape_9", "variable " + oc + " not constant within " + i_vars[0],
+                                      keys + oc);
+                }
+    }
+    // j values in order, and each one's suffix text.
+    std::vector<int64_t> jrep;  // a row holding each distinct j value
+    {
+        std::vector<int64_t> byj(order);
+        std::stable_sort(byj.begin(), byj.end(), [&](int64_t a, int64_t b) { return reshape_cell_cmp(jc, a, b) < 0; });
+        for (size_t k = 0; k < byj.size(); ++k)
+            if (k == 0 || !reshape_cell_eq(jc, byj[k - 1], byj[k])) jrep.push_back(byj[k]);
+    }
+    std::vector<std::string> jsuf;
+    for (int64_t r : jrep)
+        jsuf.push_back(jc.is_factor ? jc.levels[static_cast<size_t>(jc.codes[static_cast<size_t>(r)])]
+                                    : reshape_num_suffix(jc.f64[static_cast<size_t>(r)]));
+    const size_t G = groups.size();
+    Frame out;
+    out.n_ = static_cast<int64_t>(G);
+    auto first_rows = [&](const FrameColumn* c) {
+        std::vector<std::pair<const FrameColumn*, int64_t>> src;
+        for (const auto& g : groups) src.emplace_back(c, order[g.first]);
+        return src;
+    };
+    for (const auto& iv : i_vars) {
+        const FrameColumn& c = col(iv);
+        FrameColumn nc = reshape_gather(iv, c.is_factor, first_rows(&c));
+        nc.format = c.format; nc.label = c.label;
+        out.cols_.push_back(std::move(nc));
+    }
+    for (size_t jk = 0; jk < jrep.size(); ++jk) {
+        for (const auto& st : stubs) {
+            const FrameColumn& c = col(st);
+            std::vector<std::pair<const FrameColumn*, int64_t>> src;
+            for (const auto& g : groups) {
+                int64_t hit = -1;
+                for (size_t k = g.first; k < g.second; ++k)
+                    if (reshape_cell_eq(jc, order[k], jrep[jk])) { hit = order[k]; break; }
+                src.emplace_back(&c, hit);
+            }
+            FrameColumn nc = reshape_gather(st + jsuf[jk], c.is_factor, src);
+            nc.format = c.format;
+            out.cols_.push_back(std::move(nc));
+        }
+    }
+    for (const auto& oc : other_cols) {
+        const FrameColumn& c = col(oc);
+        FrameColumn nc = reshape_gather(oc, c.is_factor, first_rows(&c));
+        nc.format = c.format; nc.label = c.label;
+        out.cols_.push_back(std::move(nc));
+    }
+    out.reindex();
+    ReshapeResult res;
+    res.frame = std::move(out);
+    res.j_values = jsuf;
+    return res;
+}
+
 // ---------------------------------------------------------------------------
 // merge 1:1|m:1|1:m KEYLIST using USING — see MergeOpts/MergeResult in frame.h.
 // Mirrors merge_op.py's run_merge() exactly: pandas outer-join semantics on
@@ -2279,6 +2795,10 @@ MergeResult merge_frames(const Frame& master, const Frame& usingf, const MergeOp
     // the non-update path below is byte-identical to what it was.
     const bool do_update = opts.update || opts.replace;  // replace alone still update-merges
     std::vector<std::string> overlap;
+    // stata_plan: every shared non-key variable the using brings (keepusing
+    // permitting) whose string-vs-numeric kind agrees with the master's. Its
+    // using copy fills the using-only rows (see MergeOpts::stata_plan).
+    std::vector<std::string> shared_vars;
     {
         std::unordered_map<std::string, char> master_non_key;
         for (const auto& c : master.columns())
@@ -2289,7 +2809,16 @@ MergeResult merge_frames(const Frame& master, const Frame& usingf, const MergeOp
         for (const auto& name : using_cols_keep) {
             if (std::find(opts.keylist.begin(), opts.keylist.end(), name) == opts.keylist.end() &&
                 master_non_key.count(name)) {
-                if (do_update) overlap.push_back(name);
+                const bool kinds_agree = master.col(name).is_factor == usingf.col(name).is_factor;
+                if (opts.stata_plan) {
+                    // `force`: a string/numeric clash keeps the master's column only.
+                    if (kinds_agree) {
+                        shared_vars.push_back(name);
+                        if (do_update) overlap.push_back(name);
+                    }
+                } else if (do_update) {
+                    overlap.push_back(name);
+                }
                 continue;  // master wins — drop the using's copy (update: merged in below)
             }
             kept.push_back(name);
@@ -2364,11 +2893,11 @@ MergeResult merge_frames(const Frame& master, const Frame& usingf, const MergeOp
         }
         return -1;
     };
-    if (opts.type == "1:1" || opts.type == "1:m") {
+    if (!opts.sequential && (opts.type == "1:1" || opts.type == "1:m")) {
         int64_t d = find_dup(MK, nm);
         if (d >= 0) throw std::runtime_error("merge " + opts.type + ": master dataset is not unique on the key(s)");
     }
-    if (opts.type == "1:1" || opts.type == "m:1") {
+    if (!opts.sequential && (opts.type == "1:1" || opts.type == "m:1")) {
         int64_t d = find_dup(UK, nu);
         if (d >= 0) throw std::runtime_error("merge " + opts.type + ": using dataset is not unique on the key(s)");
     }
@@ -2398,25 +2927,90 @@ MergeResult merge_frames(const Frame& master, const Frame& usingf, const MergeOp
     struct Plan { int64_t mrow, urow; int merge_code; };
     std::vector<Plan> plan;
     plan.reserve(nm + nu);
-    std::vector<char> u_matched(nu, 0);
-    for (int64_t i = 0; i < nm; ++i) {
-        RowKey k = make_key(MK, i);
-        auto it = u_by_key.find(k);
-        if (it == u_by_key.end() || it->second.empty()) {
-            plan.push_back({i, -1, 1});
-        } else {
-            for (int64_t ur : it->second) { plan.push_back({i, ur, 3}); u_matched[ur] = 1; }
+    if (!opts.stata_plan) {
+        std::vector<char> u_matched(nu, 0);
+        for (int64_t i = 0; i < nm; ++i) {
+            RowKey k = make_key(MK, i);
+            auto it = u_by_key.find(k);
+            if (it == u_by_key.end() || it->second.empty()) {
+                plan.push_back({i, -1, 1});
+            } else {
+                for (int64_t ur : it->second) { plan.push_back({i, ur, 3}); u_matched[ur] = 1; }
+            }
+        }
+        for (int64_t j = 0; j < nu; ++j) if (!u_matched[j]) plan.push_back({-1, j, 2});
+    } else if (opts.sequential) {
+        // merge 1:1 _n (Stata's merge): observation i with observation i.
+        const int64_t n = std::max(nm, nu);
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t mr = i < nm ? i : -1, ur = i < nu ? i : -1;
+            plan.push_back({mr, ur, mr >= 0 && ur >= 0 ? 3 : (mr >= 0 ? 1 : 2)});
+        }
+    } else {
+        // Stata's key order: a string key by its text ("" first), a numeric one
+        // by stata_cmp (reals, then . < .a < ... < .z).
+        static const std::string kEmpty;
+        auto key_cmp = [&](const std::vector<std::vector<double>>& K, int64_t a, int64_t b) -> int {
+            for (size_t ki = 0; ki < nkeys; ++ki) {
+                const double x = K[ki][static_cast<size_t>(a)], y = K[ki][static_cast<size_t>(b)];
+                int c;
+                if (keymeta[ki].is_factor) {
+                    const std::string* sx = x < 0 ? &kEmpty : &keymeta[ki].levels[static_cast<size_t>(x)];
+                    const std::string* sy = y < 0 ? &kEmpty : &keymeta[ki].levels[static_cast<size_t>(y)];
+                    c = sx->compare(*sy);
+                    c = c < 0 ? -1 : (c > 0 ? 1 : 0);
+                } else {
+                    c = stata_cmp(x, y);
+                }
+                if (c != 0) return c;
+            }
+            return 0;
+        };
+        std::vector<int64_t> mord(static_cast<size_t>(nm)), uord(static_cast<size_t>(nu));
+        std::iota(mord.begin(), mord.end(), int64_t{0});
+        std::iota(uord.begin(), uord.end(), int64_t{0});
+        if (!opts.presorted) {
+            std::stable_sort(mord.begin(), mord.end(),
+                             [&](int64_t a, int64_t b) { return key_cmp(MK, a, b) < 0; });
+            std::stable_sort(uord.begin(), uord.end(),
+                             [&](int64_t a, int64_t b) { return key_cmp(UK, a, b) < 0; });
+        }
+        // Each key's using rows in using order, and its master rows in master order.
+        std::unordered_map<RowKey, std::vector<int64_t>, RowKeyHash> ug, mg;
+        for (int64_t j : uord) ug[make_key(UK, j)].push_back(j);
+        for (int64_t i : mord) mg[make_key(MK, i)].push_back(i);
+        std::unordered_map<RowKey, size_t, RowKeyHash> mseen;
+        for (int64_t i : mord) {
+            RowKey k = make_key(MK, i);
+            const size_t pos = mseen[k]++;
+            auto it = ug.find(k);
+            if (it == ug.end() || it->second.empty()) {
+                plan.push_back({i, -1, 1});
+            } else {
+                const std::vector<int64_t>& U = it->second;
+                plan.push_back({i, U[std::min(pos, U.size() - 1)], 3});
+            }
+        }
+        std::unordered_map<RowKey, size_t, RowKeyHash> useen;
+        for (int64_t j : uord) {
+            RowKey k = make_key(UK, j);
+            const size_t pos = useen[k]++;
+            auto it = mg.find(k);
+            if (it == mg.end() || it->second.empty()) {
+                plan.push_back({-1, j, 2});
+            } else if (pos >= it->second.size()) {
+                plan.push_back({it->second.back(), j, 3});
+            }
         }
     }
-    for (int64_t j = 0; j < nu; ++j) if (!u_matched[j]) plan.push_back({-1, j, 2});
 
     // ---- UPDATE merge: reclassify the matched rows into 3/4/5 -----------------
-    // Oracle private_oracle_i.log (`merge 1:1 id using ..., update`, one overlapping
+    // Oracle capture i (`merge 1:1 id using ..., update`, one overlapping
     // variable x): 1 master-only, 1 using-only, 1 "not updated" (3), 2 "missing
     // updated" (4), 2 "nonmissing conflict" (5).
     //
     // The code is per ROW, over ALL overlapping variables at once — NOT per variable.
-    // private_oracle_h.log is the falsifier that settled it: the same fixture plus a
+    // capture h is the falsifier that settled it: the same fixture plus a
     // str3 marker that differs in every matched row put ALL FIVE matches at code 5
     // (n3=0, n4=0, n5=5) while x2/x4 were still FILLED from the using (20 and 40).
     // So the classification is a row-level max over the variables, and the data
@@ -2430,35 +3024,36 @@ MergeResult merge_frames(const Frame& master, const Frame& usingf, const MergeOp
         std::vector<std::string> levels;  // unified (master-first), factor only
         std::vector<int32_t> u_remap;     // using code -> unified code, factor only
     };
+    auto make_overlap_meta = [&](const std::string& name) {
+        OverlapMeta om;
+        om.name = name;
+        om.mc = &master.col(name);
+        om.uc = &usingf.col(name);
+        if (om.mc->is_factor != om.uc->is_factor)
+            throw std::runtime_error("merge update: variable '" + name +
+                                     "' is string in one dataset and numeric in the other");
+        om.is_factor = om.mc->is_factor;
+        if (om.is_factor) {
+            om.levels = om.mc->levels.ref();
+            std::unordered_map<std::string, int32_t> dict;
+            for (size_t i = 0; i < om.levels.size(); ++i) dict[om.levels[i]] = static_cast<int32_t>(i);
+            om.u_remap.resize(om.uc->levels.size());
+            for (size_t i = 0; i < om.uc->levels.size(); ++i) {
+                auto it = dict.find(om.uc->levels[i]);
+                if (it != dict.end()) om.u_remap[i] = it->second;
+                else {
+                    om.u_remap[i] = static_cast<int32_t>(om.levels.size());
+                    dict[om.uc->levels[i]] = om.u_remap[i];
+                    om.levels.push_back(om.uc->levels[i]);
+                }
+            }
+        }
+        return om;
+    };
     std::vector<OverlapMeta> ov;
     if (do_update) {
         ov.reserve(overlap.size());
-        for (const auto& name : overlap) {
-            OverlapMeta om;
-            om.name = name;
-            om.mc = &master.col(name);
-            om.uc = &usingf.col(name);
-            if (om.mc->is_factor != om.uc->is_factor)
-                throw std::runtime_error("merge update: variable '" + name +
-                                         "' is string in one dataset and numeric in the other");
-            om.is_factor = om.mc->is_factor;
-            if (om.is_factor) {
-                om.levels = om.mc->levels.ref();
-                std::unordered_map<std::string, int32_t> dict;
-                for (size_t i = 0; i < om.levels.size(); ++i) dict[om.levels[i]] = static_cast<int32_t>(i);
-                om.u_remap.resize(om.uc->levels.size());
-                for (size_t i = 0; i < om.uc->levels.size(); ++i) {
-                    auto it = dict.find(om.uc->levels[i]);
-                    if (it != dict.end()) om.u_remap[i] = it->second;
-                    else {
-                        om.u_remap[i] = static_cast<int32_t>(om.levels.size());
-                        dict[om.uc->levels[i]] = om.u_remap[i];
-                        om.levels.push_back(om.uc->levels[i]);
-                    }
-                }
-            }
-            ov.push_back(std::move(om));
-        }
+        for (const auto& name : overlap) ov.push_back(make_overlap_meta(name));
     }
     // One cell's verdict, shared by the classifier and the emitter below so the two
     // can never drift: FILL = master missing & using nonmissing, CONFLICT = both
@@ -2509,8 +3104,10 @@ MergeResult merge_frames(const Frame& master, const Frame& usingf, const MergeOp
     // `match` (3) in keep()/assert() covers an update merge's 4 and 5 as well: those
     // ARE matches, split three ways by the update. A caller that names 4 or 5
     // explicitly gets exact codes instead, so keep(1 4) can single out the fills.
-    auto code_in = [](const std::vector<int>& codes, int code) -> bool {
+    const bool exact_codes = opts.stata_plan;
+    auto code_in = [exact_codes](const std::vector<int>& codes, int code) -> bool {
         if (std::find(codes.begin(), codes.end(), code) != codes.end()) return true;
+        if (exact_codes) return false;
         const bool exp45 = std::find(codes.begin(), codes.end(), 4) != codes.end() ||
                            std::find(codes.begin(), codes.end(), 5) != codes.end();
         return !exp45 && code >= 3 &&
@@ -2518,11 +3115,17 @@ MergeResult merge_frames(const Frame& master, const Frame& usingf, const MergeOp
     };
     if (!opts.assert_codes.empty()) {
         const std::vector<int>& ac = opts.assert_codes;
-        bool all_allowed = code_in(ac, 1) && code_in(ac, 2) && code_in(ac, 3);
+        bool all_allowed = code_in(ac, 1) && code_in(ac, 2) && code_in(ac, 3) &&
+                           (!exact_codes || (code_in(ac, 4) && code_in(ac, 5)));
         if (!all_allowed) {
             for (const auto& p : plan) {
-                if (!code_in(ac, p.merge_code))
+                if (!code_in(ac, p.merge_code)) {
+                    if (exact_codes)
+                        throw EngineError("merge_assert",
+                                          "merge assert(): assertion failed — unexpected _merge code " +
+                                              std::to_string(p.merge_code));
                     throw std::runtime_error("merge assert(): assertion failed — unexpected _merge code " + std::to_string(p.merge_code));
+                }
             }
         }
     }
@@ -2613,7 +3216,7 @@ MergeResult merge_frames(const Frame& master, const Frame& usingf, const MergeOp
     // -> master; using-only -> using). Matches pandas outer-merge key fill.
     // Factor keys emit codes in the UNIFIED level space built above (master
     // codes are already unified-space; using codes go through u_remap).
-    for (size_t ki = 0; ki < nkeys; ++ki) {
+    auto emit_key = [&](size_t ki) {
         const std::string& k = opts.keylist[ki];
         const FrameColumn& msrc = master.col(k);
         const FrameColumn& usrc = usingf.col(k);  // hoisted out of the row loop (was a per-row map lookup)
@@ -2660,12 +3263,15 @@ MergeResult merge_frames(const Frame& master, const Frame& usingf, const MergeOp
             for (int64_t x : wmiss) miss += x;  // fixed order
             out.columns().back().seed_n_missing(miss);
         }
-    }
+    };
     // An overlapping variable under `update`: ONE output column (the master's name),
     // filled cell by cell from whichever side wins. Deliberately serial — the update
     // path is the rare one, and cell_verdict() reads through the f64 proxy, whose
     // ensure_wide() must not be reached from several workers at once (BUG-395).
-    auto emit_update_col = [&](const OverlapMeta& om) {
+    // stata_plan without `update`: a shared variable keeps the master's value on
+    // every row the master has, and takes the using's on a using-only row
+    // (`update_cells` false).
+    auto emit_update_col = [&](const OverlapMeta& om, bool update_cells = true) {
         int64_t miss = 0;
         if (om.is_factor) {
             std::vector<int32_t> codes(nout, -1);
@@ -2677,7 +3283,7 @@ MergeResult merge_frames(const Frame& master, const Frame& usingf, const MergeOp
                     return uc < 0 ? static_cast<int32_t>(-1) : om.u_remap[uc];
                 };
                 if (mrow < 0) code = from_using();
-                else if (urow < 0) code = om.mc->codes[mrow];
+                else if (urow < 0 || !update_cells) code = om.mc->codes[mrow];
                 else {
                     const Cell v = cell_verdict(om, mrow, urow);
                     const bool take_using = (v == Cell::Fill) || (v == Cell::Conflict && opts.replace);
@@ -2693,7 +3299,7 @@ MergeResult merge_frames(const Frame& master, const Frame& usingf, const MergeOp
                 const int64_t mrow = filtered[r].mrow, urow = filtered[r].urow;
                 double x;
                 if (mrow < 0) x = om.uc->f64[urow];
-                else if (urow < 0) x = om.mc->f64[mrow];
+                else if (urow < 0 || !update_cells) x = om.mc->f64[mrow];
                 else {
                     const Cell v = cell_verdict(om, mrow, urow);
                     const bool take_using = (v == Cell::Fill) || (v == Cell::Conflict && opts.replace);
@@ -2707,18 +3313,42 @@ MergeResult merge_frames(const Frame& master, const Frame& usingf, const MergeOp
         out.carry_identity_to_last(*om.mc);  // BUG-363: master owns the variable
         out.columns().back().seed_n_missing(miss);
     };
-    for (const auto& name : m_non_key) {
-        const OverlapMeta* om = nullptr;
-        for (const auto& o : ov) if (o.name == name) { om = &o; break; }
-        if (om) emit_update_col(*om);
-        else emit_col(name, true);
+    if (!opts.stata_plan) {
+        for (size_t ki = 0; ki < nkeys; ++ki) emit_key(ki);
+        for (const auto& name : m_non_key) {
+            const OverlapMeta* om = nullptr;
+            for (const auto& o : ov) if (o.name == name) { om = &o; break; }
+            if (om) emit_update_col(*om);
+            else emit_col(name, true);
+        }
+    } else {
+        // Master order, keys in place; a shared variable (update or not) through
+        // emit_update_col, whose using-only rows read the using's value.
+        std::vector<OverlapMeta> sv;
+        if (!do_update) {
+            sv.reserve(shared_vars.size());
+            for (const auto& name : shared_vars) sv.push_back(make_overlap_meta(name));
+        }
+        for (const auto& c : master.columns()) {
+            auto kit = std::find(opts.keylist.begin(), opts.keylist.end(), c.name);
+            if (kit != opts.keylist.end()) {
+                emit_key(static_cast<size_t>(kit - opts.keylist.begin()));
+                continue;
+            }
+            const OverlapMeta* om = nullptr;
+            for (const auto& o : ov) if (o.name == c.name) { om = &o; break; }
+            if (om) { emit_update_col(*om); continue; }
+            for (const auto& o : sv) if (o.name == c.name) { om = &o; break; }
+            if (om) emit_update_col(*om, false);
+            else emit_col(c.name, true);
+        }
     }
     for (const auto& name : u_non_key) emit_col(name, false);
 
     if (!opts.nogenerate) {
         std::vector<double> merge_col(nout);
         for (int64_t r = 0; r < nout; ++r) merge_col[r] = static_cast<double>(filtered[r].merge_code);
-        // generate(newvar) RENAMES the marker — oracle private_oracle_h.log has
+        // generate(newvar) RENAMES the marker — oracle capture h has
         // `confirm variable _merge` at r(111) after generate(mm), so `_merge` must
         // not also exist.
         out.append_f64_column(opts.generate.empty() ? std::string("_merge") : opts.generate,
@@ -2728,6 +3358,17 @@ MergeResult merge_frames(const Frame& master, const Frame& usingf, const MergeOp
         out.columns().back().seed_n_missing(0);
     }
     out.finalize_after_bulk_load();
+    // Stata's merge ("reestablish sort order"): after keep(), a 1:1 merge with
+    // no using-only row left runs `sort varlist`, so `: sortedby` reads the keys
+    // (w2d_uncovered.log:3988 merge_sorted_ctl `|id|`). The rows already sit in key
+    // order here: the stata_plan lists master rows sorted by the keys (or presorted,
+    // which PIET checked) and only code-2 rows are appended after them; a 1:1 key is
+    // unique, so the claim is true. m:1, 1:m, m:m and `1:1 _n` mint nothing, as in
+    // merge.ado, and the pandas-order plan keeps its claimless result.
+    if (opts.stata_plan && !opts.sequential && opts.type == "1:1" && !opts.keylist.empty() &&
+        std::none_of(filtered.begin(), filtered.end(),
+                     [](const Plan& p) { return p.merge_code == 2; }))
+        out.set_sorted_by(opts.keylist);
 
     MergeResult res;
     for (const auto& p : plan) {

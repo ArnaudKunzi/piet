@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — post-OLS specification diagnostics: Breusch-Pagan / Cook-Weisberg
 // heteroskedasticity test (estat hettest) and Ramsey RESET (estat ovtest).
 // Parity notes: sigma^2 = RSS/n (OLS divisor n, NOT n-k); default hettest is the

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #pragma once
 // BUG-471 T2: the ONE place PIET decides which Stata storage type a numeric
 // store takes. The engine rounds (`cobra eval --store-type`, T1); this file only
@@ -39,6 +41,13 @@ bool isIntegerType(const std::string& t);
 // path's business and resolves to "".
 std::string resolveCreateType(const SessionState& session, const std::string& declaredToken);
 
+// The label a successful creation records (dispatcher.cpp recordDeclaredStataType's
+// rule, for a creator that resolved its type itself, e.g. predict): no declaration
+// and a float store = BUG-295's implicit plane; anything else = varMeta stataType.
+// `stored` "" (nothing numeric was stored) records nothing.
+void recordCreateType(SessionState& session, const std::string& varname,
+                      const std::string& declaredToken, const std::string& stored);
+
 // replace: varMeta[v].stataType when it is a numeric type; else "float" when v
 // is on implicitFloatVars (an untyped in-session creation); else "double" (no
 // rounding). The last case is the unrecorded-creator fallback (a column some
@@ -47,6 +56,19 @@ std::string resolveCreateType(const SessionState& session, const std::string& de
 // process total below).
 std::string resolveReplaceType(SessionState& session, const std::string& varname);
 int64_t unrecordedReplaceFallbackTotal();
+
+// FU-243: the type claim belongs to the variable, not to its name. A verb that
+// gives a variable a new name (rename/ren: `move`) or a copy of itself
+// (clonevar: copy) carries the source's claim -- the declared varMeta stataType,
+// or the implicit float of an untyped creation -- to the target, so a later
+// `replace` on the target resolves (resolveReplaceType above) to what it did on
+// the source. Before, the implicit float stayed under the old name and the
+// target fell to the double fallback: w2ah_data_verbs.log ah_fu243_clone /
+// ah_fu243_rename store float (+1.24924a0000000X-002), main stored the double
+// 2/7 under a `float` label. Only the claim moves; labels and formats are the
+// caller's. A source with no claim leaves the target with none.
+void carryTypeClaim(SessionState& session, const std::string& from, const std::string& to,
+                    bool move);
 
 // The argv tail for a resolved type: {"--store-type", t}, or nothing for "" and
 // "double" (the engine's default, so every double store keeps its old argv).
@@ -89,22 +111,35 @@ ReplaceTypeDecision decideReplaceStoreType(SessionState& session, const std::str
                                            const std::vector<std::string>& colExprs,
                                            bool drawContext);
 
+// The display format `generate` gives a numeric storage type (describe:
+// double %10.0g, long %12.0g, byte/int %8.0g, float %9.0g). StataBE keeps the
+// format a variable was created with when its type later changes
+// (exprfns_contract_oracle.log:646/736 "b1 was byte now float" -> b1 float
+// %8.0g; :655/737 "i1 was int now long" -> i1 long %8.0g; :735 `recast double
+// y` of a float -> y double %9.0g), so callers pass the creation-time type.
+// No type (an implicit float, or no claim) is %9.0g.
+std::string stataDefaultFormat(const std::optional<std::string>& t);
+
 // After a successful replace store: when the lattice widened the type, the
-// label follows the store (a double under a byte label is a wrong answer).
+// label follows the store (a double under a byte label is a wrong answer), and
+// a variable with no explicit format keeps the default format of the type it
+// held before (stataDefaultFormat above).
 void recordReplaceType(SessionState& session, const std::string& varname,
                        const std::string& resolved, const std::string& stored);
 
 // egen: the function name of `fn(...)` (lowercased, "" if none).
 std::string egenFunctionName(const std::string& rhs);
-// tag(), seq() and mode() ignore the requested type (_gtag.ado:4,24 gen byte;
-// _gseq.ado:42 gen byte; _gmode.ado:19 the source's own type): no --store-type.
+// tag(), seq() and mode() ignore the requested type (egen tag() makes a byte;
+// egen seq() a byte; egen mode() the source's own type): no --store-type.
 bool egenIgnoresStoreType(const std::string& fn);
 // The label those three take after a successful egen (egen_tag_type :1123
-// `byte`; seq = `seqType`, the type its widening replace left (runEgen's
-// seqTypeOut; byte when empty, egen_seq_type :1137); mode = the source
-// variable's type). Returns false for every other function (the caller records
-// the declared/c(type) label).
+// `byte`; seq = `fixedType`, the type its widening replace left (runEgen's
+// fixedTypeOut; byte when empty, egen_seq_type :1137); mode = `fixedType`, the
+// str# its compress left, else the source variable's type). Any other function
+// takes `fixedType` when runEgen handed one back -- the type
+// runEgenAdoFunction's functions recorded for their result -- and otherwise returns
+// false (the caller records the declared/c(type) label).
 bool recordEgenFixedType(SessionState& session, const std::string& newvar,
-                         const std::string& rhs, const std::string& seqType = std::string());
+                         const std::string& rhs, const std::string& fixedType = std::string());
 
 }  // namespace piet::storage

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // C++ port of piet/backend/piet/router/exprfns.py — read that file as the
 // spec; every branch below mirrors a specific Python code path, including
 // the defensive try/except fallbacks.
@@ -9,6 +11,7 @@
 #include "piet/eval/stata_datemask.h"  // B3(a): date()/clock()/monthly() translation
 #include "piet/eval/stata_strfns.h"    // B3(a): soundex, stritrim, ustrfix
 #include "piet/eval/session.h"         // runiform(): EvalSession::rngSeed / rngDraws
+#include "core/rng_mt64.h"               // runiform(): EvalSession::rngMt64, the Stata stream
 
 #include "../dispatch_profile.h"  // EXPRLAYER: namespace-build counter (opt-in, stderr)
 #include "piet/stata_format.h"    // BUG-195: the ONE Stata numeric-format renderer
@@ -19,6 +22,7 @@
 // duplicating a second incomplete-beta implementation here.
 #include "core/distributions.h"
 #include "core/rng.h"  // Philox4x32-10, the engine's counter-based RNG (runiform)
+#include "core/stata_arith.h"  // exp(): StataBE's underflow edge
 
 #include <algorithm>
 #include <cctype>
@@ -40,6 +44,23 @@ const double kNaN = std::nan("");
 void requireArity(const std::vector<PyValue>& args, size_t lo, size_t hi, const char* fn) {
   if (args.size() < lo || args.size() > hi) {
     throw PyExc(std::string(fn) + ": wrong number of arguments (TypeError)");
+  }
+}
+
+// A numeric function handed a string is r(109) type mismatch in Stata, even
+// when the string reads as a number. pythonFloat() would turn sqrt("4") into 2
+// and round("a") into `.` at rc 0 (StataBE 19.5: sqrt, abs, ln, mod, round,
+// sign, normal, invttail, sum and cond's test all refuse a string).
+// BUG-462: the same holds for the numeric slots of a string function, which
+// are the slots from `first` on: substr("abcdef","2",3), word("a b","1"),
+// abbrev("abcdefgh","4"), subinstr("abab","a","x","1"), strtoname("a b","1"),
+// ustrleft("abc","2") and ustrregexm("a","a","1") are all r(109), and so are
+// int, float, normalden, Ftail, min/max (of strings too), char, regexs,
+// string, hms/dhms and every date function's number (lane expr-sem
+// x1b/a20.do, a21.do; 75 shapes).
+void requireNumeric(const std::vector<PyValue>& args, size_t first = 0) {
+  for (size_t i = first; i < args.size(); ++i) {
+    if (args[i].isStr()) throw PyExc("r(109): type mismatch");
   }
 }
 
@@ -159,7 +180,7 @@ std::string gFormat(double v) {
 //
 // The renderer is now the shared one (piet/stata_format.h). Two things stay
 // local and are deliberate, both measured against
-// tests/kitchensink/fmt_oracle/fmt_g_oracle.log:
+// internal capture fmt_g_oracle.log:
 //   * THE REGEX. Still the Python ancestor's PREFIX match with its optional
 //     `0` flag, not the display layer's full match. Narrowing it here would
 //     silently change what happens to specs like `%9.0gc` that this path
@@ -177,7 +198,7 @@ std::string applyStataFmt(double v, const std::string& fmt) {
   // decimal separator (`.` or Stata's European `,`) and the `c` grouping
   // suffix. Both were previously matched-and-ignored by this prefix regex, so
   // `%9,0f` and `%12.0gc` rendered as a bare number.
-  static const std::regex re(R"(^%(-?)(0?)(\d+)?([.,])(\d+)([fge])(c?))");
+  static const std::regex re(R"(^%(-?)(0?)(?:(\d+)?([.,])(?=\d+[fge])|(?=21x$))(\d+)([fgex])(c?))");
   std::smatch m;
   if (std::regex_search(fmt, m, re)) {
     piet::fmt::StataFmtSpec sp;
@@ -280,15 +301,21 @@ PyValue fnInlist(const std::vector<PyValue>& args) {
   return PyValue::boolean(false);
 }
 
+// inrange(z,a,b), with [FN]'s ordered missing rules: a missing z is 0, a
+// missing a is minus infinity and a missing b plus infinity. This layer's
+// missing is the sentinel band, not only NaN, so `inrange(., 1, .)` compared
+// `. <= .` and answered 1 where Stata answers 0 (BUG-1360). Missing means x >= .,
+// so an overflow to -inf is a number: inrange(-1e300*1e10, ., 5) is 1.
 PyValue fnInrange(const std::vector<PyValue>& args) {
   requireArity(args, 3, 3, "inrange");
   auto fval = pythonFloat(args[0]);
   if (!fval) return PyValue::boolean(false);
-  if (std::isnan(*fval)) return PyValue::boolean(false);
+  auto isMissing = [](double d) { return std::isnan(d) || d >= kStataMissingSentinel; };
+  if (isMissing(*fval)) return PyValue::boolean(false);
   auto lo = pythonFloat(args[1]);
   auto hi = pythonFloat(args[2]);
   if (!lo || !hi) return PyValue::boolean(false);
-  return PyValue::boolean(*lo <= *fval && *fval <= *hi);
+  return PyValue::boolean((isMissing(*lo) || *lo <= *fval) && (isMissing(*hi) || *fval <= *hi));
 }
 
 PyValue fnCond(const std::vector<PyValue>& args) {
@@ -296,11 +323,17 @@ PyValue fnCond(const std::vector<PyValue>& args) {
   const PyValue& test = args[0];
   const PyValue& yes = args[1];
   const PyValue& no = args[2];
+  if (test.isStr()) throw PyExc("r(109): type mismatch");
   auto ftest = pythonFloat(test);
   if (ftest) {
-    if (std::isnan(*ftest)) {
+    // A missing test -- NaN or this layer's sentinel band -- takes the fourth
+    // argument when there is one and is otherwise true ([FN] cond(): `a if x is
+    // true and nonmissing, b if x is false, and c if x is missing`).
+    // `cond(.a, 1, 2, 3)` answered 1 where Stata answers 3 (BUG-1360). An
+    // overflow to -inf is not missing: cond(-1e300*1e10, 1, 2, 3) is 1.
+    if (std::isnan(*ftest) || *ftest >= kStataMissingSentinel) {
       if (args.size() > 3) return args[3];
-      return PyValue::floating(kNaN);
+      return yes;
     }
     return *ftest != 0.0 ? yes : no;
   }
@@ -310,24 +343,38 @@ PyValue fnCond(const std::vector<PyValue>& args) {
 
 PyValue fnMod(const std::vector<PyValue>& args) {
   requireArity(args, 2, 2, "mod");
+  requireNumeric(args);
   auto fa = pythonFloat(args[0]);
   auto fb = pythonFloat(args[1]);
   if (!fa || !fb) return PyValue::floating(kNaN);
-  if (*fb == 0.0) return PyValue::floating(kNaN);
+  // A missing argument is the sentinel band, which fmod() reads as a number:
+  // mod(., 2) was 0 and mod(5, .) was 5 where Stata answers `.` (BUG-1360).
+  if (std::fabs(*fa) >= kStataMissingSentinel || std::fabs(*fb) >= kStataMissingSentinel)
+    return PyValue::floating(kStataMissingSentinel);
+  // [FN] mod(): y's domain is 0 to 8e+307, so y <= 0 is `.` -- mod(7,-3) was -2
+  // here while generate already answered `.` (StataBE 19.5: `.` on both).
+  if (!(*fb > 0.0)) return PyValue::floating(kNaN);
   double result = std::fmod(*fa, *fb);
-  // Stata: result carries sign of b.
-  if (result != 0.0 && ((result < 0) != (*fb < 0))) {
-    result += *fb;
-  }
+  // x - y*floor(x/y): a negative x wraps into [0, y) (mod(-7,3) is 2).
+  if (result < 0) result += *fb;
   return PyValue::floating(result);
 }
 
+// missing(x1,x2,...,xn): 1 when ANY argument is missing, string and numeric
+// arguments mixed freely (w2x_fn_string_math fx_missing_edges: missing(1, "") 1,
+// missing(1, "a", 2, 3) 0, missing(., "a", 2, 3) 1; fx_missing_drop2/keep4/
+// gen4/count4 on the row path). A string is missing when it is "".
 PyValue fnMissing(const std::vector<PyValue>& args) {
-  requireArity(args, 1, 1, "missing");
-  const PyValue& val = args[0];
-  if (val.isStr()) return PyValue::boolean(val.strVal().empty());
-  double f = val.numAsDouble();  // Bool/Int/Float never fail float()
-  return PyValue::boolean(std::isnan(f) || f >= kStataMissingSentinel);
+  requireArity(args, 1, SIZE_MAX, "missing");
+  for (const PyValue& val : args) {
+    if (val.isStr()) {
+      if (val.strVal().empty()) return PyValue::boolean(true);
+      continue;
+    }
+    double f = val.numAsDouble();  // Bool/Int/Float never fail float()
+    if (std::isnan(f) || f >= kStataMissingSentinel) return PyValue::boolean(true);
+  }
+  return PyValue::boolean(false);
 }
 
 // BUG-660: Stata's round(x[,unit]) — round to the nearest MULTIPLE OF unit,
@@ -345,31 +392,31 @@ PyValue fnMissing(const std::vector<PyValue>& args) {
 // gave round(-2.5) = -3 in local, scalar and display; StataBE 19.5 gives -2
 // (w2f_residuals.log round_matrix_row: round(2.5) 3, round(-2.5) -2,
 // round(0.5) 1, round(1.5) 2, round(2.675,.01) 2.68, round(1/3,.01) .33).
-// A quotient at or past 2^52 is already integral, and adding .5 there would
-// round to even before floor() sees it, so it is kept as is.
-static double stataRoundHalfUp(double q) {
-  if (std::fabs(q) >= 4503599627370496.0) return q;  // 2^52
-  return std::floor(q + 0.5);
-}
-
+// The rule itself is cecon::stata_round_value (core/stata_arith.h), shared with
+// the engine's generate: there is no shortcut past 2^52 (round(4503599627370497)
+// is ...498 in Stata) and a unit of 0 returns x (BUG-1364). A missing x keeps
+// its kind (round(.a) and round(.a,2) are .a); a missing unit is `.`.
 PyValue fnRound(const std::vector<PyValue>& args) {
   requireArity(args, 1, 2, "round");
+  requireNumeric(args);
   auto fx = pythonFloat(args[0]);
   if (!fx) return PyValue::floating(kNaN);
   double x = *fx;
-  if (std::isnan(x) || x >= kStataMissingSentinel) return PyValue::floating(x);
+  const bool xMissing = std::isnan(x) || x >= kStataMissingSentinel;
+  if (args.size() == 1 && xMissing) return PyValue::floating(x);
   // Review finding (v3): a rounded zero can be -0.0 (std::round(-0.4) was;
   // floor(-0.4+.5)*-0.01 still is), which the integer renderers print as "-0"
   // (`local b = round(-0.4)` stored -0; frozen main, on Python round's int
   // result, stored 0). StataBE 19.5 measured: round(-0.4) and
   // round(-0.001,.01) are 0 in local, global and display. A zero result is
   // returned as +0.0.
-  if (args.size() == 1) return PyValue::floating(positiveZero(stataRoundHalfUp(x)));
+  if (args.size() == 1) return PyValue::floating(positiveZero(cecon::stata_round_value(x, 1.0)));
   auto fu = pythonFloat(args[1]);
   if (!fu) return PyValue::floating(kNaN);
   double u = *fu;
-  if (std::isnan(u) || u >= kStataMissingSentinel || u == 0.0) return PyValue::floating(kNaN);
-  double r = stataRoundHalfUp(x / u) * u;
+  if (std::isnan(u) || std::fabs(u) >= kStataMissingSentinel) return PyValue::floating(kStataMissingSentinel);
+  if (xMissing) return PyValue::floating(x);
+  double r = cecon::stata_round_value(x, u);
   return PyValue::floating(std::isfinite(r) ? positiveZero(r) : kNaN);
 }
 
@@ -379,22 +426,12 @@ PyValue fnRound(const std::vector<PyValue>& args) {
 // same for min() (missing's huge sentinel never wins a "<" comparison) but
 // is backwards for max() (the sentinel always wins ">" ), so `max(1,2,.)`
 // silently answered "." where Stata answers 2 (w2c_functions.log max_macro).
-// String args keep the old lexical-compare behaviour (no oracle arm exercises
-// Stata's own string max()/min(), and this is what `max('a','b')` needs).
 PyValue fnMinMaxStata(const std::vector<PyValue>& args, bool isMin, const char* fn) {
   if (args.empty()) throw PyExc(std::string(fn) + ": TypeError no args");
   if (args.size() == 1) throw PyExc(std::string(fn) + ": TypeError: object is not iterable");
-  bool anyStr = false, anyNum = false;
-  for (const auto& v : args) (v.isStr() ? anyStr : anyNum) = true;
-  if (anyStr && anyNum) throw PyExc(std::string(fn) + ": TypeError mixed str/num");
-  if (anyStr) {
-    size_t best = 0;
-    for (size_t i = 1; i < args.size(); ++i) {
-      int c = args[i].strVal().compare(args[best].strVal());
-      if (isMin ? (c < 0) : (c > 0)) best = i;
-    }
-    return args[best];
-  }
+  // BUG-462: min()/max() are numeric only -- max("a","b") and min("5",1) are
+  // r(109) in StataBE 19.5 (x1b/a21.do), not a lexical pick.
+  requireNumeric(args);
   bool haveReal = false;
   double best = 0.0;
   for (const auto& v : args) {
@@ -418,20 +455,69 @@ PyValue fnMaxStata(const std::vector<PyValue>& args) { return fnMinMaxStata(args
 // answers x itself: verified against w2c_functions.log's sum_macro,
 // `sum(1)` -> 1 (SPEC: "follow the arm, not memory" -- not a multi-argument
 // reducer like max()/min()).
-PyValue fnSum(const std::vector<PyValue>& args) {
-  requireArity(args, 1, 1, "sum");
-  auto f = pythonFloat(args[0]);
-  return PyValue::floating(f ? *f : kNaN);
+//
+// A missing x adds 0 to the total, so a single sum(.), sum(.a) or sum(sqrt(-1))
+// is 0, not `.` (StataBE 19.5: `display sum(.)` 0; BUG-1360), and a string is
+// r(109) like any numeric function's (`sum("4")` is not 4).
+double sumTerm(const PyValue& v) {
+  if (v.isStr()) throw PyExc("r(109): type mismatch");
+  const double x = v.numAsDouble();
+  return (std::isnan(x) || x >= kStataMissingSentinel) ? 0.0 : x;
 }
 
-// BUG-660: sign(x) -- -1/0/1, missing propagates (kind preserved: returning
-// x itself rather than a fresh kNaN keeps `.a` a `.a`, not a plain `.`).
+PyValue fnSum(const std::vector<PyValue>& args) {
+  requireArity(args, 1, 1, "sum");
+  return PyValue::floating(sumTerm(args[0]));
+}
+
+// sum(x) IN THE ROW PLANE (BUG-1369): the running total itself. The string row
+// evaluator had no sum() at all, so `generate str20 g = string(sum(k)) + s`
+// failed at obs 1 (rc 1) where Stata stores "1x" "1x" "4x" on k = 1, ., 3. A
+// missing x adds 0. Each call site keeps its own total: within one evaluation of
+// an expression on a row the calls run in a fixed order -- every operand is
+// evaluated, `&` and `|` included, since Stata has no short-circuit (strmutate.cpp
+// rewriteExpr) -- so the n-th sum() call of the condition (or of the right-hand
+// side) is the same call site on every row, and its total lives at index n.
+// Only rows the expression is evaluated on count, so `if` limits the rows a
+// total runs over, as in Stata (the engine's --gen-mask rule, exprHasRunningSum).
+namespace {
+struct RunningSumState {
+  std::vector<double> totals[2];  // [0] the condition, [1] the right-hand side
+  int which = 1;
+  size_t nextCall = 0;
+};
+thread_local std::vector<RunningSumState> tlRunningSums;  // one per open scope
+}  // namespace
+
+RunningSumRowScope::RunningSumRowScope() { tlRunningSums.emplace_back(); }
+RunningSumRowScope::~RunningSumRowScope() { tlRunningSums.pop_back(); }
+void RunningSumRowScope::beginExpression(int which) {
+  tlRunningSums.back().which = which == 0 ? 0 : 1;
+  tlRunningSums.back().nextCall = 0;
+}
+
+PyValue fnSumRow(const std::vector<PyValue>& args) {
+  requireArity(args, 1, 1, "sum");
+  if (tlRunningSums.empty()) return fnSum(args);
+  const double x = sumTerm(args[0]);
+  RunningSumState& st = tlRunningSums.back();
+  std::vector<double>& totals = st.totals[st.which];
+  const size_t site = st.nextCall++;
+  if (totals.size() <= site) totals.resize(site + 1, 0.0);
+  totals[site] += x;
+  return PyValue::floating(totals[site]);
+}
+
+// BUG-660: sign(x) -- -1/0/1, and a missing x is plain `.`: sign(.a) is `.`,
+// not `.a` (BUG-1360; StataBE 19.5). Only floor(), ceil(), int(), round(),
+// trunc(), chop() and float() keep the kind of a missing argument.
 PyValue fnSign(const std::vector<PyValue>& args) {
   requireArity(args, 1, 1, "sign");
+  requireNumeric(args);
   auto fx = pythonFloat(args[0]);
   if (!fx) return PyValue::floating(kNaN);
   double x = *fx;
-  if (std::isnan(x) || x >= kStataMissingSentinel) return PyValue::floating(x);
+  if (std::isnan(x) || x >= kStataMissingSentinel) return PyValue::floating(kStataMissingSentinel);
   if (x > 0) return PyValue::floating(1.0);
   if (x < 0) return PyValue::floating(-1.0);
   return PyValue::floating(0.0);
@@ -460,9 +546,8 @@ PyValue fnGroup(const std::vector<PyValue>& args) {
 // sentinel is a genuine, if unusual, input -- `ttail(10,.)` -- and without a
 // guard here it reaches `t*t`, which overflows to +inf, driving `x` to 0 and
 // betai(...,0) to 0: `ttail(10,.)` silently answered 0 where Stata answers
-// `.`. Kind-preserving (returns the argument itself, not a fresh kNaN) for
-// the same reason fnSign/fnNormal do: a `.a` in must stay a `.a` out, not
-// collapse to a plain `.`.
+// `.`. A missing argument of any kind answers plain `.`: StataBE gives
+// ttail(5,.a) `.`, not `.a` (BUG-1360).
 //
 // Review finding (fix round 2): near the median (t^2 < df), x = df/(df+t^2)
 // is so close to 1.0 that betai()'s own internal `1.0 - x` (both its `bt`
@@ -535,8 +620,8 @@ static double stataTDensity(double df, double t) {
 }
 
 double stataTtail(double df, double t) {
-  if (std::isnan(df) || df >= kStataMissingSentinel) return df;
-  if (std::isnan(t) || t >= kStataMissingSentinel) return t;
+  if (std::isnan(df) || df >= kStataMissingSentinel) return kStataMissingSentinel;
+  if (std::isnan(t) || t >= kStataMissingSentinel) return kStataMissingSentinel;
   if (!(df > 0)) return kNaN;
   if (t == 0.0) return 0.5;
   if (df > kTLargeDf) {
@@ -659,8 +744,8 @@ static double invttailBisectNewton(double df, double p) {
 // round v4, text 2.228138851986274) is the listed display mismatch (numeric
 // gate T1 passes); see selftest_w2c_macrofns.cpp.
 double stataInvttail(double df, double p) {
-  if (std::isnan(df) || df >= kStataMissingSentinel) return df;
-  if (std::isnan(p) || p >= kStataMissingSentinel) return p;
+  if (std::isnan(df) || df >= kStataMissingSentinel) return kStataMissingSentinel;
+  if (std::isnan(p) || p >= kStataMissingSentinel) return kStataMissingSentinel;
   if (!(df > 0) || !(p > 0.0 && p < 1.0)) return kNaN;
   // p == .5: the root is exactly t = 0 by symmetry (fix round 2).
   if (p == 0.5) return 0.0;
@@ -691,6 +776,7 @@ double stataInvttail(double df, double p) {
 
 PyValue fnTtail(const std::vector<PyValue>& args) {
   requireArity(args, 2, 2, "ttail");
+  requireNumeric(args);
   auto fdf = pythonFloat(args[0]);
   auto ft = pythonFloat(args[1]);
   if (!fdf || !ft) return PyValue::floating(kNaN);
@@ -698,6 +784,7 @@ PyValue fnTtail(const std::vector<PyValue>& args) {
 }
 PyValue fnInvttail(const std::vector<PyValue>& args) {
   requireArity(args, 2, 2, "invttail");
+  requireNumeric(args);
   auto fdf = pythonFloat(args[0]);
   auto fp = pythonFloat(args[1]);
   if (!fdf || !fp) return PyValue::floating(kNaN);
@@ -711,20 +798,434 @@ PyValue fnInvttail(const std::vector<PyValue>& args) {
 // only where it is exact.
 PyValue fnInvt(const std::vector<PyValue>& args) {
   requireArity(args, 2, 2, "invt");
+  requireNumeric(args);
   auto fdf = pythonFloat(args[0]);
   auto fp = pythonFloat(args[1]);
   if (!fdf || !fp) return PyValue::floating(kNaN);
   // Missing guarded before the negation below: a negated sentinel is a large
-  // NEGATIVE double and would lose the extended-missing kind `.a`..`.z`.
-  if (std::isnan(*fdf) || *fdf >= kStataMissingSentinel) return PyValue::floating(*fdf);
-  if (std::isnan(*fp) || *fp >= kStataMissingSentinel) return PyValue::floating(*fp);
+  // NEGATIVE double. A missing argument is plain `.`, whatever its kind
+  // (invt(5,.a) is `.`; BUG-1360).
+  if (std::isnan(*fdf) || *fdf >= kStataMissingSentinel) return PyValue::floating(kStataMissingSentinel);
+  if (std::isnan(*fp) || *fp >= kStataMissingSentinel) return PyValue::floating(kStataMissingSentinel);
   const double q = stataInvttail(*fdf, *fp);
   if (std::isnan(q) || q >= kStataMissingSentinel) return PyValue::floating(q);
   // invt(df,.5): q is +0.0 and -q would render "-0" (Stata: 0).
   return PyValue::floating(positiveZero(-q));
 }
 
-// normal(z): standard normal CDF. Upper half (z >= 0): `0.5*(1+erf(z/sqrt2))`,
+// ---------------------------------------------------------------------------
+// Ftail(df1,df2,f): the F distribution's upper tail P(F > f).
+//
+// Implements the function per the StataNow help file (f_ftail.ihlp) and
+// identified against StataBE probes (a 1,440-point grid over df1, df2, f plus
+// the edge cases below; the selftest in selftest_w2c_macrofns.cpp keeps a
+// representative subset with the expression for each value):
+//   * any missing argument -> plain `.` (StataBE drops the .a-.z kind here:
+//     Ftail(.a,100,2), Ftail(3,.b,2) and Ftail(3,100,.c) all print `.`);
+//   * df1 or df2 outside 2e-10..2e17 -> `.`  (2e-10 and 2e17 themselves are
+//     in the domain, 1.99999e-10 and 2.00001e17 are not);
+//   * f <= 0 -> 1, exactly (after the df checks: Ftail(0,100,0) is `.`).
+//
+// With a = df2/2, b = df1/2 and s = (b/a) f the tail is the regularized
+// incomplete beta  Q = I_x(a,b),  x = 1/(1+s),  and also the mass of the
+// density of t = ln F beyond ln f,
+//     g(t) = x^a y^b / B(a,b),   y = 1-x,   t = ln f.
+// Three methods cover the whole domain; all of them build the prefactor
+// x^a y^b / B(a,b) in log form so that no large lgamma values cancel:
+//   * max(a,b) < kFtailAsymFrom: the incomplete beta continued fraction, on
+//     the side where it converges (x < (a+1)/(a+b+2));
+//   * min(a,b) >= 10 beyond that: Gauss-Legendre panels over g(t) (it is
+//     log-concave, so the panels decay), which stays accurate to df = 2e17
+//     where the continued fraction would need O(sqrt(a)) steps and loses
+//     digits to rounding;
+//   * min(a,b) < 10 beyond that (the large-sample regression case, small
+//     df1): an expansion of the beta integral in 1/A, A the large parameter,
+//     whose terms are incomplete gamma functions of z = A ln(1+s).
+// Development checks (not committed): against exact references (finite-sum
+// identities for integer a or b, 400-digit Decimal arithmetic; 5,517 points,
+// Q down to 1e-300) the worst relative error is 5.3e-13; against the StataBE
+// grid 3.6e-13. Known limits: (1) with df1 < 0.1 and df2 < 20 the CF branch
+// gets Q as 1 - P, so the ABSOLUTE error stays ~1e-16 but the relative error
+// grows like 1e-16/df1 (2e-7 at df1 = 2e-10; StataBE keeps full precision);
+// (2) once both df pass ~1e10 StataBE's own digits drift (about 1e-6 at
+// df = 2e17 on the deep tail) and an independent 70-digit quadrature of g(t)
+// agrees with this implementation instead; (3) StataBE returns 0 a little
+// before the true tail leaves the normal double range (Ftail(19,73076,79.5) is
+// 0 there, 4.6e-306 here).
+// The cobra engine's data plane (src/data/frame.cpp) has no Ftail yet:
+// `gen p = Ftail(...)` is a separate unit.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr double kFtailAsymFrom = 1e4;  // max(a,b) at which the CF hands over
+constexpr double kFtLn2Pi = 1.83787706640934548356065947281;
+constexpr double kFtLnSqrt2Pi = 0.918938533204672741780329736406;
+
+// Stirling remainder  lgamma(x) - ((x-1/2) ln x - x + ln sqrt(2 pi)),  x >= 10.
+double ftLgammaCorr(double x) {
+  const double x2 = 1.0 / (x * x);
+  return (1.0 / 12.0 -
+          x2 * (1.0 / 360.0 -
+                x2 * (1.0 / 1260.0 -
+                      x2 * (1.0 / 1680.0 -
+                            x2 * (1.0 / 1188.0 -
+                                  x2 * (691.0 / 360360.0 -
+                                        x2 * (1.0 / 156.0 - x2 * 3617.0 / 122400.0))))))) / x;
+}
+
+// x ln(x/np) + np - x (>= 0) with d = x - np supplied exactly by the caller, so
+// the near-equal case is a series in v = d/(x+np) instead of a difference of
+// two nearly equal logarithms.
+double ftBd0(double x, double np, double d) {
+  if (std::fabs(d) < 0.1 * (x + np)) {
+    const double v0 = d / (x + np);
+    double s = d * v0;
+    if (std::fabs(s) < 1e-300) return s;
+    double ej = 2.0 * x * v0;
+    const double v2 = v0 * v0;
+    for (int j = 1; j < 1000; ++j) {
+      ej *= v2;
+      const double s1 = s + ej / (2.0 * j + 1.0);
+      if (s1 == s) return s1;
+      s = s1;
+    }
+    return s;
+  }
+  return x * std::log(x / np) - d;
+}
+
+// ln B(a,b) without differencing the large lgamma values.
+double ftLbeta(double a, double b) {
+  const double p = std::min(a, b), q = std::max(a, b);
+  if (p >= 10.0) {
+    const double corr = ftLgammaCorr(p) + ftLgammaCorr(q) - ftLgammaCorr(p + q);
+    return -0.5 * std::log(q) + kFtLnSqrt2Pi + corr + (p - 0.5) * std::log(p / (p + q)) +
+           q * std::log1p(-p / (p + q));
+  }
+  if (q >= 10.0) {
+    const double corr = ftLgammaCorr(q) - ftLgammaCorr(p + q);
+    return std::lgamma(p) + corr + p - p * std::log(p + q) + (q - 0.5) * std::log1p(-p / (p + q));
+  }
+  return std::lgamma(p) + std::lgamma(q) - std::lgamma(p + q);
+}
+
+// ln of x^a y^b / B(a,b) for a, b >= 10 in the saddle-point form
+//   -(bd0(a,nx) + bd0(b,ny)) + ln sqrt(ab/(2 pi n)) - corr,   n = a+b,
+// which has no large cancelling terms at any size. The caller supplies the
+// three quantities that depend on where x is: d = a - n x (exact in its own
+// parameterisation), n x and n y.
+double ftLogDensitySaddle(double a, double b, double d, double npa, double npb) {
+  const double n = a + b;
+  const double corr = ftLgammaCorr(a) + ftLgammaCorr(b) - ftLgammaCorr(n);
+  return -(ftBd0(a, npa, d) + ftBd0(b, npb, -d)) + 0.5 * std::log(a * b / n) - 0.5 * kFtLn2Pi -
+         corr;
+}
+
+// ln of x^a y^b / B(a,b) at f (x = a/(a+bf), y = 1-x): the saddle-point form
+// when both a and b >= 10, otherwise the lgamma form with log1p pieces.
+double ftLogPrefactor(double a, double b, double f) {
+  const double n = a + b;
+  if (std::min(a, b) >= 10.0) {
+    if (f > 1e100) return -HUGE_VAL;  // x^a < 1e-2000: the tail is exactly 0
+    const double den = a + b * f;
+    return ftLogDensitySaddle(a, b, a * b * (f - 1.0) / den, n * a / den, n * (b * f) / den);
+  }
+  const double s = (b / a) * f;
+  double ls, l1;
+  if (s > 1e-290 && s < 1e300) {
+    ls = std::log(s);
+    l1 = std::log1p(s);
+  } else {
+    ls = std::log(b) - std::log(a) + std::log(f);
+    l1 = s > 1.0 ? ls : 0.0;
+  }
+  const double lny = s >= 1.0 ? (s < 1e300 ? -std::log1p(1.0 / s) : 0.0) : ls - l1;
+  return -a * l1 + b * lny - ftLbeta(a, b);
+}
+
+// Both parameters moderate: incomplete beta by the continued fraction on the
+// side that converges (the other side is 1 minus the small tail).
+double ftTailCF(double a, double b, double f) {
+  const double s = (b / a) * f;
+  const bool direct = s > (b + 1.0) / (a + 1.0);
+  const double lbt = ftLogPrefactor(a, b, f);
+  const double r = s > 1.0 ? 1.0 / s : s;  // s = inf: x = 0, y = 1 without inf/inf
+  const double x = s > 1.0 ? r / (1.0 + r) : 1.0 / (1.0 + r);
+  const double y = s > 1.0 ? 1.0 / (1.0 + r) : r / (1.0 + r);
+  constexpr int kMaxIt = 3000;  // <= 300 needed anywhere below kFtailAsymFrom
+  if (direct) {
+    if (lbt < -745.2) return 0.0;
+    return std::exp(lbt) * cecon::betacf(a, b, x, kMaxIt) / a;
+  }
+  const double lower = std::exp(lbt) * cecon::betacf(b, a, y, kMaxIt) / b;
+  return std::min(1.0, std::max(0.0, 1.0 - lower));
+}
+
+// 16-point Gauss-Legendre rule on [-1,1] (positive half).
+constexpr double kGl16X[8] = {0.0950125098376374401853193, 0.2816035507792589132304605,
+                              0.4580167776572273863424194, 0.6178762444026437484466718,
+                              0.7554044083550030338951012, 0.8656312023878317438804679,
+                              0.9445750230732325760779884, 0.9894009349916499325961542};
+constexpr double kGl16W[8] = {0.1894506104550684962853967, 0.1826034150449235888667637,
+                              0.1691565193950025381893121, 0.1495959888165767320815017,
+                              0.1246289712555338720524763, 0.0951585116824927848099251,
+                              0.0622535239386478928628438, 0.0271524594117540948517806};
+
+// ln g(t) for t >= 0 with a, b >= 10 (the saddle-point prefactor of
+// ftLogPrefactor, written in e^-t so a large t never overflows).
+double ftLogDensityT(double a, double b, double t) {
+  const double n = a + b;
+  const double em = std::exp(-t);
+  const double den = b + a * em;
+  return ftLogDensitySaddle(a, b, a * b * (-std::expm1(-t)) / den, n * a * em / den, n * b / den);
+}
+
+// Mass of g beyond t0 >= 0. d/dt ln g = -lam, lam = ab(e^t-1)/(a+be^t), and
+// d2/dt2 ln g = -kap, kap = n a b e^t/(a+be^t)^2; panels are 5/(lam+sqrt(kap))
+// wide, so ln g falls by a few units across each and the 16-point rule
+// resolves it. Stops when a panel is below 1e-18 of the running sum.
+double ftRightTailQuad(double a, double b, double t0) {
+  const double n = a + b;
+  if (ftLogDensityT(a, b, t0) < -745.5) return 0.0;
+  double sum = 0.0, t = t0;
+  for (int panel = 0; panel < 400; ++panel) {
+    const double em = std::exp(-t);
+    const double den = b + a * em;
+    const double lam = a * b * (-std::expm1(-t)) / den;
+    const double kap = n * a * b * em / (den * den);
+    const double w = 5.0 / (lam + std::sqrt(kap));
+    const double half = 0.5 * w, mid = t + half;
+    double acc = 0.0;
+    for (int i = 0; i < 8; ++i) {
+      acc += kGl16W[i] * (std::exp(ftLogDensityT(a, b, mid - half * kGl16X[i])) +
+                          std::exp(ftLogDensityT(a, b, mid + half * kGl16X[i])));
+    }
+    const double pv = half * acc;
+    sum += pv;
+    t += w;
+    if (pv <= 1e-18 * sum) break;
+  }
+  return sum;
+}
+
+// a, b >= 10. Below the mode (f < 1) the mass beyond ln f is 1 minus the mass
+// of the reciprocal F(df2,df1) beyond -ln f; for a, b >= 10 neither is small.
+double ftTailQuad(double a, double b, double f) {
+  const double t0 = std::log(f);
+  if (t0 >= 0.0) return ftRightTailQuad(a, b, t0);
+  return std::min(1.0, std::max(0.0, 1.0 - ftRightTailQuad(b, a, -t0)));
+}
+
+// phi(v) = ((1-e^-v)/v)^(B-1) = sum_k phi_k v^k to order K. ln((1-e^-v)/v) =
+// -v/2 + sum_n B_2n v^2n / (2n (2n)!), exponentiated by the usual recurrence.
+void ftPhiCoeffs(double B, int K, double* phi) {
+  static const double kB2n[12] = {
+      1.0 / 6,       -1.0 / 30,      1.0 / 42,      -1.0 / 30,       5.0 / 66,     -691.0 / 2730,
+      7.0 / 6,       -3617.0 / 510,  43867.0 / 798, -174611.0 / 330, 854513.0 / 138,
+      -236364091.0 / 2730};
+  double g[32] = {0};
+  g[1] = -0.5 * (B - 1.0);
+  double fact = 1.0;
+  for (int n = 1; n <= 12 && 2 * n <= K; ++n) {
+    fact *= (2.0 * n - 1.0) * (2.0 * n);
+    g[2 * n] = (B - 1.0) * kB2n[n - 1] / (2.0 * n * fact);
+  }
+  phi[0] = 1.0;
+  for (int k = 1; k <= K; ++k) {
+    double acc = 0.0;
+    for (int j = 1; j <= k; ++j) acc += j * g[j] * phi[k - j];
+    phi[k] = acc / k;
+  }
+}
+
+// e^z Gamma(s,z) for z > 1: the incomplete gamma continued fraction.
+double ftGammaUpperScaledCF(double s, double z) {
+  constexpr double kTiny = 1e-300;
+  double bb = z + 1.0 - s, c = 1.0 / kTiny, d = 1.0 / bb, h = d;
+  for (int i = 1; i < 100000; ++i) {
+    const double an = -i * (i - s);
+    bb += 2.0;
+    d = an * d + bb;
+    if (std::fabs(d) < kTiny) d = kTiny;
+    c = bb + an / c;
+    if (std::fabs(c) < kTiny) c = kTiny;
+    d = 1.0 / d;
+    const double del = d * c;
+    h *= del;
+    if (std::fabs(del - 1.0) < 1e-16) break;
+  }
+  return std::exp(s * std::log(z)) * h;
+}
+
+// Gamma(1+B) - 1, accurate for tiny B (series in zeta values below 0.1).
+double ftGamma1pm1(double B) {
+  if (B >= 0.1) return std::expm1(std::lgamma(1.0 + B));
+  // zeta(2..24): tabulated up to 9, summed directly (40 terms, error < 1e-15)
+  // above; built once.
+  struct ZetaTable {
+    double v[25];
+    ZetaTable() {
+      static const double lead[8] = {1.6449340668482264, 1.2020569031595943, 1.0823232337111382,
+                                     1.0369277551433699, 1.0173430619844491, 1.0083492773819228,
+                                     1.0040773561979443, 1.0020083928260822};
+      for (int k = 2; k <= 24; ++k) {
+        if (k <= 9) {
+          v[k] = lead[k - 2];
+          continue;
+        }
+        double zk = 0.0;
+        for (int m = 40; m >= 1; --m) {
+          zk += std::pow(static_cast<double>(m), -static_cast<double>(k));
+        }
+        v[k] = zk;
+      }
+    }
+  };
+  static const ZetaTable zeta;
+  double lg = -0.5772156649015329 * B, p = -B;
+  for (int k = 2; k <= 24; ++k) {
+    p *= -B;
+    lg += zeta.v[k] * p / k;
+  }
+  return std::expm1(lg);
+}
+
+// e^z Gamma(B,z) for 0 < B < 1 and z <= 1 (lz = ln z, -inf at z = 0): the
+// small-z expansion, which keeps Gamma(B) - z^B/B in one expm1 difference.
+double ftGammaUpperScaledSmallZ(double B, double z, double lz) {
+  double ser = 0.0, term = 1.0;  // sum_{j>=1} (-z)^j / (j! (B+j))
+  for (int j = 1; j < 60; ++j) {
+    term *= -z / j;
+    const double t = term / (B + j);
+    ser += t;
+    if (std::fabs(t) < 1e-18) break;
+  }
+  const double head = (ftGamma1pm1(B) - std::expm1(B * lz)) / B;
+  return std::exp(z) * (head - std::exp(B * lz) * ser);
+}
+
+// e^z gamma(s,z) (lower incomplete gamma): the positive power series.
+double ftGammaLowerScaled(double s, double z, double lz) {
+  double term = 1.0 / s, sum = term;
+  for (int j = 1; j < 100000; ++j) {
+    term *= z / (s + j);
+    sum += term;
+    if (term < 1e-18 * sum) break;
+  }
+  return std::exp(s * lz) * sum;
+}
+
+// I_{exp(-v0)}(A,B) = (1/B(A,B)) * integral_{v0}^inf e^{-Av} (1-e^-v)^{B-1} dv
+// with (1-e^-v)^{B-1} = v^{B-1} phi(v): the integral is the series
+//     (B/Gamma(1+B)) R * sum_k phi_k A^-k Gamma(B+k, z),   z = A v0,
+// R = Gamma(A+B)/(Gamma(A) A^B). `upper` selects that tail (the incomplete
+// beta itself); otherwise the complementary lower integral with gamma(B+k,z)
+// is returned, which is the small one when z is below the gamma median. The
+// terms carry e^z, so the result is assembled as exp(ln(pref) + ln(sum) - z):
+// e^-z alone underflows (z > 745) while the product is still a normal double.
+// The callers use `upper` only above the gamma median, so z <= 1 there means
+// B < 1 (the small-z expansion).
+double ftAsymTailF(double A, double B, double z, double lz, bool upper) {
+  constexpr int kK = 24;
+  if (upper && z > 1000.0) return 0.0;  // < e^-1000 z^9 even for B < 10
+  const double lnR = (A + B - 0.5) * std::log1p(B / A) - B + ftLgammaCorr(A + B) - ftLgammaCorr(A);
+  const double lpref = std::log(B / std::tgamma(1.0 + B)) + lnR;
+  double phi[kK + 1];
+  ftPhiCoeffs(B, kK, phi);
+  double sum = 0.0, Ak = 1.0, G = 0.0;
+  if (upper) G = (z > 1.0) ? ftGammaUpperScaledCF(B, z) : ftGammaUpperScaledSmallZ(B, z, lz);
+  for (int k = 0; k <= kK; ++k) {
+    if (!upper) G = ftGammaLowerScaled(B + k, z, lz);
+    const double term = phi[k] * Ak * G;
+    sum += term;
+    if (k > 3 && std::fabs(term) < 1e-17 * std::fabs(sum)) break;
+    Ak /= A;
+    // Gamma(s+1,z) = s Gamma(s,z) + z^s e^-z, scaled by e^z; all terms positive.
+    if (upper) G = (B + k) * G + std::exp((B + k) * lz);
+  }
+  if (!(sum > 0.0)) return 0.0;
+  const double lres = lpref + std::log(sum) - z;
+  return lres < -745.2 ? 0.0 : std::exp(lres);
+}
+
+// Median of the gamma(B) distribution, to within a factor of 2: the point
+// above which the upper incomplete gamma is the small side.
+double ftMedianZ(double B) {
+  return B >= 1.0 ? B : std::pow(0.5 * std::tgamma(1.0 + B), 1.0 / B);
+}
+
+// v0 = ln(1+w) and ln v0, for w = (u/v) f (inv = false) or (v/u)/f (inv = true),
+// without losing w to overflow/underflow at the extremes of f.
+void ftLog1pRatio(double u, double v, double f, bool inv, double* v0, double* lv0) {
+  const double w = inv ? (v / u) / f : (u / v) * f;
+  if (w > 1e-290 && w < 1e300) {
+    *v0 = std::log1p(w);
+    *lv0 = std::log(*v0);
+    return;
+  }
+  const double lw =
+      inv ? std::log(v) - std::log(u) - std::log(f) : std::log(u) - std::log(v) + std::log(f);
+  if (w >= 1e300) {  // ln(1+w) = ln w
+    *v0 = lw;
+    *lv0 = std::log(lw);
+  } else {  // ln(1+w) = w
+    *v0 = std::exp(lw);
+    *lv0 = lw;
+  }
+}
+
+// One of a, b is >= kFtailAsymFrom and the other < 10. For large a the tail
+// is the upper integral beyond v0 = ln(1+s); for large b the complement P is
+// the upper integral beyond ln(1+1/s) and Q the lower one. Whichever side is
+// the small one is computed directly, the other as 1 minus it.
+double ftTailAsym(double a, double b, double f) {
+  double v0, lv0;
+  if (a > b) {
+    ftLog1pRatio(b, a, f, false, &v0, &lv0);
+    const double z = a * v0, lz = std::log(a) + lv0;
+    if (z > ftMedianZ(b)) return ftAsymTailF(a, b, z, lz, true);
+    return std::min(1.0, std::max(0.0, 1.0 - ftAsymTailF(a, b, z, lz, false)));
+  }
+  ftLog1pRatio(b, a, f, true, &v0, &lv0);
+  const double z = b * v0, lz = std::log(b) + lv0;
+  if (z <= ftMedianZ(a)) return ftAsymTailF(b, a, z, lz, false);
+  return std::min(1.0, std::max(0.0, 1.0 - ftAsymTailF(b, a, z, lz, true)));
+}
+
+double stataFtail(double df1, double df2, double f) {
+  if (std::isnan(df1) || df1 >= kStataMissingSentinel) return kNaN;
+  if (std::isnan(df2) || df2 >= kStataMissingSentinel) return kNaN;
+  if (std::isnan(f) || f >= kStataMissingSentinel || f <= -kStataMissingSentinel) return kNaN;
+  if (!(df1 >= 2e-10 && df1 <= 2e17) || !(df2 >= 2e-10 && df2 <= 2e17)) return kNaN;
+  if (f <= 0.0) return 1.0;
+  const double a = df2 / 2.0, b = df1 / 2.0;
+  if (std::max(a, b) < kFtailAsymFrom) {
+    // Tiny df1 on the side where the CF would hand back 1 - P (the tail is
+    // O(df1), so that subtraction costs ~1e-16/df1 in relative terms): with
+    // df2 >= 20 the 1/A expansion is accurate here (z = A ln(1+s) stays ~1).
+    if (b < 0.05 && a >= 10.0 && (b / a) * f <= (b + 1.0) / (a + 1.0)) return ftTailAsym(a, b, f);
+    return ftTailCF(a, b, f);
+  }
+  if (std::min(a, b) >= 10.0) return ftTailQuad(a, b, f);
+  return ftTailAsym(a, b, f);
+}
+
+}  // namespace
+
+PyValue fnFtail(const std::vector<PyValue>& args) {
+  requireArity(args, 3, 3, "Ftail");
+  requireNumeric(args);  // BUG-462
+  auto fdf1 = pythonFloat(args[0]);
+  auto fdf2 = pythonFloat(args[1]);
+  auto ff = pythonFloat(args[2]);
+  if (!fdf1 || !fdf2 || !ff) return PyValue::floating(kNaN);
+  return PyValue::floating(stataFtail(*fdf1, *fdf2, *ff));
+}
+
+// normal(z): standard normal CDF, now cecon::stata_normal (Cody's ANORM),
+// which StataBE 19.5 matches bit for bit on 3,409 z (src/core/distributions.h);
+// the history below is what it replaced.
+// Formerly: upper half (z >= 0): `0.5*(1+erf(z/sqrt2))`,
 // not the mathematically-equivalent `0.5*erfc(-z/sqrt2)` -- the two round
 // differently in the last bit and only the erf form is bit-identical to the
 // oracle (w2c_functions.log normal_macro, normal(1.96) -> .9750021048517796;
@@ -737,29 +1238,136 @@ PyValue fnInvt(const std::vector<PyValue>& args) {
 // has no subtraction and stays relative-accurate down to the underflow.
 PyValue fnNormal(const std::vector<PyValue>& args) {
   requireArity(args, 1, 1, "normal");
+  requireNumeric(args);
   auto fz = pythonFloat(args[0]);
   if (!fz) return PyValue::floating(kNaN);
   double z = *fz;
-  if (std::isnan(z) || z >= kStataMissingSentinel) return PyValue::floating(z);
-  if (z < 0.0) return PyValue::floating(0.5 * std::erfc(-z / std::sqrt(2.0)));
-  return PyValue::floating(0.5 * (1.0 + std::erf(z / std::sqrt(2.0))));
+  // A missing z is plain `.`: normal(.a) is `.` (BUG-1360).
+  if (std::isnan(z) || z >= kStataMissingSentinel) return PyValue::floating(kStataMissingSentinel);
+  return PyValue::floating(cecon::stata_normal(z));
+}
+
+// serset-twoway FN: normalden(z), normalden(x, s), normalden(x, m, s) -- the
+// normal density (functions.sthlp: normalden(x,m,s) = normalden((x-m)/s)/s; s
+// <= 0 is missing). `twoway function normalden(x)` (w2al tf_fn_drop,
+// log:2990-3000) reaches it through the macro evaluator; it answered `unknown
+// function normalden()`. The density itself is the engine's (BUG-1124,
+// cecon::stata_normalden), so `display normalden(x)` and `generate` agree to the
+// bit.
+PyValue fnNormalden(const std::vector<PyValue>& args) {
+  requireArity(args, 1, 3, "normalden");
+  requireNumeric(args);  // BUG-462
+  std::vector<double> v;
+  for (const auto& a : args) {
+    auto f = pythonFloat(a);
+    if (!f) return PyValue::floating(kNaN);
+    if (std::isnan(*f) || *f >= kStataMissingSentinel) return PyValue::floating(kStataMissingSentinel);
+    v.push_back(*f);
+  }
+  double m = 0.0, sd = 1.0;
+  if (v.size() == 2) sd = v[1];
+  if (v.size() == 3) {
+    m = v[1];
+    sd = v[2];
+  }
+  const double d = cecon::stata_normalden(v[0], m, sd);
+  return PyValue::floating(std::isnan(d) ? kStataMissingSentinel : d);
 }
 
 // invnormal(p): the inverse standard normal CDF, through the engine's own
 // AS241 (cecon::stata_invnormal, core/distributions.h) rather than a second
-// implementation. A missing argument comes back unchanged (`.a` stays `.a`,
-// as fnNormal); outside (0,1) the engine answers NaN, which is returned as
+// implementation. A missing argument is plain `.` (invnormal(.a) is `.`,
+// BUG-1360); outside (0,1) the engine answers NaN, which is returned as
 // the macro layer's finite missing sentinel so that `invnormal(2) == .` is
 // true, as for fnFloat (BUG-584; a NaN prints `.` but compares false).
 // Oracle w2c_functions.log:320/:331 (invnormal_matrix_lit/_elem, rc 0).
 PyValue fnInvnormal(const std::vector<PyValue>& args) {
   requireArity(args, 1, 1, "invnormal");
+  requireNumeric(args);
   auto fp = pythonFloat(args[0]);
   if (!fp) return PyValue::floating(kNaN);
   const double p = *fp;
-  if (std::isnan(p) || p >= kStataMissingSentinel) return PyValue::floating(p);
+  if (std::isnan(p) || p >= kStataMissingSentinel) return PyValue::floating(kStataMissingSentinel);
   const double z = cecon::stata_invnormal(p);
   return PyValue::floating(std::isnan(z) ? kStataMissingSentinel : z);
+}
+
+// The one numeric argument of invlogit()/logit(): a string is Stata's r(109), and
+// a missing of any kind comes back as nullopt, which those functions answer with
+// a plain `.` (StataBE 19.5, 2026-10-29: invlogit(.a) and logit(.a) print `.`).
+std::optional<double> numericArgOrMissing(const PyValue& a) {
+  if (a.isStr()) throw PyExc("r(109): type mismatch");
+  auto v = pythonFloat(a);
+  if (!v || std::isnan(*v) || std::fabs(*v) >= kStataMissingSentinel) return std::nullopt;
+  return *v;
+}
+
+// BUG-1066: invlogit(x) and logit(x), with the engine's own rules so `display`,
+// `scalar`, `local =` and `generate` agree to the bit: invlogit is
+// cecon::stata_invlogit_value (core/stata_arith.h; invlogit(2)
+// +1.c2f7d5a8a79c9X-001, invlogit(-717.5) 0), logit is ln(x/(1-x)) and missing
+// outside the open interval (0,1), as frame.cpp's stata_logit (logit(.25)
+// -1.193ea7aad030bX+000; logit(0), logit(1) and logit(2) are `.`).
+PyValue fnInvlogit(const std::vector<PyValue>& args) {
+  requireArity(args, 1, 1, "invlogit");
+  const std::optional<double> x = numericArgOrMissing(args[0]);
+  if (!x) return PyValue::floating(kStataMissingSentinel);
+  return PyValue::floating(cecon::stata_invlogit_value(*x));
+}
+PyValue fnLogit(const std::vector<PyValue>& args) {
+  requireArity(args, 1, 1, "logit");
+  const std::optional<double> x = numericArgOrMissing(args[0]);
+  if (!x || !(*x > 0.0 && *x < 1.0)) return PyValue::floating(kStataMissingSentinel);
+  return PyValue::floating(std::log(*x / (1.0 - *x)));
+}
+
+// BUG-1046: reldif(x,y) = |x-y|/(|y|+1) (StataBE 19.5: reldif(1,2)
+// +1.5555555555555X-002, reldif(0,1e-10) +1.b7cdfd9cbef6aX-022, reldif(-1,1) 1).
+// Two missings that are the same value are 0 (reldif(.,.), reldif(.a,.a),
+// reldif(1e308,1e308)); any other missing operand gives `.` (reldif(5,.),
+// reldif(.,5), reldif(.a,.b), reldif(.,.a), and reldif(1e308,-1e308): 1e308 is
+// past c(maxdouble), a missing beyond .z, and -1e308 is `.`). The division is
+// plain double arithmetic: reldif(8e307,-8e307) is 2. A string is r(109).
+PyValue fnReldif(const std::vector<PyValue>& args) {
+  requireArity(args, 2, 2, "reldif");
+  if (args[0].isStr() || args[1].isStr()) throw PyExc("r(109): type mismatch");
+  auto fx = pythonFloat(args[0]);
+  auto fy = pythonFloat(args[1]);
+  if (!fx || !fy) return PyValue::floating(kStataMissingSentinel);
+  const auto missingValue = [](double v) -> std::optional<double> {
+    if (std::isnan(v)) return kStataMissingSentinel;
+    if (stataExtendedMissingKind(v)) return v;
+    return std::nullopt;
+  };
+  const std::optional<double> mx = missingValue(*fx), my = missingValue(*fy);
+  if (mx || my) return PyValue::floating(mx && my && *mx == *my ? 0.0 : kStataMissingSentinel);
+  const double d = std::fabs(*fx - *fy) / (std::fabs(*fy) + 1.0);
+  return PyValue::floating(std::isfinite(d) && d < kStataMissingSentinel ? d
+                                                                         : kStataMissingSentinel);
+}
+
+// BUG-1373: tobytes(s[,n]) -- every byte of s as an escape, `\dDDD` (three
+// decimal digits) when n is absent or 0 and `\xhh` (two lowercase hex digits)
+// for any other n, a missing n included. StataBE 19.5 (2026-10-29):
+// tobytes("ab") \d097\d098, tobytes("é") \d195\d169, tobytes("abc",1)
+// \x61\x62\x63, tobytes("a",.) and tobytes("a",.4) \x61, tobytes("a",-0)
+// \d097, tobytes("") empty; a numeric s or a string n is r(109).
+PyValue fnTobytes(const std::vector<PyValue>& args) {
+  requireArity(args, 1, 2, "tobytes");
+  if (!args[0].isStr() || (args.size() == 2 && args[1].isStr()))
+    throw PyExc("r(109): type mismatch");
+  bool hex = false;
+  if (args.size() == 2) {
+    auto n = pythonFloat(args[1]);
+    hex = !n || *n != 0.0;  // NaN, the missing band and any nonzero n
+  }
+  std::string out;
+  char buf[8];
+  for (unsigned char c : args[0].strVal()) {
+    std::snprintf(buf, sizeof(buf), hex ? "\\x%02x" : "\\d%03u", static_cast<unsigned>(c));
+    out += buf;
+  }
+  return PyValue::str(out);
 }
 
 // runiform()/runiformint(a,b): doctrine carve-out (①-S, distributional
@@ -820,6 +1428,11 @@ void addSessionRngFns(PyNamespace& ns, EvalSession& session) {
   // 53 random bits at the centre of their 2^-53 cell: strictly inside (0,1).
   ns.fns["runiform"] = [sp](const std::vector<PyValue>& args) -> PyValue {
     requireArity(args, 0, 0, "runiform");
+    // The session's Stata stream (core/rng_mt64.h): `local u = runiform()`
+    // takes the next draw of the same stream generate uses, as in Stata.
+    if (sp->rngMt64) {
+      if (cecon::Mt64* g = sp->rngMt64()) return PyValue::floating(g->runiform());
+    }
     const uint64_t bits = macroRngDraw64(*sp) >> 11;
     return PyValue::floating((static_cast<double>(bits) + 0.5) * 0x1.0p-53);
   };
@@ -838,6 +1451,15 @@ void addSessionRngFns(PyNamespace& ns, EvalSession& session) {
     }
     long long a = static_cast<long long>(std::llround(*flo));
     long long b = static_cast<long long>(std::llround(*fhi));
+    if (sp->rngMt64) {
+      if (cecon::Mt64* g = sp->rngMt64()) {
+        // Stata: an inverted range is missing, a degenerate one is a without a
+        // draw (core/rng_mt64.h runiformint).
+        if (b < a) return PyValue::floating(kNaN);
+        return PyValue::integer(static_cast<long long>(
+            g->runiformint(static_cast<double>(a), static_cast<double>(b))));
+      }
+    }
     if (b < a) std::swap(a, b);
     const uint64_t span = static_cast<uint64_t>(b - a) + 1ull;
     // Rejection sampling: `draw % span` is biased unless span divides 2^64,
@@ -864,67 +1486,83 @@ PyValue fnUpper(const std::vector<PyValue>& args) {
   return PyValue::str(asciiUpper(pythonStr(args[0])));
 }
 
+// trim/strtrim/ltrim/rtrim strip BLANKS (char 32) only, not Python's
+// whitespace set: length(strtrim(char(9) + " a " + char(9))) is 5 in StataBE
+// 19.5 (w2x_fn_string_math fx_trim_edges).
+std::string stripBlanks(const std::string& s, bool left, bool right) {
+  size_t a = 0, b = s.size();
+  if (left) {
+    while (a < b && s[a] == ' ') ++a;
+  }
+  if (right) {
+    while (b > a && s[b - 1] == ' ') --b;
+  }
+  return s.substr(a, b - a);
+}
+
 PyValue fnStrtrim(const std::vector<PyValue>& args) {
   requireArity(args, 1, 1, "strtrim");
-  return PyValue::str(pyStripAscii(pythonStr(args[0]), true, true));
+  return PyValue::str(stripBlanks(pythonStr(args[0]), true, true));
 }
 
 PyValue fnLtrim(const std::vector<PyValue>& args) {
   requireArity(args, 1, 1, "ltrim");
-  return PyValue::str(pyStripAscii(pythonStr(args[0]), true, false));
+  return PyValue::str(stripBlanks(pythonStr(args[0]), true, false));
 }
 
 PyValue fnRtrim(const std::vector<PyValue>& args) {
   requireArity(args, 1, 1, "rtrim");
-  return PyValue::str(pyStripAscii(pythonStr(args[0]), false, true));
+  return PyValue::str(stripBlanks(pythonStr(args[0]), false, true));
 }
 
+// substr(s,n1,n2), StataBE 19.5 (w2x_fn_string_math fx_substr_edges/_neg):
+// a negative n1 counts from the end (substr("abcdef",-2,2) "ef"); n1 of 0, a
+// missing n1, or a negative n1 reaching before the first character give "";
+// a missing n2 runs to the end; n2 <= 0 gives "".
+// BUG-1372: BYTES, like length() -- usubstr() is the character form. StataBE
+// 19.5 (lane expr-sem x1b/a2.do G2-G8): substr("h\xc3\xa9llo",2,2) is the two
+// bytes of e-acute, substr(..,3,2) is "\xa9l", strlen(substr(..,2,1)) is 1.
 PyValue fnSubstr(const std::vector<PyValue>& args) {
   requireArity(args, 2, 3, "substr");
-  try {
-    std::string ss = pythonStr(args[0]);
-    auto fstart = pythonFloat(args[1]);
-    if (!fstart) throw PyExc("substr: start not numeric");
-    long long i = intFromDouble(*fstart);
-    if (i < 1) i = 1;
-    size_t pyStart = static_cast<size_t>(i - 1);
-    long long ln = -1;
-    if (args.size() >= 3) {
-      // Python: try int(float(length)) except (TypeError, ValueError): -1
-      auto fl = pythonFloat(args[2]);
-      if (fl) {
-        try {
-          ln = intFromDouble(*fl);
-        } catch (const PyExc&) {
-          // int(nan) ValueError is caught by THIS inner except -> ln = -1;
-          // int(inf) OverflowError is NOT (TypeError, ValueError) — it
-          // escapes to the outer `except Exception: return ""`.
-          if (std::isinf(*fl)) return PyValue::str("");
-          ln = -1;
-        }
-      } else {
-        ln = -1;
-      }
+  requireNumeric(args, 1);  // BUG-462
+  const std::string ss = pythonStr(args[0]);
+  const auto fstart = pythonFloat(args[1]);
+  if (!fstart || !std::isfinite(*fstart) || std::fabs(*fstart) >= kStataMissingSentinel)
+    return PyValue::str("");
+  const long long n = static_cast<long long>(ss.size());
+  const double st = std::trunc(*fstart);
+  if (st == 0.0 || std::fabs(st) > static_cast<double>(n)) return PyValue::str("");
+  const long long start = st > 0 ? static_cast<long long>(st) : n + static_cast<long long>(st) + 1;
+  long long len = n - start + 1;
+  if (args.size() >= 3) {
+    const auto fl = pythonFloat(args[2]);
+    if (!fl) return PyValue::str("");
+    if (!std::isnan(*fl) && std::fabs(*fl) < kStataMissingSentinel) {
+      const double l = std::trunc(*fl);
+      if (l <= 0.0) return PyValue::str("");
+      if (l < static_cast<double>(len)) len = static_cast<long long>(l);
     }
-    size_t n = utf8Len(ss);
-    if (ln < 0) return PyValue::str(utf8Slice(ss, pyStart, n));
-    return PyValue::str(utf8Slice(ss, pyStart, pyStart + static_cast<size_t>(ln)));
-  } catch (const PyExc&) {
-    return PyValue::str("");  // outer `except Exception: return ""`
   }
+  return PyValue::str(ss.substr(static_cast<size_t>(start - 1), static_cast<size_t>(len)));
 }
 
+// length()/strlen() count BYTES: length("é") is 2 (w2x_fn_string_math
+// fx_length_edges, fx_case_edges); ustrlen() is the character count.
 PyValue fnStrlen(const std::vector<PyValue>& args) {
   requireArity(args, 1, 1, "strlen");
-  return PyValue::integer(static_cast<long long>(utf8Len(pythonStr(args[0]))));
+  return PyValue::integer(static_cast<long long>(pythonStr(args[0]).size()));
 }
 
 PyValue fnStrpos(const std::vector<PyValue>& args) {
   requireArity(args, 2, 2, "strpos");
   std::string hs = pythonStr(args[0]);
   std::string nd = pythonStr(args[1]);
-  long long idx = utf8Find(hs, nd);
-  return PyValue::integer(idx >= 0 ? idx + 1 : 0);
+  // strpos("", "") is 0, strpos("abc", "") 1 (fx_strpos_edges).
+  if (hs.empty()) return PyValue::integer(0);
+  // BUG-1372: a BYTE position, like substr() and length() (ustrpos() counts
+  // characters): strpos("h\xc3\xa9llo","l") is 4 in StataBE 19.5 (x1b/a2.do G3).
+  const size_t idx = hs.find(nd);
+  return PyValue::integer(idx != std::string::npos ? static_cast<long long>(idx) + 1 : 0);
 }
 
 // regexm()/regexr() take a literal pattern string per call and corpora
@@ -1013,6 +1651,36 @@ PyValue fnRegexm(const std::vector<PyValue>& args) {
   }
 }
 
+// regexs() IN THE ROW PLANE (piet-row-evaluator-string-data-arms). In a `generate`,
+// regexs() inside the SAME expression as its regexm() does not see that
+// regexm()'s match: w2c_functions.log regexs_whole (:599, `cond(regexm(s,"A"),
+// regexs(0), "NOMATCH")` on 20 rows that all match) stores "" on row 1 with
+// type str1 and "(1 missing value generated)"; regexs_group_matched (:609)
+// the same; regexs_group_unmatched (:619, group 2 of "(A)(Z)?" never takes
+// part) stores "" everywhere, "(20 missing values generated)". The rule this
+// evaluator applies, which reproduces those three observables: while a
+// RegexsRowScope is open (strmutate.cpp evalRows), regexs() reads the match
+// state as it stood when the current expression BEGAN evaluating on the
+// current row -- i.e. Stata's regexs() runs before its own expression's
+// regexm(), and so sees the previous row's match (none before row 1 in a
+// fresh session). A condition (`if regexm(...)`) is a separate expression
+// evaluated before the right-hand side, so the documented idiom `generate x
+// = regexs(1) if regexm(s, ...)` reads its own row's match. UNPINNED by any
+// captured arm: rows 2..20 (this rule gives the previous row's match, "A"),
+// and whether the state survives from an earlier command (this rule keeps
+// the one process-wide state, as the macro layer always has).
+namespace {
+int gRegexsRowDepth = 0;
+RegexMatchState& regexsRowSnapshot() {
+  static RegexMatchState snap;
+  return snap;
+}
+}  // namespace
+
+RegexsRowScope::RegexsRowScope() { ++gRegexsRowDepth; }
+RegexsRowScope::~RegexsRowScope() { --gRegexsRowDepth; }
+void RegexsRowScope::beginExpression() { regexsRowSnapshot() = lastRegexMatch(); }
+
 // BUG-660 fix round: regexs(n) -- the capture-group readback for regexm()
 // above. w2c_functions.log's regexs_macro_standalone arm (`local x =
 // regexs(0)` -> "A", rc 0) needs a PRECEDING regexm() in the same evaluator;
@@ -1021,6 +1689,7 @@ PyValue fnRegexm(const std::vector<PyValue>& args) {
 // empty string, not an error.
 PyValue fnRegexs(const std::vector<PyValue>& args) {
   requireArity(args, 1, 1, "regexs");
+  requireNumeric(args);  // BUG-462
   auto fn = pythonFloat(args[0]);
   if (!fn) return PyValue::str("");
   long long idx;
@@ -1029,7 +1698,7 @@ PyValue fnRegexs(const std::vector<PyValue>& args) {
   } catch (const PyExc&) {
     return PyValue::str("");
   }
-  const RegexMatchState& st = lastRegexMatch();
+  const RegexMatchState& st = gRegexsRowDepth > 0 ? regexsRowSnapshot() : lastRegexMatch();
   if (!st.valid || idx < 0 || idx >= static_cast<long long>(st.groups.size())) {
     return PyValue::str("");
   }
@@ -1171,9 +1840,12 @@ static std::string ustrregexDivergence(const std::wstring& pattern, const std::w
   return "";
 }
 
-[[noreturn]] static void refuseUstrregexra(const std::string& why) {
-  throw PyExc("r(199): ustrregexra(): " + why +
+[[noreturn]] static void refuseUstrregex(const char* fn, const std::string& why) {
+  throw PyExc(std::string("r(199): ") + fn + "(): " + why +
               " is not supported in this build (Stata matches with ICU regular expressions)");
+}
+[[noreturn]] static void refuseUstrregexra(const std::string& why) {
+  refuseUstrregex("ustrregexra", why);
 }
 
 // BUG-660: ustrregexra(s,pattern,replace[,i]) -- replace every match (the
@@ -1181,6 +1853,7 @@ static std::string ustrregexDivergence(const std::wstring& pattern, const std::w
 // matching (measured in Stata: ustrregexra("aAbB","a","X",1) -> "XXbB").
 PyValue fnUstrregexra(const std::vector<PyValue>& args) {
   requireArity(args, 3, 4, "ustrregexra");
+  requireNumeric(args, 3);  // BUG-462
   std::wstring ws, wp, wr;
   if (!decodeUtf8Strict(pythonStr(args[0]), ws) || !decodeUtf8Strict(pythonStr(args[1]), wp) ||
       !decodeUtf8Strict(pythonStr(args[2]), wr)) {
@@ -1210,10 +1883,122 @@ PyValue fnUstrregexra(const std::vector<PyValue>& args) {
   return PyValue::str(out);
 }
 
+// ustrregexm(s,re[,noc]) -- 1 when re matches somewhere in s, else 0
+// (w2c_functions.log:1132 ustrregexm_data: ustrregexm("caf\u00e9 na\u00efve",
+// "caf") is 1). The same UTF-32 matcher and the same named refusals as
+// ustrregexra() above, so a construct ECMAScript reads differently from ICU
+// is refused (r(199)), never answered. It does not touch regexm()'s capture
+// state: regexs() reads regexm() only (ustrregexs() is a separate function,
+// not registered here).
+PyValue fnUstrregexm(const std::vector<PyValue>& args) {
+  requireArity(args, 2, 3, "ustrregexm");
+  requireNumeric(args, 2);  // BUG-462
+  std::wstring ws, wp;
+  if (!decodeUtf8Strict(pythonStr(args[0]), ws) || !decodeUtf8Strict(pythonStr(args[1]), wp)) {
+    refuseUstrregex("ustrregexm", "an argument that is not valid UTF-8");
+  }
+  bool caseInsensitive = false;
+  if (args.size() == 3) {
+    auto ci = pythonFloat(args[2]);
+    caseInsensitive = ci && *ci != 0.0 && !std::isnan(*ci);
+  }
+  const std::string why =
+      ustrregexDivergence(wp, std::wstring(), hasNonAscii(ws),
+                          ws.find(static_cast<wchar_t>(0x85)) != std::wstring::npos,
+                          caseInsensitive, hasNonAscii(wp));
+  if (!why.empty()) refuseUstrregex("ustrregexm", why);
+  try {
+    auto flags = std::regex_constants::ECMAScript;
+    if (caseInsensitive) flags |= std::regex_constants::icase;
+    const std::wregex re(wp, flags);
+    return PyValue::integer(std::regex_search(ws, re) ? 1 : 0);
+  } catch (const std::regex_error&) {
+    refuseUstrregex("ustrregexm", "a pattern std::regex cannot compile");
+  }
+}
+
+// ustrlen(s) -- the number of Unicode characters (code points) of s, where
+// strlen()/length() count bytes (w2c_functions.log:1121 ustrlen_data:
+// ustrlen("caf\u00e9 na\u00efve") is 10, strlen of it is 12). utf8Len's
+// counting of an invalid byte (each non-continuation byte is one) is unpinned.
+PyValue fnUstrlen(const std::vector<PyValue>& args) {
+  requireArity(args, 1, 1, "ustrlen");
+  return PyValue::integer(static_cast<long long>(utf8Len(pythonStr(args[0]))));
+}
+
+// ustrleft(s,n) -- the first n Unicode characters of s (w2c_functions.log:1110
+// ustrleft_data: ustrleft("caf\u00e9 na\u00efve",4) is "caf\u00e9", 5 bytes).
+// Unpinned, by design: n at or past the length gives s, n <= 0 gives "", a
+// missing n gives s (usubstr's "missing length runs to the end" reading).
+PyValue fnUstrleft(const std::vector<PyValue>& args) {
+  requireArity(args, 2, 2, "ustrleft");
+  requireNumeric(args, 1);  // BUG-462
+  const std::string s = pythonStr(args[0]);
+  const auto fn = pythonFloat(args[1]);
+  if (!fn || std::isnan(*fn) || std::fabs(*fn) >= kStataMissingSentinel) return PyValue::str(s);
+  const double n = std::trunc(*fn);
+  if (n <= 0.0) return PyValue::str("");
+  const size_t len = utf8Len(s);
+  if (n >= static_cast<double>(len)) return PyValue::str(s);
+  return PyValue::str(utf8Slice(s, 0, static_cast<size_t>(n)));
+}
+
+// ustrtrim(s) -- s without its leading and trailing Unicode white space
+// (w2c_functions.log:1163 ustrtrim_data: ustrtrim(" caf\u00e9 na\u00efve ") is
+// "caf\u00e9 na\u00efve"). Stata's help: "removes leading and trailing Unicode
+// whitespace characters and blanks". DESIGN, unpinned beyond the space: the
+// set is ICU's White_Space property (U+0009-000D, 0020, 0085, 00A0, 1680,
+// 2000-200A, 2028, 2029, 202F, 205F, 3000). Interior characters are kept.
+// strtrim() (blanks only) is a different function and is not touched.
+static bool isUnicodeWhiteSpace(unsigned cp) {
+  return (cp >= 0x09 && cp <= 0x0D) || cp == 0x20 || cp == 0x85 || cp == 0xA0 ||
+         cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 || cp == 0x2029 ||
+         cp == 0x202F || cp == 0x205F || cp == 0x3000;
+}
+PyValue fnUstrtrim(const std::vector<PyValue>& args) {
+  requireArity(args, 1, 1, "ustrtrim");
+  const std::string s = pythonStr(args[0]);
+  // Decode one code point at byte i; an invalid byte is one non-space unit.
+  auto at = [&s](size_t i, size_t& n) -> unsigned {
+    if (!strfns::utf8_seq_len(s, i, n)) {
+      n = 1;
+      return 0xFFFFFFFFu;
+    }
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    unsigned cp = n == 1 ? c : n == 2 ? (c & 0x1Fu) : n == 3 ? (c & 0x0Fu) : (c & 0x07u);
+    for (size_t k = 1; k < n; ++k) cp = (cp << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3Fu);
+    return cp;
+  };
+  size_t begin = s.size(), end = 0;
+  for (size_t i = 0; i < s.size();) {
+    size_t n = 1;
+    const unsigned cp = at(i, n);
+    if (!isUnicodeWhiteSpace(cp)) {
+      if (begin == s.size()) begin = i;
+      end = i + n;
+    }
+    i += n;
+  }
+  if (begin >= end) return PyValue::str("");
+  return PyValue::str(s.substr(begin, end - begin));
+}
+
+// real(s): a missing token keeps its kind (real(".a") is .a, fx_real_edges);
+// what Python's float() reads but Stata does not (inf, nan, 1e400) is `.`, and
+// so is a non-numeric string -- the value `.` itself, not a NaN, so
+// `real("abc") == .` is 1 (w2x_fn_string_math.log:782 f4).
 PyValue fnReal(const std::vector<PyValue>& args) {
   requireArity(args, 1, 1, "real");
+  if (args[0].isStr()) {
+    const std::string t = stripBlanks(args[0].strVal(), true, true);
+    if (t == ".") return PyValue::floating(kStataMissingSentinel);
+    if (t.size() == 2 && t[0] == '.' && t[1] >= 'a' && t[1] <= 'z')
+      return PyValue::floating(stataMissingWithKind(t[1] - 'a' + 1));
+    if (t.find('_') != std::string::npos) return PyValue::floating(kStataMissingSentinel);
+  }
   auto f = pythonFloat(args[0]);
-  return PyValue::floating(f ? *f : kNaN);
+  if (f && args[0].isStr() && !(std::fabs(*f) < kStataMissingSentinel)) return PyValue::floating(kStataMissingSentinel);
+  return PyValue::floating(f ? *f : kStataMissingSentinel);
 }
 
 // BUG-660: reverse(s) -- byte reversal (not a `ustr*` name, so plain-byte
@@ -1227,26 +2012,15 @@ PyValue fnReverse(const std::vector<PyValue>& args) {
   return PyValue::str(s);
 }
 
-// utf8Find (pyvalue.cpp/.h)'s mirror for the LAST occurrence -- strrpos()'s
-// oracle arm (strrpos_macro) needs the position of the final match, not the
-// first utf8Find already serves via strpos().
-long long utf8RFind(const std::string& s, const std::string& sub) {
-  if (sub.empty()) return -1;
-  size_t pos = s.rfind(sub);
-  if (pos == std::string::npos) return -1;
-  long long cp = 0;
-  for (size_t i = 0; i < pos; ++i) {
-    if ((static_cast<unsigned char>(s[i]) & 0xC0) != 0x80) ++cp;
-  }
-  return cp;
-}
-
+// strrpos() -- the position of the LAST match (oracle arm strrpos_macro); an
+// empty needle is 0. BUG-1372: a BYTE position, like strpos():
+// strrpos("h\xc3\xa9llo","l") is 5 in StataBE 19.5 (x1b/a2.do G9).
 PyValue fnStrrpos(const std::vector<PyValue>& args) {
   requireArity(args, 2, 2, "strrpos");
   std::string hs = pythonStr(args[0]);
   std::string nd = pythonStr(args[1]);
-  long long idx = utf8RFind(hs, nd);
-  return PyValue::integer(idx >= 0 ? idx + 1 : 0);
+  const size_t idx = nd.empty() ? std::string::npos : hs.rfind(nd);
+  return PyValue::integer(idx != std::string::npos ? static_cast<long long>(idx) + 1 : 0);
 }
 
 PyValue fnWordcount(const std::vector<PyValue>& args) {
@@ -1257,26 +2031,37 @@ PyValue fnWordcount(const std::vector<PyValue>& args) {
 // strtoname(s): every character that isn't a letter/digit/underscore becomes
 // an underscore, one-for-one (no run-collapsing — w2c_functions.log's
 // strtoname_macro turns the fixture's two leading/two interior spaces into
-// two/two underscores, not one/one). Stata's leading-digit reprefixing is
-// undocumented here (not exercised by any captured arm).
+// two/two underscores, not one/one).
+//
+// Unicode (StataBE 19.5, scratch-r150/uni-v/p3.do over every general category):
+// strtoname works on BYTES -- an ASCII byte outside [A-Za-z0-9_] becomes `_`,
+// every byte >= 0x80 (so every non-ASCII character, whatever its category, a
+// non-ASCII digit first included) is kept whole, and the result is cut at 32
+// BYTES (strtoname("é" x 40) has 16 characters). Stata may leave half a character
+// at the cut; this cut backs off to a character boundary so the string stays valid
+// UTF-8. An ASCII digit first gets a `_` in front (suppressed by strtoname(s, 0));
+// an empty string stays empty.
 PyValue fnStrtoname(const std::vector<PyValue>& args) {
-  requireArity(args, 1, 1, "strtoname");
+  requireArity(args, 1, 2, "strtoname");
+  requireNumeric(args, 1);  // BUG-462
   std::string s = pythonStr(args[0]);
+  bool prefix = true;
+  if (args.size() > 1) {
+    auto p = pythonFloat(args[1]);
+    if (!p) throw PyExc("strtoname: p not numeric");
+    prefix = *p != 0;
+  }
   std::string out;
-  out.reserve(s.size());
+  out.reserve(s.size() + 1);
   for (unsigned char c : s) {
-    out.push_back((std::isalnum(c) || c == '_') ? static_cast<char>(c) : '_');
+    out.push_back((c >= 0x80 || std::isalnum(c) || c == '_') ? static_cast<char>(c) : '_');
   }
-  // BUG-660 fix round: a Stata NAME cannot start with a digit or be empty --
-  // Stata's strtoname() prefixes an underscore in both cases -- and is
-  // capped at namelen() (32 characters), documented behaviour neither
-  // exercised by the single captured strtoname_macro arm (no leading digit,
-  // under 32 chars either way, so this is additive, not a behaviour change
-  // for that arm).
-  if (out.empty() || std::isdigit(static_cast<unsigned char>(out[0]))) {
-    out.insert(out.begin(), '_');
+  if (prefix && !out.empty() && out[0] >= '0' && out[0] <= '9') out.insert(out.begin(), '_');
+  if (out.size() > 32) {
+    size_t cut = 32;
+    while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80) --cut;
+    out.resize(cut);
   }
-  if (out.size() > 32) out.resize(32);
   return PyValue::str(out);
 }
 
@@ -1359,11 +2144,15 @@ PyValue fnUstrunescape(const std::vector<PyValue>& args) {
 
 PyValue fnWord(const std::vector<PyValue>& args) {
   requireArity(args, 2, 2, "word");
+  requireNumeric(args, 1);  // BUG-462
   try {
     auto tokens = pySplit(pythonStr(args[0]));
     auto fn = pythonFloat(args[1]);
     if (!fn) throw PyExc("word: n not numeric");
     long long idx = intFromDouble(*fn) - 1;
+    // A negative n counts from the end: word("a b c d", -1) is "d", -4 "a",
+    // -5 "" (fx_word_edges).
+    if (idx < -1) idx = static_cast<long long>(tokens.size()) + idx + 1;
     if (idx >= 0 && idx < static_cast<long long>(tokens.size())) {
       return PyValue::str(tokens[static_cast<size_t>(idx)]);
     }
@@ -1375,6 +2164,7 @@ PyValue fnWord(const std::vector<PyValue>& args) {
 
 PyValue fnSubinstr(const std::vector<PyValue>& args) {
   requireArity(args, 3, 4, "subinstr");
+  requireNumeric(args, 3);  // BUG-462
   try {
     std::string ss = pythonStr(args[0]);
     std::string sf = pythonStr(args[1]);
@@ -1395,6 +2185,12 @@ PyValue fnSubinstr(const std::vector<PyValue>& args) {
         }
       }
       // fn parse failure or NaN: count stays -1
+    }
+    // A negative count replaces nothing: subinstr("abcb", "b", "x", -1) is
+    // "abcb" (fx_subinstr_negn). Only a missing count means every occurrence.
+    if (args.size() >= 4 && count < 0) {
+      auto fn = pythonFloat(args[3]);
+      if (fn && !std::isnan(*fn) && *fn < 0) return PyValue::str(ss);
     }
     if (count < 0) return PyValue::str(pyReplace(ss, sf, st));
     if (count == 0) return PyValue::str(ss);
@@ -1437,8 +2233,9 @@ PyValue fnString(const std::vector<PyValue>& args) {
   // form stays the Python ancestor's pass-through — not in the capture, so not
   // claimed. The `r(NNN): message` prefix is the exact-rc channel evalArith
   // forwards to tryCaptureDefinition (see its raisedError contract).
-  if (n.isStr() && args.size() >= 2) throw PyExc("r(109): type mismatch");
-  if (n.isStr()) return n;  // Python: isinstance(n, str) -> return n
+  // BUG-462: the one-argument form too -- string("5") is r(109) in StataBE
+  // 19.5 (x1b/a20.do); it was the Python ancestor's pass-through.
+  if (n.isStr()) throw PyExc("r(109): type mismatch");
   double fv = n.numAsDouble();  // float() of Bool/Int/Float never fails
   // BUG-206 (third half). `isnan` ALONE IS THE WRONG MISSING TEST ON THIS PATH.
   //
@@ -1468,17 +2265,26 @@ PyValue fnString(const std::vector<PyValue>& args) {
   // string(.z,"%9.0g") -> `.z` (exprfns_contract_oracle.log, G|dot* rows). A
   // negative-side missing (the evaluator negates the sentinel like any double)
   // keeps rendering plain `.`, as before.
-  if (std::isnan(fv)) return PyValue::str(".");
-  if (std::fabs(fv) >= kStataMissingSentinel) {
-    auto kind = stataExtendedMissingKind(fv);
-    if (kind && *kind >= 1) {
-      return PyValue::str(std::string(".") + static_cast<char>('a' + *kind - 1));
-    }
-    return PyValue::str(".");
-  }
   std::optional<std::string> sfmt;
   if (args.size() >= 2) {
     sfmt = pyStripAscii(pythonStr(args[1]), true, true);
+  }
+  // BUG-918: a left-justified format keeps its trailing pad for a missing
+  // value too (`string(., "%-9.0g")` is `.        `; w2z_tostring tz_fmt_left,
+  // tostring.ado's own `string(v, fmt)`). Any other format leaves the token.
+  auto missingToken = [&](std::string tok) {
+    if (sfmt && !sfmt->empty() && (*sfmt)[0] == '%') {
+      tok = piet::fmt::padMissingLeftJustify(std::move(tok), *sfmt);
+    }
+    return PyValue::str(std::move(tok));
+  };
+  if (std::isnan(fv)) return missingToken(".");
+  if (std::fabs(fv) >= kStataMissingSentinel) {
+    auto kind = stataExtendedMissingKind(fv);
+    if (kind && *kind >= 1) {
+      return missingToken(std::string(".") + static_cast<char>('a' + *kind - 1));
+    }
+    return missingToken(".");
   }
   // gFormat/applyStataFmt may throw PyExc (int(inf) OverflowError escapes
   // Python's except (TypeError, ValueError)) — let it propagate: the whole
@@ -1515,11 +2321,15 @@ PyValue fnString(const std::vector<PyValue>& args) {
   // has not implemented" needs the date/business-calendar families decided too
   // (`%tc` and `%td` both render real values in Stata and reach gFormat here).
   if (sfmt) return PyValue::str(std::string());
-  return PyValue::str(gFormat(fv));
+  // FU-616/FU-641/FU-654: string(x) is %9.0g through the shared renderer, not
+  // gFormat's C %.7g: string(.00001) .00001, string(1e-6) 1.00e-06,
+  // string(123456789) 1.23e+08 (w2x_fn_string_math fx_string1_small/_edges).
+  return PyValue::str(piet::fmt::general(positiveZero(fv), 9, 0));
 }
 
 PyValue fnChar(const std::vector<PyValue>& args) {
   requireArity(args, 1, 1, "char");
+  requireNumeric(args);  // BUG-462
   auto f = pythonFloat(args[0]);
   if (!f) return PyValue::str("");
   long long code;
@@ -1557,6 +2367,7 @@ PyValue fnChar(const std::vector<PyValue>& args) {
 
 PyValue fnAbbrev(const std::vector<PyValue>& args) {
   requireArity(args, 2, 2, "abbrev");
+  requireNumeric(args, 1);  // BUG-462
   std::string ss = pythonStr(args[0]);
   try {
     auto fn = pythonFloat(args[1]);
@@ -1580,18 +2391,35 @@ PyValue fnAbbrev(const std::vector<PyValue>& args) {
 // expression the string-mutation evaluator handles. Both call the same
 // cecon:: helpers (data/stata_dates.h), so the two layers cannot give different
 // answers for the same date — a class of drift this campaign has paid for before.
+//
+// A missing argument reaches this layer as the finite sentinel band (|x| >= 2^1023,
+// kStataMissingSentinel), not as the engine's NaN, and the cecon:: helpers read it
+// as an ordinary huge number: hh(.) was 2562047788015, mm(.) 12 and minutes(.) a
+// 300-digit number, where Stata answers `.` (w2y_fn_datetime fd_hhmm_edges,
+// fd_minutes_edges). Every date/time argument is read through dateArg, which hands
+// the helpers NaN for it.
+// BUG-462: a string is r(109), as in every numeric slot: year("5"),
+// mdy(1,"2",2000), dofm("3"), hh("5"), ym(2000,"1") and date()'s topyear
+// "2050" all refuse in StataBE 19.5 (x1b/a20.do).
+std::optional<double> dateArg(const PyValue& v) {
+  if (v.isStr()) throw PyExc("r(109): type mismatch");
+  auto f = pythonFloat(v);
+  if (f && !(std::fabs(*f) < kStataMissingSentinel)) return kNaN;
+  return f;
+}
+
 PyValue fnMdy(const std::vector<PyValue>& args) {
   requireArity(args, 3, 3, "mdy");
-  auto a = pythonFloat(args[0]);
-  auto b = pythonFloat(args[1]);
-  auto c = pythonFloat(args[2]);
+  auto a = dateArg(args[0]);
+  auto b = dateArg(args[1]);
+  auto c = dateArg(args[2]);
   if (!a || !b || !c) return PyValue::floating(kNaN);
   return PyValue::floating(cecon::stata_mdy(*a, *b, *c));
 }
 
 PyValue datePartFn(const std::vector<PyValue>& args, cecon::DatePart part, const char* name) {
   requireArity(args, 1, 1, name);
-  auto v = pythonFloat(args[0]);
+  auto v = dateArg(args[0]);
   if (!v) return PyValue::floating(kNaN);
   return PyValue::floating(cecon::stata_date_part(*v, part));
 }
@@ -1610,21 +2438,19 @@ PyValue fnHalfyear(const std::vector<PyValue>& a) { return datePartFn(a, cecon::
 // `gen m = mofd(d)` cannot disagree. Values are pinned to
 // tests/validate/b3_funcs_oracle.json.
 //
-// Missing propagates as Stata's `.`: a non-numeric argument yields NaN here the
-// way datePartFn does, rather than throwing, because only ARITY errors throw in
-// this layer (see the header's contract note).
+// Missing propagates as Stata's `.`; a string argument is r(109) (dateArg).
 template <typename F>
 PyValue timeUnary(const std::vector<PyValue>& args, const char* name, F f) {
   requireArity(args, 1, 1, name);
-  auto v = pythonFloat(args[0]);
+  auto v = dateArg(args[0]);
   if (!v) return PyValue::floating(kNaN);
   return PyValue::floating(f(*v));
 }
 template <typename F>
 PyValue timeBinary(const std::vector<PyValue>& args, const char* name, F f) {
   requireArity(args, 2, 2, name);
-  auto a = pythonFloat(args[0]);
-  auto b = pythonFloat(args[1]);
+  auto a = dateArg(args[0]);
+  auto b = dateArg(args[1]);
   if (!a || !b) return PyValue::floating(kNaN);
   return PyValue::floating(f(*a, *b));
 }
@@ -1664,6 +2490,7 @@ PyValue fnYw(const std::vector<PyValue>& a) { return timeBinary(a, "yw", [](doub
 
 PyValue fnHms(const std::vector<PyValue>& args) {
   requireArity(args, 3, 3, "hms");
+  requireNumeric(args);  // BUG-462
   auto h = pythonFloat(args[0]); auto m = pythonFloat(args[1]); auto s = pythonFloat(args[2]);
   if (!h || !m || !s) return PyValue::floating(kNaN);
   return PyValue::floating(cecon::stata_hms(*h, *m, *s));
@@ -1671,6 +2498,7 @@ PyValue fnHms(const std::vector<PyValue>& args) {
 
 PyValue fnDhms(const std::vector<PyValue>& args) {
   requireArity(args, 4, 4, "dhms");
+  requireNumeric(args);  // BUG-462
   auto d = pythonFloat(args[0]); auto h = pythonFloat(args[1]);
   auto m = pythonFloat(args[2]); auto s = pythonFloat(args[3]);
   if (!d || !h || !m || !s) return PyValue::floating(kNaN);
@@ -1684,18 +2512,30 @@ PyValue fnDhms(const std::vector<PyValue>& args) {
 //
 // These deliberately use the ENGINE's missing convention (frame.cpp's fin():
 // a non-finite result is Stata's `.`) rather than this file's inherited Python
-// one, where sqrt(-1) and log(0) THROW. That inconsistency is real and is filed
-// rather than fixed here: changing sqrt/log/exp/log10 would move a frozen
-// 1.16.0 Python-oracle surface and needs its own adjudication and RED arm.
+// one, where sqrt(-1) and log(0) THROW. log/log10/exp now have Stata entries
+// below (fnLogStata & co., w2x_fn_string_math), registered over mathNamespace's
+// Python ones for Stata callers only, and so do sqrt and abs (fnSqrtStata,
+// BUG-1360); the postfile registry keeps the Python five.
 double engineFin(double v) { return std::isfinite(v) ? v : kNaN; }
 
 template <typename F>
 PyValue mathUnaryStata(const std::vector<PyValue>& args, const char* name, F f) {
   requireArity(args, 1, 1, name);
+  requireNumeric(args);
   auto v = pythonFloat(args[0]);
   if (!v) return PyValue::floating(kNaN);
-  if (std::isnan(*v)) return PyValue::floating(kNaN);
-  return PyValue::floating(f(*v));
+  if (std::isnan(*v)) return PyValue::floating(kStataMissingSentinel);
+  // A missing argument is the 2^1023 band here, not a number: ln(.) and
+  // asinh(.) are `.`, never ln(2^1023) = 709.78 (fx_log_edges, fx_asinh_edges).
+  // An overflow to -inf is not missing (it is below `.`): exp(-1e300*1e10) is 0.
+  if (*v >= kStataMissingSentinel) return PyValue::floating(kStataMissingSentinel);
+  // An out-of-domain result (engineFin's NaN: log(0), log(-1)) or an overflow is
+  // `.` itself, so `log(0) == .` is 1 (w2x_fn_string_math.log:1065 f1;
+  // missing_range_oracle.log:82).
+  const double r = f(*v);
+  return PyValue::floating((std::isnan(r) || std::fabs(r) >= kStataMissingSentinel)
+                               ? kStataMissingSentinel
+                               : r);
 }
 
 PyValue fnLn(const std::vector<PyValue>& a) {
@@ -1710,9 +2550,70 @@ PyValue fnCos(const std::vector<PyValue>& a) {
 PyValue fnTan(const std::vector<PyValue>& a) {
   return mathUnaryStata(a, "tan", [](double x) { return std::tan(x); });
 }
+// Stata's asinh is ln(x + sqrt(x^2 + 1)), odd-symmetric: asinh(1e-10) is
+// +1.b7cdffffa18d8X-022 where libm's asinh gives ...fd9d7bdbb (fx_asinh_edges).
+// Where x^2 overflows, ln|x| + ln 2 (asinh(1e300) +1.59bbfd8b83e43X+009).
 PyValue fnAsinh(const std::vector<PyValue>& a) {
-  return mathUnaryStata(a, "asinh", [](double x) { return engineFin(std::asinh(x)); });
+  return mathUnaryStata(a, "asinh", [](double x) {
+    const double ax = std::fabs(x);
+    const double sq = ax * ax + 1.0;
+    const double r = std::isfinite(sq) ? std::log(ax + std::sqrt(sq)) : std::log(ax) + M_LN2;
+    return engineFin(x < 0 ? -r : r);
+  });
 }
+// log/ln, log10 and exp with Stata's answers, overriding mathNamespace()'s
+// Python-semantics entries (which postfile keeps): a missing or out-of-domain
+// argument is `.`; log10(x) is ln(x)/ln(10) (log10(1000) +1.7ffffffffffffX+001,
+// fx_log10_edges); exp past Stata's largest double (2^1023) is `.` and exp of an
+// argument below -709 is 0 (exp(709.78) and exp(710) `.`, exp(-745) 0,
+// fx_exp_edges; exp(-717.5) 0 and exp(-709) libm's subnormal, StataBE bits,
+// cecon::stata_exp_value in core/stata_arith.h).
+PyValue fnLogStata(const std::vector<PyValue>& a) {
+  return mathUnaryStata(a, "log", [](double x) { return x > 0 ? std::log(x) : kNaN; });
+}
+PyValue fnLog10Stata(const std::vector<PyValue>& a) {
+  return mathUnaryStata(a, "log10", [](double x) { return x > 0 ? std::log(x) / M_LN10 : kNaN; });
+}
+PyValue fnExpStata(const std::vector<PyValue>& a) {
+  return mathUnaryStata(a, "exp", [](double x) {
+    return engineFin(cecon::stata_exp_value(x));
+  });
+}
+
+// sqrt and abs, over mathNamespace()'s Python entries for the Stata callers
+// (postfile keeps those): a missing argument is plain `.` -- sqrt(.) was
+// sqrt(2^1023) = 9.48e+153 and abs(.a) kept the `.a` -- and sqrt of a negative
+// number is `.` rather than Python's math-domain error, which failed the whole
+// expression, so `sqrt(-1) >= .` printed `.` where Stata answers 1 (BUG-1343,
+// BUG-1360).
+PyValue fnSqrtStata(const std::vector<PyValue>& a) {
+  return mathUnaryStata(a, "sqrt", [](double x) { return engineFin(std::sqrt(x)); });
+}
+PyValue fnAbsStata(const std::vector<PyValue>& a) {
+  return mathUnaryStata(a, "abs", [](double x) { return std::fabs(x); });
+}
+
+// floor and ceil, over mathNamespace()'s Python entries for the Stata callers
+// (postfile keeps those): an infinity passes through instead of raising
+// OverflowError, as in Stata -- floor(-1e300*1e10) is -inf, so missing() of it
+// is 0 -- a missing argument keeps its kind (floor(.a) is .a, BUG-1371), and a
+// string is r(109).
+template <typename F>
+PyValue integerPartStata(const std::vector<PyValue>& args, const char* name, F f) {
+  requireArity(args, 1, 1, name);
+  requireNumeric(args);
+  if (!args[0].isFloat()) return PyValue::integer(args[0].intVal());
+  const double r = f(args[0].floatVal());
+  if (!std::isfinite(r) || std::fabs(r) >= 9.3e18) return PyValue::floating(r);
+  return PyValue::integer(static_cast<long long>(r));
+}
+PyValue fnFloorStata(const std::vector<PyValue>& a) {
+  return integerPartStata(a, "floor", [](double x) { return std::floor(x); });
+}
+PyValue fnCeilStata(const std::vector<PyValue>& a) {
+  return integerPartStata(a, "ceil", [](double x) { return std::ceil(x); });
+}
+
 PyValue fnLn1p(const std::vector<PyValue>& a) {
   return mathUnaryStata(a, "ln1p", [](double x) { return engineFin(std::log1p(x)); });
 }
@@ -1731,15 +2632,21 @@ PyValue fnLn1m(const std::vector<PyValue>& a) {
 // piet/eval/stata_datemask.h and the numbers they build come from the shared
 // cecon:: calendar, so `date("2020-03-15","YMD")` and `mdy(3,15,2020)` agree.
 
+// A translator called with the wrong number of arguments is Stata's r(198), not a
+// value: `scalar s = date("01jan2010")` and `generate double g =
+// date("01jan2010")` both answer 198 (w2y_fn_datetime fd_date1). The `r(198):`
+// prefix is the channel evalArith (scalar/local/display) and the row evaluator
+// (strmutate) forward as the exact code.
 PyValue translateFn(const std::vector<PyValue>& args, datemask::Kind kind,
                     const char* name) {
-  requireArity(args, 2, 3, name);
+  if (args.size() < 2 || args.size() > 3)
+    throw PyExc(std::string("r(198): ") + name + "() takes a string, a mask and an optional topyear");
   const std::string s = pythonStr(args[0]);
   const std::string mask = pythonStr(args[1]);
   bool have_top = false;
   double top = 0.0;
   if (args.size() == 3) {
-    auto t = pythonFloat(args[2]);
+    auto t = dateArg(args[2]);
     if (!t || std::isnan(*t)) return PyValue::floating(kNaN);
     have_top = true;
     top = *t;
@@ -1825,6 +2732,7 @@ PyValue fnSoundexNara(const std::vector<PyValue>& args) {
 
 PyValue fnInt(const std::vector<PyValue>& args) {
   requireArity(args, 1, 1, "int");
+  requireNumeric(args);  // BUG-462
   auto v = pythonFloat(args[0]);
   if (!v) return PyValue::floating(kNaN);
   return PyValue::floating(std::isnan(*v) ? kNaN : std::trunc(*v));
@@ -1839,6 +2747,7 @@ PyValue fnInt(const std::vector<PyValue>& args) {
 // (src/data/frame_internal.h), restated because that header is engine-only.
 PyValue fnFloat(const std::vector<PyValue>& args) {
   requireArity(args, 1, 1, "float");
+  requireNumeric(args);  // BUG-462
   auto v = pythonFloat(args[0]);
   if (!v) return PyValue::floating(kNaN);
   const double x = *v;
@@ -1900,12 +2809,19 @@ void addStataFns(PyNamespace& ns) {
   ns.fns["float"] = fnFloat;  // BUG-471 T2
   // The engine-only seven (see engineFin above).
   ns.fns["ln"] = fnLn;
+  ns.fns["log"] = fnLogStata;
+  ns.fns["log10"] = fnLog10Stata;
+  ns.fns["exp"] = fnExpStata;
   ns.fns["sin"] = fnSin;
   ns.fns["cos"] = fnCos;
   ns.fns["tan"] = fnTan;
   ns.fns["asinh"] = fnAsinh;
   ns.fns["ln1p"] = fnLn1p;
   ns.fns["ln1m"] = fnLn1m;
+  ns.fns["sqrt"] = fnSqrtStata;  // BUG-1343/1360: over mathNamespace()'s Python sqrt
+  ns.fns["abs"] = fnAbsStata;    // BUG-1360: abs(.a) is `.`
+  ns.fns["floor"] = fnFloorStata;
+  ns.fns["ceil"] = fnCeilStata;
   // B3(a): string-argument date translation.
   ns.fns["date"] = fnDate;
   ns.fns["daily"] = fnDaily;
@@ -1979,7 +2895,7 @@ void addStataFns(PyNamespace& ns) {
   // evaluation shape there would be a silent wrong answer for `generate str
   // t = string(sum(x))` (fnSum's own comment: "outside of one a single
   // evaluation just answers x itself" — inside a row plane, Stata wants a
-  // running total, which this file does not implement). runiform()/
+  // running total -- strmutate.cpp installs that one, addRowPlaneSum). runiform()/
   // runiformint() move for the same reason: a per-evaluation draw reaching a
   // row-plane `generate` would not be the engine's seeded per-row stream.
   // The registry entries themselves refuse by name (r(199)); a session-bound
@@ -1993,8 +2909,14 @@ void addStataFns(PyNamespace& ns) {
   ns.fns["ttail"] = fnTtail;
   ns.fns["invttail"] = fnInvttail;
   ns.fns["invt"] = fnInvt;
+  ns.fns["Ftail"] = fnFtail;
   ns.fns["normal"] = fnNormal;
+  ns.fns["normalden"] = fnNormalden;
   ns.fns["invnormal"] = fnInvnormal;
+  ns.fns["invlogit"] = fnInvlogit;  // BUG-1066
+  ns.fns["logit"] = fnLogit;
+  ns.fns["reldif"] = fnReldif;  // BUG-1046
+  ns.fns["tobytes"] = fnTobytes;  // BUG-1373
   ns.fns["reverse"] = fnReverse;
   ns.fns["strrpos"] = fnStrrpos;
   ns.fns["wordcount"] = fnWordcount;
@@ -2013,6 +2935,17 @@ void addStataFns(PyNamespace& ns) {
   ns.fns["strproper"] = fnProper;
   ns.fns["strofreal"] = fnString;
   ns.fns["usubinstr"] = fnSubinstr;
+  // piet-row-evaluator-string-data-arms: the data arms of w2c_functions.log
+  // with no macro twin. itrim() is Stata's older name of stritrim() (same
+  // pointer: itrim_data :440 "  Ab cD " is exactly stritrim's internal-run
+  // collapse); the four ustr* names are new functions above. Each name is
+  // also in strmutate.cpp's stringFnNames(), the row evaluator's routing
+  // vocabulary.
+  ns.fns["itrim"] = fnStritrim;
+  ns.fns["ustrlen"] = fnUstrlen;
+  ns.fns["ustrleft"] = fnUstrleft;
+  ns.fns["ustrtrim"] = fnUstrtrim;
+  ns.fns["ustrregexm"] = fnUstrregexm;
   // The old comment here said 36 while the map held 32; registry.cpp:1702 records
   // that discrepancy as the reason --dump-functions reads the MAPS. Corrected to
   // the counted truth and kept counted: 74 = 32 pre-existing + mi + int +
@@ -2021,7 +2954,7 @@ void addStataFns(PyNamespace& ns) {
   // of mathNamespace()'s round/min/max, less sum/group/runiform/runiformint
   // and regexs, moved to addStataMacroOnlyFns) — 93 was already stale before
   // this (registry.cpp's --dump-functions is the live count, not this literal).
-  dprof::noteNsBuild(111);
+  dprof::noteNsBuild(112);
 }
 
 // BUG-660 fix round: the macro/arith-ONLY functions split out of
@@ -2044,6 +2977,13 @@ void addStataFns(PyNamespace& ns) {
 // before this fix round. macro-layer regexs (regexs_macro_standalone) has no
 // such row-plane ordering to get wrong -- it is a plain sequential call in
 // the same evaluator as its regexm() -- so it stays available here.
+//
+// piet-row-evaluator-string-data-arms: the row plane now carries regexs()
+// too, through addRowPlaneRegexs() below -- the same fnRegexs, read through
+// the RegexsRowScope snapshot that reproduces the oracle's row-1 "" (see the
+// comment above fnRegexs). Without that scope a row-plane regexs() would be
+// the silent wrong answer described above; with it, evalRows is the one
+// caller that opens the scope.
 void addStataMacroOnlyFns(PyNamespace& ns) {
   ns.fns["sum"] = fnSum;
   ns.fns["group"] = fnGroup;
@@ -2051,6 +2991,10 @@ void addStataMacroOnlyFns(PyNamespace& ns) {
   ns.fns["runiformint"] = fnRuniformintMacro;
   ns.fns["regexs"] = fnRegexs;
 }
+
+void addRowPlaneRegexs(PyNamespace& ns) { ns.fns["regexs"] = fnRegexs; }
+
+void addRowPlaneSum(PyNamespace& ns) { ns.fns["sum"] = fnSumRow; }  // BUG-1369
 
 // EXPRLAYER-1c: mathNamespace(false) + addStataFns(), built once per process.
 // Callers that used to rebuild it per expression now point a per-call

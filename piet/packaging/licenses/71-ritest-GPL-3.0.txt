@@ -1,0 +1,17 @@
+ritest 1.1.7 (Simon Hess) — GPL-3.0
+Adopted at: piet/native/src/handlers_e3_ritest.cpp (derived from ritest.ado; line cites there refer to the ado)
+
+Project:  ritest — Stata module to perform randomization inference and permutation tests
+Authors:  Simon Hess
+Version:  1.1.7 (feb2020)
+Source:   Statistical Software Components (SSC / RePEc), https://ideas.repec.org/c/boc/bocode/s458599.html
+Evidence: The licence is the GNU General Public License version 3, as stated on the SSC/RePEc listing https://ideas.repec.org/c/boc/bocode/s458599.html: "The module is made available under terms of the GPL v3 (https://www.gnu.org/licenses/gpl-3.0.txt)."
+Licence:  GNU General Public License version 3.
+
+No upstream LICENSE text ships with the package; the licence is stated in its
+SSC listing. The ado carries no licence header, and the project's GitHub repository (simonheb/ritest) has no LICENSE file.
+
+The full text of the GNU General Public License version 3 or later, under which this project is distributed, ships beside this application as LICENSE.txt.
+
+Copyright remains with the package authors for the portions derived from their
+code.

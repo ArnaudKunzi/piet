@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — reg3: systems estimation (SUR / 3SLS) matching Stata `reg3`.
 // Stage 1: project endogenous regressors onto the full instrument set W → Ẑ_i
 //   (SUR has no endogenous regressors, so Ẑ_i = Z_i). Stage 2: Σ=I first pass

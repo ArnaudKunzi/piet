@@ -1,7 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Group-level parallel execution — `parallel[, workers(N)] { … }`.
 //
 // PLEVEL-IMPL-WAVE arc ① (SKELETON). Design authority =
-// private-notes/plans/FLOOR-20260721-campaign/PLEVEL-DESIGN-brief.md; the User
+// internal note PLEVEL-DESIGN-brief.md; the User
 // rulings this file implements are PENDING-USER #14 (RESOLVED block) + SE-062:
 //   · syntax = §2.3 option **B** (a real block command, not the `*! piet`
 //     comment directive of option A — A is a later surface on top of this same
@@ -215,10 +217,12 @@ ojson buildTaskSpec(const std::vector<std::string>& tasks, const SessionState& s
 // schema, and arc ② replaces the env gate with the real per-worker handoff.
 std::string dumpTaskSpecIfRequested(const ojson& spec);
 
-// `piet_native --parallel-worker <spec.json>` — the child entry point (§3.2).
+// `piet_native --parallel-worker <spec>` — the child entry point (§3.2).
 // Reads a spec written by buildTaskSpec, runs its tasks through the SAME
-// dispatch()/doexec path the parent would have, and writes ONE JSON object to
+// dispatch()/doexec path the parent would have, and writes ONE object to
 // stdout: {"ok":true,"tasks":[{"index":i,"blocks":[…],"failed":bool}, …]}.
+// Spec and result are CBOR, which keeps a string's bytes exactly when they
+// are not UTF-8, as JSON text cannot (BUG-1131).
 // stdout is the protocol channel, so the tasks' own output lives INSIDE it as
 // data — the child never writes user-visible text to stdout, which is what lets
 // the parent replay blocks in source order and keep G-1 byte-identity.

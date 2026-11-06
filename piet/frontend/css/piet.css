@@ -672,7 +672,7 @@ td.vg-cell-editing input {
    mouseleave) and inserts the variable's bare name at the cursor (B8).
    Quick-stats (B14) read the passive summarize-result cache (varstats.js) —
    a "summarize 캐시" chip when cached, else a hint to run summarize / enable
-   auto-summarize. Design ref: private-notes/plans/
+   auto-summarize. Design ref: internal mockup
    UIUX-P8-mockup-v3-pipboy.html §2 (.vcard). Tokens only, so light/dark and
    Boring/De Stijl all resolve automatically — --primary-blue repoints to a
    neutral dark-blue in Boring-Dark and to the Pip-Boy phosphor in

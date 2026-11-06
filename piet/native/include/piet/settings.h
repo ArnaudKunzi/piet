@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // PIET 2.2.0 item D — persisted app-shell settings + hardware detection.
 //
 // The "Engine & scratch" half of the Settings panel is persisted NATIVELY

@@ -1,66 +1,24 @@
-# Unreleased
+# PIET A.0.0 / CoBrA 1.0.0 — public source cut of 2026-11-06
 
-- Restore `egen concat()`, `egen cut()`, and `bcal create` with three independent
-  algorithms written against public behavior specifications and small synthetic
-  black-box observations. No excluded private implementations or Stata ado
-  source were used for these replacements.
-- Add optional value-label transport for `concat(), decode` and `cut(), label`.
-- Add self-contained public regressions for strings, numeric formatting, interval
-  and quantile bins, labels, qualifiers, calendar omissions, and date conversion.
-  Local validation passes all 18 restored-function groups, the existing smoke
-  suite, CTest 3/3, and the 24-step native UI journey. No new packaged release is
-  declared here.
-- Reject malformed or duplicate options, preserve string and numeric storage
-  metadata, and reload generated calendars from the session working directory.
-- Clip decoded labels at complete UTF-8 character boundaries under `maxlength()`;
-  use the numeric code if no character fits the byte limit.
-- Calendar generation emits explicit omissions in the documented file grammar.
-  It does not promise byte-identical Stata serialization. Personal calendars use
-  the configured PERSONAL directory and can be loaded from another working
-  directory or a fresh session. `generate()` accepts `if`/`in` while preserving
-  original row order and missing values outside the sample. Ranges may extend the observed
-  span; inferred nonbusiness weekdays and the maximum-gap limit still apply.
+This cut replaces the experimental 2026-10 source beta with the full current
+source tree of PIET A.0.0 and CoBrA 1.0.0 (the compiled version strings), as
+prepared for public distribution on 2026-11-06. The whole tree is replaced in
+one commit on top of the beta's own public history; no private development
+history, private oracle logs, licensed reference datasets, or internal
+automation is included.
 
-See [RESTORED_FUNCTIONS.md](docs/RESTORED_FUNCTIONS.md) for sources, design, and limits.
-The Beta 1 download and its original release record below remain historical.
+- Every statistical routine ships as the project's own implementation. Code
+  adapted from GPL-compatible open-source projects is declared in
+  `THIRD_PARTY_NOTICES.txt` and in a header comment of the file that carries it.
+- Tests and self-test arms that depend on private oracle fixtures report
+  themselves as declared skips in a public clone; the fixtures they name are
+  not required to build or use the software.
+- Corresponding source for any binary published on the release page is this
+  repository at the release tag.
 
-# PIET 1.0 Beta 1 — v1.0.0-beta.1
+# PIET 1.0 Beta 1 — v1.0.0-beta.1 (historical)
 
-This adds an Apple Silicon DMG to the first public source snapshot of PIET + CoBrA.
-It has a new Git history containing only the public distribution tree.
-No private development history, licensed reference datasets, reference-software
-binaries, reference logs, or internal automation configuration are included.
-Corresponding source: [public beta tag](https://github.com/w4s7jksf68-ai/piet/tree/v1.0.0-beta.1)
-and the source archives on its GitHub release page.
-
-## Changes for public distribution
-
-- PIET now reports `1.0.0-beta.1` and shows **PIET 1.0 Beta 1** in About;
-  CoBrA keeps its separate `0.41.0` engine version.
-- Downloadable macOS app containing the native interface, CoBrA engine,
-  synthetic sample, GPL text, and third-party notices.
-- The DMG is ad-hoc signed and not notarized. macOS may require the user to
-  allow the first launch in System Settings → Privacy & Security.
-- Source build instructions and one-command macOS build/test entry point.
-- Synthetic sample in place of a third-party research dataset.
-- Original dependency licenses and a consolidated attribution file, including
-  Howard Hinnant's public-domain civil-date algorithms.
-- `egen concat`, `egen cut`, and `bcal create` implementations withheld pending
-  provenance clearance; invocation fails explicitly. Calendar reading remains.
-- Browser fixture mode disabled: statistical output requires native computation.
-- Self-contained thread/determinism tests and independent OLS/data IO checks.
-
-## Validation scope
-
-See the GitHub Actions result for this exact public commit. The earlier source
-snapshot's local checks are recorded in VALIDATION.md; this DMG's checks are
-recorded on the GitHub release page. The original private reference corpus is
-not part of this release and was not rerun as public-release certification.
-
-No Developer ID signed or notarized installer is provided. The DMG is for
-Apple Silicon, requires macOS 13.3 or newer, and was tested on macOS 26.6.2.
-Older macOS versions, Windows, and Linux are not validated release targets.
-Compatibility is incomplete;
-passing the included checks does not certify all estimators or command syntax.
-PIET reports `1.0.0-beta.1`; CoBrA reports `0.41.0` separately. Include the
-public tag and commit when reporting issues.
+The first public source snapshot (2026-10-12) with an Apple Silicon DMG. It
+used a different version naming scheme and withheld several functions pending
+provenance review; those functions are present in the current tree as the
+project's own implementations.

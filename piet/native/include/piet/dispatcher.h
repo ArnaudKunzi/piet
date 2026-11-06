@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // dispatcher — the central dispatch function, C++ port of
 // piet/backend/piet/dispatcher.py's dispatch(): raw Stata command string ->
 // list[ResultBlock] (see CONTRACT.md's ResultBlock union).

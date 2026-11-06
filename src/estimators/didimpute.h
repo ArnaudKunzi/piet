@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Borusyak, Jaravel & Spiess imputation estimator for staggered-adoption
 // event studies, implemented from the published methodology paper:
 //
@@ -5,11 +7,8 @@
 //           Event-Study Designs: Robust and Efficient Estimation", Review of
 //           Economic Studies 91(6), 3253-3285.
 //
-// Clean-room provenance: implemented from the paper cited above only. No
-// existing did_imputation.ado (or the didimputation R package, or any other
-// prior art) was read or consulted; conventions the paper leaves open are
-// pinned by this project's own committed goldens and unit tests, per the
-// clean-room precedent set for csdid (docs/legal/CSDID_CLEANROOM_WALL.md).
+// Method source: the paper cited above. Conventions the paper leaves open are
+// pinned by this project's own committed goldens and unit tests.
 //
 // didimpute_run implements BJS24's imputation estimator (§2-3):
 //

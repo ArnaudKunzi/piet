@@ -1,4 +1,6 @@
-// See sdid.h for method sources, clean-room provenance, and the list of
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
+// See sdid.h for method sources and the list of
 // conventions AAHIW21 leaves open that this file pins.
 //
 // SWEEP (fleet law: when several plausible formulations exist, MEASURE which one

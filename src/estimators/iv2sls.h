@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — 2SLS / IV with high-dimensional fixed effects (FWL within transform).
 #pragma once
 #include <cstdint>
@@ -29,12 +31,12 @@ namespace cecon {
 //     OLS) come back at mreldif ~1.0 and ~0.93, so the comparator is not vacuous.
 //   * arm F: the first stage is INVARIANT to the parent's `small`
 //     (mreldif = +0.0000000000000X-3ff, i.e. exactly 0, and dfr unchanged) while the
-//     PARENT's own V moves by a factor 1.042. ivreg2.sthlp:719-722 — "The first-stage
-//     results are ALWAYS reported with small-sample statistics."
+//     PARENT's own V moves by a factor 1.042. ivreg2's help (help ivreg2) states that the first-stage
+//     results are always reported with small-sample statistics.
 // So: the stored first stage is `regress <endog> <exexog> <inexog>, <parent vce>`
 // with the small-sample correction always on, whatever the parent asked for.
 //
-// The ONE place it is not `regress`: `df_r`. ivreg2.ado:3143 posts N - iv1_ct -
+// The ONE place it is not `regress`: `df_r`. ivreg2 posts N - iv1_ct -
 // dofminus - sdofminus unconditionally, so under cluster() it is N-K where Stata's
 // own `regress, cluster()` would post M-1 — measured in arm E as dfr_fs = 70 against
 // dfr_ols = 8 on the same fit. Every t, p and CI a consumer computes off a restored
@@ -47,12 +49,25 @@ struct IvFirstStage {
     std::string vcov_type;
     int n_clusters = 0;
     int64_t n = 0;
-    int64_t df_r = 0;   // ivreg2.ado:3143 — N - iv1_ct - dofminus, EVEN under cluster
+    int64_t df_r = 0;   // ivreg2 posts N - iv1_ct - dofminus, EVEN under cluster
     int df_m = 0;       // slopes only (arm A: 4 of 5 columns)
-    int k_eq = 0;       // ivreg2.ado:3153 posts the ENDOGENOUS COUNT here, not this eq's k
-    double rmse = 0;    // ivreg2.ado:6151 sqrt(rss/(N-L-dofminus-sdofminus))
+    int k_eq = 0;       // ivreg2 posts the ENDOGENOUS COUNT here, not this eq's k
+    double rmse = 0;    // ivreg2: sqrt(rss/(N-L-dofminus-sdofminus))
     double rss = 0;
+    // ivreg2's e(first) column for this regressor (s_ffirst),
+    // the 21 rows in ivreg2_first_stat_rows() order. Empty when not computed: absorbed
+    // fixed effects (no captured dofminus/sdofminus regime) or a multiway VCE.
+    std::vector<double> ffirst;
 };
+
+// Row names of ivreg2's e(first), in order (as ivreg2 posts them).
+inline const std::vector<std::string>& ivreg2_first_stat_rows() {
+    static const std::vector<std::string> rows = {
+        "rmse", "sheapr2", "pr2", "F", "df", "df_r", "pvalue",
+        "SWF", "SWFdf1", "SWFdf2", "SWFp", "SWchi2", "SWchi2p", "SWr2",
+        "APF", "APFdf1", "APFdf2", "APFp", "APchi2", "APchi2p", "APr2"};
+    return rows;
+}
 
 struct IvResult {
     int64_t n = 0;
@@ -81,6 +96,12 @@ struct IvResult {
     // Stata's ivreghdfe silently omits these and proceeds; empty on every fit that
     // has nothing to omit, which is what keeps the JSON byte-identical there.
     std::vector<std::string> omitted;
+    // BUG-1225: included exogenous regressors dropped as collinear after the FE
+    // absorption (ivreghdfe posts them as omitted, b 0 and se 0, and leaves them out
+    // of K), and the pre-omission [exog, endog] names that place them in the reply.
+    // Both empty on every fit with nothing to omit.
+    std::vector<std::string> omitted_exog;
+    std::vector<std::string> full_names;
     std::vector<double> first_stage_F;  // per endogenous regressor (homoskedastic)
     // `ivreg2 …, savefirst`: the full per-endogenous first-stage estimate, so a
     // consumer can register it as a stored estimate. Empty unless savefirst was
@@ -118,8 +139,16 @@ struct IvResult {
 // Ignored when gmm=true (GMM's own sandwich VCE is untouched either way).
 // `savefirst` additionally fills IvResult::first_stage (see IvFirstStage above).
 // Default false leaves the fit and its JSON byte-identical to before it existed.
+// `multiway_subset_factors` (FU-387): with small=true and a multiway VCE, Stata
+// ivregress's `small` multiway variance -- compute_vcov's built-in convention
+// (per-combination G_S/(G_S-1)*(N-1)/(N-K), the full-matrix clip). Read nowhere else;
+// default false keeps every fit byte-identical.
+// md.weights (aweight/pweight only): the fit is weighted the way ivreg2 weights it,
+// with a weighted within transform under --fe (iv_apply_weights in iv2sls.cpp);
+// empty leaves the fit untouched.
 IvResult iv2sls_fit(IvModelData& md, Vcov vt, int cluster_index = 0, bool gmm = false,
-                    bool small = false, bool savefirst = false);
+                    bool small = false, bool savefirst = false,
+                    bool multiway_subset_factors = false);
 
 // Multi-outcome batch: fit the SAME 2SLS design (exog/endog/instruments/fe in
 // md) against several outcomes, sharing the expensive FE absorption of the X
@@ -128,7 +157,8 @@ IvResult iv2sls_fit(IvModelData& md, Vcov vt, int cluster_index = 0, bool gmm = 
 // the per-outcome demean(y)/solve/residuals/vcov/Hansen-J are recomputed.
 // `ys[o]` is outcome o's values aligned to md's kept rows (length md.n), assumed
 // jointly observed (the caller enforces a common sample). md.Xexog/Xendog/Zinst
-// are demeaned in place once. Returns one IvResult per outcome.
+// are demeaned in place once. md.weights weight every outcome alike (the X side
+// once, each y in turn). Returns one IvResult per outcome.
 std::vector<IvResult> iv2sls_fit_multi(IvModelData& md, std::vector<std::vector<double>>& ys,
                                        Vcov vt, int cluster_index = 0, bool gmm = false,
                                        bool small = false, bool savefirst = false);

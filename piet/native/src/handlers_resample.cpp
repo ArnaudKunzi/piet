@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // resampling prefixes — `bootstrap:`, `jackknife:`, `permute:` (P6 wave).
 //
 // DESIGN — the loop lives HERE, on the PIET side, and the inner command runs
@@ -25,15 +27,17 @@
 // are expanded, because those may legitimately carry locals
 // (`reps(`R')`, `: regress `depvar' x`).
 //
-// RNG — ours, not Stata's. A fixed `seed()` makes OUR stream reproducible
-// (Philox4x32-10 from the engine's own rng.h: counter-based, so replicate r,
-// position j is a pure function of the seed and never depends on evaluation
-// order). We do not attempt to reproduce Stata's draw sequence, and there is no
-// sense in which we could: what is contracted is that the ESTIMATOR MATHEMATICS
-// is right and the presentation follows Stata. Consequently the deterministic
-// method (jackknife) is checked against the oracle digit for digit, while the
-// stochastic ones are checked on their own algebraic identities plus agreement
-// with the analytic limit.
+// RNG. `bootstrap` draws Stata's own replicates (User ruling 2026-10-27: the
+// session RNG is Stata-exact MT19937-64 and resampling draws follow the Stata
+// stream). runBootstrap below implements bootstrap's behaviour, identified
+// against StataBE probes (scratch-r150/lee/bs/o1.do/.log): `seed()` is a
+// `set seed` issued after the full-sample run, each replicate is one `bsample`
+// call (bsample_draws.h, shared with the `bsample` command) on the session
+// stream, so with the same seed PIET reproduces Stata's bootstrap standard
+// errors, and without one the draws continue the session stream as Stata's do.
+// `permute` still shuffles on Philox4x32-10 (the engine's counter-based rng.h,
+// reproducible for a fixed seed() but NOT Stata's permutation stream): it is
+// checked on its own counting identities, not on Stata's p-values.
 //
 // MATERIALIZATION — PIET has no hbin writer, so a computed column reaches the
 // data the way every other PIET-side computation does: write a CSV, run `cobra
@@ -45,18 +49,25 @@
 #include "piet/handlers.h"
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <numeric>
 #include <optional>
+#include <regex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
+#include "bsample_draws.h"       // bsample's Stata draws (shared with the bsample command)
+#include "core/ident.h"          // the shared Unicode name rule
 #include "core/distributions.h"  // t_critical / t_twosided_pvalue / z_critical (shared with cobra)
-#include "core/rng.h"            // Philox4x32-10, the engine's own counter-based RNG
+#include "core/rng.h"            // Philox4x32-10, the engine's own counter-based RNG (permute)
+#include "handlers_e3_common.h"  // postBV / installEsampleMask / invsym / setE*OnFit
 #include "io/win_compat.h"
 #include "piet/cobra_runner.h"
 #include "piet/datastore.h"
@@ -66,6 +77,7 @@
 #include "piet/eval/macros.h"
 #include "piet/session_state.h"
 #include "piet/scratch_seq.h"
+#include "piet/strutil.h"
 
 namespace piet {
 namespace handlers {
@@ -78,11 +90,11 @@ ojson rsError(const std::string& message, const std::string& code = "engine_erro
   return ojson(eval::engineError(message, code));
 }
 
+// BUG-389: the tree's one minting body, so every replicate frame is in the mint
+// registry and the exit sweep reclaims what no ledger owns (the probe's census
+// counted 151 ORPHAN replicate files per bootstrap with the old local copy).
 std::string nextPath(const std::string& workdir, const std::string& prefix) {
-  static std::atomic<uint64_t> counter{0};
-  static const long long pid = static_cast<long long>(cecon::native_process_id());
-  return workdir + "/" + prefix + "_" + std::to_string(pid) + "_" +
-         std::to_string(counter.fetch_add(1, std::memory_order_relaxed)) + ".hbin";
+  return mintScratchPath(workdir, prefix);
 }
 
 CobraError errorFromRaw(const CobraRunResult& r) {
@@ -128,7 +140,7 @@ std::vector<ExpItem> parseExpList(const std::string& raw, std::string* err) {
     skipWs();
     if (i >= s.size()) break;
     const size_t nameStart = i;
-    while (i < s.size() && (std::isalnum(static_cast<unsigned char>(s[i])) || s[i] == '_')) ++i;
+    while (i < s.size() && cecon::ident::isIdentByte(s[i])) ++i;  // bytes >= 0x80: Unicode names
     const std::string name = s.substr(nameStart, i - nameStart);
     skipWs();
     if (name.empty() || i >= s.size() || s[i] != '=') {
@@ -151,7 +163,7 @@ std::vector<ExpItem> parseExpList(const std::string& raw, std::string* err) {
         size_t k = j;
         while (k < s.size() && std::isspace(static_cast<unsigned char>(s[k]))) ++k;
         size_t m = k;
-        while (m < s.size() && (std::isalnum(static_cast<unsigned char>(s[m])) || s[m] == '_')) ++m;
+        while (m < s.size() && cecon::ident::isIdentByte(s[m])) ++m;
         size_t n = m;
         while (n < s.size() && std::isspace(static_cast<unsigned char>(s[n]))) ++n;
         if (m > k && n < s.size() && s[n] == '=' && (n + 1 >= s.size() || s[n + 1] != '=')) {
@@ -256,7 +268,7 @@ std::string commaGroup(int64_t v) {
 std::string g9(double v) { return fmtStataDefaultG(v); }
 
 // BUG-183: a COEFFICIENT-TABLE cell is one character narrower than the shared
-// %9.0g `display` renderer — `_coef_table` reserves the sign column, so the
+// %9.0g `display` renderer — the coefficient table reserves the sign column, so the
 // digits get 8 characters where `display` gets 9. `fmtStataDefaultG` is
 // calibrated for `display` (its own doc comment records
 // `2.157789219986937 -> "2.1577892"`, nine characters) and is correct THERE, so
@@ -293,11 +305,15 @@ std::string g9cell(double v) {
   return s;
 }
 
+// Widths count CHARACTERS (StataBE pads a Unicode name by characters:
+// scratch-r150/uni-v/p4.do), so a multi-byte name stays aligned.
 std::string padLeft(const std::string& s, size_t w) {
-  return s.size() >= w ? s : std::string(w - s.size(), ' ') + s;
+  const size_t n = cecon::ident::codePointCount(s);
+  return n >= w ? s : std::string(w - n, ' ') + s;
 }
 std::string padRight(const std::string& s, size_t w) {
-  return s.size() >= w ? s : s + std::string(w - s.size(), ' ');
+  const size_t n = cecon::ident::codePointCount(s);
+  return n >= w ? s : s + std::string(w - n, ' ');
 }
 std::string fixed2(double v) {
   char buf[64];
@@ -352,7 +368,975 @@ std::pair<double, double> clopperPearson(int64_t c, int64_t n, double alpha) {
 // from here.
 double normalTwoSidedP(double z) { return std::erfc(std::fabs(z) * 0.7071067811865476); }
 
+// bootstrap's exp_list: `name=exp` elements (exp one token or parenthesized) and
+// UNNAMED ones, a parenthesized `(exp)` or a bare token such as
+// `_b[treat:lower]`; an unnamed element at position i is named `_bs_i` and its
+// e(exp#) loses the outer parentheses (StataBE scratch-r150/lee/bs/o5.log U1:
+// `_b[treat:lower] (_b[treat:upper]*2)` -> _bs_1 _bs_2, e(exp2) `_b[treat:upper]*2`).
+std::vector<ExpItem> parseBootstrapExpList(const std::string& s, std::string* err) {
+  std::vector<ExpItem> out;
+  size_t i = 0;
+  auto ws = [&](size_t k) { return k < s.size() && std::isspace(static_cast<unsigned char>(s[k])); };
+  // End of a bracket-balanced run starting at k that stops at depth-0 space.
+  auto tokenEnd = [&](size_t k) {
+    int depth = 0;
+    while (k < s.size()) {
+      const char c = s[k];
+      if (c == '(' || c == '[') ++depth;
+      else if (c == ')' || c == ']') --depth;
+      else if (depth <= 0 && std::isspace(static_cast<unsigned char>(c))) break;
+      ++k;
+    }
+    return k;
+  };
+  while (true) {
+    while (ws(i)) ++i;
+    if (i >= s.size()) break;
+    size_t m = i;
+    while (m < s.size() && cecon::ident::isIdentByte(s[m])) ++m;
+    size_t n = m;
+    while (ws(n)) ++n;
+    const bool named = m > i && n < s.size() && s[n] == '=' && (n + 1 >= s.size() || s[n + 1] != '=');
+    if (named) {
+      // name=exp: the expression is ONE token -- a spaced expression must be
+      // parenthesized, as in Stata (`d = _b[x] - (_b[_cons])` is "expressions
+      // must be bound in parentheses", o6.log I2; the bare `-` token below).
+      size_t j = n + 1;
+      while (ws(j)) ++j;
+      const size_t e = tokenEnd(j);
+      std::string expr = s.substr(j, e - j);
+      if (expr.size() >= 2 && expr.front() == '(' && expr.back() == ')') expr = expr.substr(1, expr.size() - 2);
+      if (expr.empty()) {
+        *err = "empty expression for `" + s.substr(i, m - i) + "`";
+        return {};
+      }
+      out.push_back(ExpItem{s.substr(i, m - i), expr});
+      i = e;
+      continue;
+    }
+    const size_t e = tokenEnd(i);
+    std::string expr = s.substr(i, e - i);
+    if (std::strchr("+-*/^&|!<>=,", expr[0]) != nullptr) {
+      *err = "expressions must be bound in parentheses";
+      return {};
+    }
+    if (expr.size() >= 2 && expr.front() == '(' && expr.back() == ')') expr = expr.substr(1, expr.size() - 2);
+    if (expr.empty() || expr == "_b" || expr == "_se") {
+      *err = "`" + s.substr(i, e - i) +
+             "` mixed with other elements is not implemented in this version of PIET (the "
+             "default _b alone is)";
+      return {};
+    }
+    out.push_back(ExpItem{"_bs_" + std::to_string(out.size() + 1), expr});
+    i = e;
+  }
+  if (out.empty()) *err = "expression list required";
+  return out;
+}
+
+// `cmd ... [if exp] [in range] [weight] [, options]` with the if and in removed
+// (outside quotes and brackets; the if-expression runs to ` in `, `[` or the
+// option comma). Spacing of what remains is normalized to single blanks.
+std::string stripIfIn(const std::string& cmd) {
+  std::string head = cmd, tail;
+  const long long comma = eval::findUnquotedComma(cmd);
+  if (comma >= 0) {
+    head = cmd.substr(0, static_cast<size_t>(comma));
+    tail = cmd.substr(static_cast<size_t>(comma) + 1);
+  }
+  const std::vector<bool> quoted = eval::quotedSpanMask(head);
+  // Depth-0, unquoted word starts.
+  std::vector<std::pair<size_t, size_t>> words;  // [begin, end)
+  {
+    int depth = 0;
+    size_t i = 0;
+    while (i < head.size()) {
+      while (i < head.size() && std::isspace(static_cast<unsigned char>(head[i])) && depth == 0) ++i;
+      if (i >= head.size()) break;
+      const size_t b = i;
+      while (i < head.size()) {
+        const char c = head[i];
+        const bool q = i < quoted.size() && quoted[i];
+        if (!q && (c == '(' || c == '[')) ++depth;
+        else if (!q && (c == ')' || c == ']') && depth > 0) --depth;
+        else if (!q && depth == 0 && std::isspace(static_cast<unsigned char>(c))) break;
+        ++i;
+      }
+      words.emplace_back(b, i);
+    }
+  }
+  std::string out;
+  for (size_t w = 0; w < words.size(); ++w) {
+    const std::string word = head.substr(words[w].first, words[w].second - words[w].first);
+    if (w > 0 && word == "if") {
+      // skip the expression: up to the next `in` word or a `[weight]` word
+      size_t k = w + 1;
+      while (k < words.size()) {
+        const std::string nw = head.substr(words[k].first, words[k].second - words[k].first);
+        if (nw == "in" || nw[0] == '[') break;
+        ++k;
+      }
+      w = k - 1;
+      continue;
+    }
+    if (w > 0 && word == "in" && w + 1 < words.size()) {
+      ++w;  // the range
+      continue;
+    }
+    if (!out.empty()) out += ' ';
+    out += word;
+  }
+  while (!tail.empty() && std::isspace(static_cast<unsigned char>(tail.front()))) tail.erase(0, 1);
+  return tail.empty() ? out : out + ", " + tail;
+}
+
+// An error block carrying Stata's rc (coarseRc reads the `r(NNN)` reason).
+ojson bsRc(const std::string& message, int rc, const std::string& code = "engine_error") {
+  return ojson(eval::errorBlock(code, message, std::nullopt, std::nullopt, std::nullopt,
+                                "r(" + std::to_string(rc) + ")"));
+}
+
+const ojson* firstErrorBlock(const ojson& blocks) {
+  if (blocks.is_object()) return blocks.value("type", std::string()) == "error" ? &blocks : nullptr;
+  if (!blocks.is_array()) return nullptr;
+  for (const auto& b : blocks)
+    if (b.is_object() && b.value("type", std::string()) == "error") return &b;
+  return nullptr;
+}
+
+// Stata's `_pctile x, p(#)` (the default definition) on ascending `x`:
+// P = n*p/100, i = floor(P); x_(i+1) when P has a fractional part, else the
+// mean of x_(i) and x_(i+1) (clamped at the ends).
+double pctileStata(const std::vector<double>& x, double p) {
+  const size_t n = x.size();
+  if (n == 0) return std::nan("");
+  const double P = static_cast<double>(n) * p / 100.0;
+  const double fi = std::floor(P);
+  const long long i = static_cast<long long>(fi);
+  auto at = [&](long long k) {  // 1-based, clamped
+    if (k < 1) k = 1;
+    if (k > static_cast<long long>(n)) k = static_cast<long long>(n);
+    return x[static_cast<size_t>(k - 1)];
+  };
+  if (P - fi > 0) return at(i + 1);
+  return (at(i) + at(i + 1)) / 2.0;
+}
+
+// chi2tail(df, x) for the bootstrap Wald model test. PIET's expression layer
+// has no chi2tail(), so: df == 1 is 2*normal(-sqrt(x)) on Stata's normal()
+// (cecon::stata_normal); otherwise the regularized upper incomplete gamma
+// Q(df/2, x/2) by series / continued fraction -- the form handlers_e3_qreg2.cpp
+// chi2tailQ uses (file-local there, so kept in step here).
+double chi2tailBs(double df, double x) {
+  if (!(x > 0)) return 1.0;
+  if (df == 1.0) return 2.0 * cecon::stata_normal(-std::sqrt(x));
+  const double a = df / 2.0, z = x / 2.0;
+  const double gln = std::lgamma(a);
+  if (z < a + 1.0) {
+    double ap = a, sum = 1.0 / a, del = sum;
+    for (int n = 0; n < 1000; ++n) {
+      ap += 1.0;
+      del *= z / ap;
+      sum += del;
+      if (std::fabs(del) < std::fabs(sum) * 1e-16) break;
+    }
+    return 1.0 - sum * std::exp(-z + a * std::log(z) - gln);
+  }
+  double b = z + 1.0 - a, c = 1.0 / 1e-300, d = 1.0 / b, h = d;
+  for (int i = 1; i < 1000; ++i) {
+    const double an = -i * (i - a);
+    b += 2.0;
+    d = an * d + b;
+    if (std::fabs(d) < 1e-300) d = 1e-300;
+    c = b + an / c;
+    if (std::fabs(c) < 1e-300) c = 1e-300;
+    d = 1.0 / d;
+    const double del = d * c;
+    h *= del;
+    if (std::fabs(del - 1.0) < 1e-16) break;
+  }
+  return std::exp(-z + a * std::log(z) - gln) * h;
+}
+
+// A posted e() matrix (replaces one of the same name).
+void setEMatrix(SessionState& session, const std::string& name, eval::EvalMatrix m) {
+  for (auto& kv : session.eval.eMatrices) {
+    if (kv.first == name) {
+      kv.second = std::move(m);
+      return;
+    }
+  }
+  session.eval.eMatrices.emplace_back(name, std::move(m));
+}
+
+// Stata's option-abbreviation rule for one option: `key` names `full` when it
+// is a prefix of it at least `minLen` long.
+bool optIs(const std::string& key, const char* full, size_t minLen) {
+  const std::string f(full);
+  return key.size() >= minLen && key.size() <= f.size() && f.compare(0, key.size(), key) == 0;
+}
+
+// _prefix_title: the inner e(title) when it has one, else bootstrap.ado's
+// table of titles for a few commands, else "Bootstrap results".
+std::string bootstrapTitle(const std::string& innerTitle, const std::string& cmdname) {
+  if (!innerTitle.empty()) return innerTitle;
+  static const std::vector<std::pair<std::string, std::string>> k = {
+      {"cnreg", "Censored normal regression"},   {"logit", "Logistic regression"},
+      {"mlogit", "Multinomial logistic regression"}, {"ologit", "Ordered logistic regression"},
+      {"oprobit", "Ordered probit regression"},  {"probit", "Probit regression"},
+      {"regress", "Linear regression"},          {"tobit", "Tobit regression"}};
+  for (const auto& [c, t] : k)
+    if (c == cmdname) return t;
+  return "Bootstrap results";
+}
+
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// `bootstrap [exp_list] [, options] : command`
+//
+// Implements bootstrap's behaviour (with bsample), identified against StataBE probes (scratch-r150/lee/bs/o1.do,
+// o1.log; T-numbers below are its sections):
+//   * e() and r() are cleared, then the command runs once on the data (the
+//     observed statistics). An e-class command's e(sample) is the resampling
+//     base: rows outside it are dropped before the replicates (T6: 54 of 60
+//     rows after a missing regressor; T10: `if x > 2`). A command that leaves
+//     no e(sample) resamples the whole data.
+//   * No exp_list (or `_b`): every column of the command's e(b), named as e(b)
+//     names them, equation stripes included (T1, T4, T11 `y:x ... c:_cons`).
+//     A command without e(b) is r(100) "expression list required".
+//   * seed(#) is `set seed #` after the full-sample run (T9: `set seed 123` +
+//     bootstrap equals seed(123); without seed() the draws continue the
+//     session stream). Nothing else draws between replicates.
+//   * cluster(var): the base is sorted by the cluster (stable; a string cluster
+//     sorts by its bytes, T7) and each replicate is `bsample, cluster()`
+//     (bsdraw::clustSrswr); a missing cluster value in the base is r(459)
+//     (T8), one cluster r(460). Without cluster() each replicate is the
+//     no-option `bsample` (bsdraw::srswrFast).
+//   * Replicates are posted with `postfile` in FLOAT (bootstrap's default
+//     storage), so e(V) is the (n-1)-divisor covariance of the float-rounded
+//     replicate values over the replicates with no missing statistic; a
+//     replicate whose command fails or whose e(b) changes shape posts missing.
+//   * e(): e(b) the observed values, e(V) the replicate covariance, the
+//     inner e() copied (default _b only, less F/chi2/df_r/df_m), e(cmd) the
+//     inner e(cmd) for the default _b and "bootstrap" otherwise, plus
+//     bootstrap's own: N, N_reps, N_misreps, N_clust, level, k_eq, k_exp,
+//     k_eexp, k_extra, rank, bs_version, prefix, cmdname, command, exp#,
+//     vce, vcetype, clustvar/cluster, title, rngstate, the Wald model test
+//     (chi2/df_m/p/chi2type, default _b only) and the matrices b_bs, reps,
+//     bias, z0, se, ci_normal, ci_percentile, ci_bc, V_modelbased.
+//   * r(table): normal-based (z, df missing, crit invnormal(.975)).
+// Refused by name (not implemented): strata(), size(), idcluster(), saving(),
+// bca, mse, nodrop, reject(), and an r-class command with if/in.
+static ojson runBootstrap(const std::string& expListRaw, const std::string& optsRaw,
+                          const std::string& innerCmd, SessionState& session) {
+  const std::string method = "bootstrap";
+  if (!session.currentHbin().has_value()) return eval::noDataLoaded();
+  if (innerCmd.empty()) return rsError("bootstrap: no command found after the colon");
+
+  // -- the exp_list ----------------------------------------------------------
+  std::string expTrim = expListRaw;
+  while (!expTrim.empty() && std::isspace(static_cast<unsigned char>(expTrim.back()))) expTrim.pop_back();
+  while (!expTrim.empty() && std::isspace(static_cast<unsigned char>(expTrim.front()))) expTrim.erase(0, 1);
+  const bool bMode = expTrim.empty() || expTrim == "_b" || expTrim == "(_b)";
+  std::vector<ExpItem> expList;
+  if (!bMode) {
+    std::string perr;
+    expList = parseBootstrapExpList(expTrim, &perr);
+    if (expList.empty()) {
+      if (perr == "expressions must be bound in parentheses") return bsRc(perr, 198, "syntax_error");
+      return rsError("bootstrap: " + perr);
+    }
+  }
+
+  // -- options ---------------------------------------------------------------
+  int reps = 50;
+  std::string seedText;
+  std::string clusterVar;
+  double level = static_cast<double>(session.level);
+  {
+    size_t i = 0;
+    while (i < optsRaw.size()) {
+      while (i < optsRaw.size() &&
+             (std::isspace(static_cast<unsigned char>(optsRaw[i])) || optsRaw[i] == ',')) ++i;
+      if (i >= optsRaw.size()) break;
+      const size_t ns = i;
+      while (i < optsRaw.size() &&
+             (std::isalnum(static_cast<unsigned char>(optsRaw[i])) || optsRaw[i] == '_')) ++i;
+      const std::string key = strutil::lower(optsRaw.substr(ns, i - ns));
+      std::string val;
+      bool hasVal = false;
+      if (i < optsRaw.size() && optsRaw[i] == '(') {
+        hasVal = true;
+        int depth = 1;
+        ++i;
+        const size_t vs = i;
+        while (i < optsRaw.size() && depth > 0) {
+          if (optsRaw[i] == '(') ++depth;
+          else if (optsRaw[i] == ')') --depth;
+          if (depth > 0) ++i;
+        }
+        val = optsRaw.substr(vs, i - vs);
+        if (i < optsRaw.size()) ++i;
+      }
+      if (key.empty()) break;
+      auto trimmed = [](std::string v) {
+        while (!v.empty() && std::isspace(static_cast<unsigned char>(v.back()))) v.pop_back();
+        while (!v.empty() && std::isspace(static_cast<unsigned char>(v.front()))) v.erase(0, 1);
+        return v;
+      };
+      if (optIs(key, "reps", 1)) {
+        try {
+          size_t pos = 0;
+          const std::string v = trimmed(val);
+          reps = std::stoi(v, &pos);
+          if (pos != v.size()) throw std::invalid_argument(v);
+        } catch (const std::exception&) {
+          return bsRc("option reps() incorrectly specified", 198, "syntax_error");
+        }
+      } else if (key == "seed" || key == "rseed") {
+        seedText = trimmed(val);
+        if (seedText.empty()) return bsRc("option " + key + "() incorrectly specified", 198, "syntax_error");
+      } else if (optIs(key, "cluster", 2)) {
+        std::istringstream is(val);
+        std::vector<std::string> names;
+        for (std::string w; is >> w;) names.push_back(w);
+        if (names.size() != 1)
+          return rsError("bootstrap: cluster() with " + std::to_string(names.size()) +
+                             " variables is not implemented in this version of PIET (one cluster "
+                             "variable is).",
+                         "unsupported_option");
+        clusterVar = names[0];
+      } else if (optIs(key, "level", 1)) {
+        try {
+          level = std::stod(trimmed(val));
+        } catch (const std::exception&) {
+          return bsRc("option level() incorrectly specified", 198, "syntax_error");
+        }
+        if (!(level >= 10.0 && level <= 99.99))
+          return bsRc("level() must be between 10 and 99.99 inclusive", 198, "syntax_error");
+      } else if (!hasVal && (key == "nodots" || key == "noisily" || key == "nowarn" ||
+                             key == "notable" || key == "noheader" || key == "nolegend" ||
+                             key == "verbose" || optIs(key, "noisily", 3) || optIs(key, "verbose", 1))) {
+        // Presentation-only switches: nothing about the numbers depends on them.
+      } else if (key == "dots") {
+        // dots(#): progress output, which PIET does not print.
+      } else {
+        return rsError("bootstrap: option `" + key +
+                           "` is not implemented in this version of PIET. Implemented: reps(), "
+                           "seed(), cluster(), level(), and the presentation switches "
+                           "(nodots/notable/...).",
+                       "unsupported_option");
+      }
+    }
+  }
+  if (reps < 2) return bsRc("option reps() requires an integer greater than 1", 198, "syntax_error");
+
+  try {
+    (void)session.datastore();
+  } catch (const std::exception& e) {
+    return rsError(std::string("bootstrap: could not materialize the working dataset: ") + e.what());
+  }
+  const std::string startHbin = *session.currentHbin();
+  std::istringstream cmdWords(innerCmd);
+  std::string cmdname;
+  cmdWords >> cmdname;
+  {
+    const size_t cut = cmdname.find(',');
+    if (cut != std::string::npos) cmdname = cmdname.substr(0, cut);
+  }
+  // The command each replicate runs (and e(command)): the inner command without
+  // its if/in -- the resampling base is already restricted to its sample, and an
+  // `in` range or `_n` condition must not be re-applied to the resampled rows --
+  // options and weights kept (bootstrap.ado's `command`; o1.log T10 e(command)
+  // `regress y x` for `regress y x if x > 2`).
+  const std::string repCmd = stripIfIn(innerCmd);
+
+  // -- 1. the full-sample run ------------------------------------------------
+  // `_prefix_clear, e r` first: an r-class command then leaves no e() behind,
+  // which is how "no e(sample)" is told apart from the previous model's.
+  (void)dispatch("ereturn clear", session);
+  eval::replaceRClass(session.eval);
+  {
+    const ojson obs = dispatch(innerCmd, session);
+    if (const ojson* err = firstErrorBlock(obs)) {
+      session.load(startHbin);
+      return *err;  // _prefix_run_error: the command's own error and rc
+    }
+  }
+  std::vector<std::string> names;  // e(b)'s column names (eq:name when striped)
+  std::vector<std::string> exprs;  // e(exp#)
+  std::vector<double> observed;
+  std::optional<eval::EvalMatrix> obsV;
+  if (bMode) {
+    int ebRc = 0;
+    std::string ebWhy;
+    const std::optional<eval::EvalMatrix> eb = session.eval.resolveEMatrix("b", &ebRc, &ebWhy);
+    if (!eb.has_value() || eb->data.size() != 1 || eb->data[0].empty() ||
+        eb->data[0].size() != eb->colnames.size()) {
+      // A command that posts no e(b) is Stata's r(100); one whose e(b) this
+      // build refuses to build keeps that named refusal.
+      if (!eb.has_value() && ebRc == 198 && !ebWhy.empty())
+        return bsRc("bootstrap: the default exp_list is _b, and " + ebWhy, 198, "unsupported_option");
+      return bsRc("expression list required", 100);
+    }
+    names = eb->colnames;
+    observed = eb->data[0];
+    // e(exp#): `_b[x]`, or `[eq]_b[x]` on a striped e(b) (o2.log A3).
+    for (const auto& n : names) {
+      const size_t colon = n.find(':');
+      exprs.push_back(colon == std::string::npos
+                          ? "_b[" + n + "]"
+                          : "[" + n.substr(0, colon) + "]_b[" + n.substr(colon + 1) + "]");
+    }
+    obsV = session.eval.resolveEMatrix("V");
+  } else {
+    for (const auto& e : expList) {
+      std::optional<double> v = evalStat(e.expr, session);
+      if (!v.has_value()) {
+        return rsError("bootstrap: could not evaluate `" + e.expr + "` after running `" + innerCmd +
+                       "` — it does not resolve to a number.");
+      }
+      names.push_back(e.name);
+      exprs.push_back(e.expr);
+      observed.push_back(*v);
+    }
+  }
+  for (size_t k = 0; k < observed.size(); ++k) {
+    if (std::isnan(observed[k])) {
+      return bsRc("'" + exprs[k] + "' evaluated to missing in full sample", 322);
+    }
+  }
+  const size_t K = names.size();
+
+  // What the copied e() carries (default _b only): the inner fit's block, its
+  // posted scalars/macros, its e(cmd)/e(depvar)/e(title).
+  std::optional<ojson> innerBlock;
+  std::vector<std::pair<std::string, double>> innerScalars;
+  std::vector<std::pair<std::string, std::string>> innerStrings;
+  const std::string innerECmd = session.eval.eStrings.get("cmd", std::string());
+  const std::string innerDepvar = session.eval.eStrings.get("depvar", std::string());
+  const std::string innerTitle = session.eval.eStrings.get("title", std::string());
+  double innerDfM = std::nan("");
+  if (bMode) {
+    if (session.lastEstBlock.has_value()) innerBlock = *session.lastEstBlock;
+    for (const auto& [k, v] : session.eval.eScalars.items()) innerScalars.emplace_back(k, v);
+    for (const auto& [k, v] : session.eval.eStrings.items()) innerStrings.emplace_back(k, v);
+    if (const std::optional<double> dfm = evalStat("e(df_m)", session)) innerDfM = *dfm;
+  }
+
+  // -- 2. the resampling base ------------------------------------------------
+  // The working frame now (the full-sample run may have installed its
+  // e(sample) column on it) is the frame the session returns to.
+  try {
+    (void)session.datastore();
+  } catch (const std::exception& e) {
+    return rsError(std::string("bootstrap: could not materialize the working dataset: ") + e.what());
+  }
+  const std::string obsHbin = *session.currentHbin();
+  int64_t nHead = 0;
+  std::vector<char> inBase;  // per head row: in the resampling base (and e(sample) after)
+  bool haveEsample = false;
+  {
+    Datastore d(obsHbin);
+    nHead = d.nRows();
+    inBase.assign(static_cast<size_t>(nHead), 1);
+    const SessionState::EsampleReading er = session.esampleReading();
+    if (er.kind == SessionState::EsampleReading::Kind::kRefused) {
+      return rsError("bootstrap: the estimation sample of `" + innerCmd +
+                         "` cannot be determined in this version of PIET, so the rows to resample "
+                         "are unknown: " + er.refusal,
+                     "unsupported_option");
+    }
+    if (er.kind == SessionState::EsampleReading::Kind::kColumn && d.has(kEsampleColumn)) {
+      const double* m = d.col(kEsampleColumn).f64();
+      int64_t ones = 0;
+      for (int64_t i = 0; i < nHead; ++i) {
+        const bool in = m != nullptr && m[i] == static_cast<double>(er.serial);
+        inBase[static_cast<size_t>(i)] = in ? 1 : 0;
+        ones += in ? 1 : 0;
+      }
+      // _prefix_check4esample: all-0 e(sample) is "no e(sample)" (whole data).
+      if (ones == 0) std::fill(inBase.begin(), inBase.end(), 1);
+      else haveEsample = true;
+    }
+    if (!haveEsample) {
+      // An r-class command: Stata marks its if/in and resamples those rows;
+      // this build does not evaluate the inner qualifier itself.
+      static const std::regex reQual(R"(\s(if|in)\s)");
+      std::smatch qm;
+      if (eval::searchUnquoted(" " + innerCmd + " ", reQual, qm)) {
+        return rsError("bootstrap: `" + innerCmd +
+                           "` sets no e(sample), and resampling the rows of its if/in qualifier "
+                           "is not implemented in this version of PIET; restrict the data first "
+                           "(preserve + keep if ...).",
+                       "unsupported_option");
+      }
+    }
+  }
+  std::vector<int64_t> baseRows;  // 0-based head rows, in resampling order
+  for (int64_t i = 0; i < nHead; ++i)
+    if (inBase[static_cast<size_t>(i)]) baseRows.push_back(i);
+  const int64_t nBase = static_cast<int64_t>(baseRows.size());
+  if (nBase <= 1) {
+    return bsRc("insufficient observations to compute bootstrap standard errors", 2000);
+  }
+
+  // cluster(): sort the base by the cluster, stable; number the clusters.
+  std::vector<int64_t> clid;
+  int64_t nClust = 0;
+  if (!clusterVar.empty()) {
+    Datastore d(obsHbin);
+    if (!d.has(clusterVar) || isHiddenColumn(clusterVar)) {
+      return bsRc("variable " + clusterVar + " not found", 111);
+    }
+    const cecon::Column& c = d.col(clusterVar);
+    const bool isStr = c.dtype == cecon::DType::Factor;
+    std::vector<std::string> skey(isStr ? static_cast<size_t>(nBase) : 0);
+    std::vector<double> nkey(isStr ? 0 : static_cast<size_t>(nBase));
+    for (int64_t k = 0; k < nBase; ++k) {
+      const int64_t row = baseRows[static_cast<size_t>(k)];
+      bool missing = false;
+      if (isStr) {
+        const int32_t code = c.codes()[row];
+        missing = code < 0 || static_cast<size_t>(code) >= c.levels.size() ||
+                  c.levels[static_cast<size_t>(code)].empty();
+        if (!missing) skey[static_cast<size_t>(k)] = c.levels[static_cast<size_t>(code)];
+      } else {
+        const double v = c.f64()[row];
+        missing = std::isnan(v);
+        nkey[static_cast<size_t>(k)] = v;
+      }
+      if (missing) {
+        return bsRc("missing values in cluster variable " + clusterVar + " not allowed", 459);
+      }
+    }
+    std::vector<int64_t> ord(static_cast<size_t>(nBase));
+    std::iota(ord.begin(), ord.end(), int64_t{0});
+    std::stable_sort(ord.begin(), ord.end(), [&](int64_t a, int64_t b) {
+      return isStr ? skey[static_cast<size_t>(a)] < skey[static_cast<size_t>(b)]
+                   : nkey[static_cast<size_t>(a)] < nkey[static_cast<size_t>(b)];
+    });
+    std::vector<int64_t> sorted(static_cast<size_t>(nBase));
+    clid.assign(static_cast<size_t>(nBase), 0);
+    for (size_t q = 0; q < ord.size(); ++q) {
+      const size_t k = static_cast<size_t>(ord[q]);
+      sorted[q] = baseRows[k];
+      const bool fresh =
+          q == 0 || (isStr ? skey[k] != skey[static_cast<size_t>(ord[q - 1])]
+                           : nkey[k] != nkey[static_cast<size_t>(ord[q - 1])]);
+      if (fresh) ++nClust;
+      clid[q] = nClust;
+    }
+    baseRows = std::move(sorted);
+    if (nClust == 1) {
+      return bsRc("singleton cluster detected", 460);
+    }
+  }
+
+  // -- 3. the seed, then the replicates --------------------------------------
+  if (!seedText.empty()) {
+    const ojson s = dispatch("set seed " + seedText, session);
+    if (const ojson* err = firstErrorBlock(s)) {
+      return *err;
+    }
+  }
+  const std::string rngstate = session.seed.stream().state_string();
+
+  const std::string basePathIdx = nextPath(session.workdir(), "bs_baseidx");
+  {
+    CobraRunResult cr = runCobra({"eval", "--data", obsHbin, "--egen",
+                                  std::string(kRowIdx) + " = seq()", "--out", basePathIdx});
+    if (!cr.ok) {
+      CobraError ce = errorFromRaw(cr);
+      return rsError(cobraErrorStr(ce), ce.code);
+    }
+  }
+  SessionState::ScratchPin pin(session, {basePathIdx, startHbin, obsHbin});
+
+  std::vector<std::vector<double>> repVals;  // one row per replicate, NaN = missing
+  repVals.reserve(static_cast<size_t>(reps));
+  std::string failure;
+  for (int b = 0; b < reps && failure.empty(); ++b) {
+    const std::vector<int64_t> pos =
+        clusterVar.empty() ? bsdraw::srswrFast(session.seed.stream(), nBase)
+                           : bsdraw::clustSrswr(session.seed.stream(), clid, nClust);
+    std::vector<int64_t> idx;
+    idx.reserve(pos.size());
+    for (int64_t p : pos) idx.push_back(baseRows[static_cast<size_t>(p)] + 1);
+    const std::string csv = session.workdir() + "/bs_idx.csv";
+    registerScratchMint(csv);  // BUG-389
+    if (!writeIndexCsv(csv, kRowIdx, idx)) { failure = "could not write the resample index"; break; }
+    const std::string idxHbin = nextPath(session.workdir(), "bs_idx");
+    CobraRunResult c1 = runCobra({"convert", "--data", csv, "--out", idxHbin, "--delim", ","});
+    if (!c1.ok) { failure = cobraErrorStr(errorFromRaw(c1)); break; }
+    const std::string merged = nextPath(session.workdir(), "bs_merged");
+    // master = the drawn rows (with repeats, in the resample's row order),
+    // using = the base keyed by the same index; the using-only (undrawn) rows
+    // are not part of the sample.
+    CobraRunResult c2 = runCobra({"merge", "--data", idxHbin, "--using", basePathIdx, "--type",
+                                  "m:1", "--key", kRowIdx, "--out", merged});
+    if (!c2.ok) { failure = cobraErrorStr(errorFromRaw(c2)); break; }
+    const std::string repPath = nextPath(session.workdir(), "bs_rep");
+    CobraRunResult c3 = runCobra({"eval", "--data", merged, "--keepif", "_merge!=2", "--drop",
+                                  "_merge", "--out", repPath});
+    if (!c3.ok) { failure = cobraErrorStr(errorFromRaw(c3)); break; }
+    // The two intermediates are never loaded; drop them now rather than at exit.
+    for (const std::string& p : {idxHbin, merged}) {
+      cecon::native_unlink(p);
+      forgetScratchMint(p);
+    }
+
+    session.load(repPath);
+    const ojson inner = dispatch(repCmd, session);
+    std::vector<double> vals(K, std::nan(""));
+    if (firstErrorBlock(inner) == nullptr) {
+      if (bMode) {
+        const std::optional<eval::EvalMatrix> rb = session.eval.resolveEMatrix("b");
+        // A replicate whose e(b) is not the full sample's columns posts missing
+        // (_loop_bs's _check_omit rule).
+        if (rb.has_value() && rb->data.size() == 1 && rb->colnames == names &&
+            rb->data[0].size() == K)
+          vals = rb->data[0];
+      } else {
+        for (size_t k = 0; k < K; ++k) {
+          std::optional<double> v = evalStat(expList[k].expr, session);
+          if (v.has_value()) vals[k] = *v;
+        }
+      }
+    }
+    // postfile stores the replicates as float (bootstrap's default storage).
+    for (double& v : vals) v = e3::toFloat(v);
+    repVals.push_back(std::move(vals));
+  }
+  session.load(obsHbin);
+  // A failed run leaves no e(): the live one would be the last replicate's fit
+  // on resampled data, which no later `test`/`predict` may read.
+  auto failNoE = [&](const ojson& err) {
+    (void)dispatch("ereturn clear", session);
+    eval::replaceRClass(session.eval);
+    return err;
+  };
+  if (!failure.empty()) return failNoE(rsError("bootstrap: " + failure));
+
+  // -- 4. _bs_sum ------------------------------------------------------------
+  std::vector<const std::vector<double>*> good;  // listwise: every statistic present
+  for (const auto& rv : repVals) {
+    bool ok = true;
+    for (double v : rv) ok = ok && !std::isnan(v);
+    if (ok) good.push_back(&rv);
+  }
+  const int64_t nReps = static_cast<int64_t>(good.size());
+  const int64_t nMis = static_cast<int64_t>(repVals.size()) - nReps;
+  if (nReps <= 1)
+    return failNoE(bsRc("insufficient observations to compute bootstrap standard errors; no "
+                        "results will be saved",
+                        2000));
+  std::vector<double> mean(K, 0.0);
+  for (size_t k = 0; k < K; ++k) {
+    long double s = 0;
+    for (const auto* rv : good) s += (*rv)[k];
+    mean[k] = static_cast<double>(s / static_cast<long double>(nReps));
+  }
+  std::vector<std::vector<double>> V(K, std::vector<double>(K, 0.0));
+  for (size_t a = 0; a < K; ++a) {
+    for (size_t c = 0; c <= a; ++c) {
+      long double s = 0;
+      for (const auto* rv : good)
+        s += (static_cast<long double>((*rv)[a]) - mean[a]) * (static_cast<long double>((*rv)[c]) - mean[c]);
+      V[a][c] = V[c][a] = static_cast<double>(s / static_cast<long double>(nReps - 1));
+    }
+  }
+  const double zalpha = cecon::stata_invnormal((100.0 + level) / 200.0);
+  std::vector<double> se(K), bias(K), z0(K), pLo(K), pHi(K), bcLo(K), bcHi(K);
+  for (size_t k = 0; k < K; ++k) {
+    se[k] = V[k][k] >= 0 ? std::sqrt(V[k][k]) : std::nan("");
+    bias[k] = mean[k] - observed[k];
+    std::vector<double> xs;
+    xs.reserve(good.size());
+    for (const auto* rv : good) xs.push_back((*rv)[k]);
+    std::sort(xs.begin(), xs.end());
+    int64_t ct = 0;
+    for (double x : xs) ct += x <= observed[k] ? 1 : 0;
+    z0[k] = bcLo[k] = bcHi[k] = std::nan("");
+    if (ct > 0 && ct < nReps) {
+      z0[k] = cecon::stata_invnormal(static_cast<double>(ct) / static_cast<double>(nReps));
+      bcLo[k] = pctileStata(xs, 100.0 * cecon::stata_normal(2 * z0[k] - zalpha));
+      bcHi[k] = pctileStata(xs, 100.0 * cecon::stata_normal(2 * z0[k] + zalpha));
+    }
+    pLo[k] = pctileStata(xs, (100.0 - level) / 2.0);
+    pHi[k] = pctileStata(xs, (100.0 + level) / 2.0);
+  }
+
+  // rank of e(V) and the Wald model test
+  // (`test [#1]`, the first equation's coefficients but its _cons).
+  const std::vector<std::vector<double>> Vinv = e3::invsym(V);
+  int rank = 0;
+  for (size_t k = 0; k < K; ++k) rank += Vinv[k][k] != 0.0 ? 1 : 0;
+  double chi2 = std::nan(""), chi2p = std::nan(""), dfM = std::nan("");
+  const bool modelTest = bMode && std::isfinite(innerDfM);
+  if (modelTest) {
+    const std::string eq1 = names[0].find(':') == std::string::npos
+                                ? std::string()
+                                : names[0].substr(0, names[0].find(':'));
+    std::vector<size_t> sel;
+    for (size_t k = 0; k < K; ++k) {
+      const size_t colon = names[k].find(':');
+      const std::string eq = colon == std::string::npos ? std::string() : names[k].substr(0, colon);
+      const std::string nm = colon == std::string::npos ? names[k] : names[k].substr(colon + 1);
+      if (eq != eq1) continue;
+      if (nm == "_cons") continue;
+      if (V[k][k] == 0.0 && observed[k] == 0.0) continue;  // a base / omitted column
+      sel.push_back(k);
+    }
+    std::vector<std::vector<double>> Vs(sel.size(), std::vector<double>(sel.size()));
+    for (size_t a = 0; a < sel.size(); ++a)
+      for (size_t c = 0; c < sel.size(); ++c) Vs[a][c] = V[sel[a]][sel[c]];
+    const std::vector<std::vector<double>> Vsi = e3::invsym(Vs);
+    int df = 0;
+    long double q = 0;
+    for (size_t a = 0; a < sel.size(); ++a) {
+      if (Vsi[a][a] != 0.0) ++df;
+      for (size_t c = 0; c < sel.size(); ++c)
+        q += static_cast<long double>(observed[sel[a]]) * Vsi[a][c] * observed[sel[c]];
+    }
+    dfM = df;
+    if (df > 0) {
+      chi2 = static_cast<double>(q);
+      chi2p = chi2tailBs(static_cast<double>(df), chi2);
+    }
+  }
+
+  // -- 5. post e() -----------------------------------------------------------
+  const double crit = zalpha;  // invnormal((100+level)/200), as e(ci_normal)
+  ojson rows = ojson::array();
+  for (size_t k = 0; k < K; ++k) {
+    ojson r;
+    r["name"] = names[k];
+    r["b"] = observed[k];
+    if (std::isfinite(se[k]) && se[k] > 0) {
+      const double z = observed[k] / se[k];
+      r["se"] = se[k];
+      r["z"] = z;
+      r["p"] = normalTwoSidedP(z);
+      r["ci_lo"] = observed[k] - crit * se[k];
+      r["ci_hi"] = observed[k] + crit * se[k];
+    } else {
+      r["se"] = std::isfinite(se[k]) ? ojson(se[k]) : ojson(nullptr);
+      r["z"] = nullptr;
+      r["p"] = nullptr;
+      r["ci_lo"] = nullptr;
+      r["ci_hi"] = nullptr;
+    }
+    rows.push_back(r);
+  }
+  ojson block = innerBlock.has_value() && innerBlock->is_object() ? *innerBlock : ojson::object();
+  // bootstrap's exclusions from the copied e() (F chi2 df_r df_m, the fit's
+  // own V and its p), plus the fit's stripe/rank/cluster keys, which describe
+  // the engine's coefficient table rather than this posting.
+  // An eform fit's `coef_metric` would make r(table) exponentiate these
+  // coefficient-metric rows.
+  for (const char* key : {"df_r", "df_m", "F", "p_F", "chi2", "p", "e_V", "eb_stripe", "k_vars",
+                          "n_clusters", "vce", "vcetype", "cluster", "clustvar", "coef_metric"})
+    block.erase(key);
+  block["type"] = "estimation";
+  block["estimator"] = "bootstrap";
+  const double nObs = static_cast<double>(std::count(inBase.begin(), inBase.end(), char{1}));
+  block["n_obs"] = static_cast<long long>(nObs);
+  block["coeftable"] = rows;
+  if (bMode && !innerDepvar.empty()) block["depvar"] = innerDepvar;
+  else block.erase("depvar");
+
+  LastModel lm;
+  lm.cobraCmd = "bootstrap";
+  lm.stataCmd = bMode && !innerECmd.empty() ? innerECmd : "bootstrap";
+  lm.depvar = bMode ? innerDepvar : std::string();
+  lm.vcov = "bootstrap";
+  lm.eVce = "bootstrap";
+  lm.result = block;
+  if (!e3::installEsampleMask(session, lm, inBase))
+    return rsError("bootstrap: the results were computed, but e(sample) could not be installed");
+  session.setLastModel(lm);
+  session.lastEstBlock = block;
+  {
+    std::vector<double> bvec = observed;
+    e3::postBV(session, names, bvec, V);
+  }
+  // The copied inner e() (default _b only).
+  if (bMode) {
+    static const std::set<std::string> kXScalars = {"F", "chi2", "df_r", "df_m", "N", "N_clust",
+                                                    "rank", "p", "level"};
+    static const std::set<std::string> kXStrings = {
+        "cmd", "_estimates_name", "chi2type", "novariance", "clustvar", "vce", "vcetype",
+        "cmdline", "title", "properties", "depvar", "cluster", "prefix"};
+    for (const auto& [k, v] : innerScalars)
+      if (!kXScalars.count(k)) e3::setEScalarOnFit(session, k, v);
+    for (const auto& [k, v] : innerStrings)
+      if (!kXStrings.count(k)) e3::setEStringOnFit(session, k, v);
+    if (obsV.has_value() && obsV->data.size() == K) setEMatrix(session, "V_modelbased", *obsV);
+  }
+  e3::setEScalarOnFit(session, "N", nObs);
+  e3::setEScalarOnFit(session, "level", level);
+  e3::setEScalarOnFit(session, "N_reps", static_cast<double>(nReps));
+  e3::setEScalarOnFit(session, "N_misreps", static_cast<double>(nMis));
+  e3::setEScalarOnFit(session, "bs_version", 3);
+  e3::setEScalarOnFit(session, "rank", rank);
+  std::set<std::string> eqs;
+  for (const auto& n : names) {
+    const size_t colon = n.find(':');
+    eqs.insert(colon == std::string::npos ? std::string() : n.substr(0, colon));
+  }
+  e3::setEScalarOnFit(session, "k_eq", static_cast<double>(eqs.size()));
+  e3::setEScalarOnFit(session, "k_exp", bMode ? 0.0 : static_cast<double>(K));
+  e3::setEScalarOnFit(session, "k_eexp", bMode ? static_cast<double>(K) : 0.0);
+  e3::setEScalarOnFit(session, "k_extra", 0);
+  if (!clusterVar.empty()) {
+    e3::setEScalarOnFit(session, "N_clust", static_cast<double>(nClust));
+    e3::setEStringOnFit(session, "clustvar", clusterVar);
+    e3::setEStringOnFit(session, "cluster", clusterVar);
+  }
+  if (modelTest) {
+    e3::setEScalarOnFit(session, "df_m", dfM);
+    if (std::isfinite(chi2)) {
+      e3::setEScalarOnFit(session, "chi2", chi2);
+      e3::setEScalarOnFit(session, "p", chi2p);
+    }
+    e3::setEStringOnFit(session, "chi2type", "Wald");
+  }
+  {
+    // Stata's `bootstrap `0'' (o1.log T1 `bootstrap , rep(50) seed(123): regress y x`).
+    std::string cmdline = "bootstrap " + expTrim + (optsRaw.empty() ? "" : ", " + optsRaw) + ": " +
+                          innerCmd;
+    e3::setEStringOnFit(session, "cmdline", cmdline);
+  }
+  e3::setEStringOnFit(session, "cmdname", cmdname);
+  e3::setEStringOnFit(session, "prefix", "bootstrap");
+  e3::setEStringOnFit(session, "title", bootstrapTitle(innerTitle, cmdname));
+  e3::setEStringOnFit(session, "rngstate", rngstate);
+  for (size_t k = 0; k < K; ++k) e3::setEStringOnFit(session, "exp" + std::to_string(k + 1), exprs[k]);
+  e3::setEStringOnFit(session, "command", repCmd);
+  e3::setEStringOnFit(session, "vcetype", "Bootstrap");
+  e3::setEStringOnFit(session, "vce", "bootstrap");
+  e3::setEStringOnFit(session, "properties", "b V");
+  {
+    auto rowVec = [&](const std::vector<double>& v) {
+      eval::EvalMatrix m;
+      m.data.push_back(v);
+      m.rownames = {"y1"};
+      m.colnames = names;
+      return m;
+    };
+    auto ci = [&](const std::vector<double>& lo, const std::vector<double>& hi) {
+      eval::EvalMatrix m;
+      m.data = {lo, hi};
+      m.rownames = {"ll", "ul"};
+      m.colnames = names;
+      return m;
+    };
+    std::vector<double> repsV(K, static_cast<double>(nReps)), nlo(K), nhi(K);
+    for (size_t k = 0; k < K; ++k) {
+      nlo[k] = observed[k] - zalpha * se[k];
+      nhi[k] = observed[k] + zalpha * se[k];
+    }
+    setEMatrix(session, "b_bs", rowVec(mean));
+    setEMatrix(session, "reps", rowVec(repsV));
+    setEMatrix(session, "bias", rowVec(bias));
+    setEMatrix(session, "z0", rowVec(z0));
+    setEMatrix(session, "se", rowVec(se));
+    setEMatrix(session, "ci_normal", ci(nlo, nhi));
+    setEMatrix(session, "ci_percentile", ci(pLo, pHi));
+    setEMatrix(session, "ci_bc", ci(bcLo, bcHi));
+  }
+
+  // r(): the coefficient table's r(table) (normal-based) and r(N).
+  eval::replaceRClass(session.eval);
+  (void)postRTableFromBlock(session, block, level);
+  session.eval.rValues.set("N", nObs);
+
+  // -- 6. render -------------------------------------------------------------
+  ojson lines = ojson::array();
+  auto say = [&lines](const std::string& t) { lines.push_back(ojson{{"type", "display"}, {"text", t}}); };
+  if (haveEsample) say("(running " + cmdname + " on estimation sample)");
+  say("");
+  say(padRight(bootstrapTitle(innerTitle, cmdname), 56) + "Number of obs = " +
+      padLeft(commaGroup(static_cast<int64_t>(nObs)), 6));
+  say(padRight("", 56) + "Replications  = " + padLeft(std::to_string(nReps), 6));
+  if (modelTest && std::isfinite(chi2)) {
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%.2f", chi2);
+    say(padRight("", 56) + padRight("Wald chi2(" + std::to_string(static_cast<int>(dfM)) + ")", 14) +
+        "= " + padLeft(buf, 6));
+    say(padRight("", 56) + "Prob > chi2   = " + padLeft(fixed4(chi2p), 6));
+  }
+  if (!bMode) {
+    say("");
+    say("      Command: " + innerCmd);
+    for (const auto& e : expList) say(padLeft(e.name, 13) + ": " + e.expr);
+  }
+  say("");
+  if (!clusterVar.empty())
+    say(padLeft("(Replications based on " + std::to_string(nClust) + " clusters in " + clusterVar + ")",
+                78));
+  const std::string rule(78, '-');
+  say(rule);
+  say("             |   Observed   Bootstrap                         Normal-based");
+  {
+    std::string corner = bMode && eqs.size() == 1 && eqs.count(std::string()) ? innerDepvar : "";
+    say(padLeft(corner, 12) + " | coefficient  std. err.      z    P>|z|     [" +
+        std::to_string(static_cast<int>(level)) + "% conf. interval]");
+  }
+  say("-------------+" + std::string(64, '-'));
+  std::string lastEq = "\x01";
+  for (size_t k = 0; k < K; ++k) {
+    const size_t colon = names[k].find(':');
+    const std::string eq = colon == std::string::npos ? std::string() : names[k].substr(0, colon);
+    const std::string nm = colon == std::string::npos ? names[k] : names[k].substr(colon + 1);
+    if (!eq.empty() && eq != lastEq) {
+      if (lastEq != "\x01") say("-------------+" + std::string(64, '-'));
+      say(padRight(eq, 12) + " |");
+    }
+    lastEq = eq;
+    const ojson& r = rows[k];
+    std::string line = padLeft(nm, 12) + " |" + padLeft(g9cell(observed[k]), 11);
+    if (r["z"].is_number()) {
+      line += padLeft(g9cell(se[k]), 11) + padLeft(fixed2(r["z"].get<double>()), 9) +
+              padLeft(fixed3(r["p"].get<double>()), 8) + padLeft(g9cell(r["ci_lo"].get<double>()), 13) +
+              padLeft(g9cell(r["ci_hi"].get<double>()), 12);
+    } else {
+      line += padLeft("(omitted)", 13);
+    }
+    say(line);
+  }
+  say(rule);
+  if (nMis > 0)
+    say("Note: One or more parameters could not be estimated in " + std::to_string(nMis) +
+        " bootstrap replicate" + (nMis == 1 ? "" : "s") + ";\n      standard-error estimates "
+        "include only complete replications.");
+
+  ojson out;
+  out["type"] = "resample";
+  out["method"] = method;
+  out["command"] = innerCmd;
+  out["n_obs"] = static_cast<int64_t>(nObs);
+  out["n_reps"] = nReps;
+  out["n_reps_requested"] = reps;
+  out["level"] = level;
+  ojson srows = ojson::array();
+  for (size_t k = 0; k < K; ++k) {
+    ojson r = rows[k];
+    r["bias"] = bias[k];
+    srows.push_back(r);
+  }
+  out["rows"] = srows;
+  out["est_sample"] = haveEsample;
+  if (!seedText.empty()) out["seed"] = seedText;
+  if (!clusterVar.empty()) {
+    out["cluster"] = clusterVar;
+    out["n_clust"] = nClust;
+  }
+  lines.push_back(out);
+  return lines;
+}
 
 // ---------------------------------------------------------------------------
 // The driver.
@@ -363,6 +1347,7 @@ double normalTwoSidedP(double z) { return std::erfc(std::fabs(z) * 0.70710678118
 ojson runResample(const std::string& method, const std::string& permuteVar,
                   const std::string& expListRaw, const std::string& optsRaw,
                   const std::string& innerCmd, SessionState& session) {
+  if (method == "bootstrap") return runBootstrap(expListRaw, optsRaw, innerCmd, session);
   if (!session.currentHbin().has_value()) return eval::noDataLoaded();
   if (innerCmd.empty()) return rsError(method + ": no command found after the colon");
 
@@ -465,6 +1450,30 @@ ojson runResample(const std::string& method, const std::string& permuteVar,
                      "` — it does not resolve to a number.");
     }
     observed.push_back(*v);
+  }
+  // jackknife posts its own e() over the observed run's estimation sample
+  // (BUG-1456): its mask and e(title) are read here, while that fit is live.
+  std::vector<char> jkSample;
+  const std::string innerTitle = session.eval.eStrings.get("title", std::string());
+  if (method == "jackknife") {
+    const SessionState::EsampleReading er = session.esampleReading();
+    Datastore* d = session.datastore();
+    if (d != nullptr) {
+      const int64_t nHead = d->nRows();
+      if (er.kind == SessionState::EsampleReading::Kind::kColumn && d->has(kEsampleColumn)) {
+        const double* m = d->col(kEsampleColumn).f64();
+        jkSample.assign(static_cast<size_t>(nHead), 0);
+        for (int64_t i = 0; i < nHead; ++i)
+          jkSample[static_cast<size_t>(i)] = m != nullptr && m[i] == static_cast<double>(er.serial);
+      } else if (!session.lastModel().has_value()) {
+        // An r-class command: the whole data unless it carries an if/in, whose
+        // rows this build does not mark (e(sample) then stays unavailable).
+        static const std::regex reQual(R"(\s(if|in)\s)");
+        std::smatch qm;
+        if (!eval::searchUnquoted(" " + innerCmd + " ", reQual, qm))
+          jkSample.assign(static_cast<size_t>(nHead), 1);
+      }
+    }
   }
 
   // -- 2. the resampling base ------------------------------------------------
@@ -574,39 +1583,6 @@ ojson runResample(const std::string& method, const std::string& permuteVar,
                                     std::string(kRowIdx) + "!=" + std::to_string(b + 1), "--out",
                                     repPath});
       if (!cr.ok) { failure = cobraErrorStr(errorFromRaw(cr)); break; }
-    } else if (method == "bootstrap") {
-      // n draws with replacement. Philox is counter-based, so draw (b, j) does
-      // not depend on how the loop is scheduled. The modulo bias at these n is
-      // ~1e-8 and we match no external stream, so it is not worth a rejection
-      // loop that would only make the stream harder to reason about.
-      std::vector<int64_t> idx(static_cast<size_t>(nBase));
-      for (int64_t j = 0; j < nBase; ++j) {
-        const uint32_t d = cecon::Philox::draw32(seed, static_cast<uint64_t>(b),
-                                                 static_cast<uint64_t>(j));
-        idx[static_cast<size_t>(j)] = static_cast<int64_t>(d % static_cast<uint32_t>(nBase)) + 1;
-      }
-      const std::string csv = session.workdir() + "/bs_idx.csv";
-      registerScratchMint(csv);  // BUG-389
-      if (!writeIndexCsv(csv, kRowIdx, idx)) { failure = "could not write the resample index"; break; }
-      const std::string idxHbin = nextPath(session.workdir(), "bs_idx");
-      CobraRunResult c1 = runCobra({"convert", "--data", csv, "--out", idxHbin, "--delim", ","});
-      if (!c1.ok) { failure = cobraErrorStr(errorFromRaw(c1)); break; }
-      const std::string merged = nextPath(session.workdir(), "bs_merged");
-      // master = the drawn indices (with repeats), using = the base keyed by
-      // the same index: an m:1 join materializes the bootstrap sample in draw
-      // order, duplicates and all.
-      CobraRunResult c2 = runCobra({"merge", "--data", idxHbin, "--using", basePathIdx, "--type",
-                                    "m:1", "--key", kRowIdx, "--out", merged});
-      if (!c2.ok) { failure = cobraErrorStr(errorFromRaw(c2)); break; }
-      // A draw of n WITH REPLACEMENT leaves roughly a third of the base rows
-      // undrawn, and merge's default keeps those using-only rows — which would
-      // silently inflate every replicate (measured: mean replicate n = 165.2
-      // instead of 120, halving the bootstrap SE). The sample is the MASTER
-      // side only, so drop what came from the using side alone.
-      repPath = nextPath(session.workdir(), "bs_rep");
-      CobraRunResult c3 = runCobra({"eval", "--data", merged, "--keepif", "_merge!=2", "--drop",
-                                    "_merge", "--out", repPath});
-      if (!c3.ok) { failure = cobraErrorStr(errorFromRaw(c3)); break; }
     } else {  // permute
       std::vector<double> shuffled = permOriginal;
       // Fisher-Yates over the Philox stream.
@@ -671,6 +1647,13 @@ ojson runResample(const std::string& method, const std::string& permuteVar,
     return rsError(method + ": only " + std::to_string(nCompleted) +
                    " replicate(s) completed successfully — too few to report a standard error.");
   }
+  // jackknife keeps its replicates as float (postfile's default storage; the
+  // `double` option is not implemented here) and computes e(V) from those
+  // (StataBE 19.5, BUG-1456: _se[b1] .15455305643343692, where the double
+  // replicates give .15455301963687726).
+  if (method == "jackknife")
+    for (auto& rv : reps_values)
+      for (double& v : rv) v = static_cast<double>(static_cast<float>(v));
 
   // -- 4. aggregate ----------------------------------------------------------
   const double alpha = 1.0 - static_cast<double>(session.level) / 100.0;
@@ -727,20 +1710,96 @@ ojson runResample(const std::string& method, const std::string& permuteVar,
       row["ci_lo"] = observed[k] - crit * se;
       row["ci_hi"] = observed[k] + crit * se;
       row["df"] = dof;
-    } else {  // bootstrap
-      // The bootstrap SE is the sample SD of the replicate statistics; Stata's
-      // default table is normal-based (z, not t).
-      const double se = std::sqrt(ss / static_cast<double>(nCompleted - 1));
-      const double z = se > 0 ? observed[k] / se : std::nan("");
-      row["se"] = se;
-      row["z"] = z;
-      row["p"] = normalTwoSidedP(z);
-      const double crit = cecon::z_critical(alpha);
-      row["ci_lo"] = observed[k] - crit * se;
-      row["ci_hi"] = observed[k] + crit * se;
-      row["bias"] = mean - observed[k];
     }
     rows.push_back(row);
+  }
+
+  // -- 4b. e() ----------------------------------------------------------------
+  // Neither prefix leaves the last replicate's fit live (BUG-1456; StataBE 19.5):
+  // permute empties e(); jackknife posts its own -- e(b) the observed statistics
+  // under the exp_list names, e(V) the jackknife covariance (n-1)/n * sum of the
+  // replicates' cross-deviations, e(b_jk) the mean of the pseudovalues
+  // n*b - (n-1)*mean(replicates) (2.0658634 against b 2.0621382), e(sample) the
+  // observed run's sample, and the scalars and macros `ereturn list` shows there.
+  clearEResults(session);
+  if (method == "jackknife") {
+    const size_t K = expList.size();
+    const double n = static_cast<double>(nCompleted);
+    std::vector<std::string> names;
+    std::vector<double> means(K, 0.0);
+    for (size_t k = 0; k < K; ++k) {
+      names.push_back(expList[k].name);
+      for (const auto& rv : reps_values) means[k] += rv[k];
+      means[k] /= n;
+    }
+    std::vector<std::vector<double>> V(K, std::vector<double>(K, 0.0));
+    for (size_t a = 0; a < K; ++a)
+      for (size_t c = 0; c < K; ++c) {
+        double s = 0.0;
+        for (const auto& rv : reps_values) s += (rv[a] - means[a]) * (rv[c] - means[c]);
+        V[a][c] = (n - 1.0) / n * s;
+      }
+    ojson block = ojson::object();
+    block["type"] = "estimation";
+    block["estimator"] = "jackknife";
+    block["n_obs"] = nBase;
+    block["coeftable"] = rows;
+    LastModel lm;
+    lm.cobraCmd = "jackknife";
+    lm.stataCmd = "jackknife";
+    lm.vcov = "jackknife";
+    lm.eVce = "jackknife";
+    lm.result = block;
+    if (!jkSample.empty() && !e3::installEsampleMask(session, lm, jkSample))
+      return rsError("jackknife: the results were computed, but e(sample) could not be installed");
+    session.setLastModel(lm);
+    session.lastEstBlock = block;
+    e3::postBV(session, names, observed, V);
+    {
+      eval::EvalMatrix m;
+      std::vector<double> bjk(K);
+      for (size_t k = 0; k < K; ++k) bjk[k] = n * observed[k] - (n - 1.0) * means[k];
+      m.data.push_back(bjk);
+      m.rownames = {"y1"};
+      m.colnames = names;
+      setEMatrix(session, "b_jk", std::move(m));
+    }
+    const std::vector<std::vector<double>> Vinv = e3::invsym(V);
+    int rank = 0;
+    for (size_t k = 0; k < K; ++k) rank += Vinv[k][k] != 0.0 ? 1 : 0;
+    e3::setEScalarOnFit(session, "df_r", n - 1.0);
+    e3::setEScalarOnFit(session, "N_reps", static_cast<double>(nReps));
+    e3::setEScalarOnFit(session, "N_misreps", static_cast<double>(nReps - nCompleted));
+    e3::setEScalarOnFit(session, "rank", rank);
+    e3::setEScalarOnFit(session, "k_eq", 1);
+    e3::setEScalarOnFit(session, "k_exp", static_cast<double>(K));
+    e3::setEScalarOnFit(session, "k_eexp", 0);
+    e3::setEScalarOnFit(session, "k_extra", 0);
+    e3::setEScalarOnFit(session, "singleton", std::nan(""));
+    e3::setEScalarOnFit(session, "N", static_cast<double>(nBase));
+    std::string cmdname;
+    {
+      std::istringstream words(innerCmd);
+      words >> cmdname;
+      const size_t cut = cmdname.find(',');
+      if (cut != std::string::npos) cmdname = cmdname.substr(0, cut);
+    }
+    std::string title = bootstrapTitle(innerTitle, cmdname);
+    if (title == "Bootstrap results") title = "Jackknife results";
+    e3::setEStringOnFit(session, "cmdline", "jackknife " + strutil::trim(expListRaw) +
+                                                (optsRaw.empty() ? "" : ", " + optsRaw) + ": " +
+                                                innerCmd);
+    e3::setEStringOnFit(session, "cmd", "jackknife");
+    e3::setEStringOnFit(session, "prefix", "jackknife");
+    e3::setEStringOnFit(session, "cmdname", cmdname);
+    if (haveEstSample) e3::setEStringOnFit(session, "nfunction", "e(N)");
+    e3::setEStringOnFit(session, "command", innerCmd);
+    for (size_t k = K; k-- > 0;)
+      e3::setEStringOnFit(session, "exp" + std::to_string(k + 1), expList[k].expr);
+    e3::setEStringOnFit(session, "title", title);
+    e3::setEStringOnFit(session, "vcetype", "Jackknife");
+    e3::setEStringOnFit(session, "vce", "jackknife");
+    e3::setEStringOnFit(session, "properties", "b V");
   }
 
   // -- 5. render, in Stata's own layout -------------------------------------
@@ -760,7 +1819,7 @@ ojson runResample(const std::string& method, const std::string& permuteVar,
       say(padRight("Permutation variable: " + permuteVar, 51) +
           "Number of permutations = " + padLeft(std::to_string(nCompleted), 3));
     } else {
-      const std::string title = (method == "bootstrap") ? "Bootstrap results" : "Linear regression";
+      const std::string title = "Linear regression";  // jackknife
       say(padRight(title, 59) + "Number of obs = " + padLeft(obsStr, 3));
       say(padRight("", 59) + "Replications  = " + padLeft(std::to_string(nCompleted), 3));
     }
@@ -806,16 +1865,10 @@ ojson runResample(const std::string& method, const std::string& permuteVar,
     say("       For two-sided test, p = 2*min(p_lower, p_upper); SE and CI approximate.");
   } else {
     const std::string rule(78, '-');
-    const bool boot = (method == "bootstrap");
-    const std::string stat = boot ? "z" : "t";
+    const std::string stat = "t";  // jackknife (bootstrap renders in runBootstrap)
     say(rule);
-    if (boot) {
-      say("             |   Observed   Bootstrap                         Normal-based");
-      say("             | coefficient  std. err.      z    P>|z|     [95% conf. interval]");
-    } else {
-      say("             |              Jackknife");
-      say("             | Coefficient  std. err.      t    P>|t|     [95% conf. interval]");
-    }
+    say("             |              Jackknife");
+    say("             | Coefficient  std. err.      t    P>|t|     [95% conf. interval]");
     say("-------------+" + std::string(64, '-'));
     for (const auto& row : rows) {
       const double statv = row[stat].get<double>();
@@ -1075,6 +2128,134 @@ ojson runRolling(const std::string& expListRaw, const std::string& optsRaw,
                                      " on estimation sample)"}});
   lines.push_back(ojson{{"type", "display"},
                         {"text", "file " + savingPath + " saved"}});
+  return lines;
+}
+
+// `statsby _b _se, clear: command` — the UNGROUPED form (no by()): the command runs
+// once on the data in memory and the dataset is replaced by one observation holding
+// the collected statistics (w2d_uncovered.log:3422 xtreg_statsby_fe_028
+// `|0|1|4|1.981762409210205|.3451376259326935|`).
+//  - Names follow the prefix name expansion (statsby calls it with
+//    stub(_stat_)): id = <stat><name>, the name prefixed with `_` unless it already
+//    starts with one, so x1 -> _b_x1 and _cons -> _b_cons (never _b__cons). An id that
+//    is not a valid name (a factor-level column such as 1b.g) falls back to
+//    _stat_<i>, and a repeated id gets the index appended, as there.
+//  - Storage: statsby posts with `double` only when asked, so every
+//    statistic is a float by default — the oracle values are float(_b[x1]) and
+//    float(_se[x1]) of the unprefixed fit (log:3460 1.981762433275536 /
+//    .345137615018114).
+// by(), saving(), total, subsets and arbitrary expressions are not implemented and
+// are refused by name before the command runs; a multi-equation e(b) likewise.
+ojson runStatsby(const std::string& expListRaw, const std::string& optsRaw,
+                 const std::string& innerCmd, SessionState& session) {
+  if (!session.hasData()) return ojson(eval::noDataLoaded());
+  auto splitWs = [](const std::string& s) {
+    std::vector<std::string> out;
+    std::istringstream in(s);
+    for (std::string w; in >> w;) out.push_back(w);
+    return out;
+  };
+  if (splitWs(innerCmd).empty()) return rsError("statsby: no command found after the colon");
+  bool clear = false, asDouble = false;
+  for (const auto& word : splitWs(optsRaw)) {
+    std::string w = word;
+    for (auto& c : w) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (w == "clear") clear = true;
+    else if (w == "double") asDouble = true;
+    else if (w == "nodots" || w == "noisily" || w == "nolegend" || w == "verbose") continue;
+    else
+      return rsError("statsby: option `" + word +
+                         "` is a valid Stata option that this version of PIET does not implement "
+                         "(only the ungrouped `statsby _b _se, clear [double]: command` form is)",
+                     "unsupported_option");
+  }
+  std::vector<std::string> statistics;
+  for (const auto& word : splitWs(expListRaw)) {
+    if (word != "_b" && word != "_se")
+      return rsError("statsby: `" + word +
+                         "` — this version of PIET collects the _b and _se vectors only",
+                     "unsupported_option");
+    if (std::find(statistics.begin(), statistics.end(), word) == statistics.end())
+      statistics.push_back(word);
+  }
+  if (statistics.empty()) statistics.push_back("_b");  // statsby's default exp_list
+  // statsby.ado replaces the data in memory, which Stata refuses without `clear`
+  // when the data have changed since they were last saved (r(4)).
+  if (!clear)
+    return ojson(eval::errorBlock("engine_error", "no; dataset in memory has changed since last saved",
+                                  std::nullopt, std::nullopt, std::nullopt, "r(4)"));
+
+  const ojson result = dispatch(innerCmd, session);
+  for (const auto& block : result)
+    if (block.is_object() && block.value("type", std::string()) == "error") return block;
+  const auto b = session.eval.resolveEMatrix("b");
+  if (!b || b->data.size() != 1 || b->data[0].size() != b->colnames.size() ||
+      b->colnames.empty())
+    return ojson(eval::errorBlock("engine_error", "statsby: the command did not post e(b)",
+                                  std::nullopt, std::nullopt, std::nullopt, "r(301)"));
+  for (const auto& cn : b->colnames)
+    if (cn.find(':') != std::string::npos)
+      return rsError("statsby: a multi-equation e(b) is not implemented in this version of PIET",
+                     "unsupported_option");
+  std::optional<eval::EvalMatrix> v;
+  if (std::find(statistics.begin(), statistics.end(), "_se") != statistics.end()) {
+    v = session.eval.resolveEMatrix("V");
+    if (!v || v->data.size() != b->colnames.size())
+      return ojson(eval::errorBlock("engine_error", "statsby: the command did not post e(V)",
+                                    std::nullopt, std::nullopt, std::nullopt, "r(301)"));
+  }
+  auto validName = [](const std::string& s) { return cecon::ident::isValidName(s); };
+  std::vector<std::string> names, legend;
+  std::vector<double> values;
+  size_t idx = 0;
+  for (const auto& statistic : statistics) {
+    for (size_t j = 0; j < b->colnames.size(); ++j) {
+      ++idx;
+      const std::string& na = b->colnames[j];
+      std::string id = statistic + (na.rfind('_', 0) == 0 ? na : "_" + na);
+      if (std::find(names.begin(), names.end(), id) != names.end()) id += std::to_string(idx);
+      if (!validName(id)) id = "_stat_" + std::to_string(idx);
+      double value = b->data[0][j];
+      if (statistic == "_se") {
+        const double vjj = j < v->data[j].size() ? v->data[j][j] : std::nan("");
+        value = (std::isfinite(vjj) && vjj >= 0) ? std::sqrt(vjj) : std::nan("");
+      }
+      names.push_back(id);
+      legend.push_back(statistic + "[" + na + "]");
+      values.push_back(asDouble || !std::isfinite(value)
+                           ? value
+                           : static_cast<double>(static_cast<float>(value)));
+    }
+  }
+
+  const std::string out = nextPath(session.workdir(), "statsby");
+  const std::string csv = out + ".csv";
+  registerScratchMint(csv);  // BUG-389
+  {
+    std::ofstream f(cecon::to_native_path(csv));
+    if (!f) return rsError("statsby: could not write the results file");
+    f.precision(17);
+    for (size_t j = 0; j < names.size(); ++j) f << (j ? "," : "") << names[j];
+    f << '\n';
+    for (size_t j = 0; j < values.size(); ++j) {
+      if (j) f << ',';
+      if (std::isfinite(values[j])) f << values[j];
+    }
+    f << '\n';
+    if (!f) return rsError("statsby: could not write the results file");
+  }
+  const CobraRunResult converted = runCobra({"convert", "--data", csv, "--out", out, "--delim", ","});
+  if (!converted.ok) return rsError("statsby: " + cobraErrorStr(errorFromRaw(converted)));
+  session.clearMetadata();
+  session.load(out);
+  for (const auto& name : names) session.varMeta[name].stataType = asDouble ? "double" : "float";
+
+  ojson lines = ojson::array();
+  lines.push_back(ojson{{"type", "display"}, {"text", "      Command: " + innerCmd}});
+  for (size_t j = 0; j < names.size(); ++j) {
+    std::string pad = names[j].size() < 13 ? std::string(13 - names[j].size(), ' ') : std::string();
+    lines.push_back(ojson{{"type", "display"}, {"text", pad + names[j] + ": " + legend[j]}});
+  }
   return lines;
 }
 

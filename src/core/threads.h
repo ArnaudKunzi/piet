@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — worker concurrency. Two layers:
 //   * parallel_for(): coarse one-shot fan-out (spawn threads, join). For
 //     embarrassingly-parallel OUTER loops with many tasks (e.g. bootstrap reps).

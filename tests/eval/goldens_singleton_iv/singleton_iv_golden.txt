@@ -1,0 +1,19 @@
+# Golden: cobra iv singleton-FE drop (contract 1.7.0 §21a)
+# Stata oracle: ivregress 2sls y w i.firm (x = z), small  (StataNow BE 19.5)
+# See singleton_iv_oracle.do / singleton_iv_oracle.log. Data: singleton_iv.csv (45 rows, firm FE, 5 singleton firms 100-104).
+#
+# DEFAULT (cobra drops singletons; opt-out --keep-singletons):
+default.n_obs,40
+default.n_dropped_singletons,5
+default.coeftable[x].b,1.310801
+default.coeftable[x].se,0.2910784
+default.coeftable[w].b,-0.37605187
+default.coeftable[w].se,0.28054615
+#
+# KEEP-SINGLETONS (cobra --keep-singletons; all 45 rows):
+keep.n_obs,45
+keep.n_dropped_singletons,0
+keep.coeftable[x].b,1.310801
+keep.coeftable[x].se,0.2910784
+keep.coeftable[w].b,-0.37605187
+keep.coeftable[w].se,0.28054615

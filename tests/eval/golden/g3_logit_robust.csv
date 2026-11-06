@@ -1,0 +1,8 @@
+key,value
+n_obs,7.400000000000000e+01
+coeftable[mpg].b,-1.685868992056170e-01
+coeftable[mpg].se,1.116631804241380e-01
+coeftable[weight].b,-3.906700626513620e-03
+coeftable[weight].se,8.793890273062840e-04
+coeftable[(intercept)].b,1.370836702251150e+01
+coeftable[(intercept)].se,4.587696124434910e+00

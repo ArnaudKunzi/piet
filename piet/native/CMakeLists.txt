@@ -7,7 +7,7 @@
 #
 #   cmake -S piet/native -B piet/native/build -DCMAKE_BUILD_TYPE=Release
 #   cmake --build piet/native/build -j
-#   python3 tests/smoke.py  # after building the engine too
+#   ./piet/native/build/piet_native --selftest
 #   ./piet/native/build/piet_native            # interactive demo window
 #
 # cobra itself is NOT built here — piet_native calls the pinned cobra binary
@@ -49,6 +49,20 @@ set_source_files_properties(
   src/estimation_m4c.cpp
   src/eststo_esttab.cpp
   src/twoway_opts.cpp
+  # Mata invsym(): StataBE's invsym() rounds every product and difference
+  # separately; its %21x bits match unfused arithmetic and not FMA.
+  src/mata_subset.cpp
+  # ml (moptimize lf): StataBE's gradient, Hessian and step arithmetic match
+  # separately rounded products and sums, never FMA (scratch-r150/ml_tail).
+  src/handlers_ml.cpp
+  # `matrix` expressions (handlers_m3.cpp): StataBE's products and inv() round
+  # every product and sum separately; fused, `(0.1,0.7)*(0.2\0.6)` differs in
+  # the last bit and inv() of a singular X'X misses its zero pivot.
+  src/handlers_m3.cpp
+  # LAPACK DSYEVR translation (Mata symeigensystem() in StataBE): the fused
+  # multiply-adds of StataBE's gfortran build are written as std::fma at the
+  # same sites; nothing else may be contracted.
+  src/lapack_dsyevr.cpp
   PROPERTIES
   COMPILE_FLAGS "-ffp-contract=off"
 )
@@ -103,6 +117,9 @@ add_library(piet_core OBJECT
   # handlers_m3.cpp, handlers_data_verbs.cpp, egen.cpp).
   src/mutation_result.cpp
   src/handlers.cpp
+  src/handlers_ml.cpp
+  # DSYEVR(V,A,L) from Netlib LAPACK 3.12.0 for ml's `difficult` step.
+  src/lapack_dsyevr.cpp
   src/run_block.cpp
   # BETA campaign Phase A0: the command registry (registry.h/.cpp) — a
   # hand-transcribed description of dispatcher.cpp's routing table, feeding
@@ -126,6 +143,8 @@ add_library(piet_core OBJECT
   src/mata_subset.cpp
   src/handlers_aer_gtools.cpp
   src/handlers_aer_tables.cpp
+  # W2D-T01: `ereturn clear|post|local` (+ named refusals for the rest).
+  src/handlers_ereturn.cpp
   src/handlers_aer_reshape.cpp
   src/program.cpp
   src/display_hardening.cpp
@@ -133,6 +152,9 @@ add_library(piet_core OBJECT
   src/handlers_data_verbs.cpp
   src/handlers_data_verbs2.cpp
   src/handlers_data_verbs3.cpp
+  # The one delimited-text reader behind import delimited / insheet
+  # (include/piet/delimited_io.h; data-io-family design-step3.md section 2).
+  src/delimited_io.cpp
   # P6 wave: Stata frames (frame put/drop/prefix, frlink, frget)
   src/handlers_frames.cpp
   # P6 wave: bootstrap/jackknife/permute prefixes (PIET-side replicate loop)
@@ -146,6 +168,8 @@ add_library(piet_core OBJECT
   src/storage_type.cpp
   src/file_io.cpp
   src/postfile.cpp
+  # serset-twoway SS: the graph-owned serset store + `serset` command family
+  src/serset.cpp
   # BETA campaign Phase G (BS-090): shared `in a/b` + `if` row-filter
   # composition for every non-gen/replace command (materialize-idx-then-
   # keepif — see inrange_filter.h's doc comment for why the naive `_n`-fold
@@ -159,6 +183,14 @@ add_library(piet_core OBJECT
   src/estimation_m4c.cpp
   src/eststo_esttab.cpp
   src/graph_m4.cpp
+  # graph-family AI-1/AI-2: graph bar/hbar/box/hbox (bargraph_g.class) + its serset
+  src/graph_bar.cpp
+  # graph-family AI-4/6/7: graph describe/copy/rename/display/draw
+  src/graph_store.cpp
+  # coefplot-family AN-1..AN-4: coefplot 1.8.8's data pipeline (generate(), r())
+  src/handlers_coefplot.cpp
+  # graph-family AI-13: graph export to png/pdf/eps (no external library)
+  src/graph_export_formats.cpp
   # analysis.do acceptance campaign: parenthesised multi-layer twoway
   # (M4a-remaining) — C++ ports of twoway_parse.py (layer-aware raw-text
   # parser) + twoway_opts.py (Stata option -> SVG style-dict translation).
@@ -173,13 +205,35 @@ add_library(piet_core OBJECT
   src/xlsx.cpp
   src/handlers_aer_iotext.cpp
   src/handlers_aer_util.cpp
+  src/handlers_t7_lookfor.cpp
+  src/handlers_t7_ihstrans.cpp
+  src/handlers_t7_sctorezone.cpp
+  src/handlers_lb_leebounds.cpp
   src/handlers_aer_graphx.cpp
   src/handlers_aer_estim.cpp
   src/handlers_aer_k1.cpp
+  # AER tier-1 (2026-10-28): one TU per lane; zip_io.h exposes xlsx.cpp's ZIP code.
+  src/handlers_t1_zip.cpp
+  src/handlers_t1_env.cpp
+  src/handlers_t1_meta.cpp
+  src/handlers_t1_gen.cpp
+  src/handlers_t1_matrix.cpp
   # AER scope-2 B2-3: Stata business calendars (bcal create + bofd/dofb).
   # The reader/writer/index arithmetic live apart from the handler so the
   # selftest can pin the .stbcal BYTES against StataBE's own files.
   src/bcal.cpp
+  # X2-GLM: `glm` and `margins` after it run in-process. estimation_glm.cpp is the
+  # PIET half (parse, design, e() posting); the estimator is the engine TU itself,
+  # linked here the way columnar.cpp is, so both binaries fit with the same code.
+  src/estimation_glm.cpp
+  # E3 scaffold: one refusal-stub handler TU per E3 command (native tasks replace the bodies).
+  src/handlers_e3_swindex.cpp
+  src/handlers_e3_qreg2.cpp
+  src/handlers_e3_lasso.cpp
+  src/handlers_e3_suest.cpp
+  src/handlers_e3_ritest.cpp
+  src/handlers_e3_acreg.cpp
+  ${MONOREPO_ROOT}/src/estimators/glm.cpp
   ${MONOREPO_ROOT}/src/io/columnar.cpp
 )
 
@@ -190,7 +244,88 @@ add_library(piet_settings INTERFACE)
 target_link_libraries(piet_core PRIVATE piet_settings)
 
 add_executable(piet_native src/main.cpp $<TARGET_OBJECTS:piet_core>)
+add_executable(piet_selftest src/selftest.cpp src/selftest_main.cpp
+  src/selftest_w2_macron.cpp
+  src/selftest_w2_predictframe.cpp
+  src/selftest_w2_eststoprefix.cpp
+  src/selftest_w2_labelglued.cpp
+  src/selftest_w2_doinclude.cpp
+  src/selftest_w2_bykeep.cpp
+  src/selftest_w2_estimopts.cpp
+  src/selftest_w2_matrix.cpp
+  src/selftest_w2_getmata.cpp
+  src/selftest_r150_ivreg2.cpp
+  src/selftest_r150_xtivreg2.cpp
+  src/selftest_w2_loops.cpp
+  src/selftest_w2_progctl.cpp
+  src/selftest_w2_mergeappend.cpp
+  src/selftest_w2_esttabnames.cpp
+  src/selftest_w2_bs_bootstrap.cpp
+  src/selftest_w2_egenrename.cpp
+  src/selftest_w2c_macrofns.cpp
+  src/selftest_w2c_datafns.cpp
+  src/selftest_w2_xtsetpersist.cpp
+  src/selftest_w2_tsset.cpp
+  src/selftest_w2_esample.cpp
+  src/selftest_w2b_linearfe.cpp
+  src/selftest_w2b_joinreshape.cpp
+  src/selftest_w2b_strlwriter.cpp
+  src/selftest_w2b_delimited.cpp
+  src/selftest_w2b_dataopts.cpp
+  src/selftest_w2b_ivfamily.cpp
+  src/selftest_w2b_descxtset.cpp
+  src/selftest_w2b_predict.cpp
+  src/selftest_w2b_esttabscreen.cpp
+  src/selftest_w2b_egenopts.cpp
+  src/selftest_w2b_glm.cpp
+  src/selftest_w2b_cluster3.cpp
+  src/selftest_w2b_margins.cpp
+  src/selftest_w2b_misc.cpp
+  src/selftest_w2b_destring.cpp
+  src/selftest_w2d_inrange.cpp
+  src/selftest_w2c_postest.cpp
+  src/selftest_w2_ml.cpp
+  src/selftest_w2e_float.cpp
+  src/selftest_w2i_varsub.cpp
+  src/selftest_w2x_fnstring.cpp
+  src/selftest_w2z_tostring.cpp
+  src/selftest_w2y_datetime.cpp
+  src/selftest_w2b_iv.cpp
+  src/selftest_w2d_ereturn.cpp
+  src/selftest_w2_e3swindex.cpp
+  src/selftest_w2_e3qreg2.cpp
+  src/selftest_w2_e3lasso.cpp
+  src/selftest_w2_e3suest.cpp
+  src/selftest_w2_e3ritest.cpp
+  src/selftest_w2_e3acreg.cpp
+  src/selftest_w2_t1_zip.cpp
+  src/selftest_w2_t1_env.cpp
+  src/selftest_w2_t1_meta.cpp
+  src/selftest_w2_t1_gen.cpp
+  src/selftest_w2_t1_matrix.cpp
+  src/selftest_w2_lpoly.cpp
+  src/selftest_w2_ebmat.cpp
+  src/selftest_w2_gfxbinscatter.cpp
+  src/selftest_w2_gfxbar.cpp
+  src/selftest_w2ap_egen.cpp
+  src/selftest_w2aq_histogram.cpp
+  src/selftest_w2_t7_lookfor.cpp
+  src/selftest_w2_t7_ihstrans.cpp
+  src/selftest_w2_t7_sctorezone.cpp
+  src/selftest_w2_lb_leebounds.cpp
+  src/selftest_w2_t7_clearall.cpp
+  src/selftest_w2_uni_core.cpp
+  src/selftest_w2_uni_v.cpp
+  src/selftest_w2_uni_m.cpp
+  src/selftest_w2_uni_d.cpp
+  src/selftest_w2_uni_w.cpp
+  src/selftest_w2_c1067.cpp
+  src/selftest_w2_display_format.cpp
+  src/selftest_w2af_format.cpp
+  src/selftest_w2ah_dataverbs.cpp
+  $<TARGET_OBJECTS:piet_core>)
 target_link_libraries(piet_native PRIVATE piet_settings)
+target_link_libraries(piet_selftest PRIVATE piet_settings)
 
 target_include_directories(piet_settings INTERFACE
   include
@@ -234,12 +369,13 @@ target_link_libraries(piet_settings INTERFACE Iconv::Iconv)
 #     hand-synced copy — the 2.0.1 contract_a Info.plist drift bug class);
 #   - `piet_native --selftest`'s version-single-source leg asserts
 #     compiled tuple == /version route == packaged Info.plist ==
-#     private-notes/releases/CURRENT (per-artifact SKIP where not applicable).
+#     the private coordination tree's releases/CURRENT (per-artifact SKIP
+#     where not applicable).
 # Do NOT introduce another hardcoded piet version string anywhere in
 # piet/native/ or piet/packaging/ — derive from the binary instead.
 # (piet/pyproject.toml is EXCLUDED: frozen at 1.16.0, the deprecated Python
 # backend line, deletion queued separately — see ROADMAP.)
-# contract_a/contract_b mirror plans/piet/CONTRACT-engine.md / CONTRACT.md's
+# contract_a/contract_b mirror internal note CONTRACT-engine.md / CONTRACT.md's
 # frozen version headers; bump each together with its .md when a contract
 # changes (never let the compiled string drift from the doc).
 #
@@ -249,9 +385,9 @@ target_link_libraries(piet_settings INTERFACE Iconv::Iconv)
 # — the RC strings, the manifest assemblyIdentity, and the Inno installer's
 # AppVersion all trace back to PIET_VERSION_VALUE here. Editing these three
 # lines is still the one and only version bump.
-set(PIET_VERSION_VALUE    "1.0.0-beta.1")
-set(PIET_CONTRACT_A_VALUE "1.25.0")
-set(PIET_CONTRACT_B_VALUE "2.9.0")
+set(PIET_VERSION_VALUE    "A.0.0")
+set(PIET_CONTRACT_A_VALUE "1.26.0")
+set(PIET_CONTRACT_B_VALUE "2.10.0")
 target_compile_definitions(piet_settings INTERFACE
   PIET_VERSION_STRING="${PIET_VERSION_VALUE}"
   PIET_CONTRACT_A_VERSION="${PIET_CONTRACT_A_VALUE}"
@@ -345,13 +481,6 @@ elseif(WIN32)
     set(PIET_WIN_VERSION_MINOR "${CMAKE_MATCH_1}")
     set(PIET_WIN_VERSION_PATCH "${CMAKE_MATCH_2}")
     set(PIET_WIN_VERSION_BUILD 0)
-  elseif(PIET_VERSION_VALUE MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)-beta\\.([0-9]+)$")
-    # Windows requires numeric resources; preserve the complete beta string
-    # in the string table and use its serial for the fourth numeric field.
-    set(PIET_WIN_VERSION_MAJOR "${CMAKE_MATCH_1}")
-    set(PIET_WIN_VERSION_MINOR "${CMAKE_MATCH_2}")
-    set(PIET_WIN_VERSION_PATCH "${CMAKE_MATCH_3}")
-    set(PIET_WIN_VERSION_BUILD "${CMAKE_MATCH_4}")
   elseif(PIET_VERSION_VALUE MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
     set(PIET_WIN_VERSION_MAJOR "${CMAKE_MATCH_1}")
     set(PIET_WIN_VERSION_MINOR "${CMAKE_MATCH_2}")
@@ -360,7 +489,7 @@ elseif(WIN32)
   else()
     message(FATAL_ERROR
       "PIET_VERSION_VALUE ('${PIET_VERSION_VALUE}') is not a supported release "
-      "version: expected B.X.Y, A.X.Y, X.Y.Z, or X.Y.Z-beta.N. Extend the mapping in "
+      "version: expected B.X.Y, A.X.Y, or X.Y.Z. Extend the mapping in "
       "piet/native/CMakeLists.txt's WIN32 branch when the version axis changes.")
   endif()
 

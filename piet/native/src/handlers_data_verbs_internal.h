@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // R2 (giant-file split, 2026-09-01): the shared file-local helpers of the
 // former 5,589-line handlers_data_verbs.cpp, promoted VERBATIM (modulo
 // inline linkage) so its three split TUs keep one copy. Include only from
@@ -66,6 +68,7 @@
 #include "xlsx.h"   // Stata `.` / `.a`-`.z` kinds — CSV writes the extended code
 #include "piet/scratch_seq.h"
 #include "io/win_compat.h"  // cecon::native_exists / to_native_path (BUG-050 wide open)
+#include "io/columnar.h"  // cecon::hbin_level_json_text: .dta label text (BUG-1372)
 
 // ---------------------------------------------------------------------------
 // BUG-233 / FIX:OPTNET-ABBREV-SWEEP — this file's option vocabularies.
@@ -89,8 +92,101 @@ using ojson = nlohmann::ordered_json;  // the TU-local alias the helpers were wr
 // call sites didn't need touching. Pure dedup, no behavior change.
 inline std::string trim(const std::string& s) { return strutil::trim(s); }
 
+// What a using file (merge / append / joinby) states about one of its
+// variables: its label, format and storage type (handlers_data_verbs2.cpp).
+struct UsingVarMeta {
+  std::string label;
+  std::string format;
+  std::optional<std::string> stataType;
+};
+std::map<std::string, UsingVarMeta> usingVarMetaOf(SessionState& session, const std::string& usingPath,
+                                                   const std::string& usingMetaPath,
+                                                   Datastore& usingDs);
+
+// The dataset a `using` names (merge, append, joinby, cross), resolved against
+// session.cwd. [D] merge/append/joinby/cross: "If filename is specified without
+// an extension, .dta is assumed" -- unless the bare name is itself a file (an
+// extensionless tempfile PIET wrote). `shown`, when given, takes the same
+// suffix, so a missing file is reported under the name Stata looked for.
+std::string resolveUsingDataset(SessionState& session, const std::string& rawPath,
+                                std::string* shown = nullptr);
+
+// The using file's value labels after merge/append/joinby/cross: each variable
+// in `brought` keeps the set the using file attaches to it, the using's
+// definitions are copied (when `copyDefinitions`) unless the master already
+// defines the name, and every attachment then reads through its set. A .dta
+// states both in its import-dta sidecar (`usingMetaPath`), a native checkpoint
+// in the record kept beside its path.
+void adoptUsingValueLabels(SessionState& session, const std::string& usingPath,
+                           const std::string& usingMetaPath, const std::vector<std::string>& brought,
+                           bool copyDefinitions);
+
+// Stata tempfiles carry genuine DTA bytes without a .dta suffix. Match the
+// same XML/legacy headers accepted by use before resolving a using file.
+inline bool usingFileIsDta(const std::string& path) {
+  std::ifstream input(cecon::to_native_path(path), std::ios::binary);
+  char header[11] = {};
+  input.read(header, sizeof header);
+  const auto size = input.gcount();
+  const bool xml = size == 11 && std::string(header, 11) == "<stata_dta>";
+  const auto version = static_cast<unsigned char>(header[0]);
+  const bool legacy = size >= 3 && (version == 113 || version == 114 || version == 115) &&
+                      (header[1] == 1 || header[1] == 2) && header[2] == 1;
+  return xml || legacy;
+}
+
+// describe using needs only the observation count in the file header. Read
+// that small fixed prefix rather than converting a using file twice.
+inline std::optional<int64_t> usingDtaRows(const std::string& path) {
+  std::ifstream input(cecon::to_native_path(path), std::ios::binary);
+  std::string header(256, '\0');
+  input.read(header.data(), static_cast<std::streamsize>(header.size()));
+  header.resize(static_cast<size_t>(input.gcount()));
+  size_t offset = 6, width = 4;
+  bool little = header.size() > 1 && header[1] == 2;
+  if (header.rfind("<stata_dta>", 0) == 0) {
+    const bool v117 = header.find("<release>117</release>") != std::string::npos;
+    if (!v117 && header.find("<release>118</release>") == std::string::npos) return std::nullopt;
+    const auto n = header.find("<N>");
+    if (n == std::string::npos) return std::nullopt;
+    offset = n + 3;
+    width = v117 ? 4 : 8;
+    little = header.find("<byteorder>LSF</byteorder>") != std::string::npos;
+  } else if (header.size() < 3 ||
+             (static_cast<unsigned char>(header[0]) != 114 &&
+              static_cast<unsigned char>(header[0]) != 115)) return std::nullopt;
+  if (header.size() < offset + width) return std::nullopt;
+  uint64_t count = 0;
+  for (size_t i = 0; i < width; ++i) {
+    const auto byte = static_cast<unsigned char>(header[offset + (little ? i : width - 1 - i)]);
+    count |= static_cast<uint64_t>(byte) << (8 * i);
+  }
+  if (count > static_cast<uint64_t>(INT64_MAX)) return std::nullopt;
+  return static_cast<int64_t>(count);
+}
+
 inline ojson engineErrorBlock(const std::string& message, const std::string& code = "engine_error") {
   return eval::engineError(message, code);
+}
+
+// A refusal whose Stata rc the oracle pins: the block carries `r(NNN)` in its
+// reason, which eval::coarseRc reads before any message-based mapping.
+inline ojson rcErrorBlock(const std::string& message, int rc,
+                          const std::string& code = "engine_error") {
+  return ojson(eval::errorBlock(code, message, std::nullopt, std::nullopt, std::nullopt,
+                                "r(" + std::to_string(rc) + ")"));
+}
+
+// A delimited `using` file the engine would not convert. Stata reads no text
+// file here: merge, joinby and cross of any .csv answer "file X not Stata
+// format" r(610), append "file X not found" r(601). Reading one is PIET's own
+// extension, so a file it cannot read faithfully -- BUG-414: a row wider than
+// the names line, whose extra field the converter used to drop at rc 0 -- gets
+// that command's code and Stata's words exactly, the file as typed (StataBE 19.5,
+// 2026-11-03: `append using f.csv` prints only "file f.csv not found", with data
+// in memory or none).
+inline ojson delimitedUsingRefused(const std::string& shown, int rc) {
+  return rcErrorBlock("file " + shown + (rc == 601 ? " not found" : " not Stata format"), rc);
 }
 
 // BUG-038(a): forwards to the shared mapping point (piet::cobraErrorMessage,
@@ -164,9 +260,13 @@ inline std::string lower(std::string s) { return strutil::lower(std::move(s)); }
 // Lower-cased extension (including the leading dot), or "" if there is none
 // — mirrors handlers.cpp's own file-local ext() (each TU keeps its own copy
 // per this codebase's established convention, see strutil.h's header note).
+// Only the last path component has one: `save sub.d/q2` writes sub.d/q2.dta
+// (StataBE 19.5), so a dot before the last '/' is part of a directory name.
 inline std::string extOf(const std::string& path) {
   auto pos = path.find_last_of('.');
   if (pos == std::string::npos) return "";
+  const auto slash = path.find_last_of('/');
+  if (slash != std::string::npos && pos < slash) return "";
   return lower(path.substr(pos));
 }
 
@@ -237,13 +337,12 @@ inline bool cardHasName(const std::vector<VarInfo>& card, const std::string& nam
 //   · only columns present in the live card get an entry. `session.varMeta`
 //     keeps entries for dropped variables, and a hint naming a column the Frame
 //     does not have is one the writer silently never matches.
-//   · `value_label_name` is emitted only for a NON-factor column whose set is
-//     actually defined in `labelDefs`. The writer THROWS on both other cases by
-//     design (a name with no table; a value label on a string column —
-//     dta_writer.cpp:352-360, and rightly: Stata attaches value labels to
-//     numeric variables only), so passing them through would turn a perfectly
-//     legal session (`tostring` a labeled numeric, `label drop`) into a failed
-//     save.
+//   · `value_label_name` is emitted for every NON-factor column with an
+//     attachment, defined or not: Stata keeps an attachment to an undefined set
+//     (`label drop`, a misspelled `label values`) and writes it, and the writer
+//     takes a name with no table. A value label on a string column the writer
+//     still refuses (Stata attaches value labels to numeric variables only), so
+//     a factor column never carries one (`tostring` of a labeled numeric).
 //
 // `data_label` and `characteristics` (FIX:PIET-SAVE-DTA-CHARS-CARRIAGE): carried
 // the same way as the label/format layer above — from session.dataLabel /
@@ -265,7 +364,7 @@ inline std::string writeDtaMetaSidecar(SessionState& session, const std::vector<
   nlohmann::ordered_json vars = nlohmann::ordered_json::array();
   std::set<std::string> referencedSets;
   for (const auto& info : card) {
-    std::string label, format, stataType;
+    std::string label = info.label, format = session.displayFormat(info), stataType;
     auto mit = session.varMeta.find(info.name);
     if (mit != session.varMeta.end()) {
       if (mit->second.label.has_value()) label = *mit->second.label;
@@ -276,14 +375,15 @@ inline std::string writeDtaMetaSidecar(SessionState& session, const std::vector<
     // Stata's own default. Numeric columns only — PIET carries strings as
     // `factor`, and gen's string default is str#, not float, so a factor
     // column stays with the writer's scan.
-    if (stataType.empty() && info.dtype != "factor" &&
-        session.implicitFloatVars.count(info.name) != 0) {
+    if (stataType.empty() && info.dtype != "factor") {
       stataType = "float";
     }
     std::string lblSet;
     auto lit = session.varLblname.find(info.name);
-    if (lit != session.varLblname.end() && info.dtype != "factor" &&
-        session.labelDefs.count(lit->second) != 0) {
+    // An attachment to a set that is not defined is kept too: StataBE writes it
+    // (AER 007's Wave1.dta: `lab def notf ...` then `lab val not_in_LF_BL notlf`
+    // carries not_in_LF_BL -> notlf with no notlf table) and reads it back.
+    if (lit != session.varLblname.end() && info.dtype != "factor") {
       lblSet = lit->second;
     }
     // Nothing declared for this column: leave it out entirely so the writer
@@ -293,39 +393,76 @@ inline std::string writeDtaMetaSidecar(SessionState& session, const std::vector<
     if (label.empty() && format.empty() && stataType.empty() && lblSet.empty()) continue;
     nlohmann::ordered_json v;
     v["name"] = info.name;
-    if (!label.empty()) v["label"] = label;
+    if (!label.empty()) v["label"] = cecon::hbin_level_json_text(label);
     if (!format.empty()) v["format"] = format;
     if (!stataType.empty()) v["stata_type"] = stataType;
     if (!lblSet.empty()) {
       v["value_label_name"] = lblSet;
-      referencedSets.insert(lblSet);
+      if (session.labelDefs.count(lblSet) != 0) referencedSets.insert(lblSet);
     }
     vars.push_back(std::move(v));
   }
 
-  // Only the sets an emitted column actually points at — the writer's rule runs
-  // the other way (a NAME with no table is fatal), so a tight table is free.
+  // A label set used only in an inactive language is referenced too. Stata
+  // stores those attachments in variable characteristics ([D] label language,
+  // Methods and formulas, p.669), not in the active value-label-name slots.
+  std::set<std::string> liveNumeric;
+  for (const auto& info : card) if (info.dtype != "factor") liveNumeric.insert(info.name);
+  for (const auto& [language, labels] : session.labelLangStash)
+    for (const auto& [name, label] : labels.varLblname)
+      if (liveNumeric.count(name) && session.labelDefs.count(label)) referencedSets.insert(label);
+
+  // Only the defined sets an emitted column actually points at (a name with no
+  // table is written as an attachment alone, as StataBE does).
   nlohmann::ordered_json valueLabels = nlohmann::ordered_json::object();
   for (const auto& setName : referencedSets) {
     nlohmann::ordered_json codes = nlohmann::ordered_json::object();
-    for (const auto& [code, text] : session.labelDefs.at(setName)) codes[code] = text;
+    for (const auto& [code, text] : session.labelDefs.at(setName)) codes[code] = cecon::hbin_level_json_text(text);
     valueLabels[setName] = std::move(codes);
   }
 
-  // Verbatim carry, no per-column filter (see doc comment above): whatever
-  // `use` captured (or a later `char`/`label data` command changed) round-trips
-  // as-is.
+  // Rebuild Stata's reserved language characteristics from the live language
+  // state. Imported chars may describe an older current language after a switch.
   nlohmann::ordered_json chars = nlohmann::ordered_json::array();
   for (const auto& c : session.characteristics) {
-    chars.push_back({{"varname", c.varname}, {"charname", c.charname}, {"value", c.value}});
+    if (c.charname == "_lang_list" || c.charname == "_lang_c" ||
+        c.charname.rfind("_lang_v_", 0) == 0 || c.charname.rfind("_lang_l_", 0) == 0) continue;
+    chars.push_back({{"varname", c.varname}, {"charname", c.charname}, {"value", cecon::hbin_level_json_text(c.value)}});
+  }
+  if (session.labelLangs != std::vector<std::string>{"default"}) {
+    std::string languages;
+    for (const auto& language : session.labelLangs) {
+      if (!languages.empty()) languages += " ";
+      languages += language;
+    }
+    chars.push_back({{"varname", "_dta"}, {"charname", "_lang_list"}, {"value", languages}});
+    chars.push_back({{"varname", "_dta"}, {"charname", "_lang_c"}, {"value", session.labelLang}});
+    std::set<std::string> liveNames;
+    for (const auto& info : card) liveNames.insert(info.name);
+    for (const auto& [language, labels] : session.labelLangStash) {
+      if (language == session.labelLang ||
+          std::find(session.labelLangs.begin(), session.labelLangs.end(), language) == session.labelLangs.end()) continue;
+      if (!labels.dataLabel.empty())
+        chars.push_back({{"varname", "_dta"}, {"charname", "_lang_v_" + language},
+                         {"value", cecon::hbin_level_json_text(labels.dataLabel)}});
+      for (const auto& [name, label] : labels.varLabels)
+        if (liveNames.count(name) && !label.empty())
+          chars.push_back({{"varname", name}, {"charname", "_lang_v_" + language},
+                           {"value", cecon::hbin_level_json_text(label)}});
+      for (const auto& [name, label] : labels.varLblname)
+        if (liveNumeric.count(name) && !label.empty())
+          chars.push_back({{"varname", name}, {"charname", "_lang_l_" + language}, {"value", label}});
+    }
   }
 
   if (vars.empty() && valueLabels.empty() && chars.empty() && session.dataLabel.empty()) {
     return std::string();
   }
 
+  // BUG-1372: label text that is not UTF-8 (substr() counts bytes) is written
+  // escaped as a .hbin level is; export-dta's --in-meta turns it back.
   nlohmann::ordered_json meta;
-  if (!session.dataLabel.empty()) meta["data_label"] = session.dataLabel;
+  if (!session.dataLabel.empty()) meta["data_label"] = cecon::hbin_level_json_text(session.dataLabel);
   meta["variables"] = std::move(vars);
   meta["value_labels"] = std::move(valueLabels);
   if (!chars.empty()) meta["characteristics"] = std::move(chars);
@@ -371,5 +508,8 @@ ojson runDuplicatesTag(const std::optional<std::vector<std::string>>& varlist,
 ojson runDuplicatesList(const std::optional<std::vector<std::string>>& varlist,
                         SessionState& session, const std::optional<std::string>& ifExpr,
                         const std::optional<std::string>& inRange);
+ojson runDuplicatesExamples(const std::optional<std::vector<std::string>>& varlist,
+                            SessionState& session, const std::optional<std::string>& ifExpr,
+                            const std::optional<std::string>& inRange);
 }  // namespace piet::handlers
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // pyeval — a restricted Python-expression evaluator.
 //
 // The Python backend runs macro arithmetic through eval() with a
@@ -100,6 +102,35 @@ struct PyEvalOutcome {
   std::string error;   // Status::Raised — diagnostic message (e.g. "NameError: ...")
 };
 PyEvalOutcome evalPyExprDetailed(const std::string& expr, const PyNamespace& ns);
+
+// name-binding-display-literals: Stata's x/0 is missing, not an error
+// (tests/eval/golden/aer_w2/w2av_name_binding.log bd_dy_div0 `[.]`, bd_loc_div0,
+// bd_sca_div0, bd_inl_div0 at rc 0). While a scope is alive on this thread, `/`
+// by zero evaluates to the missing sentinel instead of raising
+// ZeroDivisionError. The Stata expression surfaces (eval::evalArith and
+// eval::evalMacroExpr, strmutate.cpp's string row evaluator, loops.cpp's
+// `if`/`while` condition) open one; a caller that wants Python's semantics (the
+// pyeval contract selftest, postfile) simply does not. Scopes nest.
+//
+// The same scope carries Stata's other "no error, just missing" rules, each of
+// which a NaN would otherwise break (it prints `.` but compares false):
+//   * a function result that is NaN is the missing sentinel
+//     (`invttail(5,2) == .` is 1; BUG-1358);
+//   * an arithmetic result that overflows to +/-inf stays one, and the operator
+//     that reads it -- arithmetic, comparison, negation -- reads `.`
+//     (`(1e300*1e10 == .)` is 1; BUG-1363), while a function argument gets the
+//     infinity itself, as in Stata (`inlist(1e300*1e10, .)` is 0);
+//   * `^` never raises: 0^-1, (-8)^(1/3) and 1e200^2 are the sentinel (BUG-1065).
+class StataDivisionScope {
+ public:
+  StataDivisionScope();
+  ~StataDivisionScope();
+  StataDivisionScope(const StataDivisionScope&) = delete;
+  StataDivisionScope& operator=(const StataDivisionScope&) = delete;
+
+ private:
+  bool prev_;
+};
 
 // The math-builtin namespace shared by macros._eval_arith and
 // postfile.eval_macro_expr: sqrt log log2 log10 exp abs min max round floor

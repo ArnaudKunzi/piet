@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "bridge_internal.h"
 
 #include "vendor/nlohmann/json.hpp"

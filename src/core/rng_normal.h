@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // P7 wave — Gaussian and chi-square draws on the existing counter-based Philox
 // stream (src/core/rng.h), which supplies uniforms only (rademacher/webb6).
 //

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // M0 -- the native Mata statement subset (ml-getmata T4).
 //
 // PIET has no Mata runtime. What the AER corpus does in Mata before `getmata`
@@ -14,10 +16,10 @@
 //   unary   := '-' unary | postfix
 //   postfix := primary ['[' sel ',' sel ']']  sel := '.' | positive integer
 //   primary := NUMBER | '.' | NAME | '(' expr ')'
-//            | J(r, c, v) | st_matrix("NAME") | exp(x) | rows(x) | cols(x)
+//            | J(r, c, v) | st_matrix("NAME") | exp(x) | rows(x) | cols(x) | invsym(x)
 //            | select(A, rowmissing(A):==0)   the one idiom, same NAME twice
 //
-// Every other construct -- another function (invsym, rowsum, st_numscalar ...),
+// Every other construct -- another function (rowsum, luinv, ...),
 // another operator, a subscripted assignment, a loop, a bare expression -- is
 // REFUSED BY NAME (r(199), refusedCommand("mata", ...)). A `mata:` ... `end`
 // block is parsed in full before anything runs, so one statement outside M0

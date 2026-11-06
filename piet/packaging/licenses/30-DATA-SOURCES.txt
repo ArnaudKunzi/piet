@@ -1,0 +1,21 @@
+Bundled sample dataset — provenance
+-----------------------------------
+
+"Fatalities" — US traffic fatalities panel data, 48 US states, annual
+1982–1988 (336 observations). Bundled with this application as
+Resources/sample/fatalities.csv for demonstration and teaching.
+
+The variables are compiled from United States government statistics:
+traffic fatality counts from the US Department of Transportation NHTSA
+Fatality Analysis Reporting System (FARS), with demographic and economic
+covariates from the US Census Bureau and the Bureau of Economic Analysis,
+plus state alcohol policy variables. As factual data compiled from US
+government sources, the dataset contents are public-domain facts.
+
+The panel was assembled for and analyzed in:
+  Ruhm, C. J. (1996). "Alcohol policies and highway vehicle fatalities."
+  Journal of Health Economics, 15(4), 435-454.
+It is widely used as a teaching dataset (e.g. Stock & Watson,
+"Introduction to Econometrics") and is distributed in the R package "AER"
+(Kleiber & Zeileis), from which this CSV copy was obtained via the
+Rdatasets collection (https://vincentarelbundock.github.io/Rdatasets/).

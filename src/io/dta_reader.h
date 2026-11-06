@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — native reader for Stata .dta formats 114 / 115 / 117 / 118 (no Python/pandas
 // dependency). Hand-rolled per the public Stata .dta technical spec; byte layout
 // cross-checked against pandas.io.stata (read-only reference, NOT a runtime dep).

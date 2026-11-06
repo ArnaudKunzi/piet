@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Settings-derived compute envelope (2026-09-02) — the engine's thread resolver
 // must follow the two budgets PIET exports from its Settings panel:
 //

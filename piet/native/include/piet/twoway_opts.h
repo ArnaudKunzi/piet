@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // twoway_opts.h — Stata option -> style-dict translation for twoway layers.
 // C++ port of piet/backend/piet/twoway_opts.py. Pure functions, no I/O, no
 // cobra dependency. Mirrors the SERIES_COLORS palette in frontend/js/graph.js

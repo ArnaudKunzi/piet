@@ -1,0 +1,365 @@
+{
+  "_meta": {
+    "purpose": "Phase-D2+D3 golden set (BETA campaign) — same architecture as tests/eval/piet_d1 (isolated per-case --do invocations, oracle-verbatim expected values, display-precision tolerances, standalone leg not wired into run_eval.py). D2 wirings are LANDED (op/piet @9ab18ef) — D2 cases gate GREEN against that build. D3 wirings are IN FLIGHT — D3 cases are authored golden-FIRST and are RED against the current build (RED-baseline.txt records that state); they must turn GREEN when the D3 wiring lands.",
+    "oracle_logs": {
+      "d2": "internal capture d2-oracle-stata.log (real StataBE 19.5, import delimited fatalities.csv, 336 obs, sections D2a..D2g)",
+      "d2_mediate": "internal capture d2b-mediate.log (the ONLY working Stata mediate invocation on this dataset: continuous(0.5 1))",
+      "d3": "internal capture d3-oracle-stata.log (sections D3a..D3h)",
+      "drdid": "<repo>/tests/validate/drdid2x2.log (+ drdid2x2.do for the exact command surface, drdid2x2.dta as the data; full-precision ATT/SE from the log's %20.15g di line)"
+    },
+    "dataset_loader": "D2 + D3a-g: `sysuse fatalities, clear` (piet's bundled-sample shortcut, byte-identical to the oracle's import-delimited load — established in piet_d1). D3h: `use {DRDID_DTA}, clear` — the driver resolves the {DRDID_DTA} placeholder to tests/validate/drdid2x2.dta (op-eval copy first, then the main worktree copy, env DRDID_DTA override; sha256-identical copies verified 2026-07-15).",
+    "tolerance_policy": {
+      "rationale": "Same derivation as piet_d1: oracle values are Stata's DISPLAYED numbers, so each pin's true precision is bounded by its last displayed digit. Worst display-precision cases surveyed across D2/D3: coef/se ~1.3e-4 relative (D2c unemp b=-.007616); scalar chi2 ~2.2e-3 relative (D3b LR chi2=2.25, 2 decimals). Small pseudo-R2 values displayed at 4dp (D3b r2_pseudo=.0017) have display precision up to ~3e-2 RELATIVE but only 5e-5 ABSOLUTE — hence the scalar comparator passes on EITHER rtol OR the 1e-4 atol floor (2x the half-last-digit absolute bound), instead of inflating rtol for everyone. EXCEPTION: d3h_drdid's oracle is FULL float64 precision (%20.15g di line, not display-rounded), so that case tightens to the B3/MI-049 ratified cross-impl tolerance (coef_rel=5e-4) via its per-case tol_override — see the case.",
+      "coef_rtol": 1e-3,
+      "coef_atol": 1e-6,
+      "scalar_rtol": 3e-3,
+      "scalar_atol": 1e-4,
+      "integer_fields": "EXACT (n_obs, censoring counts, n_selected, tau is float-exact-by-construction but graded as required scalar)"
+    },
+    "coeftable_name_aliases": {
+      "_cons": ["_cons", "(intercept)"],
+      "__note": "Same as piet_d1: the live D2 blocks use '(intercept)' (verified 2026-07-15 on @9ab18ef for tobit/heckman/qreg). The driver tries both spellings."
+    },
+    "check_severity_model": {
+      "coefs / equations[*].coefs": "FATAL — missing row or numeric miss fails the case",
+      "n_obs": "FATAL, exact",
+      "required_scalars": "FATAL — absent OR mismatched fails (used only where the landed D2 schema is live-verified to carry the field)",
+      "exact_scalars": "FATAL, exact integer equality",
+      "scalars": "SECONDARY — absent logs a schema note (non-fatal); present-but-mismatched IS fatal. Used for D3's in-flight schemas where field names are educated guesses (ll/chi2/r2_pseudo/n_groups) — per Art 10, Eval updates the lookup names (never the pinned values) if the landed wiring spells them differently.",
+      "unpinned_oracle_reference": "NOT GRADED — oracle values recorded for future use where the landed/expected schema demonstrably lacks the field (e.g. tobit/qreg wirings emit no chi2/r2_pseudo; live-verified) or where the value is degenerate (nbreg boundary alpha)."
+    },
+    "d2_schema_provenance": "All D2 graded field names live-verified against op/piet @9ab18ef (2026-07-15): tobit block carries ll/variance/se_variance/ul_limit|ll_limit/n_uncensored/n_left_censored/n_right_censored; heckman carries lambda/se_lambda/rho/sigma/n_selected + the reg3-style two-entry 'outcomes' array (depvar inc_obs, high); qreg carries tau/sum_adev/sparsity/bwidth; mediate carries treatment_levels + a/b/direct/indirect/total/se_*/bootstrap{reps,seed,...}."
+  },
+  "cases": {
+    "d2a_tobit_ul": {
+      "oracle_section": "D2a",
+      "stata": "tobit inc_cens beertax spirits, ul(15000)",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "gen inc_cens = min(income, 15000)",
+        "tobit inc_cens beertax spirits, ul(15000)"
+      ],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": -1445.533, "se": 180.1317},
+        "spirits": {"b": 1454.701, "se": 152.6618},
+        "_cons":   {"b": 11928.77, "se": 289.3127}
+      },
+      "required_scalars": {"ll": -2213.4499, "variance": 2338392, "se_variance": 221391.9, "ul_limit": 15000},
+      "exact_scalars": {"n_uncensored": 245, "n_right_censored": 91, "n_left_censored": 0},
+      "unpinned_oracle_reference": {"lr_chi2_2": 153.59, "p_chi2": 0.0000, "r2_pseudo": 0.0335, "__why": "the landed tobit wiring emits no chi2/r2_pseudo fields (live-verified full block dump 2026-07-15)"},
+      "notes": "Right-censored tobit at ul(15000) on a depvar constructed to actually hit the limit (min(income,15000) censors 91 obs). variance/se_variance = Stata's var(e.inc_cens) row."
+    },
+    "d2b_tobit_ll": {
+      "oracle_section": "D2b",
+      "stata": "tobit inc_lo beertax spirits, ll(11000)",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "gen inc_lo = max(income, 11000)",
+        "tobit inc_lo beertax spirits, ll(11000)"
+      ],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": -1753.19, "se": 222.6041},
+        "spirits": {"b": 1432.671, "se": 153.5904},
+        "_cons":   {"b": 12225.68, "se": 319.679}
+      },
+      "required_scalars": {"ll": -2822.1583, "variance": 3614693, "se_variance": 293093.4, "ll_limit": 11000},
+      "exact_scalars": {"n_uncensored": 312, "n_left_censored": 24, "n_right_censored": 0},
+      "unpinned_oracle_reference": {"lr_chi2_2": 135.24, "r2_pseudo": 0.0234, "__why": "same as d2a — no chi2/r2_pseudo in the landed tobit block"},
+      "notes": "Left-censored mirror of d2a (ll(11000), 24 obs censored). Together the pair proves ll()/ul() are genuinely independent code paths, not one flag aliased to the other."
+    },
+    "d2c_heckman_twostep": {
+      "oracle_section": "D2c",
+      "stata": "heckman inc_obs beertax, select(high = spirits unemp) twostep",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "gen high = (beertax > .5)",
+        "gen inc_obs = income if high==1",
+        "heckman inc_obs beertax, select(high = spirits unemp) twostep"
+      ],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "equations": {
+        "inc_obs": {
+          "coefs": {
+            "beertax": {"b": -606.9695, "se": 338.0717},
+            "_cons":   {"b": 16072.65, "se": 13807.99}
+          }
+        },
+        "high": {
+          "coefs": {
+            "spirits": {"b": -0.0290035, "se": 0.1079637},
+            "unemp":   {"b": -0.007616, "se": 0.0287377},
+            "_cons":   {"b": -0.3737082, "se": 0.3247607}
+          }
+        }
+      },
+      "required_scalars": {"lambda": -2436.094, "se_lambda": 12262.59, "rho": -0.87975, "sigma": 2769.0761},
+      "exact_scalars": {"n_selected": 106},
+      "unpinned_oracle_reference": {"wald_chi2_1": 3.22, "__why": "no chi2 field in the landed heckman block (live-verified)"},
+      "notes": "Two-step Heckit. The selection equation (high) rides the reg3-style 'outcomes' array (second entry, depvar 'high') — live-verified shape on @9ab18ef. /mills lambda + rho + sigma are the Mills-correction proof and are FATAL required scalars."
+    },
+    "d2c2_heckman_twostep_rho_boundary": {
+      "oracle_section": "Professor pangram S05 (user-run StataNow, 2026-08-01)",
+      "stata": "heckman inc_obs beertax, select(drinkd = spirits unemp) twostep",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "gen drinkd = (breath == \"yes\")",
+        "gen inc_obs = income if drinkd == 1",
+        "heckman inc_obs beertax, select(drinkd = spirits unemp) twostep"
+      ],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "equations": {
+        "inc_obs": {
+          "coefs": {
+            "beertax": {"b": -2169.38904388043, "se": 798.646868}
+          }
+        }
+      },
+      "required_scalars": {"rho": -1.0, "sigma": 5336.4025976},
+      "exact_scalars": {"n_selected": 155},
+      "tol_override": {"coef_rtol": 1e-6, "coef_atol": 1e-6, "scalar_rtol": 1e-6, "scalar_atol": 1e-6},
+      "notes": "Boundary-rho regression pin from the 2026-08-01 professor pangram. Stata reports that the unconstrained two-step rho=-1.195376 is truncated to -1 under default rhosigma behavior; sigma is adjusted consistently and the beertax VCE must use the boundary-adjusted values. The old untruncated engine path produced se=332.7821704485568, so this case discriminates the corrected covariance path sharply."
+    },
+    "d2d_heckman_mle_reject": {
+      "oracle_section": "D2d",
+      "stata": "heckman inc_obs beertax, select(high = spirits unemp)   [Stata default = full MLE]",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "gen high = (beertax > .5)",
+        "gen inc_obs = income if high==1",
+        "heckman inc_obs beertax, select(high = spirits unemp)"
+      ],
+      "oracle_kind": "reject",
+      "expect_stop_contains": ["Full maximum-likelihood", "twostep"],
+      "expect_error_code": "unsupported_option",
+      "unpinned_oracle_reference": {
+        "beertax_b": -644.3823, "beertax_se": 284.5267, "cons_b": 16383.48, "cons_se": 569.4911,
+        "sel_spirits_b": 0.2630368, "sel_unemp_b": -0.0871921, "rho": -0.9365439, "sigma": 2949.13, "lambda": -2761.99,
+        "ll": -1144.574,
+        "__why": "Stata's MLE heckman runs fine (oracle D2d, rc=0) but the engine implements ONLY two-step Heckit — PIET honest-rejects the MLE form per the coordinator's gate note rather than silently answering an MLE request with two-step numbers. These oracle MLE values are recorded UNPINNED for a future engine MLE implementation."
+      },
+      "notes": "Honest-reject case: PASS = the run STOPS with the documented unsupported_option error naming the two-step alternative. A future engine heckman-MLE would flip this case's design (reject -> golden with the values above) — that is a deliberate Eval decision at that time, not a tolerance relax."
+    },
+    "d2e_qreg_median": {
+      "oracle_section": "D2e",
+      "stata": "qreg income beertax spirits",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "qreg income beertax spirits"
+      ],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": -1710.042, "se": 304.9989},
+        "spirits": {"b": 1422.217, "se": 213.2057},
+        "_cons":   {"b": 12207.09, "se": 442.4769}
+      },
+      "required_scalars": {"tau": 0.5},
+      "scalars": {"sum_adev": 243469.7},
+      "unpinned_oracle_reference": {"r2_pseudo": 0.1813, "raw_sum_dev": 297390.7, "__why": "no r2_pseudo in the landed qreg block (live-verified)"},
+      "notes": "Median regression with NO quantile() option — tau must come back 0.5 via cobra's own --tau default (proves the default path, not just the explicit-quantile path). sum_adev = Stata's 'Min sum of deviations'."
+    },
+    "d2f_qreg_p25": {
+      "oracle_section": "D2f",
+      "stata": "qreg income beertax, quantile(.25)",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "qreg income beertax, quantile(.25)"
+      ],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": -1427.91, "se": 294.0854},
+        "_cons":   {"b": 13123.5, "se": 206.0881}
+      },
+      "required_scalars": {"tau": 0.25},
+      "scalars": {"sum_adev": 203536},
+      "unpinned_oracle_reference": {"r2_pseudo": 0.0724, "__why": "same as d2e"},
+      "notes": "quantile(.25) — tau=0.25 required in the block (proves the quantile() forward, distinct from d2e's default). Different b/se from the median case on the same data is itself the estimator-really-moved signal."
+    },
+    "d2g_mediate_engine_parity": {
+      "oracle_section": "D2g / d2b-mediate.log",
+      "stata": "mediate (income) (spirits) (beertax, continuous(0.5 1))",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "mediate (income) (spirits) (beertax, continuous(0.5 1)), reps(199) seed(20260715)"
+      ],
+      "oracle_kind": "engine_parity",
+      "treatment_levels": [0.5, 1.0],
+      "bootstrap_reps_requested": 199,
+      "bootstrap_seed": 20260715,
+      "grading": "Run the SAME do_body TWICE (two cold --do invocations, identical fixed seed). PASS iff: (1) both runs complete; (2) block['treatment_levels'] == [0.5, 1.0] (the continuous(#L0 #L1) parse-and-tag proof); (3) block['bootstrap']['reps'] == 199 and block['bootstrap']['seed'] == 20260715 (options genuinely forwarded); (4) the two runs' full estimation blocks are byte-identical under canonical JSON serialization (sort_keys) — fixed-seed reproducibility of the ENTIRE payload including the bootstrap CIs.",
+      "unpinned_oracle_reference": {
+        "stata_NIE": -107.2333, "stata_NIE_se": 47.01594,
+        "stata_NDE": -855.2799, "stata_NDE_se": 107.8894,
+        "stata_TE": -962.5132, "stata_TE_se": 127.3219,
+        "__why": "DELIBERATELY NOT PINNED (coordinator directive): the engine's mediate computes a no-interaction Baron-Kenny per-unit decomposition while Stata's continuous(#L0 #L1) mediate fits a treatment#mediator-interaction model with VanderWeele NDE/NIE at the (0.5,1) contrast — ~20-95% point-estimate divergence, disclosed in [BETA D2]'s commit and in the wiring's own source comment (estimation_m4.cpp runMediate, 'ENGINE-PARITY DISCLOSURE, NOT STATA-PARITY'). Pinning Stata's numbers would hard-RED a documented, disclosed engine-model gap; this case gates what IS promised: deterministic reproducibility + honest option forwarding. If cobra later gains the interaction+contrast model, upgrade this case to golden with these values."
+      },
+      "notes": "The engine block's direct/indirect/total are NOT NDE/NIE/TE — see unpinned_oracle_reference.__why."
+    },
+    "d3a_poisson": {
+      "oracle_section": "D3a",
+      "stata": "poisson cnt beertax unemp",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "gen cnt = round(spirits * 3)",
+        "encode state, gen(snum)",
+        "xtset snum year",
+        "poisson cnt beertax unemp"
+      ],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": -0.0537468, "se": 0.0514636},
+        "unemp":   {"b": -0.0349375, "se": 0.0097193},
+        "_cons":   {"b": 1.940487, "se": 0.076412}
+      },
+      "scalars": {"ll": -691.51427, "r2_pseudo": 0.0106, "chi2": 14.76},
+      "notes": "Pooled Poisson, iid SEs. Scalars are SECONDARY (in-flight schema, field names are the cobraToEstimation passthrough's existing spellings — ll/r2_pseudo/chi2 — as the most likely landing shape)."
+    },
+    "d3b_poisson_offset": {
+      "oracle_section": "D3b",
+      "stata": "poisson cnt beertax, offset(lpop)",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "gen cnt = round(spirits * 3)",
+        "encode state, gen(snum)",
+        "xtset snum year",
+        "gen lpop = ln(income)",
+        "poisson cnt beertax, offset(lpop)"
+      ],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": 0.0753822, "se": 0.0495923},
+        "_cons":   {"b": -7.914716, "se": 0.0343278}
+      },
+      "scalars": {"ll": -672.48943},
+      "unpinned_oracle_reference": {"lr_chi2_1": 2.25, "r2_pseudo": 0.0017, "__why": "chi2=2.25 (2dp) and r2_pseudo=.0017 (4dp on a tiny value) are the two worst display-precision scalars in the whole leg — recorded but left unpinned to keep the tolerance policy honest; ll is the sharper likelihood pin for the same fit"},
+      "notes": "THE defining test is the offset: a wiring that silently drops offset(lpop) still 'runs' but gets b(_cons)=1.94-ish (the no-offset fit) instead of -7.914716 — a >100x coefficient shift, unmissable. Do NOT expect a coeftable row for lpop (Stata shows it as '1 (offset)', display-only)."
+    },
+    "d3c_poisson_robust": {
+      "oracle_section": "D3c",
+      "stata": "poisson cnt beertax unemp, vce(robust)",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "gen cnt = round(spirits * 3)",
+        "encode state, gen(snum)",
+        "xtset snum year",
+        "poisson cnt beertax unemp, vce(robust)"
+      ],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": -0.0537468, "se": 0.0320636},
+        "unemp":   {"b": -0.0349375, "se": 0.0085351},
+        "_cons":   {"b": 1.940487, "se": 0.0626609}
+      },
+      "scalars": {"chi2": 30.47},
+      "notes": "Identical b's to d3a by construction (vcov never moves MLE point estimates) with DIFFERENT robust se's — the parsed-and-ignored-vce trap detector, same pattern as piet_d1's d1c."
+    },
+    "d3d_ppmlhdfe_absorb": {
+      "oracle_section": "D3d",
+      "stata": "ppmlhdfe cnt beertax, absorb(snum)",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "gen cnt = round(spirits * 3)",
+        "encode state, gen(snum)",
+        "xtset snum year",
+        "ppmlhdfe cnt beertax, absorb(snum)"
+      ],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": 0.4671475, "se": 0.1146782},
+        "_cons":   {"b": 1.487721, "se": 0.0590467}
+      },
+      "scalars": {"ll": -592.0901171, "r2_pseudo": 0.1528, "chi2": 16.59},
+      "notes": "PPML with one absorbed FE dimension (snum, 48 categories). ppmlhdfe's default vce IS robust (the oracle's SEs are the 'Robust std. err.' column with NO vce() given) — a wiring that returns iid SEs here is wrong even though no vce() appears in the command. Stata reports Residual df=287; not pinned (field name unknowable pre-landing)."
+    },
+    "d3e_nbreg": {
+      "oracle_section": "D3e",
+      "stata": "nbreg cnt beertax unemp",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "gen cnt = round(spirits * 3)",
+        "encode state, gen(snum)",
+        "xtset snum year",
+        "nbreg cnt beertax unemp"
+      ],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": -0.0537468, "se": 0.0514636},
+        "unemp":   {"b": -0.0349375, "se": 0.0097193},
+        "_cons":   {"b": 1.940487, "se": 0.076412}
+      },
+      "scalars": {"ll": -691.51427},
+      "unpinned_oracle_reference": {"lnalpha": -44.32735, "alpha": 5.61e-20, "lr_chibar2": 0.00, "__why": "this fixture's cnt is equidispersed, so NB2 collapses to Poisson at the alpha->0 BOUNDARY: Stata itself reports lnalpha with a MISSING se ('.') and alpha=5.61e-20 (pure numerical noise whose exact value is optimizer-dependent) — pinning either would gate noise, not correctness. The b/se/ll matching Poisson's exactly IS the boundary-case correctness signal."},
+      "notes": "Boundary-case nbreg: correct behavior is coefs == d3a's Poisson coefs (alpha -> 0). See unpinned reference for why alpha/lnalpha are not pinned."
+    },
+    "d3f_xtpoisson_fe": {
+      "oracle_section": "D3f",
+      "stata": "xtpoisson cnt beertax unemp, fe",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "gen cnt = round(spirits * 3)",
+        "encode state, gen(snum)",
+        "xtset snum year",
+        "xtpoisson cnt beertax unemp, fe"
+      ],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": 0.2515227, "se": 0.4539126},
+        "unemp":   {"b": 0.0295428, "se": 0.0147832}
+      },
+      "scalars": {"ll": -460.6417, "chi2": 5.09, "n_groups": 48},
+      "forbid_cons": true,
+      "notes": "Conditional FE Poisson — NO constant term exists in the conditional likelihood (Stata's own output has no _cons row); forbid_cons asserts the wiring doesn't fabricate one. Panel context comes from the preamble's xtset snum year."
+    },
+    "d3g_xtlogit_fe": {
+      "oracle_section": "D3g",
+      "stata": "xtlogit hi2 beertax unemp, fe",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "gen cnt = round(spirits * 3)",
+        "encode state, gen(snum)",
+        "xtset snum year",
+        "gen hi2 = (spirits > 1.5)",
+        "xtlogit hi2 beertax unemp, fe"
+      ],
+      "oracle_kind": "golden",
+      "n_obs": 77,
+      "coefs": {
+        "beertax": {"b": 7.153253, "se": 6.451944},
+        "unemp":   {"b": 0.9185957, "se": 0.3185256}
+      },
+      "scalars": {"ll": -24.342906, "chi2": 16.81, "n_groups": 11},
+      "forbid_cons": true,
+      "notes": "Conditional FE logit. n_obs=77 EXACT is the sharpest check in the D3 set: Stata drops 37 all-positive/all-negative groups (259 obs) from the conditional likelihood — a wiring that reports n_obs=336 kept the degenerate groups and is wrong even if the coefficients look plausible. No constant (conditional likelihood), same forbid_cons assert as d3f."
+    },
+    "d3h_drdid_dripw": {
+      "oracle_section": "D3h + <repo>/tests/validate/drdid2x2.log",
+      "stata": "drdid Y x1 x2, ivar(id) time(t) treatment(treat) dripw",
+      "do_body": [
+        "use {DRDID_DTA}, clear",
+        "drdid Y x1 x2, ivar(id) time(t) treatment(treat) dripw"
+      ],
+      "oracle_kind": "golden",
+      "n_obs": 600,
+      "coefs": {
+        "treat": {"b": 2.05610834185971, "se": 0.124005088944043}
+      },
+      "coef_aliases": {"treat": ["treat", "ATET", "att", "(1 vs 0)", "ATET:treat", "r1vs0.treat", "1.treat"]},
+      "att_fallback": true,
+      "tol_override": {"coef_rtol": 5e-4},
+      "notes": "Doubly-robust DID (dripw = IPW-weighted regression flavor), 2x2 panel, oracle from the SSC drdid package run recorded at FULL float64 precision (%20.15g: ATT=2.05610834185971, SE=.124005088944043) — hence the tighter per-case tol_override (B3/MI-049 ratified cross-impl coef_rel=5e-4) instead of the leg-wide display-precision 1e-3. FIXTURE FORMAT NOTE: the original oracle .dta (<repo>/tests/validate/drdid2x2.dta) is legacy format v114, which the engine's dta reader rejects outright ('unsupported legacy format version 114', live-verified) — the driver therefore resolves {DRDID_DTA} to the in-leg drdid2x2_v118.dta, a bit-identical pandas format conversion of the original (verified column-by-column at conversion, 600x6: id/t/Y/x1/x2/treat); the pinned oracle values apply unchanged. SCHEMA NOTE (open, in-flight): `drdid` currently shares dispatcher.cpp's csdid arm (routes to runCsdid); the landed wiring's coeftable row name for the ATT is unknowable now, so the driver tries the coef_aliases list and, failing that, top-level att/se_att fields (att_fallback). Eval updates the LOOKUP (never the pinned values) if the landed shape differs."
+    }
+  }
+}

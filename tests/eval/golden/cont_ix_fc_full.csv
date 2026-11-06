@@ -1,0 +1,11 @@
+key,value
+coeftable[(intercept)].b,3.9646964514024731e+01
+coeftable[(intercept)].se,2.2433638586615134e+00
+coeftable[1.foreign].b,9.2713327177184546e+00
+coeftable[1.foreign].se,4.5004087273214193e+00
+coeftable[weight].b,-5.9750835105182101e-03
+coeftable[weight].se,6.6218040165741507e-04
+coeftable[1.foreign#weight].b,-4.4508740772806147e-03
+coeftable[1.foreign#weight].se,1.7845905259814259e-03
+n_obs,7.400000000000000e+01
+dof_resid,7.000000000000000e+01

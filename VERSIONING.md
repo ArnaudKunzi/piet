@@ -1,18 +1,14 @@
-# PIET public versions
+# Versions
 
-The public product is **PIET**. Its first named public prerelease is
-**PIET 1.0 Beta 1**, with version string `1.0.0-beta.1` and Git tag
-`v1.0.0-beta.1`.
+PIET (the application) and CoBrA (the engine) carry separate version strings.
 
-`piet/native/CMakeLists.txt` defines the compiled application version in
-`PIET_VERSION_VALUE`. The API and `piet_native --version` return that complete
-string. About formats it as the product name and shows the CoBrA engine
-version separately. The engine keeps its own version sequence.
+- **PIET** uses a letter line: `A.y.z` is the official release line. `A.0.0`
+  (2026-11-05) is the first official release; `A.0.x` will be patch cuts of it.
+  Earlier `B.y.z` versions were beta cuts and `2.y.z` the MVP line.
+- **CoBrA** uses ordinary semantic versions (`1.0.0` at PIET A.0.0).
+- `piet_native --version` prints the compiled PIET version; About shows the
+  engine version separately.
 
-Further beta cuts use `1.0.0-beta.2`, `1.0.0-beta.3`, and so on. A release
-candidate uses `1.0.0-rc.1`; a stable release uses `1.0.0`. Advancing a name
-does not by itself certify readiness. Build, packaging, and release records
-must refer to the same source commit and compiled version.
-
-The earlier `beta-2026.10.12.1` tag identifies the original source snapshot.
-It remains historical and is not moved to the newly named version.
+The public tag `v1.0.0-beta.1` (2026-10-12) identifies an earlier experimental
+source snapshot published under a different naming scheme. It remains
+historical; it is not part of the `A` line and is not moved.

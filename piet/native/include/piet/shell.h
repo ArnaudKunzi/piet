@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // piet::Shell — thin wrapper around the vendored webview/webview single-header
 // library (piet/native/vendor/webview/webview.h, pinned 0.10.0).
 //

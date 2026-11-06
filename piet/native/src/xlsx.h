@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Minimal .xlsx (SpreadsheetML) reader/writer — P1 wave `import excel` /
 // `export excel`.
 //
@@ -20,6 +22,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace piet::xlsx {
@@ -32,6 +35,14 @@ struct Cell {
   double number = 0.0;
   std::string text;
   bool blank = true;
+  // The cell's number format, from its style (xl/styles.xml cellXfs): the
+  // numFmtId and, for a custom one, its format code. `isDate` is true for a
+  // date format (the built-in ids 14-22, 27-36, 45-47, 50-58, or a custom
+  // code with day/month/year letters outside quotes and brackets). Stata's
+  // import excel reads a date-formatted column as %td (w2ar log:1714).
+  int numFmtId = 0;
+  std::string numFmtCode;
+  bool isDate = false;
 };
 
 struct Sheet {
@@ -46,7 +57,7 @@ struct Sheet {
 
 // AER scope-2 W3a: `import excel ..., sheet("NoSuchSheet")` is r(601) in Stata,
 // with the message `worksheet NoSuchSheet not found` (captured, aer_b4
-// private_oracle_g.log:136-139). A distinct exception type so the Stata
+// pins_oracle_g.log:136-139). A distinct exception type so the Stata
 // surface answers that code from a TYPE rather than by matching on the text of
 // a generic runtime_error.
 struct SheetNotFound : std::runtime_error {
@@ -142,6 +153,11 @@ struct OutColumn {
   std::vector<bool> isBlank;
   std::vector<double> numbers;
   std::vector<std::string> strings;
+  // The number format the column's numeric cells carry: 0 = General (no
+  // style), 14 = the m/d/yyyy date format Stata writes for a %td variable,
+  // 2 = the 0.00 format it writes for a %#.2f one (w2ar log:1089-1104). A
+  // non-zero id makes the workbook carry a styles part.
+  int numFmtId = 0;
 };
 
 // Write a single worksheet. `writeHeader` emits the column names as row 1.

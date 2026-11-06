@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // console.js — append-only results console
 // The critical path is formatEstimation() — verified against piet/fixtures/golden/*.json.
 
@@ -99,6 +101,17 @@ let _elidedCount = 0;      // cumulative blocks dropped this session
 // the reference regardless).
 let _activeBlockEl = null;
 
+// BUG-1473: `display ... _continue` leaves its line open (a display block
+// flagged `continue`), and the next display's text goes on that line, past any
+// command echo between them -- the join doexec.cpp's pushBlock makes in the
+// stored transcript. A streaming do-run has already shown the first block when
+// the next one comes (streamed, not stored), so it is joined here. Any other
+// block closes the line, and so does the start of a run (endDisplayLine, from
+// app.js's setBusy): the transcript joins within one run only.
+let _openDisplayEl = null;
+/** Close an open `_continue` display line (a new run starts on its own line). */
+export function endDisplayLine() { _openDisplayEl = null; }
+
 // T3 (P8.1): output fold/unfold ("안2-lite"). An `echo` block (the
 // `. <command>` line) is a fold head; its group is every flat sibling that
 // follows it up to (not including) the next fold head — computed
@@ -185,6 +198,19 @@ export function appendBlock(block) {
   if (isCleanExitSentinel(block)) return;   // BUG-150 — see above
   hideEmpty();
 
+  // BUG-1473: a display continuing an open `_continue` line joins it.
+  if (block.type === 'display' && _openDisplayEl && _openDisplayEl.isConnected) {
+    _openDisplayEl.textContent += block.text ?? '';
+    const live = _liveBlocks.find(b => b.el === _openDisplayEl);
+    const bytes = estimateBlockBytes(block);
+    if (live) { live.bytes += bytes; _liveBytes += bytes; }
+    if (!block.continue) _openDisplayEl = null;
+    enforceConsoleCap();
+    if (!_userScrolledUp) _wrapEl.scrollTop = _wrapEl.scrollHeight;
+    return;
+  }
+  if (block.type !== 'echo') _openDisplayEl = null;
+
   let el;
   switch (block.type) {
     case 'echo':             el = renderEcho(block);           break;
@@ -254,6 +280,7 @@ export function appendBlock(block) {
   }
 
   _bodyEl.appendChild(el);
+  if (block.type === 'display' && block.continue) _openDisplayEl = el;   // BUG-1473
 
   // C4 (P8-S9): live-coding anchor — hand .block-active to this block if
   // it's an estimation result (the mockup's demoed case: `regress` sits
@@ -375,6 +402,7 @@ export function clearConsole() {
   // C4: the active block (if any) was just removed above too — nothing left
   // to strip .block-active from until the next estimation block arrives.
   _activeBlockEl = null;
+  _openDisplayEl = null;   // BUG-1473: its line went with the blocks
   // T3: no group-counter state to reset — fold membership is computed
   // positionally at click-time (_toggleFold), and every block it could
   // touch was just removed above.
@@ -533,14 +561,22 @@ export async function getGraphById(id) {
   return e ? rehydrate(e) : null;
 }
 
-/** All blocks in order, rehydrating spilled ones one at a time (lost ones skipped). */
-export async function getGraphsAsync() {
-  const out = [];
+/** Block for entry id if it is resident now (sync), else null: a spilled entry
+ *  is loaded only when asked for, through getGraphById. */
+export function getResidentGraph(id) {
+  const e = _graphGallery.find(g => g.id === id);
+  return e && e.block ? e.block : null;
+}
+
+/** All blocks in order, rehydrating spilled ones one at a time (lost ones
+ *  skipped). An async iterator, so the caller holds one rehydrated block at a
+ *  time: collecting them all in one array kept every spilled plot in memory
+ *  at once, past the gallery's byte budget (BUG-1472). */
+export async function* getGraphsAsync() {
   for (const e of _graphGallery.slice()) {
     const b = await rehydrate(e);
-    if (b) out.push(b);
+    if (b) yield b;
   }
-  return out;
 }
 
 /** Entries preserved on disk right now (the gallery's "N stored on disk"). */
@@ -982,13 +1018,21 @@ function formatTestBlock(block) {
 
   if (restrictions.length) lines.push('');
 
+  // BUG-1057: a statistic the engine could not form (R V R' exactly 0 after an
+  // exact fit) arrives null, which Stata prints as `.` (StataBE 19.5 `test x` after
+  // `regress y2 x` on y2 = 3 + 2*x: `F(  1,    48) =       .`, `Prob > F =
+  // .`); Number(null) printed 0.00 and fmtP(null) nothing.
+  const missing = (x) => x == null || !Number.isFinite(Number(x));
+  const stat = (x) => (missing(x) ? '.' : Number(x).toFixed(2));
+  const prob = (x) => (missing(x) ? '.' : fmtP(Number(x)));
+
   // iid → F statistic; robust/cluster → Wald chi2 (matches buildStats footer).
   if (block.vcov_type !== 'iid') {
-    lines.push(`chi2(${block.df1}) = ${Number(block.chi2).toFixed(2)}`);
-    lines.push(`Prob > chi2 = ${fmtP(block.p_chi2)}`);
+    lines.push(`chi2(${block.df1}) = ${stat(block.chi2)}`);
+    lines.push(`Prob > chi2 = ${prob(block.p_chi2)}`);
   } else {
-    lines.push(`F(${block.df1}, ${Math.round(block.df2)}) = ${Number(block.F).toFixed(2)}`);
-    lines.push(`Prob > F = ${fmtP(block.p_F)}`);
+    lines.push(`F(${block.df1}, ${Math.round(block.df2)}) = ${stat(block.F)}`);
+    lines.push(`Prob > F = ${prob(block.p_F)}`);
   }
 
   return lines.join('\n');
@@ -1192,6 +1236,7 @@ function formatOneTable(block) {
     first_stage_F, kp_wald_F, hansen_j, hansen_j_p,
     // MI-081 / Contract B v1.8.0 model-fit scalars (all optional):
     adj_r2, F, p_F, rmse, mss, rss, df_m, df_r,          // OLS family
+    df_b,                                                  // xtreg FE header numerator
     ll, ll_0, r2_pseudo, chi2, df_chi2, p_chi2,           // logit/probit / xtreg RE
     r2_between, r2_overall,                                // xtreg RE
   } = block;
@@ -1252,7 +1297,7 @@ function formatOneTable(block) {
   const statsArr = buildStats({
     n_obs, r2, r2_within, sigma2, dof_resid, absKeys,
     // MI-081 new scalars
-    adj_r2, F, p_F, rmse, mss, rss, df_m, df_r,
+    adj_r2, F, p_F, rmse, mss, rss, df_m, df_r, df_b,
     ll, ll_0, r2_pseudo, chi2, df_chi2, p_chi2,
     r2_between, r2_overall,
   });
@@ -1398,6 +1443,7 @@ function estimatorTitle(est, absKeys) {
     logit:        'Logistic regression',
     logistic:     'Logistic regression',
     probit:       'Probit regression',
+    cloglog:      'Complementary log\u2013log regression',
     fepois:       'Poisson regression',
     poisson:      'Poisson regression',
     nbreg:        'Negative binomial regression',
@@ -1449,6 +1495,10 @@ function buildStats({
   n_obs, r2, r2_within, sigma2, dof_resid, absKeys,
   // OLS family
   adj_r2, F, p_F, rmse, mss, rss, df_m, df_r,
+  // BUG-1291: xtreg, fe prints its model F as F(e(df_b), e(df_r))
+  // (xtreg,fe's header), not over e(df_m), which counts the panel means
+  // (StataBE "F(2, 148) = 1191.52" where e(df_m) is 31). Only that block carries it.
+  df_b,
   // logit/probit / xtreg RE
   ll, ll_0, r2_pseudo, chi2, df_chi2, p_chi2,
   // xtreg RE
@@ -1487,7 +1537,8 @@ function buildStats({
       if (p_chi2 != null) stats.push(['Prob > chi2', fmtP4h(p_chi2)]);
     } else if (F != null) {
       // FE case (xtreg,fe / areg / single-FE feols): F test, not Wald chi2.
-      const dfStr = (df_m != null && df_r != null) ? `(${df_m}, ${df_r})` : '';
+      const dfNum = df_b != null ? df_b : df_m;
+      const dfStr = (dfNum != null && df_r != null) ? `(${dfNum}, ${df_r})` : '';
       stats.push([`F${dfStr}`, fmt2f(F)]);
       if (p_F != null) stats.push(['Prob > F', fmtP4h(p_F)]);
     }
@@ -1509,7 +1560,9 @@ function buildStats({
   // ── OLS family path: has F or adj_r2 or rmse ────────────────────────────
   if (F != null || adj_r2 != null || rmse != null) {
     if (F != null) {
-      const dfStr = (df_m != null && df_r != null) ? `(${df_m}, ${df_r})` : '';
+      // a weighted xtreg, fe block (no between/overall R-squared) lands here
+      const dfNum = df_b != null ? df_b : df_m;
+      const dfStr = (dfNum != null && df_r != null) ? `(${dfNum}, ${df_r})` : '';
       stats.push([`F${dfStr}`, fmt2f(F)]);
     }
     if (p_F     != null) stats.push(['Prob > F', fmtP4h(p_F)]);
@@ -1676,8 +1729,39 @@ function formatTabulateOneway(vars, table, chi2) {
   return lines.join('\n');
 }
 
+/**
+ * BUG-1514: the statistic lines Stata prints under a two-way table, in its layout
+ * (StataBE 19.5, `tabulate c d, chi2 lrchi2 V gamma taub`): a blank line, then the
+ * label right-aligned in 25 columns, ` = `, the statistic as %8.4f, and `   Pr = `
+ * or `  ASE = ` with %5.3f; Fisher's exact p (2 x 2 tables) ends in the Pr column.
+ *           Pearson chi2(6) =   1.4977   Pr = 0.960
+ *  Likelihood-ratio chi2(6) =   1.5348   Pr = 0.957
+ *                Cramér's V =   0.1117
+ *                     gamma =  -0.0311  ASE = 0.175
+ *           Kendall's tau-b =  -0.0208  ASE = 0.117
+ *            Fisher's exact =                 0.800
+ *    1-sided Fisher's exact =                 0.486
+ */
+function formatTabulateStats(block) {
+  const lab = s => s.padStart(25);
+  const f4 = x => Number(x).toFixed(4).padStart(8);
+  const f3 = x => Number(x).toFixed(3);
+  const lines = [];
+  const { chi2, lrchi2, cramers_v: v, gamma, taub } = block;
+  if (chi2) lines.push(`${lab(`Pearson chi2(${chi2.df})`)} = ${f4(chi2.statistic)}   Pr = ${f3(chi2.p_value)}`);
+  if (lrchi2) lines.push(`${lab(`Likelihood-ratio chi2(${lrchi2.df})`)} = ${f4(lrchi2.statistic)}   Pr = ${f3(lrchi2.p_value)}`);
+  if (v != null) lines.push(`${lab('Cramér\'s V')} = ${f4(v)}`);
+  if (gamma) lines.push(`${lab('gamma')} = ${f4(gamma.value)}  ASE = ${f3(gamma.ase)}`);
+  if (taub) lines.push(`${lab('Kendall\'s tau-b')} = ${f4(taub.value)}  ASE = ${f3(taub.ase)}`);
+  if (block.exact) {
+    lines.push(`${lab('Fisher\'s exact')} = ${' '.repeat(16)}${f3(block.exact.p)}`);
+    if (block.exact.p1 != null) lines.push(`${lab('1-sided Fisher\'s exact')} = ${' '.repeat(16)}${f3(block.exact.p1)}`);
+  }
+  return lines.length ? ['', ...lines] : [];
+}
+
 /** Format a two-way contingency table block (vars.length === 2). */
-function formatTabulateTwoway(vars, table, chi2) {
+function formatTabulateTwoway(vars, table, block) {
   const lines = [];
   const [rowVar, colVar] = vars;
   const { rows, cols, values, margins } = table;
@@ -1731,9 +1815,7 @@ function formatTabulateTwoway(vars, table, chi2) {
   totCells.push(padL(String(grandTotal), totalColW));
   lines.push(padL('Total', stubW) + ' │ ' + totCells.join('   '));
 
-  if (chi2) {
-    lines.push(`χ²(${chi2.df}) = ${fmtG(chi2.statistic) ?? '?'}   Pr = ${fmtP(chi2.p_value)}`);
-  }
+  lines.push(...formatTabulateStats(block));
   return lines.join('\n');
 }
 
@@ -1799,7 +1881,7 @@ export function formatTabulate(block) {
     return formatTabulateOneway(vars, table, chi2);
   } else {
     // A5: two-way contingency table (was a literal-string stub)
-    return formatTabulateTwoway(vars, table, chi2);
+    return formatTabulateTwoway(vars, table, block);
   }
 }
 

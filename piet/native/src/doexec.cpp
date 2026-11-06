@@ -1,13 +1,18 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "piet/doexec.h"
 
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <regex>
 #include <sstream>
+#include <unordered_set>
 #include <variant>
 
+#include "piet/cclass.h"         // BUG-1330: kVersionLocal
 #include "piet/counters.h"       // B2 NAMED-OWED ③: live_named_bytes_peak high-water accumulator
 #include "piet/eval/errors.h"
 #include "piet/eval/macros.h"
@@ -254,6 +259,101 @@ struct CollectResult {
   size_t next = 0;
 };
 
+CollectResult collectBody(const std::vector<std::string>& lines, size_t start, size_t n);
+
+// FU-602: Stata's braceless branch pair. `if exp command` on one line may be
+// followed by `else command` (or `else {` / `else if ...`) on the next one, and
+// the `else` runs when that `if` was false (oracle w2_esample_copies.do:39-40,
+// program pcnt: `if _rc c_local `name' = .` / `else c_local `name' = r(N)`;
+// StataBE writes all 22 PREC records, w2_esample_copies.log). The pair is
+// folded here into the same BraceBlock a braced `if {} else {}` builds, so the
+// condition and both bodies take runIf's semantics through executeLoop; a
+// one-line `if` that no `else` follows stays a plain line and keeps the
+// dispatcher's braceless intercept. The split is splitOneLineIf's, the same
+// walk that intercept uses, so the two forms cannot cut a line differently.
+bool startsWithElseWord(const std::string& s) {
+  if (s.size() < 4 || lower(s.substr(0, 4)) != "else") return false;
+  return s.size() == 4 || s[4] == '{' || std::isspace(static_cast<unsigned char>(s[4])) != 0;
+}
+
+bool splitBracelessIf(const std::string& stripped, std::string& cond, std::string& body) {
+  if (stripped.size() <= 3 || lower(stripped.substr(0, 3)) != "if " ||
+      stripped.find('{') != std::string::npos)
+    return false;
+  return loops::splitOneLineIf(trim(stripped.substr(3)), cond, body) && !body.empty();
+}
+
+// The else part that may follow an if body ending before lines[start]. Returns
+// false (nothing consumed) when the next non-empty line is not an else form.
+bool collectElse(const std::vector<std::string>& lines, size_t start, size_t n,
+                 std::vector<Item>& elseBody, size_t& next) {
+  size_t j = start;
+  while (j < n && trim(lines[j]).empty()) ++j;
+  if (j >= n) return false;
+  std::string nextLine = trim(lines[j]);
+  std::string nlLower = lower(nextLine);
+
+  static const std::regex reElseIf(R"(^else\s+if\b(.*))", std::regex::icase);
+  std::smatch m;
+  if (std::regex_search(nextLine, m, reElseIf)) {
+    const std::string tail = trim(m.str(1));
+    // FU-602: `else if exp command` on one line, with no brace on it or on the
+    // next line, is a braceless if of its own and may carry its own else.
+    if (tail.find('{') == std::string::npos) {
+      size_t k = j + 1;
+      while (k < n && trim(lines[k]).empty()) ++k;
+      std::string c, b;
+      if (!(k < n && trim(lines[k]) == "{") && loops::splitOneLineIf(tail, c, b) && !b.empty()) {
+        auto bb = std::make_shared<BraceBlock>();
+        bb->header = "if " + c + " {";
+        bb->body = {Item(b)};
+        size_t after = j + 1;
+        if (!collectElse(lines, j + 1, n, bb->elseBody, after)) after = j + 1;
+        elseBody = {Item(bb)};
+        next = after;
+        return true;
+      }
+    }
+    ++j;
+    std::string innerHeader = trim("if " + tail);
+    if (innerHeader.empty() || innerHeader.back() != '{') {
+      while (j < n && trim(lines[j]).empty()) ++j;
+      if (j < n && trim(lines[j]) == "{") ++j;
+      innerHeader += " {";
+    }
+    CollectResult inner = collectBody(lines, j, n);
+    auto bb = std::make_shared<BraceBlock>();
+    bb->header = innerHeader;
+    bb->body = inner.body;
+    bb->elseBody = inner.elseBody;
+    elseBody = {Item(bb)};
+    next = inner.next;
+    return true;
+  }
+  if (nlLower == "else {" || nlLower == "else{" || nlLower == "else") {
+    ++j;
+    if (nlLower != "else {" && nlLower != "else{") {
+      while (j < n && trim(lines[j]).empty()) ++j;
+      if (j < n && trim(lines[j]) == "{") ++j;
+    }
+    CollectResult rawElse = collectBody(lines, j, n);
+    elseBody = rawElse.body;
+    next = rawElse.next;
+    return true;
+  }
+  // FU-602: `else command` — one command, no brace block on the line.
+  if (startsWithElseWord(nextLine) && nextLine.size() > 4 &&
+      std::isspace(static_cast<unsigned char>(nextLine[4])) != 0) {
+    const std::string cmd = trim(nextLine.substr(5));
+    if (!cmd.empty() && cmd[0] != '{' && countNetBraces(cmd) == 0) {
+      elseBody = {Item(cmd)};
+      next = j + 1;
+      return true;
+    }
+  }
+  return false;
+}
+
 CollectResult collectBody(const std::vector<std::string>& lines, size_t start, size_t n) {
   std::vector<std::string> rawBody;
   int depth = 1;
@@ -281,46 +381,7 @@ CollectResult collectBody(const std::vector<std::string>& lines, size_t start, s
 
   CollectResult result;
   result.body = aggregateBraces(rawBody);
-
-  // Check if the next non-empty line is else / else if.
-  size_t j = i;
-  while (j < n && trim(lines[j]).empty()) ++j;
-  if (j < n) {
-    std::string nextLine = trim(lines[j]);
-    std::string nlLower = lower(nextLine);
-
-    static const std::regex reElseIf(R"(^else\s+if\b(.*))", std::regex::icase);
-    std::smatch m;
-    if (std::regex_search(nextLine, m, reElseIf)) {
-      ++j;
-      std::string innerHeader = trim("if " + trim(m.str(1)));
-      if (innerHeader.empty() || innerHeader.back() != '{') {
-        while (j < n && trim(lines[j]).empty()) ++j;
-        if (j < n && trim(lines[j]) == "{") ++j;
-        innerHeader += " {";
-      }
-      CollectResult inner = collectBody(lines, j, n);
-      auto bb = std::make_shared<BraceBlock>();
-      bb->header = innerHeader;
-      bb->body = inner.body;
-      bb->elseBody = inner.elseBody;
-      result.elseBody = {Item(bb)};
-      result.next = inner.next;
-      return result;
-    }
-    if (nlLower == "else {" || nlLower == "else{" || nlLower == "else") {
-      ++j;
-      if (nlLower != "else {" && nlLower != "else{") {
-        while (j < n && trim(lines[j]).empty()) ++j;
-        if (j < n && trim(lines[j]) == "{") ++j;
-      }
-      CollectResult rawElse = collectBody(lines, j, n);
-      result.elseBody = rawElse.body;
-      result.next = rawElse.next;
-      return result;
-    }
-  }
-
+  if (collectElse(lines, i, n, result.elseBody, result.next)) return result;
   result.next = i;
   return result;
 }
@@ -338,8 +399,15 @@ std::vector<Item> aggregateBraces(const std::vector<std::string>& lines) {
     if (stripped.empty()) continue;
     if (stripped == "}") continue;  // lone closer — malformed guard, drop.
 
+    // DO-BRACE (W2AK): a trailing `{` opens a block only when the head is a
+    // control word or EVERY token before the brace is a prefix keyword
+    // (loops::opensBraceBlock's rule). `capture noisily tex \resizebox{..}{!}{`
+    // is an ordinary command whose TEXT ends in a brace; reading it as a block
+    // header silently swallowed it and the `capture noisily tex }` line after it
+    // (w2at wt_x04).
     bool opensWithBrace = !stripped.empty() && stripped.back() == '{' &&
-                          loops::isLoopHeader(trim(stripped.substr(0, stripped.size() - 1)));
+                          loops::isLoopHeader(trim(stripped.substr(0, stripped.size() - 1))) &&
+                          (loops::isParallelHeader(stripped) || loops::opensBraceBlock(stripped));
 
     if (!opensWithBrace && loops::opensBraceBlock(stripped)) {
       size_t firstBrace = stripped.find('{');
@@ -404,6 +472,19 @@ std::vector<Item> aggregateBraces(const std::vector<std::string>& lines) {
       bb->elseBody = cr.elseBody;
       result.emplace_back(bb);
     } else {
+      // FU-602: a braceless `if exp command` followed by an else form.
+      std::string c, b;
+      std::vector<Item> eb;
+      size_t after = i;
+      if (splitBracelessIf(stripped, c, b) && collectElse(lines, i, n, eb, after)) {
+        auto bb = std::make_shared<BraceBlock>();
+        bb->header = "if " + c + " {";
+        bb->body = {Item(b)};
+        bb->elseBody = std::move(eb);
+        result.emplace_back(bb);
+        i = after;
+        continue;
+      }
       result.emplace_back(stripped);
     }
   }
@@ -599,6 +680,37 @@ ExecuteResult executeDoSource(const std::string& source, SessionState& session,
 
   if (!cacheHit) {
     std::vector<std::string> preprocessed = eval::preprocessDo(source);
+    // DO-TABEXPAND (W2AK), narrowly: a texdoc `tex` line writes its own text,
+    // and Stata's file carries the line's TABs as blanks to 8-column stops
+    // counted from the start of the do-file line (w2at wt_x01_L2, wt_x02_L1:
+    // Python's expandtabs(8) over the whole line reproduces both byte for
+    // byte). Applied to `tex` lines only, where it is measured.
+    for (auto& line : preprocessed) {
+      if (line.find('\t') == std::string::npos) continue;
+      static const std::unordered_set<std::string> kPfx = {
+          "cap", "capt", "captu", "captur", "capture", "n", "no", "noi", "nois",
+          "noisi", "noisil", "noisily", "qui", "quie", "quiet", "quietl", "quietly"};
+      std::istringstream iss(line);
+      std::string w;
+      bool isTex = false;
+      while (iss >> w) {
+        std::string lw = lower(w);
+        if (!lw.empty() && lw.back() == ':') lw.pop_back();
+        if (kPfx.count(lw) != 0) continue;
+        isTex = (lw == "tex");
+        break;
+      }
+      if (!isTex) continue;
+      std::string out;
+      for (char c : line) {
+        if (c == '\t') {
+          out.append(8 - (out.size() % 8), ' ');
+        } else {
+          out += c;
+        }
+      }
+      line = out;
+    }
 
     // U5 (S6): capture `program [define] NAME … end` blocks. Must run
     // POST-preprocess (so /// continuations are already joined and each
@@ -713,6 +825,14 @@ ExecuteResult executeDoSource(const std::string& source, SessionState& session,
   // exactly as without them (same error/_control detection, same side effects).
   bool truncated = false;
   size_t storedBytes = 0;
+  // serset-twoway (2026-10-21): the COUNT ceiling counts the blocks that carry
+  // output, not the per-line command echoes. A program or loop body echoes every
+  // dispatched line on every iteration (Stata's log echoes none of them), so a
+  // do-file whose helper loops over graph sersets row by row stored 16,600
+  // echoes against 3,400 output blocks and lost its last records to the cap
+  // (w2aq_histogram_family hk_kd_aw_g onward). Echoes stay STORED and stay
+  // under the byte budget below, which is what bounds a runaway.
+  size_t storedCounted = 0;
   static const size_t byteBudget = maxRunBytes();  // A1: getenv, hoisted (see above)
 
   // N6 (P8.1-W2) + F6c: pushBlock is the ONE append+stream point for top-level
@@ -744,14 +864,45 @@ ExecuteResult executeDoSource(const std::string& source, SessionState& session,
     if (piet::counters::g_doexecDepth <= 1 && b.is_object()) {
       piet::counters::noteEmittedBlockType(b.value("type", std::string()));
     }
+    // name-binding-display-literals: `display ... _continue` suppresses the
+    // newline at the end of its line, so the next display's text continues it
+    // (w2av_name_binding bd_dy_cont `[ab]`, bd_dy_contc `[a b]`). The block
+    // says so (handleDisplay's `continue`); the text is joined onto it here,
+    // past any command echo between them. The stored transcript holds the
+    // joined line; a streaming console was sent the first block already, and
+    // joins the next one's text onto it itself (console.js appendBlock,
+    // BUG-1473), so both show one line.
+    if (!truncated && b.is_object() && b.value("type", std::string()) == "display") {
+      for (size_t k = out.blocks.size(); k-- > 0;) {
+        ojson& prev = out.blocks[k];
+        if (!prev.is_object()) break;
+        const std::string pt = prev.value("type", std::string());
+        if (pt == "echo") continue;
+        if (pt != "display" || !prev.value("continue", false)) break;
+        prev["text"] = prev.value("text", std::string()) + b.value("text", std::string());
+        if (b.value("continue", false)) {
+          prev["continue"] = true;
+        } else {
+          prev.erase("continue");
+        }
+        if (onBlock) onBlock(b);  // streamed, not stored: not counted (see below)
+        return;
+      }
+    }
     if (!truncated) {
       // Size proxy for the byte budget — the block's own JSON dump length.
       // Only paid for blocks we actually STORE (post-trip blocks skip it), so
       // the measurement work is itself bounded by the budget.
-      size_t est = b.is_null() ? 0 : b.dump().size();
-      if (out.blocks.size() >= kMaxRunBlocks || storedBytes + est > byteBudget) {
+      // BUG-1372: byte-based string functions can leave a split UTF-8
+      // sequence in a block's text (substr("h\xc3\xa9llo",3,2), reverse()),
+      // and a throwing dump() failed the whole run; such a byte is counted
+      // as the U+FFFD the transcript will carry. So is a byte that is not
+      // UTF-8 at all (`type` of a Latin-1 file, BUG-1131).
+      size_t est = b.is_null() ? 0 : b.dump(-1, ' ', false, ojson::error_handler_t::replace).size();
+      const bool isEcho = b.is_object() && b.value("type", std::string()) == "echo";
+      if ((!isEcho && storedCounted >= kMaxRunBlocks) || storedBytes + est > byteBudget) {
         std::string reason =
-            out.blocks.size() >= kMaxRunBlocks
+            (!isEcho && storedCounted >= kMaxRunBlocks)
                 ? ("this run exceeded " + std::to_string(kMaxRunBlocks) + " stored blocks")
                 : ("this run exceeded its " + std::to_string(byteBudget) +
                    "-byte stored-transcript budget");
@@ -766,6 +917,7 @@ ExecuteResult executeDoSource(const std::string& source, SessionState& session,
       }
       out.blocks.push_back(b);
       storedBytes += est;
+      if (!isEcho) ++storedCounted;
       if (onBlock) {
         onBlock(b);
         ++out.streamedCount;
@@ -1163,7 +1315,24 @@ ExecuteResult executeDoSource(const std::string& source, SessionState& session,
       const std::string& stripped = std::get<std::string>(item);
       if (trim(stripped).empty()) continue;
 
-      ojson blocks = dispatchFn(stripped, session);
+      // BUG-920: a close brace with code after it (`} else if c {`, `} else {`)
+      // is r(198) "code follows on the same line as close brace" in Stata
+      // (oracle w2_prog_controlflow pc_if_brace_else, log 858-860: the block
+      // runs up to that line, then the line refuses). collectBody keeps such a
+      // line in the body (its braces net to zero), so it reached the
+      // dispatcher as a command named `}` and came back r(199).
+      ojson blocks;
+      {
+        const std::string t = trim(stripped);
+        const std::string after = t.size() > 1 && t[0] == '}' ? trim(t.substr(1)) : std::string();
+        if (!after.empty() && after.rfind("//", 0) != 0 && after.rfind("/*", 0) != 0) {
+          blocks = ojson::array({ojson(eval::errorBlock(
+              "syntax_error", "code follows on the same line as close brace", t, std::nullopt,
+              std::nullopt, std::string("r(198)")))});
+        } else {
+          blocks = dispatchFn(stripped, session);
+        }
+      }
       coalesceMutationVarlists(blocks);  // F8: one varlist card per top-level command
       std::optional<std::string> ctrl;
       for (const auto& b : blocks) {
@@ -1207,6 +1376,10 @@ PrivateLocalScope::PrivateLocalScope(SessionState& session) : session_(session) 
   const std::string* callerRc = session_.eval.locals.find("_rc");
   eval::OrderedDict fresh;
   if (callerRc != nullptr) fresh.set("_rc", *callerRc);
+  // BUG-1330: a do/run file starts under its caller's `version`; its own
+  // `version #` ends with it, as the scope pops.
+  for (const char* key : {kVersionLocal, kUserVersionLocal})
+    if (const std::string* ver = session_.eval.locals.find(key)) fresh.set(key, *ver);
   session_.scopeStack.push_back(std::move(session_.eval.locals));
   session_.eval.locals = std::move(fresh);
   depth_ = session_.scopeStack.size();

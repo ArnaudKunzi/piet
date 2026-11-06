@@ -1,0 +1,18 @@
+{
+  "varlist": [
+    { "name": "make",         "dtype": "factor", "format": "%18s", "label": "model name",           "n_levels": 74, "levels": ["Alder Coupe", "Birch Sedan", "Cedar Wagon"], "n_missing": 0 },
+    { "name": "price",        "dtype": "f64",    "format": "%8.0g", "label": "list price (USD)",    "n_missing": 0 },
+    { "name": "mpg",          "dtype": "f64",    "format": "%8.0g", "label": "fuel economy",        "n_missing": 0 },
+    { "name": "rep78",        "dtype": "f64",    "format": "%8.0g", "label": "service rating",      "n_missing": 5 },
+    { "name": "headroom",     "dtype": "f64",    "format": "%6.1f", "label": "cabin height (cm)",   "n_missing": 0 },
+    { "name": "trunk",        "dtype": "f64",    "format": "%8.0g", "label": "cargo volume (L)", "n_missing": 0 },
+    { "name": "weight",       "dtype": "f64",    "format": "%8.0g", "label": "curb mass (kg)",      "n_missing": 0 },
+    { "name": "length",       "dtype": "f64",    "format": "%8.0g", "label": "body length (cm)",    "n_missing": 0 },
+    { "name": "turn",         "dtype": "f64",    "format": "%8.0g", "label": "turning radius (m)",  "n_missing": 0 },
+    { "name": "displacement", "dtype": "f64",    "format": "%8.0g", "label": "engine size (cc)", "n_missing": 0 },
+    { "name": "gear_ratio",   "dtype": "f64",    "format": "%6.2f", "label": "final drive ratio",   "n_missing": 0 },
+    { "name": "foreign",      "dtype": "f64",    "format": "%8.0g", "label": "origin (0=local, 1=import)", "n_missing": 0 }
+  ],
+  "n_rows": 74,
+  "n_cols": 12
+}

@@ -1,0 +1,9 @@
+key,value
+margins[p1].margin,2.00451825347036e-01
+margins[p1].se,7.13912603077748e-02
+margins[p1].ci_lo,6.05275263328732e-02
+margins[p1].ci_hi,3.40376124361198e-01
+margins[p2].margin,6.97908655929297e-01
+margins[p2].se,1.08995100275561e-01
+margins[p2].ci_lo,4.84282184897867e-01
+margins[p2].ci_hi,9.11535126960728e-01

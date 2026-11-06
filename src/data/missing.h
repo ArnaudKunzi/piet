@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Stata missing values — system missing `.` plus the 26 extended codes
 // `.a` … `.z`, carried inside the f64 column representation.
 //

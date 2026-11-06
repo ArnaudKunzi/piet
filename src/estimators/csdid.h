@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Callaway–Sant'Anna staggered difference-in-differences estimation.
 //
 // Implemented from the published methodology papers:
@@ -5,7 +7,6 @@
 //          with multiple time periods", Journal of Econometrics 225(2), 200-230.
 //   [SZ20] Sant'Anna, P.H.C. and J. Zhao (2020), "Doubly robust difference-in-
 //          differences estimators", Journal of Econometrics 219(1), 101-122.
-// Clean-room provenance record: docs/legal/CSDID_CLEANROOM_WALL.md.
 //
 // drdid_dripw_cell estimates one 2x2 group-time cell with SZ20's doubly-robust
 // DiD estimator for panel data (propensity score by ML logit, outcome
@@ -41,10 +42,22 @@ struct DrdidCell {
 DrdidCell drdid_dripw_cell(const double* dy, const double* X, int64_t n, int p,
                            const double* trt, double pscoretrim = 0.995);
 
+// One 2x2 outcome-regression DiD cell (SZ20 §2, panel case): β̂ = least squares
+// of dy on [X, 1] over the comparison units, ATT = mean over treated units of
+// dy − [X, 1]'β̂. Same argument conventions as drdid_dripw_cell; the influence
+// function carries the first-step effect of β̂.
+DrdidCell drdid_reg_cell(const double* dy, const double* X, int64_t n, int p,
+                         const double* trt);
+
 // -----------------------------------------------------------------------------
 // csdid_dripw_run: full Callaway-Sant'Anna driver.
 
 enum class CsdidComparison { Never, Notyet };
+
+// The per-cell estimator: doubly-robust IPW (SZ20 §3.1) or outcome regression
+// (SZ20 §2). Stata's csdid uses reg when method() is empty and there is no
+// covariate (csdid-drdid LAYOUT.md 0); the CLI applies that default.
+enum class CsdidMethod { Dripw, Reg };
 
 struct CsdidConfig {
     CsdidComparison comparison = CsdidComparison::Never;
@@ -63,6 +76,17 @@ struct CsdidConfig {
     // VV = Σ_c (Σ_{u∈c} IF_u)² / N². If null, each unit is its own cluster
     // (the default — identical to unit-level IID inference).
     const double* cluster = nullptr;
+    CsdidMethod method = CsdidMethod::Dripw;
+};
+
+// An e(b)/e(V) posting in Stata's layout: names[j] is the j-th column's full
+// name (`eq:name`, or a bare name), b its coefficient, V the m×m covariance
+// (row-major) of the per-unit influence functions behind b, cluster-folded
+// when a cluster variable is set.
+struct CsdidPosting {
+    std::vector<std::string> names;
+    std::vector<double> b;
+    std::vector<double> V;
 };
 
 struct CsdidCellEstimate {
@@ -95,16 +119,26 @@ struct CsdidRunResult {
     double post_avg = 0, post_avg_se = 0;
     std::vector<CsdidEventBin> events;   // one bin per realized event time in window
 
-    // Event-study e(b)/e(V) (for `estat event, post`). event_names[j] is the
-    // relative-period name for events[j]: "Tm#" for e=-#, "Tp#" for e=+#
-    // (Tp0 = the e==0 contemporaneous period). event_b == events[j].att.
-    // event_V is the full E×E covariance of the event vector (row-major), built
-    // from the per-event influence functions (Σ_c IF_h[c]·IF_h'[c]/N²), so the
-    // diagonal sqrt == events[j].se and off-diagonals support downstream
-    // test/lincom on the posted event coefficients.
+    // Event-study e(b)/e(V) (for `estat event, post`): [Pre_avg, Post_avg,
+    // Tm#.. Tp#..]; "Tm#" for e=-#, "Tp#" for e=+# (Tp0 = the e==0 period),
+    // event_b[2+j] == events[j].att. event_V is the (2+E)×(2+E) covariance
+    // (row-major) of the per-event influence functions (Σ_c IF_h[c]·IF_h'[c]/N²)
+    // with the averages block and the bins block only: estat event posts the
+    // two blocks block-diagonally (csdid-drdid LAYOUT.md 1.8).
     std::vector<std::string> event_names;
-    std::vector<double> event_b;            // length E
-    std::vector<double> event_V;            // E*E, row-major
+    std::vector<double> event_b;            // length 2+E
+    std::vector<double> event_V;            // (2+E)*(2+E), row-major
+
+    // csdid's own e(b)/e(V) (csdid-drdid LAYOUT.md 1.1-1.6). attgt: one column
+    // per ATT(g,t) cell (`g<g>:t_<a>_<b>`, cohort-major) then one wgt column
+    // per cell (`wgt:w<g>_<t>`, the cell's share of treated units), with the
+    // joint covariance of all 2K influence functions. long2 posts no column for
+    // a cohort's t == g − gdelta cell (it is the base). agg_*: the aggregate's
+    // own columns (ATT; Pre_avg Post_avg Tm#.. Tp#..; GAverage G#..; CAverage
+    // T#..) with their full covariance. event_V above is agg_event.V with the
+    // averages-by-bins blocks zeroed.
+    CsdidPosting attgt;
+    CsdidPosting agg_simple, agg_event, agg_group, agg_calendar;
 
     // Pre-trends test: joint Wald that all pre-treatment att(g,t) cells (t<g) == 0.
     double pretrend_chi2 = 0, pretrend_p = 1;
@@ -117,6 +151,7 @@ struct CsdidRunResult {
     std::vector<GroupBin> groups;
 
     int64_t n_units = 0;
+    int64_t n_clusters = 0;  // # clusters of the fold (== n_units without a cluster variable)
     int64_t n_obs_est = 0;   // # distinct raw rows used across all (g,t) cell
                              // estimation samples (base+target rows, unioned).
     bool ok = true;

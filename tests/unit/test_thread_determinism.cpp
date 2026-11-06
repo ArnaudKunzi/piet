@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // P9 entry contract — thread-count determinism for the ESTIMATOR-side parallel
 // kernels (TOLERANCE.md §4.2, ROADMAP P9 row).
 //
@@ -13,7 +15,7 @@
 //
 //   src/hdfe/demean.cpp:116,122   ThreadPool::global().run over reduction LANES
 //   src/estimators/xtlogit.cpp:324,438  parallel_for over panels
-//   src/inference/wildboot.cpp:109      parallel_for over bootstrap replicates
+//   src/inference/wildboot.cpp:193      parallel_for over bootstrap replicates
 //
 // All three are compliant BY CONSTRUCTION today — demean re-keys its reduction
 // width to reduction_lanes(n) (a pure function of n, independent of the worker
@@ -217,8 +219,7 @@ static std::vector<double> case_wildboot() {
 
     WildBootResult R = wild_cluster_bootstrap(md, /*param_index=*/1, /*null_beta=*/0.0,
                                               /*reps=*/999, /*seed=*/20260814ULL,
-                                              /*cluster_index=*/0, BootWeights::Rademacher,
-                                              /*webb_auto=*/false);
+                                              /*cluster_index=*/0, BootWeights::Rademacher);
     std::vector<double> out;
     out.insert(out.end(), R.tstars.begin(), R.tstars.end());
     out.push_back(R.beta);

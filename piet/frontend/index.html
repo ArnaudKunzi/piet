@@ -125,7 +125,7 @@
           <!-- U3: one click loads the bundled sample — data-run reuses
                app.js's existing generic "[data-run] -> runCommand()" wiring
                (init(), same mechanism as the Data ▾ items below), no new JS. -->
-          <a href="#" data-run="sysuse synthetic_panel">Open sample dataset</a>
+          <a href="#" data-run="sysuse fatalities">Open sample dataset</a>
           <!-- B3 (P8-S6): Recent files — last ~8 opened data/do files,
                persisted in localStorage (app.js's trackRecentFile/
                renderRecentFiles). Hidden as a whole group until there is at
@@ -235,7 +235,7 @@
           <!-- white cells (breathing room) -->
           <rect x="64"  y="104" width="172" height="52"  fill="#faf9f8"/>
         </svg>
-        <div class="empty-text">. Try sysuse synthetic_panel, then regress fatal beertax unemp, robust — or File ▾ &gt; Open sample dataset</div>
+        <div class="empty-text">. Try sysuse fatalities, then regress fatal beertax unemp, robust — or File ▾ &gt; Open sample dataset</div>
       </div>
 
       <!-- Append-only block log (z-index 2) -->
@@ -518,7 +518,7 @@
           </span>
           <span class="settings-hint">Accept the 17 command names introduced by independent,
             community-authored Stata packages (<code>reghdfe</code>, <code>csdid</code>,
-            <code>esttab</code>, …). These names do not install the original packages; PIET is not
+            <code>esttab</code>, …). PIET contains no code from those packages and is not
             affiliated with their authors; the full list and attributions are under
             <em>About &rsaquo; Third-party notices</em>. Off = PIET answers only to its own
             command names. Applies to the next command.</span>
@@ -633,8 +633,9 @@
           &lsquo;Stata&rsquo; is a registered trademark of StataCorp LLC.</p>
         <p>For the convenience of users migrating existing do-files, PIET also answers to a
           number of command names introduced by independent, community-authored Stata
-          packages. These names do not install those packages. Implementations target
-          published methods and compatible behavior; results are not guaranteed to match the original
+          packages. <strong>PIET contains no code from those packages.</strong> Every
+          estimator behind these names is an independent implementation written for this
+          project from published methods; results are not guaranteed to match the original
           package, and any difference is PIET&rsquo;s responsibility, not the original
           author&rsquo;s. The names are:</p>
         <p class="consent-names"><code>reghdfe</code> <code>ivreghdfe</code>

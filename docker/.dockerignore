@@ -1,0 +1,13 @@
+build/
+build-*/
+dist/
+.git/
+*.hbin
+*.dta
+*.parquet
+*.log
+tests/validate/*.dta
+tests/validate/*.log
+tests/validate/*.csv
+tests/validate/*.hbin
+tests/validate/*.parquet

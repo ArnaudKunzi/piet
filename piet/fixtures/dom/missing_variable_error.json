@@ -1,0 +1,5 @@
+{
+  "code": "engine_error",
+  "message": "variable nosuchvar not found",
+  "type": "error"
+}

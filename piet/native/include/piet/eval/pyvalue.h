@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // PyValue — a Python-object model for the M1 evaluator port.
 //
 // The Python backend evaluates macro `= expr` arithmetic and expression

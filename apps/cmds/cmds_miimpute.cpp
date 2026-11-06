@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 #include "core/distributions.h"
@@ -19,7 +21,7 @@
 // `_mi_id` however its frame model wants them — the engine's job is the draw, not
 // the reshape.
 //
-// Oracle: StataBE 19.5, tests/kitchensink/pangram/waves/_oracle/p7_stata.log.
+// Oracle: StataBE 19.5, internal capture p7_stata.log.
 // Assertions: tests/unit/test_miimpute.cpp.
 
 namespace cecon {

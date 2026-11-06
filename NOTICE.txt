@@ -20,8 +20,14 @@ any sponsorship, endorsement, or affiliation.
 ----------------------------------------
 For the convenience of users migrating existing do-files, PIET accepts a number
 of command names that were introduced by independent, community-authored Stata
-packages. These compatibility names do not include or install the original packages.
-Implementations in this repository target published methods and compatible behavior; results are not guaranteed to match the original package,
+packages. **Except for the declared adoptions, PIET contains no code from those
+packages.** The declared adoptions, each marked in the source file that carries
+it and reproduced with its licence in THIRD_PARTY_NOTICES.txt, are code derived
+from estout/esttab/estadd/eststo (MIT), coefplot (MIT), texsave (MIT), outreg2
+(GPL v3), mat2txt (GPL v3), acreg (GPL v3), qreg2 (GPL v3), ritest (GPL v3),
+lassopack (rlasso; GPL v3) and swindex (GPL v3). Every other estimator behind
+these names is an independent implementation written for this project from
+published methods; results are not guaranteed to match the original package,
 and any difference is PIET's responsibility, not the original author's.
 
 The names, and the authors who introduced them, are:
@@ -66,6 +72,9 @@ The names, and the authors who introduced them, are:
   splitvallabels                Nicholas Winter, Ben Jann
   filelist                      Robert Picard
   carryforward                  David Kantor
+  ihstrans                      Jan Helmdag
+  sctorezone                    SurveyCTO (William Blackmon, IPA)
+  leebounds                     Harald Tauchmann
   rangestat                     Robert Picard, Nicholas J. Cox,
                                 Roberto Ferrer
   gunique                       Mauricio Caceres Bravo
@@ -78,6 +87,17 @@ The names, and the authors who introduced them, are:
   ivreg2                        Christopher F. Baum, Mark E. Schaffer,
                                 Steven Stillman
   xtivreg2                      Mark E. Schaffer
+  require                       Sergio Correia, Matthew P. Seay
+  labvars                       Daniel Klein
+  astile, fillmissing           Attaullah Shah
+  matsort                       Paul Millar
+  matselrc, findname            Nicholas J. Cox
+  sencode                       Roger Newson
+  zipsave, zipuse               Henrik Stovring
+  rlasso                        Achim Ahrens, Christian B. Hansen,
+                                Mark E. Schaffer (lassopack; adapted, GPL-3)
+  swindex                       Benjamin Schwab, Sarah Janzen, Nicholas Magnan,
+                                William M. Thompson (adapted, GPL-3)
   feols                         name shared with the fixest R package
                                 (Laurent Berge)
 
@@ -88,7 +108,7 @@ at any time with `set extcompat off`, after which PIET responds only to its own
 native command names.
 
 If you are the author of one of these packages and would prefer that PIET not
-accept your command name, please contact us at the address in section 5 and we
+accept your command name, please open an issue (section 5) and we
 will remove it.
 
 
@@ -108,13 +128,13 @@ research-methodology judgment.
 -------------------------------------------------------
 If you use an estimator in published or for-credit academic work, please cite
 the method's original authors. The application prints the relevant reference
-with the estimators that have one; implementation headers identify further
-method references. THIRD_PARTY_NOTICES.txt lists bundled code licenses.
+with the estimators that have one; the packaged THIRD_PARTY_NOTICES.txt carries
+the full list.
 
 If you use the tool itself, a citation is appreciated:
 
     Kim, M.K. 2026. "PIET: a Stata-syntax-compatible econometrics tool."
-    https://github.com/w4s7jksf68-ai/piet
+    [software]. https://github.com/w4s7jksf68-ai/piet
 
 
 5. THIRD-PARTY COMPONENTS AND CONTACT
@@ -126,4 +146,4 @@ application bundle and is generated from piet/packaging/licenses/ in the source
 tree. On Windows, the Microsoft Edge WebView2 Runtime is provided under
 Microsoft's own distribution terms, not under this project's license.
 
-Contact: https://github.com/w4s7jksf68-ai/piet/issues
+Contact: open an issue at https://github.com/w4s7jksf68-ai/piet/issues

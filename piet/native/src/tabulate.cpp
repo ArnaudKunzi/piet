@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // tabulate/tab/tab1/tab2 + table — C++ port of piet/backend/piet/tabulate.py
 // and piet/backend/piet/table.py (ROADMAP M4a item 1: data-summary output).
 // Pure computation over a Datastore — no cobra call. Mirrors the oracle's
@@ -5,6 +7,10 @@
 // scipy-free continued-fraction/series expansion, N/A vs 0 vs null semantics
 // for degenerate cells).
 #include "piet/handlers.h"
+#include "piet/eval/errors.h"
+
+#include "data/missing.h"  // cecon::missing_kind: the `.a`-`.z` kind of a cell
+#include "piet/eval/exprfns.h"  // stataMissingWithKind / stataExtendedMissingKind
 
 #include <algorithm>
 #include <limits>
@@ -76,7 +82,11 @@ double chi2Sf(double x, double k) {
   double a = k / 2.0;
   double x2 = x / 2.0;
   if (x2 < a + 1) {
-    double s = std::exp(-x2 + a * std::log(x2) - logGamma(a));
+    // BUG-1012: the series is P(a,x) = e^-x x^a / Gamma(a+1) * sum, and it used
+    // Gamma(a): the lower tail came out `a` times too large, so every p below the
+    // continued-fraction switch (x/2 < k/2 + 1) was wrong. w2as sx_tab_two_chi2,
+    // chi2 1.2446 on 3 df: Stata p 0.7425, this 0.6137 (1 - 1.5 x 0.2575).
+    double s = std::exp(-x2 + a * std::log(x2) - logGamma(a)) / a;
     double term = s;
     for (int n = 1; n <= 300; ++n) {
       term *= x2 / (a + n);
@@ -170,7 +180,8 @@ struct GroupCol {
   std::vector<double> raw;         // f64 values (NaN = missing) OR factor codes as double
   std::vector<std::string> levels; // factor dictionary (empty for f64)
   // BUG-371 (`tabulate, missing`): when set, readGroupCol has already rewritten
-  // every missing cell to +inf, and missing is an ORDINARY CATEGORY from here on.
+  // every missing cell to its category key (see readGroupCol), and missing is an
+  // ORDINARY CATEGORY from here on.
   bool includeMissing = false;
 };
 
@@ -181,26 +192,36 @@ GroupCol readGroupCol(Datastore& ds, const std::string& name, bool includeMissin
   gc.isFactor = ds.dtype(name) == "factor";
   gc.includeMissing = includeMissing;
   gc.raw.resize(static_cast<size_t>(n));
-  // BUG-371: missing becomes +inf rather than staying NaN/-1, for two reasons that
-  // both matter. (1) The category set is a std::set<double>, and NaN is not a
-  // valid key for a strict weak ordering — two NaNs compare "equivalent" only by
-  // accident. (2) Stata orders missing ABOVE every number and prints it LAST,
-  // which +inf gives for free. This file's own `mi()` convention already maps
-  // missing to +inf for ordering, so the representation is not new here.
-  // A genuine +inf cannot appear in a column: the engine's fin() turns every
-  // non-finite arithmetic result into missing before it is ever stored.
-  const double kMissCat = std::numeric_limits<double>::infinity();
+  // BUG-371: a numeric missing becomes a finite key rather than staying NaN, for
+  // two reasons that both matter. (1) The category set is a std::set<double>,
+  // and NaN is not a valid key for a strict weak ordering. (2) Stata orders
+  // missing ABOVE every number and prints it LAST.
+  // BUG-1012: each missing KIND is its own category, `.` before `.a` before ... `.z`
+  // (StataBE 19.5, w2as_summary_stats_family sx_tab_m_plain: x holds `.` twice and
+  // `.a` once, r(r) 16 = 14 values + 2 missing rows; matrow sx_tab_m_R2 reads
+  // `.` = +1.0000000000000X+3ff and `.a` = +1.0010000000000X+3ff). The key is
+  // exactly the double Stata's matrow() holds for that kind
+  // (eval::stataMissingWithKind), so ordering and the matrow() read-back come
+  // from one representation. Before, every kind became +inf: one merged row.
+  // A string column's missing is "" (code < 0): with `missing` it stays -1, an
+  // ordinary category whose label is "" and which sorts first, as "" does in
+  // Stata's byte order (sx_tab_gen_m: sm1 is `s==`).
   if (gc.isFactor) {
     const int32_t* codes = c.codes();
     for (int64_t i = 0; i < n; ++i) {
       const double v = static_cast<double>(codes[i]);
-      gc.raw[static_cast<size_t>(i)] = (includeMissing && v < 0) ? kMissCat : v;
+      gc.raw[static_cast<size_t>(i)] = (includeMissing && v < 0) ? -1.0 : v;
     }
     gc.levels = c.levels;
   } else {
     const double* d = c.f64();
     for (int64_t i = 0; i < n; ++i) {
-      gc.raw[static_cast<size_t>(i)] = (includeMissing && std::isnan(d[i])) ? kMissCat : d[i];
+      double v = d[i];
+      if (includeMissing && std::isnan(v)) {
+        const int kind = cecon::missing_kind(v);
+        v = eval::stataMissingWithKind(kind < 0 ? 0 : kind);
+      }
+      gc.raw[static_cast<size_t>(i)] = v;
     }
   }
   return gc;
@@ -218,18 +239,24 @@ bool validAt(const GroupCol& gc, size_t i) {
 // Label for a category value — factor: levels[code] (or str(code) if OOB);
 // f64: pyFloatStr(v).
 std::string labelFor(const GroupCol& gc, double v) {
-  if (gc.includeMissing && std::isinf(v)) return ".";  // BUG-371: the missing category
   if (gc.isFactor) {
     int code = static_cast<int>(v);
+    if (gc.includeMissing && code < 0) return "";  // a string's missing category
     if (code >= 0 && static_cast<size_t>(code) < gc.levels.size()) return gc.levels[static_cast<size_t>(code)];
     return std::to_string(code);
+  }
+  // BUG-371/BUG-1012: a missing category, labelled by its kind.
+  if (gc.includeMissing) {
+    if (auto kind = eval::stataExtendedMissingKind(v)) {
+      return *kind == 0 ? std::string(".") : std::string(".") + static_cast<char>('a' + *kind - 1);
+    }
   }
   return pyFloatStr(v);
 }
 
 // Sorted-unique category (value, label) pairs among valid rows.
 // `weightValid`, when non-null, further restricts to rows where
-// (*weightValid)[i] is true (project Step-1 D3: excludes fweight-missing rows
+// (*weightValid)[i] is true (Step-1 D3: excludes fweight-missing rows
 // from the category set entirely, not just from the cell counts — a category
 // that only occurs in weight-missing rows must not appear in the table at
 // all, mirroring Stata's implicit `if !missing(weightvar)`). Defaulted to
@@ -245,10 +272,16 @@ std::vector<std::pair<double, std::string>> uniqueCats(
   std::vector<std::pair<double, std::string>> out;
   out.reserve(uniq.size());
   for (double v : uniq) out.emplace_back(v, labelFor(gc, v));
+  // A string variable's categories are in Stata's byte order of the strings, not
+  // in the order the factor dictionary happened to assign codes.
+  if (gc.isFactor) {
+    std::stable_sort(out.begin(), out.end(),
+                     [](const auto& a, const auto& b) { return a.second < b.second; });
+  }
   return out;
 }
 
-// project Step-1 D3: parallel weight-array read alongside GroupCol/readGroupCol.
+// Step-1 D3: parallel weight-array read alongside GroupCol/readGroupCol.
 // A weight column is plain numeric (Stata errors on a string/factor weight
 // var), so this is deliberately simpler than GroupCol — no factor/levels
 // branch. `outW` is resized to ds.nRows(); NaN marks a missing weight (caller
@@ -257,8 +290,25 @@ std::vector<std::pair<double, std::string>> uniqueCats(
 // doesn't exist, isn't numeric, or contains a non-integer non-missing value
 // (fweight must be integer) — native tabulate has no cobra call to delegate
 // this validation to, so PIET must enforce it here itself.
+// The four weight kinds tabulate serves. Freq keeps every pre-existing
+// fweight answer byte-identical (integer cells); Analytic and Importance are
+// the [aw=] and [iw=] tables of StataBE 19.5 (w2aj_qualifiers qf_tb_aw_sp,
+// qf_tb_iw_sp): an aweight table's cells are Σw rescaled so the weights sum to
+// the tabulated N (r(N) 12 on 12 rows), an iweight table's cells are the raw
+// Σw (r(N) 28.5 = Σwf).
+enum class TabWeight { None, Freq, Analytic, Importance };
+
+TabWeight tabWeightKind(const std::optional<std::string>& weightType) {
+  if (!weightType) return TabWeight::Freq;
+  std::string t = *weightType;
+  std::transform(t.begin(), t.end(), t.begin(), [](unsigned char c) { return std::tolower(c); });
+  if (t == "aw" || t == "aweight") return TabWeight::Analytic;
+  if (t == "iw" || t == "iweight") return TabWeight::Importance;
+  return TabWeight::Freq;
+}
+
 std::optional<ojson> readFweightCol(Datastore& ds, const std::string& weightVar,
-                                     std::vector<double>& outW) {
+                                     std::vector<double>& outW, TabWeight kind = TabWeight::Freq) {
   if (!ds.has(weightVar)) {
     ojson err;
     err["type"] = "error";
@@ -281,6 +331,18 @@ std::optional<ojson> readFweightCol(Datastore& ds, const std::string& weightVar,
     double v = d[i];
     outW[static_cast<size_t>(i)] = v;
     if (std::isnan(v)) continue;  // missing weight -> row dropped by callers
+    if (kind == TabWeight::Analytic || kind == TabWeight::Importance) {
+      // Stata's mark: a zero weight leaves the sample (w2aj_qualifiers
+      // qf_cl_aw_wzero counts 5, not 6, in the group holding the zero); a
+      // negative aweight is r(402), a negative iweight is legal.
+      if (v == 0.0) {
+        outW[static_cast<size_t>(i)] = std::numeric_limits<double>::quiet_NaN();
+      } else if (v < 0.0 && kind == TabWeight::Analytic) {
+        return ojson(eval::errorBlock("engine_error", "negative weights encountered", std::nullopt,
+                                      std::nullopt, std::nullopt, "r(402)"));
+      }
+      continue;
+    }
     if (v != std::floor(v)) {
       ojson err;
       err["type"] = "error";
@@ -288,6 +350,9 @@ std::optional<ojson> readFweightCol(Datastore& ds, const std::string& weightVar,
       err["message"] = "tabulate: frequency weights (fweight) must be integer";
       return err;
     }
+    // A zero fweight leaves the sample too, so a category holding only
+    // zero-weight rows is no row of the table (BUG-1153, StataBE: r(r) 1).
+    if (v == 0.0) outW[static_cast<size_t>(i)] = std::numeric_limits<double>::quiet_NaN();
   }
   return std::nullopt;
 }
@@ -297,7 +362,7 @@ std::optional<ojson> readFweightCol(Datastore& ds, const std::string& weightVar,
 
 // `weight`, when non-null, is a Σw-sized-to-nRows fweight array (NaN =
 // missing -> row dropped): each cell's freq becomes Σw of its rows instead of
-// a plain row count (project Step-1 D3). Defaulted to nullptr so the unweighted
+// a plain row count (Step-1 D3). Defaulted to nullptr so the unweighted
 // call sites are byte-identical to before this change.
 //
 // `sortByFreq` (B5-D-TAB-SORT, one-way ONLY — real Stata's `sort` option
@@ -308,7 +373,7 @@ std::optional<ojson> readFweightCol(Datastore& ds, const std::string& weightVar,
 // pre-existing call site is byte-identical.
 ojson tabulateOne(Datastore& ds, const std::string& varname,
                    const std::vector<double>* weight = nullptr, bool includeMissing = false,
-                   bool sortByFreq = false) {
+                   bool sortByFreq = false, TabWeight kind = TabWeight::Freq) {
   GroupCol gc = readGroupCol(ds, varname, includeMissing);
   std::vector<bool> weightValid;
   const std::vector<bool>* weightValidPtr = nullptr;
@@ -323,42 +388,71 @@ ojson tabulateOne(Datastore& ds, const std::string& varname,
   struct CatCount {
     std::string label;
     int64_t count;
+    double wsum;  // Σw of the category (aweight/iweight tables only)
   };
   std::vector<CatCount> catCounts;
   catCounts.reserve(cats.size());
   int64_t total = 0;
+  double wtotal = 0.0;
   for (const auto& [v, label] : cats) {
     int64_t cnt = 0;
+    double wsum = 0.0;
     for (size_t i = 0; i < gc.raw.size(); ++i) {
       if (!validAt(gc, i) || gc.raw[i] != v) continue;
       if (weight == nullptr) {
         ++cnt;
       } else if (!std::isnan((*weight)[i])) {
-        cnt += static_cast<int64_t>((*weight)[i]);
+        if (kind == TabWeight::Freq) {
+          cnt += static_cast<int64_t>((*weight)[i]);
+        } else {
+          ++cnt;
+          wsum += (*weight)[i];
+        }
       }
     }
-    catCounts.push_back({label, cnt});
+    catCounts.push_back({label, cnt, wsum});
     total += cnt;
+    wtotal += wsum;
   }
+  const bool realWeighted =
+      weight != nullptr && (kind == TabWeight::Analytic || kind == TabWeight::Importance);
+  // An aweight cell is its Σw rescaled to the tabulated N; an iweight cell is
+  // its Σw. `count` stays the row count, so the sort below orders the shown
+  // frequencies through `wsum`.
+  auto shownFreq = [&](const CatCount& cc) -> double {
+    if (kind == TabWeight::Analytic) return wtotal != 0.0 ? cc.wsum * static_cast<double>(total) / wtotal : 0.0;
+    return cc.wsum;
+  };
   // stable_sort: ties keep the ascending-value order as their tie-break. The
   // measured fixture (rep78) has no tied frequencies, so a real Stata
   // tie-break rule is not something this cell can confirm either way — this
   // is the one choice that leaves the UNSORTED row order provably unchanged.
   if (sortByFreq) {
-    std::stable_sort(catCounts.begin(), catCounts.end(),
-                      [](const CatCount& a, const CatCount& b) { return a.count > b.count; });
+    std::stable_sort(catCounts.begin(), catCounts.end(), [&](const CatCount& a, const CatCount& b) {
+      return realWeighted ? a.wsum > b.wsum : a.count > b.count;
+    });
   }
   ojson rows = ojson::array();
   ojson values = ojson::object();
   for (const auto& cc : catCounts) {
     rows.push_back(cc.label);
-    values[cc.label] = cc.count;
+    if (realWeighted) {
+      values[cc.label] = shownFreq(cc);
+    } else {
+      values[cc.label] = cc.count;
+    }
   }
   ojson table;
   table["rows"] = rows;
   table["values"] = values;
   ojson margins;
-  margins["total"] = total;
+  // The aweight total is the row count itself (the rescaled cells sum to it
+  // only up to rounding); the iweight total is Σw.
+  if (realWeighted && kind == TabWeight::Importance) {
+    margins["total"] = wtotal;
+  } else {
+    margins["total"] = total;
+  }
   table["margins"] = margins;
 
   ojson out;
@@ -374,7 +468,8 @@ ojson tabulateOne(Datastore& ds, const std::string& varname,
 // table with no further changes needed). Defaulted to nullptr so unweighted
 // call sites stay byte-identical.
 ojson tabulateTwo(Datastore& ds, const std::string& rowVar, const std::string& colVar, bool chi2,
-                   const std::vector<double>* weight = nullptr, bool includeMissing = false) {
+                   const std::vector<double>* weight = nullptr, bool includeMissing = false,
+                   TabWeight kind = TabWeight::Freq, unsigned stats = 0) {
   GroupCol rc = readGroupCol(ds, rowVar, includeMissing);
   GroupCol cc = readGroupCol(ds, colVar, includeMissing);
   size_t n = rc.raw.size();
@@ -390,7 +485,71 @@ ojson tabulateTwo(Datastore& ds, const std::string& rowVar, const std::string& c
   auto rowCats = uniqueCats(rc, weightValidPtr);
   auto colCats = uniqueCats(cc, weightValidPtr);
 
-  // Contingency counts (Σw per cell/margin/total when weighted).
+  // Contingency counts (Σw per cell/margin/total when weighted). Under
+  // [aw=]/[iw=] the cells are real-valued: Σw per cell, and for an aweight
+  // rescaled so the weights sum to the tabulated N (tabulateOne's contract).
+  const bool realWeighted =
+      weight != nullptr && (kind == TabWeight::Analytic || kind == TabWeight::Importance);
+  if (realWeighted) {
+    std::map<std::pair<double, double>, double> wc;
+    std::map<double, double> wr, wcol;
+    double wtot = 0.0;
+    int64_t nrows = 0;
+    for (size_t i = 0; i < n; ++i) {
+      if (!validAt(rc, i) || !validAt(cc, i) || std::isnan((*weight)[i])) continue;
+      double w = (*weight)[i];
+      wc[{rc.raw[i], cc.raw[i]}] += w;
+      wr[rc.raw[i]] += w;
+      wcol[cc.raw[i]] += w;
+      wtot += w;
+      ++nrows;
+    }
+    const double scale =
+        kind == TabWeight::Analytic ? (wtot != 0.0 ? static_cast<double>(nrows) / wtot : 0.0) : 1.0;
+    ojson rowsArr = ojson::array();
+    ojson colsArr = ojson::array();
+    for (const auto& [v, l] : rowCats) rowsArr.push_back(l);
+    for (const auto& [v, l] : colCats) colsArr.push_back(l);
+    ojson values = ojson::object();
+    for (const auto& [rv, rl] : rowCats) {
+      ojson rowObj = ojson::object();
+      for (const auto& [cv, cl] : colCats) {
+        auto it = wc.find({rv, cv});
+        rowObj[cl] = (it == wc.end()) ? 0.0 : it->second * scale;
+      }
+      values[rl] = rowObj;
+    }
+    ojson marginsRow = ojson::object();
+    for (const auto& [rv, rl] : rowCats) marginsRow[rl] = wr.count(rv) ? wr[rv] * scale : 0.0;
+    ojson marginsCol = ojson::object();
+    for (const auto& [cv, cl] : colCats) marginsCol[cl] = wcol.count(cv) ? wcol[cv] * scale : 0.0;
+    ojson table;
+    table["rows"] = rowsArr;
+    table["cols"] = colsArr;
+    table["values"] = values;
+    ojson margins;
+    margins["row"] = marginsRow;
+    margins["col"] = marginsCol;
+    if (kind == TabWeight::Analytic) {
+      margins["total"] = nrows;
+    } else {
+      margins["total"] = wtot;
+    }
+    table["margins"] = margins;
+    ojson result;
+    result["type"] = "tabulate";
+    result["vars"] = ojson::array({rowVar, colVar});
+    result["table"] = table;
+    if (chi2) {
+      // Stata: "chi2 may not be used with aweights or iweights" is not a
+      // statistic this table computes; refuse by name rather than report an
+      // unweighted or a rescaled-count chi2.
+      return ojson(eval::unsupportedOption(
+          "chi2", "`tabulate ..., chi2` with [aw=]/[iw=] is not supported in this version of PIET."));
+    }
+    return result;
+  }
+
   std::map<std::pair<double, double>, int64_t> counts;
   std::map<double, int64_t> rowTotals, colTotals;
   int64_t grandTotal = 0;
@@ -443,7 +602,11 @@ ojson tabulateTwo(Datastore& ds, const std::string& rowVar, const std::string& c
   result["vars"] = ojson::array({rowVar, colVar});
   result["table"] = table;
 
-  if (chi2 && grandTotal > 0) {
+  // BUG-1514: no Pearson chi2 for a table with one row or one column either:
+  // StataBE 19.5 `tabulate one d, chi2` (1 x 3) and `tabulate c one, chi2 V`
+  // (4 x 1) print no statistic and post only r(N) r(r) r(c); this posted r(chi2) 0
+  // and r(p) 1.
+  if (chi2 && grandTotal > 0 && rowCats.size() >= 2 && colCats.size() >= 2) {
     double stat = 0.0;
     for (const auto& [rv, rl] : rowCats) {
       for (const auto& [cv, cl] : colCats) {
@@ -464,6 +627,143 @@ ojson tabulateTwo(Datastore& ds, const std::string& rowVar, const std::string& c
     chi2Obj["df"] = static_cast<int64_t>(dof);
     chi2Obj["p_value"] = p;
     result["chi2"] = chi2Obj;
+  }
+  // BUG-1514: lrchi2, V, gamma and taub, by [R] tabulate twoway's Methods and
+  // formulas on the cells n_ij (Σw under fweights). Stata computes none of them
+  // for a table with one row or one column: it prints no statistic line and
+  // posts only r(N) r(r) r(c) (StataBE 19.5, `tabulate one d, chi2 lrchi2 V
+  // gamma taub` on a 1 x 3 table). On the 4 x 3 probe table every value below
+  // matches StataBE's to the last digit or two (r(chi2_lr) 1.5348030177726524,
+  // r(CramersV) .11171749536720448, r(gamma) -.031133250311332503, r(ase_gam)
+  // .17468596948023596, r(taub) -.020830078887740824, r(ase_taub)
+  // .11692105991378575).
+  const size_t nr = rowCats.size(), nc = colCats.size();
+  if (stats != 0 && grandTotal > 0 && nr >= 2 && nc >= 2) {
+    const double n = static_cast<double>(grandTotal);
+    std::vector<double> cell(nr * nc, 0.0), ri(nr, 0.0), cj(nc, 0.0);
+    for (size_t i = 0; i < nr; ++i) {
+      for (size_t j = 0; j < nc; ++j) {
+        auto it = counts.find({rowCats[i].first, colCats[j].first});
+        cell[i * nc + j] = it == counts.end() ? 0.0 : static_cast<double>(it->second);
+      }
+      ri[i] = static_cast<double>(rowTotals[rowCats[i].first]);
+    }
+    for (size_t j = 0; j < nc; ++j) cj[j] = static_cast<double>(colTotals[colCats[j].first]);
+    const double dof = static_cast<double>((nr - 1) * (nc - 1));
+    if (stats & kTabLrchi2) {
+      // G2 = 2 Σ n_ij ln(n_ij / m_ij), m_ij = n_i. n_.j / n; an empty cell adds 0.
+      double g2 = 0.0;
+      for (size_t i = 0; i < nr; ++i)
+        for (size_t j = 0; j < nc; ++j) {
+          const double o = cell[i * nc + j];
+          if (o > 0) g2 += o * std::log(o / (ri[i] * cj[j] / n));
+        }
+      g2 *= 2.0;
+      result["lrchi2"] = ojson{{"statistic", g2}, {"df", static_cast<int64_t>(dof)},
+                               {"p_value", chi2Sf(g2, dof)}};
+    }
+    if (stats & kTabCramersV) {
+      // Signed on a 2 x 2 table, (n11 n22 - n12 n21) / sqrt(n1. n2. n.1 n.2)
+      // (StataBE: -.0091535337745252288 where Pearson's chi2 is .0044);
+      // otherwise sqrt((X2 / n) / min(I - 1, J - 1)).
+      double v;
+      if (nr == 2 && nc == 2) {
+        v = (cell[0] * cell[3] - cell[1] * cell[2]) / std::sqrt(ri[0] * ri[1] * cj[0] * cj[1]);
+      } else {
+        double x2 = 0.0;
+        for (size_t i = 0; i < nr; ++i)
+          for (size_t j = 0; j < nc; ++j) {
+            const double m = ri[i] * cj[j] / n;
+            const double d = cell[i * nc + j] - m;
+            x2 += d * d / m;
+          }
+        v = std::sqrt((x2 / n) / static_cast<double>(std::min(nr, nc) - 1));
+      }
+      result["cramers_v"] = v;
+    }
+    if (stats & (kTabGamma | kTabTaub)) {
+      // A_ij / D_ij: the counts concordant / discordant with cell (i, j), from
+      // the 2-D prefix sums S[a][b] = Σ_{k<a, l<b} n_kl. P = Σ n_ij A_ij and
+      // Q = Σ n_ij D_ij are twice the concordant and discordant pairs.
+      std::vector<double> S((nr + 1) * (nc + 1), 0.0);
+      for (size_t a = 1; a <= nr; ++a)
+        for (size_t b = 1; b <= nc; ++b)
+          S[a * (nc + 1) + b] = cell[(a - 1) * nc + (b - 1)] + S[(a - 1) * (nc + 1) + b] +
+                                S[a * (nc + 1) + (b - 1)] - S[(a - 1) * (nc + 1) + (b - 1)];
+      auto at = [&](size_t a, size_t b) { return S[a * (nc + 1) + b]; };
+      std::vector<double> A(nr * nc), D(nr * nc);
+      double P = 0.0, Q = 0.0;
+      for (size_t i = 0; i < nr; ++i)
+        for (size_t j = 0; j < nc; ++j) {
+          const double below = n - at(i + 1, nc) - at(nr, j + 1) + at(i + 1, j + 1);  // k>i, l>j
+          const double above = at(i, j);                                              // k<i, l<j
+          const double belowLeft = at(nr, j) - at(i + 1, j);                          // k>i, l<j
+          const double aboveRight = at(i, nc) - at(i, j + 1);                         // k<i, l>j
+          A[i * nc + j] = below + above;
+          D[i * nc + j] = belowLeft + aboveRight;
+          P += cell[i * nc + j] * A[i * nc + j];
+          Q += cell[i * nc + j] * D[i * nc + j];
+        }
+      if (stats & kTabGamma) {
+        // gamma = (P - Q)/(P + Q), asymptotic variance 16 Σ n_ij (Q A_ij - P D_ij)^2 / (P + Q)^4.
+        double s = 0.0;
+        for (size_t k = 0; k < nr * nc; ++k) {
+          const double t = Q * A[k] - P * D[k];
+          s += cell[k] * t * t;
+        }
+        const double pq = P + Q;
+        result["gamma"] = ojson{{"value", (P - Q) / pq},
+                                {"ase", std::sqrt(16.0 * s / (pq * pq * pq * pq))}};
+      }
+      if (stats & kTabTaub) {
+        // tau_b = (P - Q)/sqrt(wr wc), wr = n^2 - Σ n_i.^2, wc = n^2 - Σ n_.j^2, with
+        // asymptotic variance {Σ n_ij (2 sqrt(wr wc) d_ij + tau_b v_ij)^2 - n^3 tau_b^2
+        // (wr + wc)^2} / (wr wc)^2, d_ij = A_ij - D_ij, v_ij = n_i. wc + n_.j wr.
+        double wr = n * n, wc = n * n;
+        for (double r : ri) wr -= r * r;
+        for (double c : cj) wc -= c * c;
+        const double w = std::sqrt(wr * wc);
+        const double tau = (P - Q) / w;
+        double s = 0.0;
+        for (size_t i = 0; i < nr; ++i)
+          for (size_t j = 0; j < nc; ++j) {
+            const double t = 2.0 * w * (A[i * nc + j] - D[i * nc + j]) + tau * (ri[i] * wc + cj[j] * wr);
+            s += cell[i * nc + j] * t * t;
+          }
+        const double var = (s - n * n * n * tau * tau * (wr + wc) * (wr + wc)) / (wr * wc * wr * wc);
+        result["taub"] = ojson{{"value", tau}, {"ase", std::sqrt(var)}};
+      }
+    }
+    if (stats & kTabExact) {
+      // Fisher's exact test, served on a 2 x 2 table: with the margins fixed, n11
+      // is hypergeometric, P(a+1)/P(a) = (n1.-a)(n.1-a) / ((a+1)(n2.-n.1+a+1)). The
+      // two-sided p sums the tables no more probable than the observed one (a 1e-7
+      // relative tie tolerance), the one-sided p the observed table's tail: below
+      // it when n11 n22 < n12 n21, above it otherwise. StataBE 19.5 on
+      // [[12,18],[9,13]]: r(p_exact) .9999999999999787, r(p1_exact)
+      // .5858028964541573 (the lower tail). An r x c table needs the network
+      // algorithm (FEXACT), which this build does not have: refused by name.
+      if (nr != 2 || nc != 2)
+        return ojson(eval::unsupportedOption(
+            "exact", "Fisher's exact test is served for 2 x 2 tables only; this table is " +
+                         std::to_string(nr) + " x " + std::to_string(nc) + "."));
+      const double r1 = ri[0], r2 = ri[1], c1 = cj[0];
+      const double lo = std::max(0.0, c1 - r2), hi = std::min(r1, c1);
+      std::vector<double> lw(1, 0.0);
+      for (double a = lo; a < hi; a += 1.0)
+        lw.push_back(lw.back() + std::log((r1 - a) * (c1 - a)) - std::log((a + 1.0) * (r2 - c1 + a + 1.0)));
+      const double top = *std::max_element(lw.begin(), lw.end());
+      double total = 0.0;
+      for (double& x : lw) total += (x = std::exp(x - top));
+      const size_t obs = static_cast<size_t>(cell[0] - lo);
+      double two = 0.0, one = 0.0;
+      const bool lower = cell[0] * cell[3] < cell[1] * cell[2];
+      for (size_t k = 0; k < lw.size(); ++k) {
+        if (lw[k] <= lw[obs] * (1.0 + 1e-7)) two += lw[k];
+        if (lower ? k <= obs : k >= obs) one += lw[k];
+      }
+      result["exact"] = ojson{{"p", two / total}, {"p1", one / total}};
+    }
   }
   return result;
 }
@@ -617,15 +917,17 @@ ojson tabulateSummaryTwo(Datastore& ds, const std::string& rowVar, const std::st
 ojson runTabulate(Datastore& ds, const std::vector<std::string>& varlist, bool chi2,
                    const std::string& cmd, const std::optional<std::string>& sumvar,
                    const std::optional<std::string>& weightVar, bool includeMissing,
-                   bool sortByFreq) {
-  // project Step-1 D3: native tabulate has no cobra call, so — unlike
+                   bool sortByFreq, const std::optional<std::string>& weightType,
+                   unsigned twoWayStats) {
+  // Step-1 D3: native tabulate has no cobra call, so — unlike
   // summarize/collapse — PIET must read, validate, and apply the fweight
   // itself. Read once up front; `weightPtr` (non-null only on success) is
   // threaded into every branch below that computes a frequency table.
   std::vector<double> weightVals;
   const std::vector<double>* weightPtr = nullptr;
+  const TabWeight kind = tabWeightKind(weightType);
   if (weightVar.has_value() && !weightVar->empty()) {
-    std::optional<ojson> werr = readFweightCol(ds, *weightVar, weightVals);
+    std::optional<ojson> werr = readFweightCol(ds, *weightVar, weightVals, kind);
     if (werr.has_value()) return *werr;
     weightPtr = &weightVals;
   }
@@ -638,7 +940,7 @@ ojson runTabulate(Datastore& ds, const std::vector<std::string>& varlist, bool c
       ojson err;
       err["type"] = "error";
       err["code"] = "unsupported_option";
-      err["message"] = "tabulate: fweight is not yet supported with the sum() option";
+      err["message"] = "tabulate: weights are not yet supported with the sum() option";
       return err;
     }
     // BS-027: two-way form (`tabulate v1 v2, summarize(v3)`) — one-way
@@ -651,7 +953,7 @@ ojson runTabulate(Datastore& ds, const std::vector<std::string>& varlist, bool c
   if (cmd == "tab1") {
     ojson tables = ojson::array();
     for (const auto& v : varlist)
-      tables.push_back(tabulateOne(ds, v, weightPtr, includeMissing, sortByFreq));
+      tables.push_back(tabulateOne(ds, v, weightPtr, includeMissing, sortByFreq, kind));
     ojson out;
     out["type"] = "tabulate";
     out["mode"] = "oneway_multi";
@@ -667,11 +969,13 @@ ojson runTabulate(Datastore& ds, const std::vector<std::string>& varlist, bool c
     // printed nothing and set no r(), so a script reading r(r) got an error for a
     // command Stata answers.
     if (varlist.size() == 1) {
-      tables.push_back(tabulateOne(ds, varlist[0], weightPtr, includeMissing, sortByFreq));
+      tables.push_back(tabulateOne(ds, varlist[0], weightPtr, includeMissing, sortByFreq, kind));
     }
     for (size_t i = 0; i < varlist.size(); ++i) {
       for (size_t j = i + 1; j < varlist.size(); ++j) {
-        tables.push_back(tabulateTwo(ds, varlist[i], varlist[j], chi2, weightPtr, includeMissing));
+        ojson t = tabulateTwo(ds, varlist[i], varlist[j], chi2, weightPtr, includeMissing, kind, twoWayStats);
+        if (t.value("type", std::string()) == "error") return t;  // BUG-1514: an r x c `exact`
+        tables.push_back(std::move(t));
       }
     }
     ojson out;
@@ -680,12 +984,12 @@ ojson runTabulate(Datastore& ds, const std::vector<std::string>& varlist, bool c
     out["tables"] = tables;
     return out;
   }
-  if (varlist.size() == 1) return tabulateOne(ds, varlist[0], weightPtr, includeMissing, sortByFreq);
+  if (varlist.size() == 1) return tabulateOne(ds, varlist[0], weightPtr, includeMissing, sortByFreq, kind);
   // `sort` is a one-way-only Stata option (kVocabTabulate's comment, dispatcher.cpp):
   // accepted-but-inert here is intentional, not a silent drop of a two-way
   // semantic — see kVocabTabulate's own comment for cell/col/row/nofreq, the
   // four two-way display options in the identical position.
-  return tabulateTwo(ds, varlist[0], varlist[1], chi2, weightPtr, includeMissing);
+  return tabulateTwo(ds, varlist[0], varlist[1], chi2, weightPtr, includeMissing, kind, twoWayStats);
 }
 
 // ---------------------------------------------------------------------------

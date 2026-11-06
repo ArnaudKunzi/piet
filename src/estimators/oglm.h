@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — ordered logit / ordered probit MLE, matching Stata `ologit` / `oprobit`.
 //
 // The outcome is recoded to categories 0..J-1 by SORTED DISTINCT VALUE (Stata's
@@ -17,10 +19,17 @@
 // crosses two cutpoints drives some P_ij to ≤ 0, whose clamped log is a very large
 // negative number, so the backtracking line search rejects the step.
 //
-// Optimizer follows the house new-MLE recipe (see estimators/tobit.h): analytic
-// gradient, central-difference numerical Hessian of that gradient, symmetrize,
-// spd_inverse(−H) for the model-based VCE, 40-halving backtracking line search,
-// maxit 200, convergence |ΔLL| < 1e-9·(|LL|+1e-9).
+// Optimizer: Stata's own iterate (BUG-1550). ologit/oprobit report ml's iterate,
+// not the exact MLE: StataBE 19.5 stops `ologit yo x1 x2` at iteration 4 with
+// /cut1 -.091028014590738324, 1.2e-8 short of the MLE this file used to converge
+// to. oglm_fit runs ml's path from Stata's start (β = 0, κ = F^{-1} of the
+// cumulative shares, iteration 0's ll = ll_0): Newton-Raphson on the analytic
+// Hessian, a full step, halved toward the old point while it does not improve ll,
+// else extended by 1/8, 1/4, ... of the step while each extension improves; stop
+// when (mreldif(θ) <= 1e-6 or reldif(ll) <= 1e-7) and g·inv(−H)·g' < 1e-5 at the
+// new point (ml_max.ado defaults; the same emulation as logit.h's binary_ml_fit).
+// Every iterate of that ologit fit, and oprobit's final one, match StataBE's
+// iterate(k) captures to 5e-15. V = inv(−H) at the final θ.
 #pragma once
 #include "core/threads.h"
 #include <algorithm>
@@ -94,7 +103,10 @@ inline double ll_grad(const double* X, int64_t n, int k, const int* cat, int J, 
                       std::vector<double>* scores = nullptr) {
     const int nc = J - 1;  // number of cutpoints
     const int np = k + nc;
-    double LL = 0;
+    // LL is a Neumaier-compensated sum: oglm_fit's ml step rules compare it, and a
+    // plain sum's rounding on a large sample exceeds its last changes near the maximum
+    // (the nbreg.cpp LlSum note, BUG-1550).
+    double LL = 0, LLc = 0;
     if (grad) std::fill(grad->begin(), grad->end(), 0.0);
     if (scores) scores->assign(static_cast<size_t>(n) * np, 0.0);
     double* S = scores ? scores->data() : nullptr;
@@ -117,7 +129,9 @@ inline double ll_grad(const double* X, int64_t n, int k, const int* cat, int J, 
         // row, so the line search rejects the step instead of carrying a NaN into
         // the Hessian.
         if (P < 1e-300) P = 1e-300;
-        LL += std::log(P);
+        const double lp = std::log(P), tsum = LL + lp;
+        LLc += (std::fabs(LL) >= std::fabs(lp)) ? (LL - tsum) + lp : (lp - tsum) + LL;
+        LL = tsum;
         if (grad) {
             double c = (f1 - f2) / P;
             for (int p = 0; p < k; ++p) (*grad)[p] += c * X[static_cast<int64_t>(p) * n + i];
@@ -132,37 +146,56 @@ inline double ll_grad(const double* X, int64_t n, int k, const int* cat, int J, 
             if (j < nc) S[static_cast<int64_t>(k + j) * n + i] = f2 / P;
         }
     }
-    return LL;
+    return LL + LLc;
 }
 
-// Numerical (central-difference) Hessian of ll_grad's analytic gradient, symmetrized.
-inline void hessian(const double* X, int64_t n, int k, const int* cat, int J, OrdLink link,
-                    const std::vector<double>& theta, std::vector<double>& H) {
-    const int np = static_cast<int>(theta.size());
-    H.assign(static_cast<size_t>(np) * np, 0.0);
-    // Column j reads only theta and j and writes only H[:, j] -- no accumulator is
-    // shared between columns -- so evaluating them concurrently returns the identical
-    // matrix, with no summation order to reorder. These 2*np full-data gradient passes
-    // are what a Newton step costs here. (PERFSWEEP H: same class as ivml/zicount.)
-    parallel_for(np, [&](int64_t jj) {
-        const int j = static_cast<int>(jj);
-        thread_local std::vector<double> gp, gm, tp, tm;
-        gp.resize(static_cast<size_t>(np));
-        gm.resize(static_cast<size_t>(np));
-        double h = 1e-6 * (std::fabs(theta[static_cast<size_t>(j)]) + 1.0);
-        tp = theta; tm = theta;
-        tp[static_cast<size_t>(j)] += h; tm[static_cast<size_t>(j)] -= h;
-        ll_grad(X, n, k, cat, J, link, tp, &gp);
-        ll_grad(X, n, k, cat, J, link, tm, &gm);
-        for (int i = 0; i < np; ++i)
-            H[static_cast<size_t>(i) * np + j] =
-                (gp[static_cast<size_t>(i)] - gm[static_cast<size_t>(i)]) / (2 * h);
-    }, threads_for_work(static_cast<int64_t>(np) * n));
-    for (int i = 0; i < np; ++i)
-        for (int j = i + 1; j < np; ++j) {
-            double s = 0.5 * (H[static_cast<size_t>(i) * np + j] + H[static_cast<size_t>(j) * np + i]);
-            H[static_cast<size_t>(i) * np + j] = H[static_cast<size_t>(j) * np + i] = s;
+// Analytic negative Hessian −∂²LL/∂θ∂θ' (np*np, symmetric). Per row, with
+// P = F(a2) − F(a1), a = κ − xβ: −∂²ln P = ∇P∇P'/P² − ∇²P/P, where ∇P is
+// ((f1 − f2)x, −f1 at κ_{j−1}, f2 at κ_j) and ∇²P has (f2' − f1')xx',
+// f1'x / −f2'x across (β, κ_{j−1} / κ_j), −f1' and f2' on the cut diagonals;
+// f' = f(1 − 2F) (logistic) or −aφ(a) (normal).
+inline void neg_hessian(const double* X, int64_t n, int k, const int* cat, int J, OrdLink link,
+                        const std::vector<double>& theta, std::vector<double>& A) {
+    const int nc = J - 1, np = k + nc;
+    A.assign(static_cast<size_t>(np) * np, 0.0);
+    std::vector<double> gP(static_cast<size_t>(np));
+    for (int64_t i = 0; i < n; ++i) {
+        double xb = 0;
+        for (int p = 0; p < k; ++p) xb += X[static_cast<int64_t>(p) * n + i] * theta[p];
+        const int j = cat[i];
+        double F1 = 0.0, f1 = 0.0, d1 = 0.0, F2 = 1.0, f2 = 0.0, d2 = 0.0;
+        if (link == OrdLink::Logit) {
+            if (j > 0) { double a1 = theta[k + j - 1] - xb; F1 = lcdf(a1); f1 = F1 * (1.0 - F1); d1 = f1 * (1.0 - 2.0 * F1); }
+            if (j < nc) { double a2 = theta[k + j] - xb; F2 = lcdf(a2); f2 = F2 * (1.0 - F2); d2 = f2 * (1.0 - 2.0 * F2); }
+        } else {
+            if (j > 0) { double a1 = theta[k + j - 1] - xb; F1 = ncdf(a1); f1 = npdf(a1); d1 = -a1 * f1; }
+            if (j < nc) { double a2 = theta[k + j] - xb; F2 = ncdf(a2); f2 = npdf(a2); d2 = -a2 * f2; }
         }
+        double P = F2 - F1;
+        if (P < 1e-300) P = 1e-300;
+        std::fill(gP.begin(), gP.end(), 0.0);
+        for (int p = 0; p < k; ++p) gP[static_cast<size_t>(p)] = (f1 - f2) * X[static_cast<int64_t>(p) * n + i];
+        if (j > 0) gP[static_cast<size_t>(k + j - 1)] = -f1;
+        if (j < nc) gP[static_cast<size_t>(k + j)] = f2;
+        for (int a = 0; a < np; ++a)
+            for (int b = 0; b < np; ++b)
+                A[static_cast<size_t>(a) * np + b] += gP[static_cast<size_t>(a)] * gP[static_cast<size_t>(b)] / (P * P);
+        for (int a = 0; a < k; ++a) {
+            const double xa = X[static_cast<int64_t>(a) * n + i];
+            for (int b = 0; b < k; ++b)
+                A[static_cast<size_t>(a) * np + b] -= (d2 - d1) * xa * X[static_cast<int64_t>(b) * n + i] / P;
+            if (j > 0) {
+                A[static_cast<size_t>(a) * np + (k + j - 1)] -= d1 * xa / P;
+                A[static_cast<size_t>(k + j - 1) * np + a] -= d1 * xa / P;
+            }
+            if (j < nc) {
+                A[static_cast<size_t>(a) * np + (k + j)] += d2 * xa / P;
+                A[static_cast<size_t>(k + j) * np + a] += d2 * xa / P;
+            }
+        }
+        if (j > 0) A[static_cast<size_t>(k + j - 1) * np + (k + j - 1)] += d1 / P;
+        if (j < nc) A[static_cast<size_t>(k + j) * np + (k + j)] -= d2 / P;
+    }
 }
 
 }  // namespace ogl
@@ -215,37 +248,61 @@ inline OglmResult oglm_fit(const double* X, int64_t n, int k, const int* cat, in
         }
     }
 
-    std::vector<double> grad(static_cast<size_t>(np)), H, negH, step(static_cast<size_t>(np));
-    double prevLL = -1e300;
+    // ml's Newton-Raphson (header comment). `V` holds inv(−H) at `theta`.
+    std::vector<double> grad(static_cast<size_t>(np)), V, step(static_cast<size_t>(np));
+    auto evaluate = [&](const std::vector<double>& th, std::vector<double>& g, std::vector<double>& Vinv) {
+        const double LL = ogl::ll_grad(X, n, k, cat, J, link, th, &g);
+        ogl::neg_hessian(X, n, k, cat, J, link, th, Vinv);
+        return la::spd_inverse(Vinv.data(), np) == 0 ? LL : std::nan("");
+    };
+    auto llat = [&](const std::vector<double>& th) { return ogl::ll_grad(X, n, k, cat, J, link, th, nullptr); };
+    double LL = evaluate(theta, grad, V);
     int it = 0;
-    for (; it < 200; ++it) {
-        double LL = ogl::ll_grad(X, n, k, cat, J, link, theta, &grad);
-        ogl::hessian(X, n, k, cat, J, link, theta, H);
-        negH.assign(H.size(), 0.0);
-        for (size_t i = 0; i < H.size(); ++i) negH[i] = -H[i];
-        if (la::spd_inverse(negH.data(), np) != 0) break;
-        la::matvec(negH.data(), np, grad.data(), step.data());  // step = (−H)^{-1} grad
-        double t = 1.0;
-        std::vector<double> cand(static_cast<size_t>(np));
-        double candLL = LL;
-        for (int bt = 0; bt < 40; ++bt) {
-            for (int i = 0; i < np; ++i) cand[static_cast<size_t>(i)] = theta[static_cast<size_t>(i)] + t * step[static_cast<size_t>(i)];
-            candLL = ogl::ll_grad(X, n, k, cat, J, link, cand, nullptr);
-            if (std::isfinite(candLL) && candLL >= LL) break;
-            t *= 0.5;
+    bool conv = false;
+    std::vector<double> cand(static_cast<size_t>(np)), tryth(static_cast<size_t>(np)), dd(static_cast<size_t>(np));
+    std::vector<double> g2(static_cast<size_t>(np)), V2;
+    while (it < 300 && !conv && std::isfinite(LL)) {
+        la::matvec(V.data(), np, grad.data(), step.data());  // step = inv(−H) g
+        for (int i = 0; i < np; ++i) cand[static_cast<size_t>(i)] = theta[static_cast<size_t>(i)] + step[static_cast<size_t>(i)];
+        double f1 = llat(cand);
+        if (!(f1 >= LL)) {
+            for (int nh = 0; nh < 60 && !(f1 >= LL); ++nh) {
+                for (int i = 0; i < np; ++i)
+                    cand[static_cast<size_t>(i)] = (cand[static_cast<size_t>(i)] + theta[static_cast<size_t>(i)]) / 2.0;
+                f1 = llat(cand);
+            }
+        } else {
+            for (int i = 0; i < np; ++i) dd[static_cast<size_t>(i)] = 0.125 * step[static_cast<size_t>(i)];
+            for (int nf = 0; nf < 100; ++nf) {
+                for (int i = 0; i < np; ++i) tryth[static_cast<size_t>(i)] = cand[static_cast<size_t>(i)] + dd[static_cast<size_t>(i)];
+                const double fc = llat(tryth);
+                if (!(fc > f1)) break;
+                cand = tryth;
+                f1 = fc;
+                for (double& v : dd) v *= 2.0;
+            }
         }
+        const double LL2 = evaluate(cand, g2, V2);
+        ++it;
+        if (!std::isfinite(LL2)) { theta = cand; LL = LL2; break; }
+        la::matvec(V2.data(), np, g2.data(), step.data());
+        double nr = 0.0, pc = 0.0;
+        for (int i = 0; i < np; ++i) {
+            nr += g2[static_cast<size_t>(i)] * step[static_cast<size_t>(i)];
+            pc = std::max(pc, std::fabs(cand[static_cast<size_t>(i)] - theta[static_cast<size_t>(i)]) /
+                                  (std::fabs(theta[static_cast<size_t>(i)]) + 1.0));
+        }
+        const double rl = std::fabs(LL2 - LL) / (std::fabs(LL) + 1.0);
+        conv = (pc <= 1e-6 || rl <= 1e-7) && nr < 1e-5;
         theta = cand;
-        if (std::fabs(candLL - prevLL) < 1e-9 * (std::fabs(prevLL) + 1e-9)) {
-            prevLL = candLL; ++it; r.converged = true; break;
-        }
-        prevLL = candLL;
+        LL = LL2;
+        grad.swap(g2);
+        V.swap(V2);
     }
+    r.converged = conv;
     r.iters = it;
-    r.ll = ogl::ll_grad(X, n, k, cat, J, link, theta, &grad);
-    ogl::hessian(X, n, k, cat, J, link, theta, H);
-    std::vector<double> V(H.size());
-    for (size_t i = 0; i < V.size(); ++i) V[i] = -H[i];
-    if (la::spd_inverse(V.data(), np) != 0) return r;
+    if (!std::isfinite(LL)) return r;
+    r.ll = LL;
     r.vcov = V;
     r.beta.assign(theta.begin(), theta.begin() + k);
     r.cuts.assign(theta.begin() + k, theta.end());

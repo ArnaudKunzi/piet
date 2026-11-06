@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // R1 (selftest split, 2026-09-01): app-support helpers extracted VERBATIM from
 // main.cpp's `namespace piet` block (old lines 101-333) so that BOTH
 // executables — piet_native (product) and piet_selftest (the 24k-line test

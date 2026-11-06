@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Internal helper shared between shell.cpp and bridge.cpp. Not part of the
 // public piet/shell.h surface — deliberately kept out of include/piet/ so it
 // never leaks to demo/main consumers.

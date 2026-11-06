@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // stata_format.h — the ONE implementation of Stata's numeric display formats.
 //
 // WHY THIS FILE EXISTS (BUG-195).
@@ -27,7 +29,7 @@
 //
 // THE ORACLE.
 // -----------
-// tests/kitchensink/fmt_oracle/fmt_g_oracle.{do,log}: 513 StataBE 19.5 cases,
+// internal capture fmt_g_oracle.{do,log}: 513 StataBE 19.5 cases,
 // 9 specs x 19 values x 3 surfaces (display / string() / tostring). Two facts
 // the capture establishes mechanically over all 171 value-spec pairs:
 //   * every `display` rendering is EXACTLY w characters wide (right-justified);
@@ -69,8 +71,42 @@
 //      expansion so there is no double-rounding.
 //   7. SCIENTIFIC DECIMALS = min(w-7, sig-1). %9.2g 1234567890 is 1.2e+09 (one
 //      decimal), %9.3g is 1.23e+09, %12.0g 12345678901234 is 1.23457e+13.
+//   8. SMALL SIDE. Fixed is refused below 1e-5 at every width and precision:
+//      .00001 and .000012345 stay fixed (.0000123 at %9.0g), while 1e-6 is
+//      1.00e-06 / 1.000e-06 / 1.00000e-06 at %9/%10/%12.0g, and %18.0g
+//      4.856548857184447e-13 is 4.85654885718e-13, never .0000000000004857.
+//      Captured in tests/eval/golden/aer_b4/pins_oracle_g3.log (1e-5..1e-10,
+//      1.23456789e-6/-7, -1e-7) and tests/eval/golden/aer_w2/
+//      w2u_binary_ml_edges.log (bm_[lp]_(dflt|tight)_test, bm_[lp]_dz0_asis_pred).
+//      The same clause reproduces w2f_residuals.log:406 (1e-4/3 stays fixed at
+//      %18.0g, .0000333333333333) and :428 (1e-5/3 is 3.33333333333e-06).
 // Rider on the neighbouring branch, same capture: `%w.0e` shows w-7 decimals,
 // not printf's none — %9.0e 42 is 4.20e+01.
+//   9. A THREE-DIGIT EXPONENT SPENDS ONE MANTISSA DIGIT. The scientific form
+//      obeys the same w-1 budget as clause 4, so `e-300` costs a decimal:
+//      %16.0g/%17.0g/%18.0g of 1e-300 are 1.00000000e-300 / 1.000000000e-300 /
+//      1.0000000000e-300 (w2f_residuals.log:802), and 5e-324 the same way
+//      (:824). Two-digit exponents already fit at w-7 decimals and do not move.
+//
+// THE HEX FORMAT `%21x` (BUG-444, W2D-T03). Stata's hexadecimal float shows the
+// STORED double bit for bit: sign, the leading bit, `.`, the 13 hex digits of
+// the 52-bit mantissa, `X`, sign, and the unbiased binary exponent as 3 hex
+// digits — always 21 characters. Every form is a captured row:
+//   3 -> +1.8000000000000X+001 (w2f_residuals.log:1339); -2, 2.68, .33 ->
+//   -1.0000000000000X+001, +1.570a3d70a3d71X+001, +1.51eb851eb851fX-002
+//   (:1303); 1/3 -> +1.5555555555555X-002 (w2e_float_default.log:124);
+//   0 -> +0.0000000000000X-3ff (w2g_ebmat.log:481); `.` ->
+//   +1.0000000000000X+3ff (w2_openbugs.log:45); `.a` -> +1.0010000000000X+3ff
+//   (w2i_varsub.log:161); `.z` -> +1.01a0000000000X+3ff (aer_b4/esttab-beta.log:100).
+// So zero and `.` are just their raw IEEE fields (biased exponent 0 -> -3ff,
+// 0x7fe -> +3ff), which is what hexFloat() prints for every value; a negative
+// zero prints as zero (w2x_fn_string_math fx_ceil_edges: ceil(-0.5) is
+// +0.0000000000000X-3ff). Grammar: display claims `%21x` and `%-21x` in its
+// own renderer (display_hardening.cpp renderHex21, which spells the same
+// fields); string() admits only the 21-wide, flag-free spec (1107 golden
+// uses, all `%21x`) through a `(?=21x$)` alternative of its own regex, which
+// leaves the width group unmatched and puts `21` in the precision group, and
+// `%-21x`, `%021x` and any other width keep string()'s old fall-through.
 //
 // Header-only on purpose. A .cpp would have to be added to piet/native/
 // CMakeLists.txt, which is outside this change's file manifest and is a
@@ -81,7 +117,9 @@
 #define PIET_STATA_FORMAT_H
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <optional>
 #include <string>
 
@@ -100,7 +138,7 @@ struct StataFmtSpec {
   bool hasWidth = false;     // a widthless `%.3g` keeps the historical printf path
   int width = 0;             // w
   int prec = 0;              // P
-  char conv = 'g';           // 'f' | 'g' | 'e', already case-folded
+  char conv = 'g';           // 'f' | 'g' | 'e' | 'x', already case-folded
   // BUG-296: the two taxonomy axes the format grammar never had a slot for.
   // `commaDecimal` is Stata's `%w,pf` — the SAME format with ',' as the decimal
   // separator (and, when grouped, '.' as the thousands separator: the European
@@ -168,15 +206,23 @@ inline std::string trimNumber(std::string s) {
   return s;
 }
 
-// Clause 7.
+// Clause 7, with clause 4's budget (clause 9): a three-digit exponent sheds a
+// decimal (%18.0g 8.154790500675727e-123 is 8.1547905007e-123, 17 characters,
+// not 11 decimals in 18; w2u_binary_ml_edges.log bm_p_xd_pred).
 inline std::string scientific(double v, int width, int sig) {
   int edec = width - 7;
   if (edec > sig - 1) edec = sig - 1;
   if (edec < 0) edec = 0;
-  char buf[512];
-  int n = std::snprintf(buf, sizeof(buf), "%.*e", edec, v);
-  if (n < 0 || n >= static_cast<int>(sizeof(buf))) return std::string();
-  return std::string(buf, static_cast<size_t>(n));
+  const size_t budget = static_cast<size_t>(width < 1 ? 0 : width - 1) + (v < 0.0 ? 1u : 0u);
+  std::string out;
+  for (; edec >= 0; --edec) {
+    char buf[512];
+    int n = std::snprintf(buf, sizeof(buf), "%.*e", edec, v);
+    if (n < 0 || n >= static_cast<int>(sizeof(buf))) return std::string();
+    out.assign(buf, static_cast<size_t>(n));
+    if (out.size() <= budget) break;
+  }
+  return out;
 }
 
 // Stata's `%w.Pg` — clauses 1-7 above.
@@ -197,7 +243,8 @@ inline std::string general(double v, int width, int prec) {
   const int e10 = static_cast<int>(std::floor(std::log10(a)));
   const int intDigits = e10 >= 0 ? e10 + 1 : 0;
   const int intDigitCap = width - 2 < 1 ? 1 : width - 2;
-  if (intDigits <= intDigitCap) {
+  // Clause 8: below 1e-5 there is no fixed form at any width.
+  if (intDigits <= intDigitCap && a >= 1e-5) {
     int decimals = e10 >= 0 ? (sig - intDigits) : (sig + (-e10 - 1));
     if (decimals < 0) decimals = 0;
     for (; decimals >= 0; --decimals) {
@@ -220,7 +267,7 @@ inline std::string general(double v, int width, int prec) {
 //
 // Both rendered as their raw underlying number before this — a legitimate value
 // with no diagnostic, which is the silent-wrong-answer shape. Every clause here
-// is a captured fact (tests/kitchensink/fmt_oracle/exprfns_contract_oracle.log,
+// is a captured fact (internal capture exprfns_contract_oracle.log,
 // sections FTC/FTD, all three surfaces):
 //   * %td counts DAYS since 01jan1960 and FLOORS a fractional or negative value
 //     (42.5 and 42.9 -> 12feb1960; -0.5 and -1 -> 31dec1959; 20000 -> 04oct2014).
@@ -291,7 +338,7 @@ inline std::optional<std::string> renderTc(double v) {
 }
 
 // --- BUG-296: the %t calendars other than tc/td ------------------------------
-// Measured (tests/kitchensink/wsn_oracle/wsr_oracle.log, section WSR|T, StataBE
+// Measured (internal capture wsr_oracle.log, section WSR|T, StataBE
 // 19.5 IC, four values each including negatives): every one of these counts
 // PERIODS since 1960 and FLOORS, exactly as %td/%tc do.
 //   %tq 42.5 -> 1970q3 · 0 -> 1960q1 · -3 -> 1959q2 · 245 -> 2021q2
@@ -516,7 +563,7 @@ inline size_t fieldBudget(double v, int width) {
 }
 
 // --- BUG-296 / WS-R: the `f` family's OVERFLOW arm ---------------------------
-// Measured (tests/kitchensink/wsn_oracle/wsr_oracle.log, section WSR|F, StataBE
+// Measured (internal capture wsr_oracle.log, section WSR|F, StataBE
 // 19.5 IC): when the fixed rendering is LONGER than the field, Stata does not
 // widen the field — it switches to scientific. `%9.2f 1234567.89` is ` 1.23e+06`,
 // not `1234567.89`. PIET printed the fixed form at any length, which is how a
@@ -545,9 +592,82 @@ inline std::string fixedOverflowScientific(double v, const StataFmtSpec& sp) {
   return out;
 }
 
+// BUG-1353: Stata's `%w.de`. It shows d decimals (w-7 when d is 0), at most
+// w-7 and at least one, so a two-digit exponent always fits the w-1 budget or
+// keeps that one decimal past it (`%5.0e 1.5` is 1.5e+00). A three-digit
+// exponent is one character longer: it sheds decimals to meet the budget, the
+// sign aside, down to none, keeping the point (StataBE 19.5: `%10.3e
+// 8.988465674311579e+307` is 8.99e+307 where `%11.3e` keeps 8.988e+307, and
+// `%8.3e 1.5e+300` is 2.e+300; string() gives the same text). printf printed
+// every decimal asked for, and none at all for `%w.0e` below width 7.
+// The exponent that decides is the value's own, before rounding: 9.9999e99 has
+// two digits and keeps its decimals (`%9.0e` is 1.00e+100), -9.99999e-100 has
+// three and sheds as if it still printed them (`%9.0e` is -1.0e-99).
+inline std::string exponential(double v, int width, int prec) {
+  int edec = prec > 0 && prec < width - 7 ? prec : width - 7;
+  if (edec < 1) edec = 1;
+  const auto render = [v](int d) {
+    char buf[512];
+    const int n = std::snprintf(buf, sizeof(buf), d > 0 ? "%.*e" : "%#.*e", d, v);
+    if (n < 0 || n >= static_cast<int>(sizeof(buf))) return std::string();
+    return std::string(buf, static_cast<size_t>(n));
+  };
+  const size_t budget = fieldBudget(v, width);
+  const std::string own = render(16);
+  const bool threeDigitExp = own.size() - own.rfind('e') == 5;
+  // The width the text would take with the value's own three-digit exponent.
+  const auto ownWidth = [](const std::string& s) { return s.rfind('e') + 5; };
+  std::string out = render(edec);
+  while (edec > 0 && threeDigitExp && ownWidth(out) > budget) out = render(--edec);
+  return out;
+}
+
+// `%21x` of the double's raw IEEE fields (see THE HEX FORMAT in the header).
+// The leading digit is the implicit bit (0 for zero and subnormals), the
+// exponent is the biased exponent minus 0x3ff, so zero is X-3ff and Stata's `.`
+// (biased 0x7fe) is X+3ff. A subnormal therefore prints +0.<mantissa>X-3ff (no
+// golden captures it); a negative zero prints as zero, as display's
+// renderHex21 does (fx_ceil_edges).
+inline std::string hexFloat(double v) {
+  if (v == 0.0) v = 0.0;
+  uint64_t bits = 0;
+  std::memcpy(&bits, &v, sizeof bits);
+  const bool neg = (bits >> 63) != 0;
+  const int biased = static_cast<int>((bits >> 52) & 0x7ffu);
+  const unsigned long long mant = static_cast<unsigned long long>(bits & 0xfffffffffffffull);
+  const int e = biased - 0x3ff;
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%c%c.%013llxX%c%03x", neg ? '-' : '+', biased == 0 ? '0' : '1',
+                mant, e < 0 ? '-' : '+', static_cast<unsigned>(e < 0 ? -e : e));
+  return std::string(buf);
+}
+
+// Stata's stored double for a missing value: `.` is 0x7FE0000000000000 and
+// `.a`-`.z` follow at a stride of 1<<40 — the encoding the engine's .dta
+// writer already defines (src/io/dta_writer.cpp:72-74 kMissF64Bits /
+// kMissF64Stride, confirmed there against a StataBE file). `kind` is 0 for `.`,
+// 1..26 for `.a`..`.z`. The expression layer holds the same doubles
+// (eval/exprfns.h stataMissingWithKind: 2^1023 + kind * 2^1011).
+inline double stataMissingDouble(int kind) {
+  if (kind < 0 || kind > 26) kind = 0;
+  const uint64_t bits = 0x7FE0000000000000ull + static_cast<uint64_t>(kind) * 0x0000010000000000ull;
+  double d = 0.0;
+  std::memcpy(&d, &bits, sizeof d);
+  return d;
+}
+
 // Callers fall back to passing the value through untouched, which is what both
 // layers already did for that case.
 inline std::optional<std::string> renderValue(double v, const StataFmtSpec& sp) {
+  // BUG-444: `%21x`. Width/precision are not read — both grammars admit only
+  // the 21-wide spelling. A flag (`%-21x`, `%021x`) and a non-finite value
+  // (PIET's NaN missing carriers) are unclaimed: nullopt keeps each caller's
+  // old fall-through.
+  if (sp.conv == 'x') {
+    if (sp.leftJustify || sp.zeroFill || sp.commaDecimal || sp.groupThousands) return std::nullopt;
+    if (!std::isfinite(v)) return std::nullopt;
+    return hexFloat(v);
+  }
   // BUG-192: `g` gets Stata's own general-format rule, not printf's `%g`.
   // Only when the spec carries an explicit width, which every Stata display
   // format does — a widthless `%.3g` keeps the historical printf path so
@@ -575,15 +695,18 @@ inline std::optional<std::string> renderValue(double v, const StataFmtSpec& sp) 
     }
     return finishNumeric(g, sp, false);  // grouping does not fit at all
   }
+  if (sp.conv == 'e' && sp.hasWidth && sp.width > 0) {
+    const std::string e = exponential(v, sp.width, sp.prec);
+    if (e.empty()) return std::nullopt;
+    return finishNumeric(e, sp, false);
+  }
   char spec[16];
   if (sp.conv == 'f') {
     std::snprintf(spec, sizeof(spec), "%%.%df", sp.prec);
   } else if (sp.conv == 'e') {
-    // BUG-192 rider, same oracle capture: Stata's `%w.0e` shows w-7 decimals
-    // (`%9.0e 42` is 4.20e+01), where printf's `%.0e` shows none.
-    int edec = sp.prec;
-    if (sp.prec == 0 && sp.hasWidth && sp.width >= 7) edec = sp.width - 7;
-    std::snprintf(spec, sizeof(spec), "%%.%de", edec);
+    // A widthless `%.3e` (string() only); every display format has a width and
+    // takes exponential() above (BUG-192's `%9.0e 42` is 4.20e+01 there).
+    std::snprintf(spec, sizeof(spec), "%%.%de", sp.prec);
   } else if (sp.conv == 'g') {
     std::snprintf(spec, sizeof(spec), "%%.%dg", sp.prec);
   } else {
@@ -610,10 +733,15 @@ inline std::optional<std::string> renderValue(double v, const StataFmtSpec& sp) 
   //   %9,0fc  123456789012.5 -> 1,23e+11   (fixed is 12 > 9: scientific, no group)
   //   %14,0fc 123456789012.5 -> 123456789012 (fits 14; grouped 15 does not)
   //   %9,0fc  -1234567.89    -> -1234568   (grouped -1.234.568 is 10 > 9)
+  // The scientific form replaces the fixed one only when it is SHORTER; a field
+  // too narrow for either widens on the fixed form (w2x_fn_string_math
+  // fx_string2_fmts: string(0.5, "%03.2f") 0.50, string(1234.5, "%5.2fc")
+  // 1234.50, string(123, "%02.0f") 123, where 5.0e-01 / 1.2e+03 / 1.2e+02 are
+  // no shorter). Every WSR|FA/FB overflow row above has a shorter scientific.
   if (sp.conv == 'f' && sp.hasWidth && sp.width > 0 &&
       static_cast<int>(out.size()) > sp.width) {
     std::string sci = fixedOverflowScientific(v, sp);
-    if (!sci.empty()) return finishNumeric(sci, sp, false);
+    if (!sci.empty() && sci.size() < out.size()) return finishNumeric(sci, sp, false);
   }
   if (sp.groupThousands && sp.conv == 'f') {
     const std::string grouped = finishNumeric(out, sp, true);
@@ -632,6 +760,32 @@ inline std::string padValueLeftJustify(std::string s, const StataFmtSpec& sp) {
     s.append(static_cast<size_t>(sp.width) - s.size(), ' ');
   }
   return s;
+}
+
+// BUG-918: the same trailing pad for a MISSING value. `string(., "%-9.0g")` is
+// `.        `, len 9 (w2z_tostring tz_fmt_left: tostring.ado's
+// `string(vb, "%-9.0g")` stores vb[6] = . as `[.        ]` in a str9). Both
+// callers return the missing token before the numeric renderer is reached, so
+// the pad must be applied to the token itself. Only the numeric prefix grammar
+// applyStataFmt pads (`%-[0]W(.|,)P(f|g|e)`) is recognized; any other format
+// (right-justified, widthless, %t, %x) returns the token as it was.
+inline std::string padMissingLeftJustify(std::string token, const std::string& fmt) {
+  if (fmt.size() < 2 || fmt[0] != '%' || fmt[1] != '-') return token;
+  size_t i = 2;
+  if (i < fmt.size() && fmt[i] == '0') ++i;
+  const size_t w0 = i;
+  while (i < fmt.size() && fmt[i] >= '0' && fmt[i] <= '9') ++i;
+  if (i == w0 || i - w0 > 4) return token;
+  const int width = std::stoi(fmt.substr(w0, i - w0));
+  if (i >= fmt.size() || (fmt[i] != '.' && fmt[i] != ',')) return token;
+  const size_t p0 = ++i;
+  while (i < fmt.size() && fmt[i] >= '0' && fmt[i] <= '9') ++i;
+  if (i == p0 || i >= fmt.size() || (fmt[i] != 'f' && fmt[i] != 'g' && fmt[i] != 'e')) return token;
+  StataFmtSpec sp;
+  sp.leftJustify = true;
+  sp.hasWidth = true;
+  sp.width = width;
+  return padValueLeftJustify(std::move(token), sp);
 }
 
 // The display-only half: right-justify into the field (left-justify on `-`).

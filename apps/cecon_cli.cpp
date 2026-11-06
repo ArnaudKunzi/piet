@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cobra — command-line front end.
 //   cobra info  <file.hbin>
 //   cobra ols   --data f.hbin --y Y --x X1,X2 [--no-intercept] [--out f.json]
@@ -53,13 +55,11 @@ using namespace cecon::cli;
 // its own (a usage blurb + rc==2, or an EngineError that unwound past this call)
 // is already loud about something being wrong, so this doesn't pile a second,
 // possibly-confusing error onto an already-reported one. Every `cmd_XXX` dispatch
-// line below is routed through this except `eval`: cmd_eval owns a separate,
-// hand-rolled argv scanner (its chainable --gen/--egen/--xtset/... mini-language,
-// applied in command-line order) that doesn't go through opt()/has()/opt_all() at
-// all, so this generic net has no visibility into what it actually consumed —
-// wiring it up needs a dedicated pass on that loop, not this blanket net (tracked
-// separately; cmd_eval's pre-existing silent-ignore-on-unknown-op behavior is
-// unchanged for now).
+// line below is routed through this, `eval` included: cmd_eval's hand-rolled argv
+// scanner (its chainable --gen/--egen/--xtset/... mini-language, applied in
+// command-line order) does not go through opt()/has()/opt_all(), so it marks the
+// ops it applies consumed itself (BUG-1181; it used to be exempt, and an unknown
+// flag on `eval` was silently ignored).
 // BUG-182: the COBRA_OPTIONS_STRICT drift half is NOT subject to that reasoning and
 // must run on the failure paths too, or a flag whose handler rejects it can never be
 // checked against its options_table() declaration. rc != 0 is handled here; the
@@ -72,15 +72,14 @@ int dispatch_guard(const std::vector<std::string>& a, int rc) {
 
 // The subcommand dispatch chain, factored out of main() so main() can run it with
 // stdout BUFFERED (see the buffering note in main()). Every branch routes through
-// dispatch_guard (the E6 unknown-flag net) EXCEPT `eval` — see dispatch_guard's doc
-// comment for why cmd_eval is excluded (its own hand-rolled, non-opt()-based scanner).
+// dispatch_guard (the E6 unknown-flag net).
 int dispatch_command(const std::vector<std::string>& a) {
     if (a[0] == "version" || a[0] == "--version") return dispatch_guard(a, cmd_version(a));
     if (a[0] == "options") return dispatch_guard(a, cmd_options(a));
     if (a[0] == "functions") return dispatch_guard(a, cmd_functions(a));
     if (a[0] == "info" && a.size() >= 2) return dispatch_guard(a, cmd_info(a[1]));
     if (a[0] == "convert") return dispatch_guard(a, cmd_convert(a));
-    if (a[0] == "eval") return cmd_eval(a);
+    if (a[0] == "eval") return dispatch_guard(a, cmd_eval(a));
     if (a[0] == "ols") return dispatch_guard(a, cmd_ols(a));
     if (a[0] == "feols") return dispatch_guard(a, cmd_feols(a));
     if (a[0] == "iv") return dispatch_guard(a, cmd_iv(a));
@@ -124,6 +123,7 @@ int dispatch_command(const std::vector<std::string>& a) {
     if (a[0] == "chow") return dispatch_guard(a, cmd_chow(a));
     if (a[0] == "logit") return dispatch_guard(a, cmd_logit(a));
     if (a[0] == "probit") return dispatch_guard(a, cmd_probit(a));
+    if (a[0] == "cloglog") return dispatch_guard(a, cmd_cloglog(a));
     if (a[0] == "tobit") return dispatch_guard(a, cmd_tobit(a));
     if (a[0] == "heckman") return dispatch_guard(a, cmd_heckman(a));
     if (a[0] == "reg3") return dispatch_guard(a, cmd_reg3(a));

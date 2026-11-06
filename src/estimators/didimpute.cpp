@@ -1,4 +1,6 @@
-// Borusyak-Jaravel-Spiess imputation estimator — clean-room implementation
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
+// Borusyak-Jaravel-Spiess imputation estimator — implemented
 // from the published methodology paper:
 //
 //   [BJS24] Borusyak, K., X. Jaravel and J. Spiess (2024), "Revisiting
@@ -6,9 +8,7 @@
 //           Economic Studies 91(6), 3253-3285.
 //
 // See didimpute.h for the contract and for the conventions this project's
-// goldens pin. Provenance: no did_imputation.ado / Mata source and no
-// didimputation R code was read; the clean-room wall is the one recorded for
-// csdid (docs/legal/CSDID_CLEANROOM_WALL.md).
+// goldens pin.
 //
 // The Y(0) model is a two-way (unit, period) fixed-effect least squares on the
 // untreated subsample. Two things are needed from it that a plain within

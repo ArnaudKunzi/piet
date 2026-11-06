@@ -1,0 +1,14 @@
+key,value
+coeftable[x1].b,2.057945963847954e+00
+coeftable[x1].se,1.103441085039504e-01
+coeftable[(intercept)].b,9.877019321413655e+00
+coeftable[(intercept)].se,2.101138590526451e-01
+select_coefs[z1].b,7.065662111705424e-01
+select_coefs[z1].se,3.007178194183980e-02
+select_coefs[z2].b,-3.887936372691871e-01
+select_coefs[z2].se,2.736921500678408e-02
+select_coefs[(intercept)].b,3.082567841221115e-01
+select_coefs[(intercept)].se,2.596456060840860e-02
+lambda,2.620152859183737e+00
+rho,5.198250776595412e-01
+sigma,5.040451051304998e+00

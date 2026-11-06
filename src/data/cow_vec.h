@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — copy-on-write column buffer.
 //
 // A CowVec<T> is EITHER "borrowed" (a const span into another allocation — in

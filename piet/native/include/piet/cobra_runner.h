@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Subprocess wrapper around the cobra C++ engine binary — the native-side
 // analog of piet/backend/piet/cobra_runner.py. cobra stays a subprocess in
 // 2.0 (Master Plan, Boundary A untouched); M0 wired `cobra version --json`;
@@ -30,7 +32,8 @@ struct CobraRunResult {
 
 // Resolves the cobra binary path. Order (mirrors config.py's documented
 // order, Art 7 provenance): $COBRA_BIN env var (if it exists on disk) >
-// the pinned Art 7 reference, private-notes/releases/engine/current/cobra >
+// the pinned Art 7 reference (releases/engine/current/cobra in the private
+// coordination tree, when one exists on the build machine) >
 // bare `cobra` on $PATH. Never resolves to an op-cobra dev build.
 std::string resolveCobraBin();
 

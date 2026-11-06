@@ -1,6 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // M0 -- the native Mata statement subset. Grammar, scope and the namespace rule
 // are in piet/mata_subset.h; the design is SPEC.md §5.3 / D2 / D3 of
-// private-notes/plans/autonomy/scope-ge2/ml-getmata. Oracle:
+// internal notes ml-getmata. Oracle:
 // tests/eval/golden/aer_w2/w2c_ml_getmata.{do,log} families (8) and (9).
 //
 // Two phases per line, and the split is the point: every statement of a line
@@ -11,6 +13,7 @@
 // behaviour for a `mata:` block.
 #include "piet/mata_subset.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -22,8 +25,11 @@
 #include <utility>
 #include <vector>
 
+#include "core/ident.h"
+#include "core/stata_arith.h"
 #include "piet/eval/errors.h"
 #include "piet/eval/macros.h"
+#include "piet/eval/pyvalue.h"
 #include "piet/session_state.h"
 #include "piet/strutil.h"
 
@@ -45,6 +51,70 @@ struct MMat {
   std::vector<double> v;  // row-major, r*c
   double at(size_t i, size_t j) const { return v[i * c + j]; }
 };
+
+// [M-5] invsym(): the generalized inverse of a symmetric matrix read from its
+// upper triangle; an omitted column (and row) is 0, and any missing input
+// makes every entry missing. The sweep takes the largest remaining pivot
+// first and omits a column whose pivot is <= 1e-9 x its original diagonal or
+// below 1e-19, or whose original diagonal is not positive -- the rule measured
+// on StataBE for glm's rank (estimation_glm.cpp glmVceRank). StataBE 19.5
+// (impl_A probe6.do): invsym((1,2\2,1)) = (1,0\0,0), invsym((-1,0\0,2)) =
+// (0,0\0,.5), invsym((2,1\99,3)) = (.6,-.2\-.2,.4), invsym((1e-20,0\0,1)) =
+// (0,0\0,1), and a missing cell makes all four cells missing.
+MMat invsym(const MMat& in) {
+  const size_t k = in.r;
+  MMat a{k, k, std::vector<double>(k * k, 0.0)};
+  for (size_t i = 0; i < k; ++i)
+    for (size_t j = i; j < k; ++j) {
+      const double x = in.at(i, j);
+      if (std::isnan(x)) return MMat{k, k, std::vector<double>(k * k, kNaN)};
+      a.v[i * k + j] = a.v[j * k + i] = x;
+    }
+  std::vector<double> d0(k);
+  std::vector<char> left(k), swept(k, 0);
+  for (size_t j = 0; j < k; ++j) {
+    d0[j] = a.at(j, j);
+    left[j] = d0[j] > 0;
+  }
+  for (;;) {
+    size_t best = k;
+    double pivot = 0.0;
+    for (size_t j = 0; j < k; ++j) {
+      if (!left[j]) continue;
+      const double p = a.at(j, j);
+      if (p <= 1e-9 * d0[j] || p < 1e-19) continue;
+      if (best == k || p > pivot) {
+        best = j;
+        pivot = p;
+      }
+    }
+    if (best == k) break;
+    left[best] = 0;
+    swept[best] = 1;
+    // Stata's sweep arithmetic, bit for bit on StataBE (handlers_ml.cpp
+    // invsymStata): symmetric storage; for i <= j, a_ij -= (a_ip/D)*a_jp,
+    // a_ip = a_ip/D, a_pp = -1/D, negated at the end; no fused multiply-add.
+    const size_t p = best;
+    const double D = a.at(p, p);
+    for (size_t i = 0; i < k; ++i) {
+      if (i == p) continue;
+      const double t = a.at(i, p) / D;
+      for (size_t j = i; j < k; ++j) {
+        if (j == p) continue;
+        const double u = t * a.at(j, p);
+        a.v[i * k + j] = a.v[j * k + i] = a.at(i, j) - u;
+      }
+    }
+    for (size_t i = 0; i < k; ++i)
+      if (i != p) a.v[i * k + p] = a.v[p * k + i] = a.at(i, p) / D;
+    a.v[p * k + p] = -1.0 / D;
+  }
+  for (double& x : a.v) x = -x;
+  for (size_t i = 0; i < k; ++i)
+    if (!swept[i])
+      for (size_t j = 0; j < k; ++j) a.v[i * k + j] = a.v[j * k + i] = 0.0;
+  return a;
+}
 
 MMat scalarOf(double x) {
   MMat m;
@@ -113,8 +183,9 @@ struct Token {
   double num = 0.0;
 };
 
-bool isNameStart(char ch) { return std::isalpha(static_cast<unsigned char>(ch)) || ch == '_'; }
-bool isNameChar(char ch) { return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_'; }
+// Bytes >= 0x80 are name bytes (core/ident.h): a Unicode name stays whole.
+bool isNameStart(char ch) { return cecon::ident::isIdentStartByte(ch); }
+bool isNameChar(char ch) { return cecon::ident::isIdentByte(ch); }
 
 // nullopt + *bad = the construct to name in the refusal.
 std::optional<std::vector<Token>> lex(const std::string& s, std::string* bad) {
@@ -236,7 +307,7 @@ std::optional<std::vector<Token>> lex(const std::string& s, std::string* bad) {
 
 struct Node {
   enum class K { Num, Missing, Name, Neg, Bin, RowJoin, ColJoin, J, StMatrix, Exp, Select, Rows,
-                 Cols, Sub };
+                 Cols, InvSym, Sub };
   K k;
   double num = 0.0;
   std::string text;  // Name / StMatrix name / Bin operator / Select name
@@ -489,6 +560,9 @@ struct Parser {
     } else if (fn == "cols") {
       k = Node::K::Cols;
       arity = 1;
+    } else if (fn == "invsym") {
+      k = Node::K::InvSym;
+      arity = 1;
     } else {
       fail("the function " + fn + "()");
       return nullptr;
@@ -552,10 +626,17 @@ bool isMataKeyword(const std::string& w) {
   return false;
 }
 
+// The two harmless housekeeping statements the AER corpus opens its Mata with.
+// Neither needs a Mata runtime: PIET's Mata store is the only state `mata clear`
+// has to drop, and PIET has no .mlib libraries for `mata mlib index` to index.
+enum class Housekeeping { None, Clear, MlibIndex };
+
 struct Statement {
   std::string text;  // as expanded, for messages
   std::string target;
   NodeP rhs;
+  bool stataScalar = false;
+  Housekeeping housekeeping = Housekeeping::None;
 };
 
 // Parse one statement. nullopt + *construct = outside M0.
@@ -567,6 +648,36 @@ std::optional<Statement> parseStatement(const std::string& text, std::string* co
     return std::nullopt;
   }
   const std::vector<Token>& t = *toks;
+  // `mata clear` / `mata mlib index` as a statement, ahead of the keyword refusal.
+  auto isName = [&](size_t i, const char* w) {
+    return i < t.size() && t[i].kind == Tk::Name && t[i].text == w;
+  };
+  auto endsAt = [&](size_t i) { return i < t.size() && t[i].kind == Tk::End; };
+  if (isName(0, "mata") && ((isName(1, "clear") && endsAt(2)) ||
+                            (isName(1, "mlib") && isName(2, "index") && endsAt(3)))) {
+    Statement st;
+    st.text = text;
+    st.housekeeping = isName(1, "clear") ? Housekeeping::Clear : Housekeeping::MlibIndex;
+    return st;
+  }
+  if (t.size() >= 7 && t[0].kind == Tk::Name && t[0].text == "st_numscalar" &&
+      t[1].kind == Tk::LParen && t[2].kind == Tk::Str && t[3].kind == Tk::Comma) {
+    const std::string& name = t[2].text;
+    if (!cecon::ident::isValidName(name)) {
+      *construct = "an invalid Stata scalar name";
+      return std::nullopt;
+    }
+    Parser ps(t);
+    ps.p = 4;
+    NodeP rhs = ps.expr();
+    if (!rhs || ps.peek().kind != Tk::RParen || ps.p+1 >= t.size() || t[ps.p+1].kind != Tk::End) {
+      *construct = "st_numscalar() without one scalar expression";
+      return std::nullopt;
+    }
+    Statement st;
+    st.text = text; st.target = name; st.rhs = std::move(rhs); st.stataScalar = true;
+    return st;
+  }
   if (t.size() >= 2 && t[0].kind == Tk::Name && isMataKeyword(t[0].text)) {
     *construct = "the Mata `" + t[0].text + "` statement";
     return std::nullopt;
@@ -581,7 +692,7 @@ std::optional<Statement> parseStatement(const std::string& text, std::string* co
     }
     return std::nullopt;
   }
-  if (t[0].text.size() > 32) {
+  if (cecon::ident::codePointCount(t[0].text) > 32) {
     *construct = "a name longer than 32 characters";
     return std::nullopt;
   }
@@ -648,8 +759,17 @@ class Evaluator {
       case Node::K::Exp: {
         auto x = eval(*n.kids[0]);
         if (!x) return std::nullopt;
-        for (double& d : x->v) d = std::isnan(d) ? kNaN : clean(std::exp(d));
+        // Mata's exp() is the same as Stata's: 0 for an argument below -709
+        // (StataBE 19.5, `mata: exp(-709.0000000000001)` 0, exp(-709) libm's
+        // subnormal; core/stata_arith.h).
+        for (double& d : x->v) d = std::isnan(d) ? kNaN : clean(cecon::stata_exp_value(d));
         return x;
+      }
+      case Node::K::InvSym: {
+        auto x = eval(*n.kids[0]);
+        if (!x) return std::nullopt;
+        if (x->r != x->c) return runtime(3205, "square matrix required");
+        return invsym(*x);
       }
       case Node::K::Rows:
       case Node::K::Cols: {
@@ -838,7 +958,16 @@ ojson runStatements(const std::vector<std::string>& raw, SessionState& session, 
       parsed.push_back(std::move(*st));
     }
   }
+  bool indexNote = false;
   for (const auto& st : parsed) {
+    if (st.housekeeping == Housekeeping::Clear) {
+      session.eval.mataMatrices.clear();  // silent, as in Stata
+      continue;
+    }
+    if (st.housekeeping == Housekeeping::MlibIndex) {
+      indexNote = true;
+      continue;
+    }
     Evaluator ev(session);
     auto value = ev.eval(*st.rhs);
     if (!value) {
@@ -846,7 +975,22 @@ ojson runStatements(const std::vector<std::string>& raw, SessionState& session, 
       if (f.refused) return refuseOutside(st.text, f.what, false);
       return mataRuntimeError(f.rc, f.what, st.text);
     }
-    assign(session.eval, st.target, toEval(*value));
+    if (st.stataScalar) {
+      if (value->r != 1 || value->c != 1)
+        return mataRuntimeError(3200,"conformability error: st_numscalar() requires a scalar",st.text);
+      session.eval.scalars.set(st.target,std::isfinite(value->v[0]) ? eval::pythonFloatRepr(value->v[0]) : ".");
+      // One namespace with Stata's matrices ([P] matrix define, "Namespace").
+      auto& mats = session.eval.matrices;
+      mats.erase(std::remove_if(mats.begin(), mats.end(),
+                                [&st](const auto& p) { return p.first == st.target; }),
+                 mats.end());
+    } else assign(session.eval, st.target, toEval(*value));
+  }
+  if (indexNote) {
+    ojson note;
+    note["type"] = "echo";
+    note["text"] = "(mata mlib index: PIET has no Mata libraries -- nothing to index)";
+    return note;
   }
   return ojson::array();
 }
@@ -984,6 +1128,16 @@ ojson runMataLine(const std::string& raw, SessionState& session) {
   if (!rest.empty() && rest.back() == kMataUnterminated) {
     unterminated = true;
     rest.pop_back();
+  }
+
+  if (!head->colon && !folded) {
+    // `mata clear` / `mata mata clear` / `mata [mata] mlib index` on one line:
+    // the same two housekeeping statements, spelled without the colon.
+    static const std::regex re(R"(^\s*(?:mata\s+)?(clear|mlib\s+index)\s*(?://.*)?$)");
+    std::smatch m;
+    if (std::regex_match(rest, m, re))
+      return runStatements({m.str(1).front() == 'c' ? "mata clear" : "mata mlib index"}, session,
+                           false);
   }
 
   if (!head->colon) {

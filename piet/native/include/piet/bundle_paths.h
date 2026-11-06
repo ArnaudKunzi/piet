@@ -1,5 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Bundle-vs-dev path resolution — M5 GA (ROADMAP §2.0.0 "M5 GA": the
-// no-Python PIET 2.0.0 .app). Call sites need "am I running out of a
+// no-Python PIET 2.0.0 .app). Two call sites need "am I running out of a
 // packaged .app, and if so where are my Resources?": main.cpp (which
 // frontend tree to load — the real piet/frontend/ dev checkout vs. a
 // bundled Resources/frontend/ copy) and cobra_runner.cpp (which cobra
@@ -42,10 +44,6 @@ std::optional<std::string> executablePath();
 // in-place, --run-block headless harness invocation via a raw build/
 // path, non-macOS platform).
 std::optional<std::string> bundleResourcesDir();
-
-// For an in-tree build at piet/native/build/piet_native, find the public
-// checkout from the executable location. Returns nullopt for other layouts.
-std::optional<std::string> devTreeRoot();
 
 }  // namespace piet
 

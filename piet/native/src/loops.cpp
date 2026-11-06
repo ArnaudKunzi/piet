@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "piet/loops.h"
 
 #include <algorithm>
@@ -8,6 +10,8 @@
 #include <regex>
 #include <set>
 #include <sstream>
+#include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "piet/cclass.h"
@@ -17,10 +21,20 @@
 #include "piet/eval/exprfns.h"
 #include "piet/eval/macros.h"
 #include "piet/eval/pyeval.h"
-#include "piet/eval/tokenizer.h"  // BUG-547: searchUnquoted/quotedSpanMask for legacy `for`
+#include "piet/eval/tokenizer.h"
 #include "piet/parallel.h"
+#include "piet/stata_format.h"  // BUG-1395: numlist element text is %15.0g
 #include "piet/strutil.h"
+#include "core/expr_blanks.h"  // FU-875: Stata's blank squeeze and r(132) pairing rule
+#include "core/ident.h"  // Unicode names: the shared identifier byte tests
+#include "data/missing.h"  // BUG-921: the extended-missing kind of a cell read by the if condition
 #include "dispatch_profile.h"  // EXPRLAYER: expression-zone attribution (opt-in, stderr)
+
+// BUG-920: Stata's macro real-to-text rule (%18.0g text, no leading 0), defined
+// in eval/macros.cpp beside the local/global store that applies it.
+namespace piet::eval {
+std::string stataMacroRealText(double d);
+}  // namespace piet::eval
 
 namespace piet::loops {
 
@@ -42,18 +56,6 @@ constexpr int kNumlistMaxElements = 10000;
 constexpr size_t kMaxLoopBlocks = 20000;
 
 ojson errBlock(const std::string& msg) { return eval::engineError(msg); }
-
-// Legacy `for`'s own validation errors (missing ':', empty/>9-list header,
-// unequal list lengths, a placeholder absent from the body, an unrecognised
-// list TYPE) are all Stata r(198) "invalid syntax" (oracle:
-// w2_cmdtriage.log for_unequal/for_no_placeholder, both PREC|...|198|).
-// coarseRc only maps code=="syntax_error" (or an explicit reason="r(NNN)")
-// to 198 -- the generic errBlock()/engineError() above always sets
-// code="engine_error", which falls through coarseRc's engine_error substring
-// rules (none of which match "for: invalid syntax...") to the historical
-// default "1". Route through errorBlock("syntax_error", ...) instead so
-// runLegacyFor's validation failures actually publish _rc=198.
-ojson errFor198(const std::string& msg) { return eval::errorBlock("syntax_error", msg); }
 
 ojson loopTruncatedBlock() {
   ojson b;
@@ -180,18 +182,6 @@ std::string headKeyword(const std::string& line) {
 }
 
 // ---------------------------------------------------------------------------
-// Number formatting (loops.py's _fmt_num): integer-looking -> no decimal.
-
-std::string fmtNum(double v) {
-  if (v == std::floor(v) && std::isfinite(v)) {
-    long long iv = static_cast<long long>(v);
-    return std::to_string(iv);
-  }
-  // Match Python's str(float) shortest round-trip formatting.
-  return eval::pythonFloatRepr(v);
-}
-
-// ---------------------------------------------------------------------------
 // Numlist expansion (loops.py's _parse_numlist)
 
 struct NumlistResult {
@@ -200,47 +190,96 @@ struct NumlistResult {
   std::vector<std::string> tokens;
 };
 
+// BUG-1395: whether the element past the end still belongs follows StataBE 19.5's
+// own measurements, not one formula: no rule tried reproduces all 2,392 measured
+// ranges (lane expr-sem x1b nl*.do, ho.do and r3/g1.do; the reviews' vnl*.do,
+// v95b-d.do and nlx.do). `v` is start + k*step and `run` the element's value
+// (numlistValue below). An element that is a whole number gets no hair:
+// 0(1)2.9999999999999996, 0.5(0.5)2.99999999999999 and 1(1.5)3.99999999999999 stop
+// short of it. An end the value lands within one unit in the last place of is
+// kept (21.10(0.07)21.31). Otherwise `v` may pass the end by a hair relative to the
+// distance covered, k*|step|, compared in doubles, so the hair rounds to the end's
+// grid: 0(0.1)0.3 ends at .3, 0(2.5)7.4999999999999 keeps 7.5, 0(0.1)0.299999999999996
+// drops .3, and 156.33(0.05)158.38 and -200.10(0.03)-198.30 keep an end `v` passes by
+// one unit in the last place. That keeps every end Stata keeps, here and on a fresh
+// hold-out of 360 ranges (r3/g2.do). 226 of the 2,392 and 3 of the 360 keep an end
+// Stata drops, as base PIET did: 60.9(0.02)61, 10(.005)10.02, 1000.1(0.1)1000.4
+// and the step 0.02 from 32.5 to 63.3 and from 128.4 up.
+bool numlistPastEnd(double v, double run, double k, double step, double end) {
+  const double over = step > 0 ? v - end : end - v;
+  if (over <= 0) return false;
+  if (v == std::floor(v)) return true;
+  const double runOver = step > 0 ? run - end : end - run;
+  const double endUlp = std::nextafter(std::fabs(end), INFINITY) - std::fabs(end);
+  if (runOver <= endUlp) return false;
+  const double hair = 1.335e-14 * std::fabs(k * step);
+  return step > 0 ? v > end + hair : v < end - hair;
+}
+
+// BUG-1395: an element's value is the running sum, start, start + step, ..., as
+// StataBE 19.5 holds it: 100(-0.1)0 prints 9.900000000001 and .1000000000014 and
+// -1(0.10000000000001).5 9.97812943e-14, the sum's digits, where start + k*step
+// prints 9.9, .1 and 9.99200722e-14. A sum that lands within 1.01e-14 of the
+// distance covered, |sum - start|, of a whole number becomes that number, and the
+// sum goes on from there: -1(.2)1 and .3(-.1)-.3 print 0, 27.88(-0.17)-192.78
+// steps on from 17 and prints .85 .68 .51, 29.8(-0.1)-26.7 prints 1 .9 ... 0 ... -1,
+// while 11.36(-0.01)-0.58 never snaps and prints -.0099999999998. The element the
+// end is reached at prints as the end: 100(-0.1)0 ends at 0, -10.65(0.01)0.11 at
+// .11. Element texts then differ from Stata's in 12 of 106,814 measured and 5 of
+// 146,546 on the hold-out, all in four ranges whose snaps sit within 0.5% of the
+// cut: Stata snapped 27.88(-0.17)-192.78 at 17 but not -55.76(0.17)87.55 at -34 at
+// the same ratio, so the cut Stata applies is not exactly this one.
+double numlistValue(double run, double start) {
+  const double whole = std::round(run);
+  if (whole != run && std::fabs(run - whole) < 1.01e-14 * std::fabs(run - start)) return whole;
+  return run;
+}
+
 NumlistResult parseNumlist(const std::string& spec) {
   NumlistResult r;
   std::vector<double> result;
 
-  static const std::regex reRangeStep(
-      R"(^([+-]?\d+(?:\.\d+)?)\(([+-]?\d+(?:\.\d+)?)\)([+-]?\d+(?:\.\d+)?)$)");
-  static const std::regex reSlash(R"(^([+-]?\d+(?:\.\d+)?)/([+-]?\d+(?:\.\d+)?)$)");
+  // A number as Stata writes one: `.5`, `-.25`, `1e3` and `1.5e-3` too
+  // (StataBE: -.5(.25)0 is -.5 -.25 0; 1e15(1e15)3e15 is three elements).
+  static const std::string kNum = R"([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)";
+  static const std::regex reRangeStep("^(" + kNum + ")\\((" + kNum + ")\\)(" + kNum + ")$");
+  static const std::regex reSlash("^(" + kNum + ")/(" + kNum + ")$");
 
   std::istringstream iss(spec);
   std::string tok;
   while (iss >> tok) {
     std::smatch m;
+    double start = 0, step = 0, end = 0;
+    bool range = false;
     if (std::regex_match(tok, m, reRangeStep)) {
-      double start = std::stod(m[1]), step = std::stod(m[2]), end = std::stod(m[3]);
+      start = std::stod(m[1]), step = std::stod(m[2]), end = std::stod(m[3]);
       if (step == 0.0) {
         r.isError = true;
         r.error = errBlock("numlist: step cannot be zero");
         return r;
       }
-      double v = start;
-      int n = 0;
-      while ((step > 0 && v <= end + 1e-9) || (step < 0 && v >= end - 1e-9)) {
-        result.push_back(v);
-        v += step;
-        if (++n > kNumlistMaxElements) {
-          r.isError = true;
-          r.error = errBlock("numlist: more than " + std::to_string(kNumlistMaxElements) + " elements");
-          return r;
-        }
-      }
-      continue;
+      // The step runs toward the end whatever its sign: StataBE 19.5 expands
+      // 3(1)1 to 3 2 1 and 1(-1)3 to 1 2 3.
+      if ((end - start) * step < 0) step = -step;
+      range = true;
+    } else if (std::regex_match(tok, m, reSlash)) {
+      start = std::stod(m[1]), end = std::stod(m[2]);
+      step = start <= end ? 1.0 : -1.0;
+      range = true;
     }
-    if (std::regex_match(tok, m, reSlash)) {
-      double start = std::stod(m[1]), end = std::stod(m[2]);
-      double step = start <= end ? 1.0 : -1.0;
-      double v = start;
-      int n = 0;
-      while ((step > 0 && v <= end + 1e-9) || (step < 0 && v >= end - 1e-9)) {
-        result.push_back(v);
-        v += step;
-        if (++n > kNumlistMaxElements) {
+    if (range) {
+      double run = start;
+      for (int k = 0;; ++k) {
+        // start + k*step, unfused, is what the end test reads (numlistPastEnd).
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+        const double v = start + k * step;
+        if (k > 0) run = numlistValue(run + step, start);
+        if (numlistPastEnd(v, run, k, step, end)) break;
+        const double hair = 1.335e-14 * std::fabs(k * step);
+        result.push_back(k > 0 && v >= end - hair && v <= end + hair ? end : run);
+        if (k + 1 > kNumlistMaxElements) {
           r.isError = true;
           r.error = errBlock("numlist: more than " + std::to_string(kNumlistMaxElements) + " elements");
           return r;
@@ -264,7 +303,10 @@ NumlistResult parseNumlist(const std::string& spec) {
     r.error = errBlock("numlist: more than " + std::to_string(kNumlistMaxElements) + " elements");
     return r;
   }
-  for (double v : result) r.tokens.push_back(fmtNum(v));
+  // BUG-1395: each element's text is its %15.0g rendering with the padding
+  // dropped -- StataBE 19.5 (x1b/a6-a8.do, 38 values): .0625 not 0.0625,
+  // .1234567890123, 1.00000000e-20, 1.23456789e+13 but 1234567890123, -.3333333333333.
+  for (double v : result) r.tokens.push_back(piet::fmt::general(v, 15, 0));
   return r;
 }
 
@@ -298,164 +340,6 @@ std::vector<std::string> splitForeachTokens(const std::string& itemsStr) {
 }
 
 // ---------------------------------------------------------------------------
-// BUG-547: legacy `for` command helpers.
-
-// A same-shape private copy of dispatcher.cpp's splitTopLevelComma (egen.py-
-// adjacent: split at the first comma outside parens). dispatcher.cpp's copy
-// has internal linkage inside its own anonymous namespace and is not reachable
-// from this translation unit; the algorithm is 8 lines, so a second copy here
-// (rather than exporting a header for one caller) is the smaller change.
-std::pair<std::string, std::optional<std::string>> splitTopLevelCommaFor(const std::string& s) {
-  int depth = 0;
-  for (size_t i = 0; i < s.size(); ++i) {
-    char ch = s[i];
-    if (ch == '(') {
-      ++depth;
-    } else if (ch == ')') {
-      --depth;
-    } else if (ch == ',' && depth == 0) {
-      return {s.substr(0, i), s.substr(i + 1)};
-    }
-  }
-  return {s, std::nullopt};
-}
-
-// `for`'s two separators (list-vs-list in the header, command-vs-command in
-// the body) are both a bare `\` OUTSIDE a quoted string. eval::quotedSpanMask
-// is the same mask eval::searchUnquoted itself is built on, so this can never
-// disagree with how the rest of the dispatcher reads a quoted span.
-std::vector<std::string> splitOnUnquotedBackslash(const std::string& s) {
-  std::vector<bool> mask = eval::quotedSpanMask(s);
-  std::vector<std::string> parts;
-  std::string cur;
-  for (size_t i = 0; i < s.size(); ++i) {
-    if (s[i] == '\\' && !mask[i]) {
-      parts.push_back(cur);
-      cur.clear();
-    } else {
-      cur.push_back(s[i]);
-    }
-  }
-  parts.push_back(cur);
-  return parts;
-}
-
-// BUG-547 (for_macro_name_has_X): `for`'s blind placeholder substitution must
-// not corrupt a macro REFERENCE's name -- `$XC` has to stay `$XC` (and expand
-// normally once the substituted command dispatches), never become `$aC`.
-// Marks every character belonging to a `` `name' ``, `$name` or `${name}`
-// span in `s` so the substitution loop below can skip over it. Design brief
-// (cmd-triage.json): "Do not substitute inside macro-reference names ...
-// Stata expands those before `for` sees the line."
-std::vector<bool> macroNameSpanMask(const std::string& s) {
-  std::vector<bool> mask(s.size(), false);
-  size_t i = 0;
-  while (i < s.size()) {
-    if (s[i] == '`') {
-      size_t j = s.find('\'', i + 1);
-      size_t end = (j == std::string::npos) ? s.size() : j + 1;
-      for (size_t k = i; k < end; ++k) mask[k] = true;
-      i = end;
-      continue;
-    }
-    if (s[i] == '$') {
-      size_t j = i + 1;
-      if (j < s.size() && s[j] == '{') {
-        size_t close = s.find('}', j + 1);
-        size_t end = (close == std::string::npos) ? s.size() : close + 1;
-        for (size_t k = i; k < end; ++k) mask[k] = true;
-        i = end;
-        continue;
-      }
-      size_t k = j;
-      while (k < s.size() &&
-             (std::isalnum(static_cast<unsigned char>(s[k])) || s[k] == '_')) {
-        ++k;
-      }
-      if (k > j) {
-        for (size_t m = i; m < k; ++m) mask[m] = true;
-        i = k;
-        continue;
-      }
-    }
-    ++i;
-  }
-  return mask;
-}
-
-// BUG-547: blind text substitution of every placeholder in `subs` (one pair
-// per list, in list order) over `text` in a SINGLE left-to-right pass --
-// design brief: "substitute every occurrence of each placeholder... also
-// inside quotes and inside words" (oracle for_in_quotes: `"X"` -> `` `"ev"' ``
-// -- see the whole-quoted-span rule just below; for_num: `pX` -> `p2`),
-// except inside a macro-reference name (masked above). A single combined
-// pass (rather than one pass per placeholder) means an inserted VALUE is
-// never itself re-scanned for a later placeholder -- each position of the
-// ORIGINAL text is visited exactly once.
-std::string substitutePlaceholders(
-    const std::string& text, const std::vector<std::pair<std::string, std::string>>& subs) {
-  std::vector<bool> mask = macroNameSpanMask(text);
-  std::string out;
-  out.reserve(text.size());
-  size_t i = 0;
-  size_t n = text.size();
-  while (i < n) {
-    if (!mask[i] && text[i] == '"') {
-      // BUG-547 (for_in_quotes): when a placeholder is the ENTIRE content of
-      // a real-quoted string, Stata's `for` does not substitute the letter
-      // in place and leave the delimiting `"` characters -- it replaces the
-      // whole quoted span with a Stata compound double-quote token (oracle
-      // w2_cmdtriage.log for_in_quotes: `s == "X"` -> `` s == `"ev"' ``, no
-      // surviving literal `"` characters around the value). Only an exact
-      // whole-span match is handled here (no oracle arm exercises a
-      // placeholder mixed with other text inside the same quoted string);
-      // anything else falls through to the plain per-character pass below,
-      // which still reaches inside a non-matching quoted span unchanged.
-      // PIET's tokenizer refuses compound double quotes by name (BUG-352),
-      // so a value with no `"` of its own is emitted as the plain, equivalent
-      // "value" string; only a value that itself contains `"` needs (and
-      // honestly hits the named refusal of) the compound form. The echo
-      // therefore shows "ev" where Stata's shows `"ev"' -- display only.
-      size_t close = text.find('"', i + 1);
-      if (close != std::string::npos) {
-        std::string content = text.substr(i + 1, close - i - 1);
-        bool spanMatched = false;
-        for (const auto& sub : subs) {
-          if (!sub.first.empty() && content == sub.first) {
-            if (sub.second.find('"') == std::string::npos)
-              out += "\"" + sub.second + "\"";
-            else
-              out += "`\"" + sub.second + "\"'";
-            i = close + 1;
-            spanMatched = true;
-            break;
-          }
-        }
-        if (spanMatched) continue;
-      }
-    }
-    bool matched = false;
-    if (!mask[i]) {
-      for (const auto& sub : subs) {
-        const std::string& ph = sub.first;
-        const std::string& val = sub.second;
-        if (!ph.empty() && text.compare(i, ph.size(), ph) == 0) {
-          out += val;
-          i += ph.size();
-          matched = true;
-          break;
-        }
-      }
-    }
-    if (!matched) {
-      out += text[i];
-      ++i;
-    }
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------------------
 // _eval_bool_expr — C++ port using the M1 pyeval/exprfns machinery instead of
 // a fresh eval engine. Rewrite order mirrors loops.py exactly.
 
@@ -483,28 +367,6 @@ std::string regexReplace(const std::regex& re, const std::string& s,
 // `(?<!X)C(?!Y)` patterns (single-char C not preceded by X, not followed by
 // Y) are ported here as manual character scans instead of regex.
 
-// Single-char lone-operator rewrite: replace occurrences of `ch` with
-// `replacement`, SKIPPING any occurrence immediately preceded OR followed by
-// `pairChar` (so "||"/"&&" are left untouched — those were already rewritten
-// by an earlier pass — and only a truly lone `|`/`&` becomes " or "/" and ").
-std::string replaceLoneChar(const std::string& s, char ch, char pairChar,
-                            const std::string& replacement) {
-  std::string out;
-  out.reserve(s.size());
-  for (size_t i = 0; i < s.size(); ++i) {
-    if (s[i] == ch) {
-      bool precededByPair = (i > 0 && s[i - 1] == pairChar);
-      bool followedByPair = (i + 1 < s.size() && s[i + 1] == pairChar);
-      if (!precededByPair && !followedByPair) {
-        out += replacement;
-        continue;
-      }
-    }
-    out += s[i];
-  }
-  return out;
-}
-
 // Single `=` (assignment-in-condition) -> `==`, skipping when adjacent to
 // =/!/</> (already part of a multi-char comparison operator).
 std::string replaceLoneEquals(const std::string& s) {
@@ -525,34 +387,155 @@ std::string replaceLoneEquals(const std::string& s) {
   return out;
 }
 
-// Bare `.` (Stata system-missing literal) -> the sentinel, skipping when
-// adjacent to a word char or another `.` (i.e. part of a number/identifier,
-// not a standalone missing-value token).
-std::string replaceBareDot(const std::string& s, const std::string& sentinel) {
-  std::string out;
-  out.reserve(s.size());
-  auto isWordOrDot = [](char c) {
-    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.';
-  };
-  for (size_t i = 0; i < s.size(); ++i) {
-    if (s[i] == '.') {
-      bool precededByWordDot = (i > 0 && isWordOrDot(s[i - 1]));
-      bool followedByWordDot = (i + 1 < s.size() && isWordOrDot(s[i + 1]));
-      if (!precededByWordDot && !followedByWordDot) {
-        out += sentinel;
-        continue;
-      }
-    }
-    out += s[i];
-  }
-  return out;
-}
-
 struct BoolEvalResult {
   bool isError = false;
   ojson error;
   bool value = false;
 };
+
+// BUG-921: a data-plane cell as the condition evaluator's number. The data
+// plane codes a missing as a NaN carrying its kind; the evaluator's missing is
+// the 2^1023 band (exprfns.h), where `x == .` is true and `. > 1e300` holds.
+// Binding the raw NaN made every comparison with a missing cell false.
+double cellAsEvalNumber(double v) {
+  if (!std::isnan(v)) return v;
+  const int k = cecon::missing_kind(v);
+  return eval::stataMissingWithKind(k >= cecon::kMissA && k <= cecon::kMissZ ? k : 0);
+}
+
+// BUG-921: the row-1 value of a dataset variable as an evaluator value -- the
+// number (missing mapped as above) or, for a string variable, its text.
+// nullopt when the column has no row 1.
+std::optional<eval::PyValue> obsValueAsPy(Datastore& ds, const std::string& name, int64_t row) {
+  if (row < 0 || row >= ds.nRows()) return std::nullopt;
+  const cecon::Column& col = ds.col(name);
+  if (ds.dtype(name) == "factor") {
+    const int32_t code = col.codes()[static_cast<size_t>(row)];
+    const auto& levels = col.levels;
+    return eval::PyValue::str(code >= 0 && static_cast<size_t>(code) < levels.size()
+                                  ? levels[static_cast<size_t>(code)]
+                                  : std::string());
+  }
+  const double* d = col.f64();
+  if (d == nullptr) return std::nullopt;
+  return eval::PyValue::floating(cellAsEvalNumber(d[row]));
+}
+
+// BUG-921: explicit subscripts `var[exp]` in an if/while condition read that
+// observation (oracle w2_prog_controlflow pc_if_varref: `if i[3] > 250` reads
+// i[3] = 300; pc_if_missing: `if d[99] == .` and `if missing(f[7])` past _N are
+// missing, so true). Each subscript of a DATASET variable is replaced by its
+// value as literal text: a number in parentheses, `.`/`.a`... for a missing
+// (the missing-literal pass below turns those into the evaluator's doubles), a
+// quoted string for a string variable ("" past _N, as Stata's string cells
+// have no missing). Matrices were already substituted (substituteMatrixRefs)
+// and _b[]/_se[] are not dataset variables, so neither is touched. Quoted text
+// is skipped. A subscript whose index does not evaluate, or a string value
+// holding a double quote, is left as it was (the evaluator then refuses it as
+// before). nullopt = nothing substituted.
+std::optional<std::string> substituteVarSubscripts(const std::string& in, SessionState& session) {
+  if (in.find('[') == std::string::npos) return std::nullopt;
+  Datastore* ds = nullptr;
+  bool dsAsked = false;
+  std::string out;
+  bool any = false;
+  // Unicode names (lane M): the shared identifier byte tests, so `قيمة[2]` and
+  // the mixed-script `دخل_2020[1]` are each one subscripted name.
+  const auto isId0 = [](char c) { return cecon::ident::isIdentStartByte(c); };
+  const auto isId = [](char c) { return cecon::ident::isIdentByte(c); };
+  size_t i = 0;
+  while (i < in.size()) {
+    const char c = in[i];
+    if (c == '"') {  // a string literal: copy through its closing quote
+      const size_t close = in.find('"', i + 1);
+      const size_t stop = close == std::string::npos ? in.size() : close + 1;
+      out.append(in, i, stop - i);
+      i = stop;
+      continue;
+    }
+    if (!isId0(c) || (i > 0 && (isId(in[i - 1]) || in[i - 1] == '.'))) {
+      out += c;
+      ++i;
+      continue;
+    }
+    size_t j = i + 1;
+    while (j < in.size() && isId(in[j])) ++j;
+    size_t k = j;
+    while (k < in.size() && (in[k] == ' ' || in[k] == '\t')) ++k;
+    const std::string name = in.substr(i, j - i);
+    if (k >= in.size() || in[k] != '[') {
+      out.append(name);
+      i = j;
+      continue;
+    }
+    // Find the matching close bracket.
+    int depth = 0;
+    size_t close = std::string::npos;
+    for (size_t q = k; q < in.size(); ++q) {
+      if (in[q] == '[') ++depth;
+      if (in[q] == ']' && --depth == 0) {
+        close = q;
+        break;
+      }
+    }
+    if (close == std::string::npos) {
+      out.append(name);
+      i = j;
+      continue;
+    }
+    if (name == "_b" || name == "_se" || session.eval.findMatrix(name) != nullptr) {
+      out.append(in, i, close + 1 - i);
+      i = close + 1;
+      continue;
+    }
+    if (!dsAsked) {
+      ds = session.datastore();
+      dsAsked = true;
+    }
+    std::optional<std::string> lit;
+    if (ds != nullptr && ds->has(name)) {
+      const std::string idxText =
+          eval::substituteObsSpecials(trim(in.substr(k + 1, close - k - 1)), session.eval);
+      std::optional<std::string> idxVal = eval::evalArith(idxText, &session.eval);
+      double idx = 0.0;
+      bool idxOk = false;
+      if (idxVal.has_value()) {
+        char* e = nullptr;
+        idx = std::strtod(idxVal->c_str(), &e);
+        idxOk = e != idxVal->c_str() && *e == '\0' && std::isfinite(idx);
+      }
+      if (idxOk) {
+        const long long obs = static_cast<long long>(std::trunc(idx));
+        const bool isStr = ds->dtype(name) == "factor";
+        std::optional<eval::PyValue> v = obsValueAsPy(*ds, name, obs - 1);
+        if (isStr) {
+          const std::string text = v.has_value() ? v->strVal() : std::string();
+          if (text.find('"') == std::string::npos) lit = "\"" + text + "\"";
+        } else if (!v.has_value()) {
+          lit = " . ";
+        } else {
+          const double d = v->floatVal();
+          if (auto kind = eval::stataExtendedMissingKind(d)) {
+            lit = std::string(" ") + cecon::missing_text(*kind) + " ";
+          } else {
+            char buf[40];
+            std::snprintf(buf, sizeof(buf), "(%.17g)", d);
+            lit = buf;
+          }
+        }
+      }
+    }
+    if (lit.has_value()) {
+      out += *lit;
+      any = true;
+    } else {
+      out.append(in, i, close + 1 - i);
+    }
+    i = close + 1;
+  }
+  if (!any) return std::nullopt;
+  return out;
+}
 
 BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
   dprof::EScope _z(dprof::kEBoolExpr);
@@ -577,32 +560,103 @@ BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
   // where not one of these six patterns can match anything. The whole cost was
   // the scan that proves the absence.
 
-  // Compound double-quotes `"..."' -> "..."
+  // Compound double-quotes `"..."' -> "..." when the body holds no '"'; EM5: one
+  // that does stays compound (eval::normalizeCompoundQuotes, nesting-aware) and
+  // is extracted whole below. The old non-greedy regex cut `"say "hi" now"' at
+  // its first inner "' (w2af mt_if_cq_eq, mt_while_cq; w2d_scan's
+  // `strpos(`"`macval(line)'"', ...)` over csv lines holding quotes).
   dprof::ezoneBegin(dprof::kEBoolStrlit);
-  static const std::regex reCompound(R"delim(`"(.*?)"')delim");
   if (cleaned.find("`\"") != std::string::npos) {
-    cleaned = regexReplace(reCompound, cleaned,
-                            [](const std::smatch& m) { return "\"" + m.str(1) + "\""; });
+    cleaned = eval::normalizeCompoundQuotes(cleaned);
+  }
+  // FU-875: the blanks inside ( ) and [ ] go, as Stata reads the condition, and
+  // brackets that do not pair are r(132) before any name is read -- the rule of
+  // the other evaluators (core/expr_blanks.h): `if abs(1 2) == 12` is true and
+  // `while (`k' < 1 2)` runs to k = 12 (StataBE 19.5). Guarded like the passes
+  // above: a condition without a bracket has nothing to squeeze or pair.
+  if (cleaned.find_first_of("()[]") != std::string::npos) {
+    cleaned = cecon::squeeze_bracketed_blanks(cleaned);
+    if (const std::string u = cecon::bracket_imbalance(cleaned); !u.empty()) {
+      dprof::ezoneEnd(dprof::kEBoolStrlit);
+      r.isError = true;
+      r.error =
+          eval::errorBlock("engine_error", u, std::nullopt, std::nullopt, std::nullopt, "r(132)");
+      return r;
+    }
   }
 
   // Quote-aware operator rewrite: extract string literals first.
+  // colnumb(M, "name") / colsof(M) / rowsof(M) in a condition: the same text
+  // substitution the display/local layer runs (eval::substituteMatrixRefs),
+  // before the literals are swapped out -- colnumb reads its name from one.
+  // `if !missing(colnumb(CB, "`col'")) {` stopped the do-file (w2x_fn_string_math
+  // fx_colnumb_if). colnumb() of a matrix that does not exist is r(111).
+  // A matrix element NAME[i,j] / el(NAME,i,j) is the same substitution: the
+  // condition `if MN[1,1]^2 > 3 {` was rc 1 (w2ac_expr_valueref ifcmd_vr_matrix,
+  // StataBE takes the branch); valueRefText keeps a negative cell one operand.
+  {
+    const std::string lower = strutil::lower(cleaned);
+    if (lower.find("colnumb") != std::string::npos || lower.find("colsof") != std::string::npos ||
+        lower.find("rowsof") != std::string::npos || lower.find('[') != std::string::npos ||
+        lower.find("el(") != std::string::npos) {
+      // Unicode names: identifier-class boundary, not ASCII `\b` (an Arabic
+      // byte is a non-word character to `\b`, so `مcolnumb(` would match).
+      static const std::regex reColnumbMat(
+          R"((?:^|[^\w\x80-\xff])colnumb\s*\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*,)",
+          std::regex::icase);
+      for (std::sregex_iterator it(cleaned.begin(), cleaned.end(), reColnumbMat), end; it != end;
+           ++it) {
+        if (session.eval.findMatrix((*it)[1].str()) == nullptr) {
+          r.isError = true;
+          r.error = eval::errorBlock("engine_error", "matrix " + (*it)[1].str() + " not found",
+                                     std::nullopt, std::nullopt, std::nullopt, "r(111)");
+          return r;
+        }
+      }
+      cleaned = eval::substituteMatrixRefs(cleaned, session.eval);
+    }
+  }
+  if (auto subbed = substituteVarSubscripts(cleaned, session)) cleaned = *subbed;
+
   std::vector<std::string> placeholders;
   static const std::regex reStrLit(R"("[^"]*")");
-  std::string pyExpr = cleaned.find('"') != std::string::npos
-                           ? regexReplace(reStrLit, cleaned,
-                                          [&](const std::smatch& m) {
-                                            placeholders.push_back(m.str(0));
-                                            return "__STR" +
-                                                   std::to_string(placeholders.size() - 1) + "__";
-                                          })
-                           : cleaned;
+  std::string pyExpr;
+  if (cleaned.find("`\"") != std::string::npos) {
+    // EM5: one left-to-right scan; a compound span (nesting) and a plain literal
+    // each become one placeholder, restored verbatim for pyeval's lexer.
+    pyExpr.reserve(cleaned.size());
+    size_t i = 0;
+    while (i < cleaned.size()) {
+      size_t end = std::string::npos;
+      if (eval::startsCompound(cleaned, i)) {
+        end = eval::compoundSpanEnd(cleaned, i);
+      } else if (cleaned[i] == '"') {
+        const size_t close = cleaned.find('"', i + 1);
+        if (close != std::string::npos) end = close + 1;
+      }
+      if (end == std::string::npos) {
+        pyExpr += cleaned[i++];
+        continue;
+      }
+      placeholders.push_back(cleaned.substr(i, end - i));
+      pyExpr += "__STR" + std::to_string(placeholders.size() - 1) + "__";
+      i = end;
+    }
+  } else {
+    pyExpr = cleaned.find('"') != std::string::npos
+                 ? regexReplace(reStrLit, cleaned,
+                                [&](const std::smatch& m) {
+                                  placeholders.push_back(m.str(0));
+                                  return "__STR" + std::to_string(placeholders.size() - 1) + "__";
+                                })
+                 : cleaned;
+  }
 
   dprof::ezoneEnd(dprof::kEBoolStrlit);
   dprof::ezoneBegin(dprof::kEBoolRewrite);
 
-  // Stata -> Python boolean/comparison operators (ORDER matters — || / &&
-  // before single | / &, so a lone '|' inside '||' is not double-rewritten;
-  // replaceLoneChar/replaceLoneEquals/replaceBareDot below replicate
+  // Stata -> Python boolean/comparison operators (replaceLoneEquals/
+  // replaceStataMissingLiterals below replicate
   // loops.py's lookaround-regex ordering via manual character scans — see
   // their doc comments for why (libc++'s std::regex has no lookbehind)).
   // A3-①: these four were the only NON-static std::regex constructions on any
@@ -616,15 +670,13 @@ BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
   static const std::regex reOrOr(R"(\|\|)");
   static const std::regex reAndAnd(R"(&&)");
   static const std::regex reNotEqTilde(R"(~=)");
-  static const std::regex reBang(R"(!(?!=))");
   //
   // EXPRLAYER-1a: each pass is now guarded by the literal it needs, and every
   // guard is RECOMPUTED against the output of the pass before it — never
-  // hoisted. That is not caution, it is required: the `~=` pass rewrites to
-  // `!=`, so it INTRODUCES the very character the `!` pass looks for. (The
-  // `!` pass then correctly declines, because reBang is `!(?!=)`; the point is
-  // that a hoisted guard set computed on the ORIGINAL text would have been
-  // wrong here.) find() is a memchr-class scan, so paying it per pass costs
+  // hoisted. That is not caution, it is required: the `|`/`&` passes run twice
+  // (the doubled forms first), and a hoisted guard set computed on the ORIGINAL
+  // text would not see what an earlier pass introduced or removed. find() is a
+  // memchr-class scan, so paying it per pass costs
   // orders of magnitude less than the regex it guards. replaceLoneChar and
   // replaceLoneEquals are full character copies, so skipping one removes an
   // allocation as well as a pass.
@@ -634,17 +686,31 @@ BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
   if (pyExpr.find('&') != std::string::npos) {
     pyExpr = std::regex_replace(pyExpr, reAndAnd, " and ");
   }
-  if (pyExpr.find('|') != std::string::npos) {
-    pyExpr = replaceLoneChar(pyExpr, '|', '|', " or ");
-  }
-  if (pyExpr.find('&') != std::string::npos) {
-    pyExpr = replaceLoneChar(pyExpr, '&', '&', " and ");
-  }
+  // A lone `|` / `&` stays as written: pyeval reads it as Stata's operator
+  // (Tok::Pipe/Tok::Amp), which evaluates every operand -- `if 1 | runiform() > 2`
+  // consumes a draw -- and refuses a string (`if 1 | "a"` is r(109)); Python's
+  // `or`/`and` skipped the right operand and let the string through (StataBE
+  // 19.5).
   if (pyExpr.find('~') != std::string::npos) {
     pyExpr = std::regex_replace(pyExpr, reNotEqTilde, "!=");
   }
-  if (pyExpr.find('!') != std::string::npos) {
-    pyExpr = std::regex_replace(pyExpr, reBang, " not ");
+  // FU-811: a bare `!` stays as written. pyeval lexes it as Stata's `!`
+  // (Tok::Bang) at negation level; the old rewrite to Python's loose `not` made
+  // `if !3==2 {` run its branch (oracle w2ac_expr_precedence ifcmd_not_eq: it
+  // does not). `^` becomes `**` the way the display/local layer does it
+  // (macros.cpp), after the string literals are placeholders; before this, every
+  // `if` condition with a `^` was rc 1 (ifcmd_neg_pow, ifcmd_chain_const, ...).
+  if (pyExpr.find('^') != std::string::npos) {
+    std::string tmp;
+    tmp.reserve(pyExpr.size() + 8);
+    for (char c : pyExpr) {
+      if (c == '^') {
+        tmp += "**";
+      } else {
+        tmp.push_back(c);
+      }
+    }
+    pyExpr = tmp;
   }
   if (pyExpr.find('=') != std::string::npos) {
     pyExpr = replaceLoneEquals(pyExpr);
@@ -675,7 +741,7 @@ BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
   }
   // BUG-456: an e-STRING arrives from the resolver as a double-quoted literal
   // (`"regress"`), AFTER the placeholder extraction above and BEFORE
-  // replaceBareDot below -- so an e(cmdline)/e(depvar) text with a `.` in it
+  // replaceStataMissingLiterals below -- so an e(cmdline)/e(depvar) text with a `.` in it
   // (`d.x`, `a.b`) would have been sentinelized (the BUG-443 class). Extract
   // the new literals into the same placeholder list; the restore loop below
   // puts them back untouched, and the identifier scan never sees their text.
@@ -694,20 +760,39 @@ BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
   // placeholder token by this point, so only a real unquoted c(name)
   // reference can match.
   pyExpr = substituteCRefs(pyExpr, session);
+  // BUG-1330: a c() nothing answers is StataBE's r(133) `c(name) undefined`, or
+  // the named refusal of a real name this build does not serve, as display and
+  // assert word it; `if c(bogus) == 1 {` failed at rc 1 with no message.
+  std::string cRc;
+  if (auto cErr = unservedCRefError(pyExpr, &cRc)) {
+    r.isError = true;
+    r.error = eval::errorBlock("engine_error", *cErr, std::nullopt, std::nullopt, std::nullopt,
+                               "r(" + cRc + ")");
+    dprof::ezoneEnd(dprof::kEBoolTail);
+    return r;
+  }
 
-  // Stata missing sentinel: scalar(NAME) unresolved + bare `.` -> the huge
-  // sentinel so `missing <= 0` is False and eval never NameErrors (matches
-  // Stata's missing = +infinity ordering).
+  // Stata missing: scalar(NAME) unresolved, a bare `.` and `.a`..`.z` -> their
+  // exact doubles (exprfns.h; `.` is 2^1023) so `missing <= 0` is False, `.a > .`
+  // is True and eval never NameErrors (Stata's missing = +infinity ordering).
   // EXPRLAYER-1a: same strict pre-filter argument. The pattern needs the
-  // literal "scalar(" and replaceBareDot needs a '.'; both were unconditional,
-  // and replaceBareDot allocates and copies the whole string even when it
-  // changes nothing.
-  static const std::regex reScalarUnresolved(R"(\bscalar\(\s*[A-Za-z_]\w*\s*\))");
+  // literal "scalar(" and replaceStataMissingLiterals needs a '.'; both were
+  // unconditional, and the rewrite allocates and copies the whole string even
+  // when it changes nothing.
+  // Unicode names: the boundary is the identifier class (group 1 keeps the
+  // character before), as in macros.cpp's substituteScalarCalls scan -- under
+  // ASCII `\b` the tail of `مscalar(y)` was rewritten.
+  static const std::regex reScalarUnresolved(
+      R"((^|[^\w\x80-\xff])scalar\(\s*[A-Za-z_\x80-\xff][\w\x80-\xff]*\s*\))");
   if (pyExpr.find("scalar(") != std::string::npos) {
-    pyExpr = std::regex_replace(pyExpr, reScalarUnresolved, "8.988465674311579e+307");
+    // A callback, not a "$1..." format: the literal starts with a digit, and
+    // "$18.98..." would read as group 18.
+    static const std::string kMissing = eval::stataMissingLiteral(0);
+    pyExpr = regexReplace(reScalarUnresolved, pyExpr,
+                          [](const std::smatch& m) { return m.str(1) + kMissing; });
   }
   if (pyExpr.find('.') != std::string::npos) {
-    pyExpr = replaceBareDot(pyExpr, "8.988465674311579e+307");
+    pyExpr = eval::replaceStataMissingLiterals(pyExpr);
   }
 
   // C4-L3 (D2a value plane): the referenced-identifier set of the FINAL
@@ -740,21 +825,14 @@ BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
     // over a corpus of condition shapes (selftestBoolIdentScanMatchesRegex).
     const size_t n = pyExpr.size();
     for (size_t i = 0; i < n;) {
-      const unsigned char c = static_cast<unsigned char>(pyExpr[i]);
-      if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_')) {
+      // Unicode names (lane M): the shared byte tests; the regex twin carries
+      // the same `\x80-\xff` widening.
+      if (!cecon::ident::isIdentStartByte(pyExpr[i])) {
         ++i;
         continue;
       }
       size_t j = i + 1;
-      while (j < n) {
-        const unsigned char d = static_cast<unsigned char>(pyExpr[j]);
-        if ((d >= 'A' && d <= 'Z') || (d >= 'a' && d <= 'z') || (d >= '0' && d <= '9') ||
-            d == '_') {
-          ++j;
-        } else {
-          break;
-        }
-      }
+      while (j < n && cecon::ident::isIdentByte(pyExpr[j])) ++j;
       const bool expTail =
           i > 0 && (std::isdigit(static_cast<unsigned char>(pyExpr[i - 1])) || pyExpr[i - 1] == '.');
       if (!expTail && pyExpr.compare(i, 5, "__STR") != 0) {
@@ -812,14 +890,20 @@ BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
   // the card answers _N and column name/dtype membership without opening the
   // datastore; session.datastore() — on a dirty virtual head, a full EMH
   // frame snapshot — is paid ONLY when the condition really reads a column's
-  // row-1 value (an f64 column reference with no same-named scalar override;
-  // scalars are bound after columns and win, so an overridden column's value
-  // is dead either way). Anything less than a current card — stale/absent,
+  // row-1 value (any referenced column; since BUG-921 a column outranks a
+  // same-named scalar and a string column binds its text). Anything less than a current card — stale/absent,
   // no dataset, or the PIET_NO_RESIDENT_READ escape arm via
   // residentReadCard()'s gate — falls to the pre-D2 eager path VERBATIM
   // below, including its bind-every-f64 behavior and its
   // materialize-on-dirty side effect (the floor RED arm's reproduction).
   dprof::ezoneBegin(dprof::kEBoolBindCard);
+  // BUG-921: column values are collected here and bound AFTER the scalars, so a
+  // variable outranks a same-named scalar (Stata's rule, and dispatcher.cpp's
+  // for row predicates). Oracle w2_prog_controlflow pc_if_varref: with
+  // `scalar i = 999` and variable i (i[1] = 100), `if i > 250` is false and
+  // `if i == 999` is false. A string variable binds its row-1 text
+  // (`if s == "s 1"`), which used to be unbound and stopped the do-file (rc 1).
+  std::unordered_map<std::string, eval::PyValue> colBound;
   bool boundLazily = false;
   if (const std::vector<VarInfo>* card = session.residentReadCard()) {
     std::optional<int64_t> cardRows = session.residentRowsIfCurrent();
@@ -831,10 +915,9 @@ BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
       std::vector<std::string> needValue;
       if (*cardRows > 0) {
         for (const auto& tok : exprRefs) {
-          if (session.eval.scalars.find(tok) != nullptr) continue;  // scalar wins below
           for (const auto& vi : *card) {
             if (vi.name == tok) {
-              if (vi.dtype == "f64") needValue.push_back(tok);
+              needValue.push_back(tok);  // BUG-921: string variables too
               break;  // a current card is authoritative for absence too
             }
           }
@@ -846,8 +929,8 @@ BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
         Datastore* dsv = session.datastore();
         if (dsv != nullptr) {
           for (const auto& tok : needValue) {
-            const double* d = dsv->col(tok).f64();
-            if (d != nullptr) ns.consts[tok] = eval::PyValue::floating(d[0]);
+            if (!dsv->has(tok)) continue;
+            if (auto v = obsValueAsPy(*dsv, tok, 0)) colBound[tok] = *v;
           }
         }
       }
@@ -871,8 +954,8 @@ BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
       // — session.datastore() still runs first and unconditionally, so the
       // materialize-on-dirty side effect this arm is deliberately preserved to
       // reproduce (the floor RED arm) happens exactly as before. Only the
-      // binding loop narrowed. Column-then-scalar order is untouched, so a
-      // same-named scalar still wins.
+      // binding loop narrowed. (BUG-921: the columns now bind after the
+      // scalars, so a same-named variable wins.)
       if (exprRefs.count("_N") > 0) {
         ns.consts["_N"] = eval::PyValue::floating(static_cast<double>(ds->nRows()));
       }
@@ -880,9 +963,7 @@ BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
       if (ds->nRows() > 0) {
         for (const auto& tok : exprRefs) {
           if (!ds->has(tok)) continue;  // col()/dtype() throw on an absent name
-          if (ds->dtype(tok) != "f64") continue;
-          const double* d = ds->col(tok).f64();
-          if (d != nullptr) ns.consts[tok] = eval::PyValue::floating(d[0]);
+          if (auto v = obsValueAsPy(*ds, tok, 0)) colBound[tok] = *v;  // BUG-921: strings too
         }
       }
     } else {
@@ -893,18 +974,23 @@ BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
 
   dprof::ezoneEnd(dprof::kEBoolBindCard);
 
-  // Named scalars (session._scalars) — bound AFTER dataset columns so a
-  // same-named scalar wins (mirrors loops.py's insertion order: scalars are
-  // bound last in the Python _NS dict.update sequence).
+  // Named scalars (session._scalars), then the dataset columns collected above
+  // on top of them: a variable wins over a same-named scalar (BUG-921; the old
+  // order, inherited from loops.py, let the scalar win).
   dprof::ezoneBegin(dprof::kEBoolBindScalars);
   for (const auto& [sname, sval] : session.eval.scalars.items()) {
     auto f = eval::pythonFloat(sval);
     if (f) ns.consts[sname] = eval::PyValue::floating(*f);
   }
+  for (auto& [cname, cval] : colBound) ns.consts[cname] = std::move(cval);
   dprof::ezoneEnd(dprof::kEBoolBindScalars);
 
   dprof::ezoneEnd(dprof::kEBoolBind);
 
+  // `if 1/0 == . {`, `if invttail(5,2) == . {` and `while sqrt(-1) == .` are
+  // Stata conditions like any other: no error, and a NaN is `.` (see
+  // StataDivisionScope; BUG-1358, BUG-1065).
+  eval::StataDivisionScope stataSemantics;
   auto outcome = eval::evalPyExprDetailed(pyExpr, ns);
   if (outcome.status != eval::PyEvalOutcome::Status::Value) {
     r.isError = true;
@@ -940,24 +1026,11 @@ BoolEvalResult evalBoolExpr(const std::string& expr, SessionState& session) {
 // exactly one character. Iterative backtracking rather than a regex, because a
 // name is short and building a std::regex per token per call is what the zone
 // profile has already caught twice in this file.
+// Unicode names (lane M): forwards to the shared matcher, whose `?` is ONE
+// CHARACTER (StataBE: `ds ق?` lists the two-letter Arabic names) -- this copy's
+// `?` was one byte, so it matched half an Arabic letter.
 bool globMatch(const std::string& pat, const std::string& name) {
-  size_t p = 0, n = 0, star = std::string::npos, mark = 0;
-  while (n < name.size()) {
-    if (p < pat.size() && (pat[p] == '?' || pat[p] == name[n])) {
-      ++p;
-      ++n;
-    } else if (p < pat.size() && pat[p] == '*') {
-      star = p++;
-      mark = n;
-    } else if (star != std::string::npos) {
-      p = star + 1;
-      n = ++mark;
-    } else {
-      return false;
-    }
-  }
-  while (p < pat.size() && pat[p] == '*') ++p;
-  return p == pat.size();
+  return strutil::globMatch(pat, name);
 }
 
 VarlistExpandResult expandVarlistImpl(const std::string& spec, SessionState& session) {
@@ -1054,7 +1127,7 @@ VarlistExpandResult expandVarlistImpl(const std::string& spec, SessionState& ses
       }
       continue;
     }
-    static const std::regex reRange(R"(^\w+-\w+$)");
+    static const std::regex reRange(R"(^[\w\x80-\xff]+-[\w\x80-\xff]+$)");
     if (std::regex_match(tok, reRange)) {
       size_t dash = tok.find('-');
       std::string v1 = tok.substr(0, dash), v2 = tok.substr(dash + 1);
@@ -1085,7 +1158,7 @@ VarlistExpandResult expandVarlistImpl(const std::string& spec, SessionState& ses
 // tests/eval/golden/aer_w2/w2_openbugs.log arms fe_unknown/fe_mixed/
 // fe_prog_unknown — the check runs over the WHOLE expanded token list before
 // runForeach ever sets the loop variable once.
-std::optional<ojson> checkKnownVarTokens(const std::vector<std::string>& tokens,
+std::optional<ojson> checkKnownVarTokens(std::vector<std::string>& tokens,
                                          SessionState& session) {
   std::vector<std::string> known;
   if (const std::vector<VarInfo>* card = session.residentReadCard()) {
@@ -1095,88 +1168,23 @@ std::optional<ojson> checkKnownVarTokens(const std::vector<std::string>& tokens,
   } else {
     return ojson(eval::noDataLoaded());
   }
-  for (const auto& t : tokens) {
-    if (std::find(known.begin(), known.end(), t) == known.end()) {
-      return ojson(eval::engineError("variable " + t + " not found", "unknown_variable"));
+  // A unique prefix stands for its variable, as in every Stata varlist
+  // (w2_openbugs.log:190-194 fe_abbrev: `foreach v of varlist alph` iterates
+  // `alpha`, rc 0); several matches are r(111) "ambiguous abbreviation".
+  for (auto& t : tokens) {
+    if (std::find(known.begin(), known.end(), t) != known.end()) continue;
+    std::vector<std::string> hits;
+    for (const auto& k : known)
+      if (k.size() > t.size() && k.compare(0, t.size(), t) == 0) hits.push_back(k);
+    if (hits.size() == 1) {
+      t = hits.front();
+      continue;
     }
+    if (hits.size() > 1)
+      return ojson(eval::engineError(t + " ambiguous abbreviation", "unknown_variable"));
+    return ojson(eval::engineError("variable " + t + " not found", "unknown_variable"));
   }
   return std::nullopt;
-}
-
-// ---------------------------------------------------------------------------
-// BUG-547: legacy `for`'s per-list parse — one `[NAME in] TYPE elements`
-// segment (already split on the header's unquoted `\`).
-
-struct ForListSpec {
-  std::string placeholder;
-  std::vector<std::string> tokens;
-};
-
-// `defaultName` is the positional default (X Y Z A B C D E F by list index)
-// used when the segment omits the `NAME in` prefix. Every malformed segment
-// (missing elements, unrecognised TYPE) is r(198) "invalid syntax" here --
-// the same code the header's other malformations (unequal list lengths, a
-// placeholder absent from the body, a missing colon) use, per the design
-// brief's four validation cases (cmd-triage.json). TYPE resolution mirrors
-// the `foreach ... of var...` abbreviation widening just below: a >=3-char
-// prefix of varlist/numlist/newlist, or exactly `any` (cmd-triage.json
-// design point 3; no oracle arm exercises an abbreviated numlist/newlist,
-// but the SAME minimum-prefix rule the oracle proves for varlist is not a
-// new invention — it is one abbreviation floor applied to all three list
-// keywords the header vocabulary already names).
-std::optional<ForListSpec> parseForListSegment(const std::string& seg,
-                                               const std::string& defaultName,
-                                               SessionState& session, ojson* errOut) {
-  std::string s = trim(seg);
-  std::string name = defaultName;
-  std::string rest = s;
-  {
-    static const std::regex reNamed(R"(^(\w+)\s+in\s+(.*))", std::regex::icase);
-    std::smatch m;
-    if (std::regex_search(s, m, reNamed)) {
-      name = m.str(1);
-      rest = m.str(2);
-    }
-  }
-  size_t sp = rest.find_first_of(" \t");
-  if (sp == std::string::npos) {
-    *errOut = errFor198("for: invalid syntax");
-    return std::nullopt;
-  }
-  std::string type = lower(rest.substr(0, sp));
-  std::string elements = trim(rest.substr(sp + 1));
-  if (elements.empty()) {
-    *errOut = errFor198("for: invalid syntax");
-    return std::nullopt;
-  }
-  static const std::regex reVarlist(R"(^var(l(i(s(t)?)?)?)?$)");
-  static const std::regex reNumlist(R"(^num(l(i(s(t)?)?)?)?$)");
-  static const std::regex reNewlist(R"(^new(l(i(s(t)?)?)?)?$)");
-  ForListSpec out;
-  out.placeholder = name;
-  if (type == "any") {
-    out.tokens = splitForeachTokens(elements);
-  } else if (std::regex_match(type, reVarlist)) {
-    VarlistExpandResult vr = expandVarlistImpl(elements, session);
-    if (vr.isError) {
-      *errOut = vr.error;
-      return std::nullopt;
-    }
-    out.tokens = vr.tokens;
-  } else if (std::regex_match(type, reNumlist)) {
-    NumlistResult nr = parseNumlist(elements);
-    if (nr.isError) {
-      *errOut = nr.error;
-      return std::nullopt;
-    }
-    out.tokens = nr.tokens;
-  } else if (std::regex_match(type, reNewlist)) {
-    out.tokens = splitForeachTokens(elements);
-  } else {
-    *errOut = errFor198("for: invalid syntax: unrecognised list type '" + type + "'");
-    return std::nullopt;
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1266,6 +1274,14 @@ ojson runForeach(const std::string& varname, const std::vector<std::string>& tok
     if (result.control == "break") break;
     // control == "continue": fall through to next token.
   }
+  // BUG-920: StataBE 19.5 leaves the loop macro EMPTY once the loop is over --
+  // not the last element, not the value it held before (oracle
+  // w2_prog_controlflow pc_fe_after: `local m "before"` then
+  // `foreach m in p1 p2 p3` leaves `m' as []). On EVERY exit: after
+  // `continue, break`, an error, zero iterations and inside an outer loop alike
+  // (w2ad_prog_preserve_nest pn_lm_fe_break, pn_lm_fe_err, pn_lm_fe_zero,
+  // pn_lm_nested_done, pn_lm_nested_break: all []).
+  session.eval.locals.erase(varname);
   return allBlocks;
 }
 
@@ -1279,26 +1295,34 @@ ojson runForeach(const std::string& varname, const std::vector<std::string>& tok
 // from an honest reject to an out-of-memory one. Generating each value in place
 // removes the reason for the cap instead of arguing with it.
 //
-// The arithmetic is deliberately IDENTICAL to the materialising version —
-// same `v += step` accumulation (drift and all), same `fmtNum` rendering, same
-// 1e-9 end tolerance — so every existing loop assigns byte-identical macro
-// text. A `foreach`-style enumerated list still goes through runForeach; only
-// the numeric range stopped being built up front.
+// The values accumulate `v += step` (drift and all), as Stata's do. BUG-920:
+// StataBE 19.5 tests the accumulated value against the end with NO tolerance
+// and writes it as macro text by the local/global rule (%18.0g, no leading
+// 0). Oracle w2_prog_controlflow: pc_fv_frac (0(0.1)1 assigns
+// 0 .1 .2 .3 ... .7999999999999999 .8999999999999999 .9999999999999999, 11
+// values) and pc_fv_frac_small (0(0.01)0.31 runs 31 times and ends at
+// .3000000000000001: the 32nd accumulated value 0.3100000000000001 is past
+// 0.31, which the old 1e-9 tolerance let through). The old rendering was
+// Python's repr (0.30000000000000004). A `foreach`-style enumerated list
+// still goes through runForeach; only the numeric range is lazy.
 ojson runForvaluesRange(const std::string& varname, double start, double step, double end,
                         const std::vector<std::string>& bodyLines, SessionState& session,
                         const DispatchFn& dispatchFn) {
   LoopBodyScope __loopBody;  // BUG-483: `continue` asks how deep we are
   ojson allBlocks = ojson::array();
   bool truncated = false;   // P7: allBlocks storage cap (see kMaxLoopBlocks)
-  for (double v = start; (step > 0 && v <= end + 1e-9) || (step < 0 && v >= end - 1e-9);
-       v += step) {
-    session.eval.locals.set(varname, fmtNum(v));
+  for (double v = start; (step > 0 && v <= end) || (step < 0 && v >= end); v += step) {
+    session.eval.locals.set(varname, eval::stataMacroRealText(v));
     BodyRunResult result = runBody(bodyLines, session, dispatchFn);
     for (auto& b : result.blocks) pushLoopBlock(allBlocks, truncated, b);
     if (result.hasError) break;
     if (result.control == "break") break;
     // control == "continue": fall through to the next value.
   }
+  // BUG-920: the loop macro is empty after the loop (oracle pc_fv_ab: `i' is
+  // [] after `forvalues i = 1/5`, though it held "before" on entry), on every
+  // exit (w2ad pn_lm_fv_break, pn_lm_fv_err, pn_lm_fv_zero: []).
+  session.eval.locals.erase(varname);
   return allBlocks;
 }
 
@@ -1387,9 +1411,23 @@ ojson runIf(const std::string& condition, const std::vector<std::string>& bodyLi
 // phase, not this fix). Reuses runBody (the SAME helper runForeach/runWhile/
 // runIf already use) so nested blocks/control-flow inside the capture body
 // work exactly like any other brace body, for free.
+//
+// BUG-1434: `showError` is a noisily after the capture (`capture noisily { …
+// }`, `capture quietly noisily { … }`) -- the halting error is kept and shown
+// (tagged captured, so it does not halt the caller), which is what StataBE
+// prints ("variable nosuchvar not found" inside the block). `quiet` is the
+// block's output visibility, which the last of the chain's capture/quietly/
+// noisily decides: a bare `capture { … }` and `capture noisily quietly { … }`
+// drop ordinary output (keptWhenQuiet), `quietly capture noisily { … }` shows
+// it.
 ojson runCaptureBlock(const std::vector<std::string>& bodyLines, SessionState& session,
-                      const DispatchFn& dispatchFn) {
-  BodyRunResult result = runBody(bodyLines, session, dispatchFn);
+                      const DispatchFn& dispatchFn, bool showError, bool quiet) {
+  BodyRunResult result;
+  {
+    std::optional<SessionState::LogVerbosityScope> lv;
+    if (quiet) lv.emplace(session, true);
+    result = runBody(bodyLines, session, dispatchFn);
+  }
   ojson out = ojson::array();
   // BUG-116/F3: the old scan below treated ANY type=="error" block as fatal
   // to this capture block, including one already caught by a NESTED
@@ -1411,12 +1449,31 @@ ojson runCaptureBlock(const std::vector<std::string>& bodyLines, SessionState& s
   // capture-BLOCK shape wraps the foreach arms there).
   std::string haltedRc = "1";
   for (const auto& b : result.blocks) {
-    if (result.hasError && b.value("type", "") == "error" && !b.value("captured", false)) {
+    const std::string t = b.value("type", "");
+    if (result.hasError && t == "error" && !b.value("captured", false)) {
       haltedRc = eval::coarseRc(b);
+      // `exit` with code 0 is no error, and capture does not hold it: StataBE
+      // `capture noisily { … exit 0 }` ends the do-file ("end of do-file").
+      if (result.exitCode == 0) {
+        out.push_back(b);
+        break;
+      }
+      if (showError) {
+        ojson tagged = b;
+        tagged["captured"] = true;
+        out.push_back(std::move(tagged));
+      }
       break;  // suppress the error itself (and anything after — the block stops here)
     }
+    // BUG-1338: a failed inline `: fn'/`=exp' in the body prints nothing under
+    // the capture (StataBE 19.5: `capture { display "`: type nosuch'" }`), and
+    // its message under `capture noisily { }`, as the halting error's.
+    if (b.value("inline_note", false) && !showError) continue;
+    if (quiet && !keptWhenQuiet(b)) continue;
     out.push_back(b);
   }
+  settleNoisily(out, session);
+  if (result.exitCode == 0) return out;
   // BUG-154: a clean `exit N` inside the block carries its EXACT code to _rc
   // (Stata 19.5: `capture { exit 5 }` → _rc 5, block stops, file continues).
   // Every other error carries the exact coarse code (BUG-546, above).
@@ -1473,14 +1530,20 @@ ojson runQuietlyBlock(const std::vector<std::string>& bodyLines, SessionState& s
   ojson out = ojson::array();
   for (const auto& b : result.blocks) {
     if (quiet) {
-      // quietly: keep only command echoes + error messages; suppress the
-      // body's normal output. Mirrors the single-line quietly filter.
+      // quietly: keep only command echoes + error messages (and a nested
+      // noisily's output, BUG-1434); suppress the body's normal output.
+      // Mirrors the single-line quietly filter.
       std::string t = b.value("type", "");
-      if (t == "echo" || t == "error") out.push_back(b);
+      if (t != "_control" && keptWhenQuiet(b)) out.push_back(b);
     } else {
       // noisily: fully transparent — show every block the body produced.
       out.push_back(b);
     }
+  }
+  if (quiet) {
+    settleNoisily(out, session);
+  } else {
+    markNoisily(out, session);
   }
   if (result.control.has_value()) {
     ojson ctrl;
@@ -1744,8 +1807,43 @@ int loopBodyDepth() { return g_loopBodyDepth; }
 LoopBodyScope::LoopBodyScope() { ++g_loopBodyDepth; }
 LoopBodyScope::~LoopBodyScope() { --g_loopBodyDepth; }
 
+void markNoisily(ojson& blocks, const SessionState& session) {
+  if (!session.logEchoSuppressed() || !blocks.is_array()) return;
+  for (auto& b : blocks) {
+    if (b.is_object() && b.value("type", std::string()) != "echo") b["noisily"] = true;
+  }
+}
+
+// BUG-1338: the message of a failed inline `: fn'/`=exp' (inline_note) shows
+// under quietly as an error's does (StataBE 19.5: `quietly { display "`: type
+// nosuch'" }` prints it).
+bool keptWhenQuiet(const ojson& b) {
+  const std::string t = b.value("type", std::string());
+  return t == "echo" || t == "error" || t == "_control" || b.value("noisily", false) ||
+         b.value("inline_note", false);
+}
+
+void settleNoisily(ojson& blocks, const SessionState& session, bool force) {
+  if ((!force && session.logEchoSuppressed()) || !blocks.is_array()) return;
+  for (auto& b : blocks) {
+    if (b.is_object()) b.erase("noisily");
+  }
+}
+
 VarlistExpandResult expandVarlist(const std::string& spec, SessionState& session) {
   return expandVarlistImpl(spec, session);
+}
+
+std::optional<nlohmann::ordered_json> checkKnownVarlist(std::vector<std::string>& tokens,
+                                                        SessionState& session) {
+  return checkKnownVarTokens(tokens, session);
+}
+
+bool expandNumlist(const std::string& spec, std::vector<std::string>* elements) {
+  NumlistResult nr = parseNumlist(spec);
+  if (nr.isError) return false;
+  *elements = std::move(nr.tokens);
+  return true;
 }
 
 bool isLoopHeader(const std::string& line) {
@@ -1850,200 +1948,510 @@ ojson runOneLineIf(const std::string& condition, const std::string& bodyLine,
   return runIf(condition, {bodyLine}, {}, session, dispatchFn);
 }
 
-// BUG-547: is `line` a legacy `for` header? First word is exactly `for`
-// (case-insensitive), word-bounded — `format`'s minimum abbreviation is also
-// `for` in real Stata, but `format` never spells its own name with a 4th
-// character that is whitespace right after `for`, so the word-boundary test
-// separates the two without needing to look at what follows. `forvalues`
-// (and its truncations) is excluded the same way: its 4th character is never
-// whitespace either. Does NOT require a colon here — a missing colon is
-// runLegacyFor's own r(198) validation (cmd-triage.json design point 4), not
-// a reason to fall through to "command not found".
-bool isLegacyForLine(const std::string& line) {
-  std::string t = trim(line);
-  if (t.size() <= 3) return false;
-  if (std::tolower(static_cast<unsigned char>(t[0])) != 'f' ||
-      std::tolower(static_cast<unsigned char>(t[1])) != 'o' ||
-      std::tolower(static_cast<unsigned char>(t[2])) != 'r') {
-    return false;
-  }
-  return std::isspace(static_cast<unsigned char>(t[3])) != 0;
+// Legacy `for` command (out of date since Stata 8, still accepted by Stata).
+// Behaviour: every rule below is
+// measured StataBE 19.5 behaviour (the manuals no longer document `for`).
+namespace {
+
+ojson forSyntaxError(const std::string& msg) {
+  return ojson(eval::errorBlock("syntax_error", msg, std::nullopt, std::nullopt, std::nullopt,
+                                std::string("r(198)")));
 }
 
-// BUG-547: the legacy `for` command. Full contract (cmd-triage.json design,
-// StataNow docs `p.pdf` foreach/for syntax reading, oracle
-// tests/eval/golden/aer_w2/w2_cmdtriage.log `for_*` arms):
-//
-//   for [NAME in] TYPE list [\ [NAME in] TYPE list ...] [, options]:
-//       body [\ body ...]
-//
-// - Header = text up to the first UNQUOTED ':' (eval::searchUnquoted), same
-//   rule the frame prefix uses — the BODY may itself contain a colon
-//   (oracle for_by_colon_noheader: `for num 1 2, noheader: bysort g: egen
-//   ...`), so only the FIRST one outside a quoted string is `for`'s own.
-// - Macros expand in the HEADER only (design brief) — the body is
-//   substituted below and dispatched as an ordinary command, which expands
-//   its own macros exactly once when it runs (oracle
-//   for_macro_name_has_X: `$XC` is NOT touched by the placeholder
-//   substitution, only resolved when the generated `gen` command executes).
-// - Options (dryrun, noheader, nostop, pause) are peeled at the first
-//   top-level comma; any other option is refused r(198) by name. `pause`
-//   is accepted and is a no-op: real Stata's pause is an interactive
-//   per-iteration halt, meaningless in this engine's batch/headless
-//   execution (no oracle arm exercises it).
-// - Lists split on unquoted `\`; each is `[NAME in] TYPE elements`
-//   (parseForListSegment). Max 9 lists (default placeholders X Y Z A B C D
-//   E F exhaust there).
-// - Validation, each r(198): unequal list lengths, a placeholder absent
-//   from the body, a missing colon, a bad list type/segment, more than 9
-//   lists.
-// - Body splits on unquoted `\` into commands. Per iteration, per command:
-//   blind-substitute every list's placeholder (substitutePlaceholders),
-//   emit a `->  <cmd>` display block unless noheader (oracle: every
-//   for_num/for_any_multi/... arm shows exactly this, two spaces after
-//   `->`), then dispatch unless dryrun. The dispatched command's own echo
-//   block is dropped (Stata's `for` does not double-echo — only the
-//   `-> ` line appears in the oracle log).
-// - The first uncaptured error STOPS the loop and propagates unmodified
-//   (oracle for_stop_on_error: iteration 3 never runs, its variable is
-//   never created). With `nostop`, that error is tagged captured:true (the
-//   same shape dispatcher.cpp's single-line capture prefix uses) and
-//   iteration continues (oracle for_nostop: all 3 iterations run, _rc 0).
+ojson forRcError(const std::string& msg, int rc) {
+  return ojson(eval::errorBlock("engine_error", msg, std::nullopt, std::nullopt, std::nullopt,
+                                "r(" + std::to_string(rc) + ")"));
+}
+
+bool forIsBlank(char c) { return c == ' ' || c == '\t'; }
+
+bool forIsWordByte(unsigned char c) { return std::isalnum(c) != 0 || c == '_' || c >= 0x80; }
+
+// Stand-in for the '(' of a bare r(name)/e(name) while the line's macros are
+// expanded: those are expressions each generated command evaluates when it
+// runs, not macros of the `for` line.
+constexpr char kForParenHold = '\x1d';
+
+// Expands the line's macros once, as Stata does for any command line, leaving
+// bare r()/e() expressions alone. Compound quotes come back as typed.
+std::optional<std::string> forExpandLine(const std::string& line, SessionState& session,
+                                         ojson& err) {
+  std::string held = line;
+  int macroDepth = 0;
+  int compound = 0;
+  for (size_t i = 0; i < held.size(); ++i) {
+    const char c = held[i];
+    const char nx = i + 1 < held.size() ? held[i + 1] : '\0';
+    if (c == '`' && nx == '"') { ++compound; ++i; continue; }
+    if (c == '"' && nx == '\'' && compound > 0) { --compound; ++i; continue; }
+    if (c == '`') { ++macroDepth; continue; }
+    if (c == '\'' && macroDepth > 0) { --macroDepth; continue; }
+    if (macroDepth == 0 && (c == 'r' || c == 'e') && nx == '(' &&
+        (i == 0 || !forIsWordByte(static_cast<unsigned char>(held[i - 1])))) {
+      held[i + 1] = kForParenHold;
+      ++i;
+    }
+  }
+  std::string out = held;
+  if (eval::hasMacroRefs(held)) {
+    eval::ExpandResult er = eval::expandMacros(held, session.eval);
+    if (er.isError) {
+      err = er.error;
+      return std::nullopt;
+    }
+    out = er.typed.empty() ? er.line : er.typed;
+  }
+  std::replace(out.begin(), out.end(), kForParenHold, '(');
+  return out;
+}
+
+// End (exclusive) of the compound-quoted span opening at `i` (s[i..i+1] is
+// `" ); nesting counts. Runs to the end of `s` when unterminated.
+size_t forCompoundEnd(const std::string& s, size_t i) {
+  int depth = 0;
+  size_t j = i;
+  while (j < s.size()) {
+    if (s[j] == '`' && j + 1 < s.size() && s[j + 1] == '"') {
+      ++depth;
+      j += 2;
+    } else if (s[j] == '"' && j + 1 < s.size() && s[j + 1] == '\'') {
+      --depth;
+      j += 2;
+      if (depth == 0) return j;
+    } else {
+      ++j;
+    }
+  }
+  return s.size();
+}
+
+// A blank-separated word of the header: `text` is the word as written,
+// `value` the element it stands for (outer quotes removed), `quoted` whether
+// it was a quoted string.
+struct ForWord {
+  std::string text;
+  std::string value;
+  bool quoted = false;
+};
+
+std::vector<ForWord> forHeaderWords(const std::string& s) {
+  std::vector<ForWord> words;
+  size_t i = 0;
+  while (i < s.size()) {
+    if (forIsBlank(s[i])) { ++i; continue; }
+    ForWord w;
+    size_t end;
+    if (s[i] == '`' && i + 1 < s.size() && s[i + 1] == '"') {
+      end = forCompoundEnd(s, i);
+      w.quoted = true;
+      const size_t inner = end - i >= 4 ? end - i - 4 : 0;
+      w.value = s.substr(i + 2, inner);
+    } else if (s[i] == '"') {
+      const size_t close = s.find('"', i + 1);
+      end = close == std::string::npos ? s.size() : close + 1;
+      w.quoted = true;
+      w.value = s.substr(i + 1, close == std::string::npos ? std::string::npos : close - i - 1);
+    } else {
+      end = i;
+      while (end < s.size() && !forIsBlank(s[end])) ++end;
+      w.value = s.substr(i, end - i);
+    }
+    w.text = s.substr(i, end - i);
+    words.push_back(std::move(w));
+    i = end;
+  }
+  return words;
+}
+
+// One command of the body rebuilt the way `for` stores it: blank runs become
+// one blank, a word opening with `"` runs to the next `"` and is rewritten as a
+// compound-quoted string, a compound-quoted word is kept, and anything else
+// runs to the next blank.
+std::string forRebuildCommand(const std::string& s) {
+  std::string out;
+  size_t i = 0;
+  auto add = [&out](const std::string& w) {
+    if (!out.empty()) out += ' ';
+    out += w;
+  };
+  while (i < s.size()) {
+    if (forIsBlank(s[i])) { ++i; continue; }
+    if (s[i] == '`' && i + 1 < s.size() && s[i + 1] == '"') {
+      const size_t end = forCompoundEnd(s, i);
+      add(s.substr(i, end - i));
+      i = end;
+    } else if (s[i] == '"') {
+      const size_t close = s.find('"', i + 1);
+      const std::string inner =
+          s.substr(i + 1, close == std::string::npos ? std::string::npos : close - i - 1);
+      add("`\"" + inner + "\"'");
+      i = close == std::string::npos ? s.size() : close + 1;
+    } else {
+      size_t end = i;
+      while (end < s.size() && !forIsBlank(s[end])) ++end;
+      add(s.substr(i, end - i));
+      i = end;
+    }
+  }
+  return out;
+}
+
+// Every non-overlapping occurrence of `from`, left to right, becomes `to`; the
+// inserted text is not rescanned.
+std::string forReplaceAll(const std::string& s, const std::string& from, const std::string& to) {
+  if (from.empty()) return s;
+  std::string out;
+  size_t pos = 0;
+  for (size_t hit = s.find(from); hit != std::string::npos; hit = s.find(from, pos)) {
+    out.append(s, pos, hit - pos);
+    out += to;
+    pos = hit + from.size();
+  }
+  out.append(s, pos, std::string::npos);
+  return out;
+}
+
+// `word` names `full` when it is a prefix of it at least `minLen` long
+// (case-sensitive).
+bool forAbbrev(const std::string& word, const std::string& full, size_t minLen) {
+  return word.size() >= minLen && word.size() <= full.size() &&
+         full.compare(0, word.size(), word) == 0;
+}
+
+struct ForOptions {
+  bool dryrun = false;
+  bool noheader = false;
+  bool nostop = false;
+};
+
+std::optional<ojson> forParseOptions(const std::string& text, ForOptions& opts) {
+  std::string own = text;
+  std::string afterSecondComma;
+  bool secondComma = false;
+  const long long c2 = eval::findUnquotedComma(text);
+  if (c2 >= 0) {
+    own = text.substr(0, static_cast<size_t>(c2));
+    afterSecondComma = text.substr(static_cast<size_t>(c2) + 1);
+    secondComma = true;
+  }
+  for (const ForWord& w : forHeaderWords(own)) {
+    const std::string& word = w.text;
+    const size_t paren = word.find('(');
+    if (paren != std::string::npos) {
+      return forSyntaxError("option " + word.substr(0, paren) + "() not allowed");
+    }
+    if (forAbbrev(word, "dryrun", 1)) opts.dryrun = true;
+    else if (forAbbrev(word, "noheader", 3)) opts.noheader = true;
+    else if (forAbbrev(word, "nostop", 3)) opts.nostop = true;
+    else if (forAbbrev(word, "pause", 1)) {
+      // Pauses only under `pause on`; nothing to do here.
+    } else {
+      return forSyntaxError("option " + word + " not allowed");
+    }
+  }
+  if (secondComma) {
+    const std::vector<ForWord> rest = forHeaderWords(afterSecondComma);
+    if (rest.empty()) return forSyntaxError("invalid syntax");
+    return forSyntaxError("invalid '" + rest.front().text + "' ");
+  }
+  return std::nullopt;
+}
+
+// Elements of one `newlist` list: a numbered range stubA-stubB expands to the
+// names in between; every name must be valid and not yet a variable.
+std::optional<ojson> forNewlistElements(const std::vector<ForWord>& words, SessionState& session,
+                                        std::vector<std::string>& out) {
+  std::vector<std::string> existing;
+  if (const std::vector<VarInfo>* card = session.residentReadCard()) {
+    for (const auto& v : *card) existing.push_back(v.name);
+  } else if (Datastore* ds = session.datastore()) {
+    existing = ds->names();
+  }
+  auto splitNumbered = [](const std::string& name, std::string& stub, std::string& digits) {
+    size_t k = name.size();
+    while (k > 0 && std::isdigit(static_cast<unsigned char>(name[k - 1])) != 0) --k;
+    stub = name.substr(0, k);
+    digits = name.substr(k);
+    return !stub.empty() && !digits.empty();
+  };
+  std::vector<std::string> names;
+  for (const ForWord& w : words) {
+    const std::string& tok = w.text;
+    const size_t dash = tok.find('-');
+    if (dash != std::string::npos && dash > 0 && dash + 1 < tok.size() &&
+        tok.find('-', dash + 1) == std::string::npos) {
+      const std::string lo = tok.substr(0, dash), hi = tok.substr(dash + 1);
+      std::string s1, d1, s2, d2;
+      if (strutil::isValidStataIdentifier(lo) && strutil::isValidStataIdentifier(hi) &&
+          splitNumbered(lo, s1, d1) && splitNumbered(hi, s2, d2) && s1 == s2 &&
+          d1.size() < 10 && d2.size() < 10) {
+        const long n1 = std::stol(d1), n2 = std::stol(d2);
+        const long step = n1 <= n2 ? 1 : -1;
+        for (long n = n1;; n += step) {
+          names.push_back(s1 + std::to_string(n));
+          if (n == n2) break;
+        }
+        continue;
+      }
+    }
+    names.push_back(tok);
+  }
+  for (const std::string& n : names) {
+    if (!strutil::isValidStataIdentifier(n) || n.size() > 32) {
+      return forSyntaxError(n + " invalid name");
+    }
+    if (std::find(existing.begin(), existing.end(), n) != existing.end()) {
+      return forRcError("variable " + n + " already defined", 110);
+    }
+  }
+  out = std::move(names);
+  return std::nullopt;
+}
+
+// Elements of one `varlist` list: existing variables, wildcards and ranges
+// expanded as in any varlist.
+std::optional<ojson> forVarlistElements(const std::vector<ForWord>& words, SessionState& session,
+                                        std::vector<std::string>& out) {
+  if (words.empty()) {
+    out.clear();
+    return std::nullopt;
+  }
+  std::string spec;
+  for (const ForWord& w : words) {
+    if (!spec.empty()) spec += ' ';
+    spec += w.text;
+  }
+  VarlistExpandResult ex = expandVarlistImpl(spec, session);
+  if (ex.isError) {
+    // A range whose end is not a variable: name the missing end.
+    std::vector<std::string> known;
+    if (Datastore* ds = session.datastore()) known = ds->names();
+    for (const ForWord& w : words) {
+      const size_t dash = w.text.find('-');
+      if (dash == std::string::npos) continue;
+      for (const std::string& end : {w.text.substr(0, dash), w.text.substr(dash + 1)}) {
+        if (!end.empty() && std::find(known.begin(), known.end(), end) == known.end())
+          return forRcError("variable " + end + " not found", 111);
+      }
+    }
+    if (eval::coarseRc(ex.error) == "111") return ex.error;
+    return forRcError(ex.error.value("message", std::string("invalid varlist")), 111);
+  }
+  if (auto bad = checkKnownVarTokens(ex.tokens, session)) return bad;
+  out = std::move(ex.tokens);
+  return std::nullopt;
+}
+
+struct ForList {
+  std::string name;
+  std::vector<std::string> elements;
+};
+
+}  // namespace
+
+bool isLegacyForLine(const std::string& line) {
+  const std::string t = trim(line);
+  if (t.compare(0, 3, "for") != 0) return false;
+  return t.size() == 3 || forIsBlank(t[3]) || t[3] == ':';
+}
+
 ojson runLegacyFor(const std::string& rawLine, SessionState& session,
                    const DispatchFn& dispatchFn) {
-  std::string line = trim(rawLine);
-  static const std::regex reColon(R"(:)");
-  std::smatch cm;
-  if (!eval::searchUnquoted(line, reColon, cm)) {
-    return ojson::array({errFor198("for: invalid syntax: missing ':'")});
-  }
-  std::string headerRaw = line.substr(0, static_cast<size_t>(cm.position()));
-  std::string bodyRaw = line.substr(static_cast<size_t>(cm.position()) + 1);
+  ojson out = ojson::array();
+  try {
+    // 1. The line's macros, once, before `for` reads it.
+    ojson expandErr;
+    const std::optional<std::string> expanded = forExpandLine(trim(rawLine), session, expandErr);
+    if (!expanded) {
+      out.push_back(expandErr);
+      return out;
+    }
+    const std::string rest = expanded->size() > 3 ? expanded->substr(3) : std::string();
 
-  // Strip the leading `for` keyword itself.
-  {
-    size_t sp = headerRaw.find_first_of(" \t");
-    headerRaw = (sp == std::string::npos) ? std::string() : headerRaw.substr(sp + 1);
-  }
+    // 2. Header : body, at the first colon outside quotes.
+    const std::vector<bool> qmask = eval::quotedSpanMask(rest);
+    size_t colon = std::string::npos;
+    for (size_t i = 0; i < rest.size(); ++i) {
+      if (rest[i] == ':' && !qmask[i]) {
+        colon = i;
+        break;
+      }
+    }
+    if (colon == std::string::npos || trim(rest.substr(0, colon)).empty()) {
+      out.push_back(forSyntaxError("invalid syntax"));
+      return out;
+    }
+    const std::string header = rest.substr(0, colon);
+    const std::string body = rest.substr(colon + 1);
 
-  if (eval::hasMacroRefs(headerRaw)) {
-    eval::ExpandResult exp = eval::expandMacros(headerRaw, session.eval);
-    if (exp.isError) return ojson::array({exp.error});
-    headerRaw = exp.line;
-  }
+    // 3. Options.
+    std::string listText = header;
+    ForOptions opts;
+    const long long comma = eval::findUnquotedComma(header);
+    if (comma >= 0) {
+      listText = header.substr(0, static_cast<size_t>(comma));
+      if (auto bad = forParseOptions(header.substr(static_cast<size_t>(comma) + 1), opts)) {
+        out.push_back(*bad);
+        return out;
+      }
+    }
 
-  auto commaSplit = splitTopLevelCommaFor(headerRaw);
-  std::string listSpecText = commaSplit.first;
-  bool optDryrun = false, optNoheader = false, optNostop = false;
-  if (commaSplit.second.has_value()) {
-    // Declared minimum abbreviations, transcribed from for.ado:91
-    // `local options "Dryrun noHeader noStop Pause"` (the capitals are the
-    // minimum): d / noh / nos / p. Matched case-sensitively, as Stata's
-    // parse does. Not eval::resolveOptionAbbrev: its 2-char floor would
-    // refuse `d` and `p`.
-    struct ForOptMin {
-      const char* full;
-      size_t minLen;
-    };
-    static const ForOptMin kForOpts[] = {
-        {"dryrun", 1}, {"noheader", 3}, {"nostop", 3}, {"pause", 1}};
-    for (const auto& tok : splitForeachTokens(*commaSplit.second)) {
-      std::string lo;
-      for (const auto& om : kForOpts) {
-        const std::string full(om.full);
-        if (tok.size() >= om.minLen && tok.size() <= full.size() &&
-            full.compare(0, tok.size(), tok) == 0) {
-          lo = full;
-          break;
+    // 4. Lists: segments separated by a `\` that stands as its own word.
+    std::vector<std::vector<ForWord>> segments(1);
+    for (ForWord& w : forHeaderWords(listText)) {
+      if (!w.quoted && w.text == "\\") {
+        segments.emplace_back();
+        continue;
+      }
+      segments.back().push_back(std::move(w));
+    }
+    segments.erase(std::remove_if(segments.begin(), segments.end(),
+                                  [](const std::vector<ForWord>& s) { return s.empty(); }),
+                   segments.end());
+    static const char* const kDefaultNames[] = {"X", "Y", "Z", "A", "B", "C", "D", "E", "F"};
+    if (segments.size() > 9) {
+      out.push_back(forSyntaxError("too many lists"));
+      return out;
+    }
+    std::vector<ForList> lists;
+    for (size_t k = 0; k < segments.size(); ++k) {
+      const std::vector<ForWord>& seg = segments[k];
+      ForList list;
+      size_t typeAt = 0;
+      if (seg.size() >= 2 && !seg[1].quoted && seg[1].text == "in") {
+        if (seg.size() < 3) {
+          out.push_back(forSyntaxError("invalid syntax"));
+          return out;
+        }
+        list.name = seg[0].text;
+        typeAt = 2;
+      } else {
+        list.name = kDefaultNames[k];
+      }
+      const std::string& type = seg[typeAt].text;
+      const std::vector<ForWord> elems(seg.begin() + static_cast<long>(typeAt) + 1, seg.end());
+      if (forAbbrev(type, "varlist", 3)) {
+        if (auto bad = forVarlistElements(elems, session, list.elements)) {
+          out.push_back(*bad);
+          return out;
+        }
+      } else if (forAbbrev(type, "numlist", 3)) {
+        if (!elems.empty()) {
+          std::string spec;
+          for (const ForWord& w : elems) spec += w.text + " ";
+          NumlistResult nl = parseNumlist(spec);
+          if (nl.isError) {
+            out.push_back(forRcError("invalid numlist", 121));
+            return out;
+          }
+          list.elements = std::move(nl.tokens);
+        }
+      } else if (forAbbrev(type, "newlist", 3)) {
+        if (auto bad = forNewlistElements(elems, session, list.elements)) {
+          out.push_back(*bad);
+          return out;
+        }
+      } else if (type == "any") {
+        for (const ForWord& w : elems) list.elements.push_back(w.value);
+      } else {
+        out.push_back(forSyntaxError("\"" + type + "\" invalid list type"));
+        return out;
+      }
+      lists.push_back(std::move(list));
+    }
+    for (const ForList& l : lists) {
+      if (l.elements.size() != lists.front().elements.size()) {
+        out.push_back(forSyntaxError("lists have unequal number of elements"));
+        return out;
+      }
+    }
+
+    // 5. Every placeholder must occur in the commands; each list's first
+    // element stands in for its placeholder before the next list is looked for.
+    {
+      std::string probe = body;
+      for (const ForList& l : lists) {
+        if (probe.find(l.name) == std::string::npos) {
+          out.push_back(forSyntaxError(l.name + " not in command"));
+          return out;
+        }
+        if (!l.elements.empty()) probe = forReplaceAll(probe, l.name, l.elements.front());
+      }
+    }
+
+    // 6. Commands: split at every `\` outside quotes, then rebuilt.
+    std::vector<std::string> commands;
+    {
+      const std::vector<bool> bmask = eval::quotedSpanMask(body);
+      size_t from = 0;
+      for (size_t i = 0; i <= body.size(); ++i) {
+        if (i == body.size() || (body[i] == '\\' && !bmask[i])) {
+          commands.push_back(forRebuildCommand(body.substr(from, i - from)));
+          from = i + 1;
         }
       }
-      if (lo == "dryrun") {
-        optDryrun = true;
-      } else if (lo == "noheader") {
-        optNoheader = true;
-      } else if (lo == "nostop") {
-        optNostop = true;
-      } else if (lo != "pause") {
-        // OPTION VOCABULARY: anything that is not a valid abbreviation of
-        // dryrun/noheader/nostop/pause is refused by name, r(198), as
-        // for.ado's parse does -- never silently dropped.
-        return ojson::array({errFor198("for: option " + tok + " not allowed")});
-      }
-      // "pause": accepted, no-op (see the function comment above).
     }
-  }
 
-  std::vector<std::string> segs = splitOnUnquotedBackslash(listSpecText);
-  if (segs.empty() || segs.size() > 9) {
-    return ojson::array({errFor198("for: invalid syntax")});
-  }
-  static const char* const kDefaultNames[9] = {"X", "Y", "Z", "A", "B", "C", "D", "E", "F"};
-  std::vector<ForListSpec> lists;
-  lists.reserve(segs.size());
-  for (size_t i = 0; i < segs.size(); ++i) {
-    ojson err;
-    std::optional<ForListSpec> spec =
-        parseForListSegment(segs[i], kDefaultNames[i], session, &err);
-    if (!spec.has_value()) return ojson::array({err});
-    lists.push_back(*spec);
-  }
-  size_t n = lists[0].tokens.size();
-  for (const auto& l : lists) {
-    if (l.tokens.size() != n) {
-      return ojson::array({errFor198("for: invalid syntax: lists have unequal length")});
-    }
-  }
-  for (const auto& l : lists) {
-    if (bodyRaw.find(l.placeholder) == std::string::npos) {
-      return ojson::array(
-          {errFor198("for: invalid syntax: placeholder '" + l.placeholder +
-                    "' does not occur in the command")});
-    }
-  }
-
-  std::vector<std::string> commands = splitOnUnquotedBackslash(bodyRaw);
-  for (auto& c : commands) c = trim(c);
-
-  ojson allBlocks = ojson::array();
-  for (size_t i = 0; i < n; ++i) {
-    std::vector<std::pair<std::string, std::string>> subs;
-    subs.reserve(lists.size());
-    for (const auto& l : lists) subs.emplace_back(l.placeholder, l.tokens[i]);
-    for (const auto& cmdText : commands) {
-      std::string substituted = substitutePlaceholders(cmdText, subs);
-      if (!optNoheader) {
-        ojson d;
-        d["type"] = "display";
-        d["text"] = "->  " + substituted;
-        allBlocks.push_back(d);
-      }
-      if (optDryrun) continue;
-      ojson result = dispatchFn(substituted, session);
-      const ojson* errBlockPtr = nullptr;
-      for (const auto& b : result) {
-        if (b.is_object() && b.value("type", std::string()) == "echo") {
-          continue;  // for's own "-> " line replaces the dispatched echo
+    // 7. Iterate. The generated commands run in a local scope of their own,
+    // as the body of any program does: a `local` they set is gone afterwards
+    // (StataBE: `local i 0` then `for num 1 2 3: local i = `i' + X` leaves i
+    // at 0, while the same with a global leaves it at 3).
+    const size_t n = lists.empty() ? 0 : lists.front().elements.size();
+    doexec::PrivateLocalScope bodyScope(session);
+    for (size_t it = 0; it < n; ++it) {
+      for (const std::string& cmdTemplate : commands) {
+        std::string cmd = cmdTemplate;
+        for (const ForList& l : lists) cmd = forReplaceAll(cmd, l.name, l.elements[it]);
+        if (!opts.noheader) {
+          ojson hdr;
+          hdr["type"] = "display";
+          hdr["text"] = cmd.empty() ? std::string("-> ") : "->  " + cmd;
+          out.push_back(std::move(hdr));
         }
-        bool isUncapturedError =
-            b.is_object() && b.value("type", std::string()) == "error" &&
-            !b.value("captured", false);
-        if (isUncapturedError) {
-          errBlockPtr = &b;
-          if (optNostop) {
-            ojson tagged = b;
-            tagged["captured"] = true;
-            allBlocks.push_back(tagged);
+        if (opts.dryrun || cmd.empty()) continue;
+        ojson res;
+        try {
+          res = dispatchFn(cmd, session);
+        } catch (const std::exception& e) {
+          res = ojson(eval::engineError(e.what()));
+        }
+        if (!res.is_array()) res = ojson::array({res});
+        // A failure is the command's first uncaptured error block. Without
+        // nostop it goes out as is and the loop ends there; with nostop it is
+        // shown as captured (an `exit N` halt has no message to show), then
+        // `->  r(N); `, and the loop goes on.
+        static const std::regex reExitHalt(R"(^exit(\s+-?\d+)?$)");
+        std::optional<std::string> failedRc;
+        for (const auto& b : res) {
+          const std::string t = b.value("type", std::string());
+          if (t == "echo") continue;
+          if (!failedRc && t == "error" && !b.value("captured", false)) {
+            failedRc = eval::coarseRc(b);
+            if (!opts.nostop) {
+              out.push_back(b);
+              return out;
+            }
+            if (std::regex_match(b.value("message", std::string()), reExitHalt)) continue;
+            ojson shown = b;
+            shown["captured"] = true;
+            out.push_back(std::move(shown));
             continue;
           }
+          out.push_back(b);
         }
-        allBlocks.push_back(b);
-      }
-      if (errBlockPtr != nullptr && !optNostop) {
-        return allBlocks;  // stop: the real error propagates unmodified
+        if (!failedRc) continue;
+        ojson rcLine;
+        rcLine["type"] = "display";
+        rcLine["text"] = "->  r(" + *failedRc + "); ";
+        out.push_back(std::move(rcLine));
       }
     }
+  } catch (const std::exception& e) {
+    out.push_back(ojson(eval::engineError(std::string("for: ") + e.what())));
+  } catch (...) {
+    out.push_back(ojson(eval::engineError("for: internal error")));
   }
-  return allBlocks;
+  return out;
 }
 
 namespace {
@@ -2101,7 +2509,7 @@ bool isNoisilyPrefix(const std::string& w) {
 
 }  // namespace
 
-ojson executeLoop(const std::string& header, const std::vector<std::string>& bodyLines,
+ojson executeLoop(const std::string& header, const std::vector<std::string>& bodyLinesIn,
                    const std::vector<std::string>& elseBodyLines, SessionState& session,
                    const DispatchFn& dispatchFn) {
   std::string hdr = rstripBrace(header);
@@ -2131,29 +2539,42 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
       // The stack is innermost-wins, so pushing the prefixes outermost-first
       // leaves the innermost keyword on top — the same rule the result filters
       // below implement by folding in reverse.
+      // BUG-1434: a capture hides output as quietly does, and a noisily after
+      // a capture or quietly turns output back on (the last word decides,
+      // StataBE 19.5) -- so either one filters only when no noisily follows.
+      auto noisilyAfter = [&](size_t at) {
+        for (size_t i = at + 1; i < prefixes.size(); ++i)
+          if (isNoisilyPrefix(prefixes[i])) return true;
+        return false;
+      };
       std::vector<std::unique_ptr<SessionState::LogVerbosityScope>> lvScopes;
-      for (const auto& p : prefixes) {
-        if (isQuietlyPrefix(p)) {
+      for (size_t i = 0; i < prefixes.size(); ++i) {
+        const std::string& p = prefixes[i];
+        if (isQuietlyPrefix(p) || (isCapturePrefix(p) && !noisilyAfter(i))) {
           lvScopes.push_back(std::make_unique<SessionState::LogVerbosityScope>(session, true));
         } else if (isNoisilyPrefix(p)) {
           lvScopes.push_back(std::make_unique<SessionState::LogVerbosityScope>(session, false));
         }
       }
-      ojson result = executeLoop(inner, bodyLines, elseBodyLines, session, dispatchFn);
+      ojson result = executeLoop(inner, bodyLinesIn, elseBodyLines, session, dispatchFn);
       lvScopes.clear();  // close the scopes before the result filters run
       for (auto it = prefixes.rbegin(); it != prefixes.rend(); ++it) {
-        if (isQuietlyPrefix(*it)) {
+        const size_t at = static_cast<size_t>(prefixes.rend() - it) - 1;
+        if ((isQuietlyPrefix(*it) || isCapturePrefix(*it)) && !noisilyAfter(at)) {
           // quietly: keep command echoes + errors, drop ordinary output —
           // the same filter runQuietlyBlock applies to a braced body.
           ojson kept = ojson::array();
-          for (const auto& b : result) {
-            std::string t = b.value("type", std::string());
-            if (t == "echo" || t == "error" || t == "_control") kept.push_back(b);
-          }
+          for (const auto& b : result)
+            if (keptWhenQuiet(b)) kept.push_back(b);
           result = kept;
-        } else if (isCapturePrefix(*it)) {
+        }
+        if (isCapturePrefix(*it)) {
           // capture: swallow an uncaught error and publish _rc, matching
           // runCaptureBlock. A loop that errored has already stopped itself.
+          // BUG-1434: under `capture noisily` the error is SHOWN (tagged
+          // captured, so it does not halt) -- StataBE prints the inner
+          // command's message, as the single-line prefix does.
+          const bool showError = noisilyAfter(at);
           ojson kept = ojson::array();
           bool errored = false;
           // BUG-546: the exact coarse rc of the FIRST uncaptured error block,
@@ -2173,20 +2594,31 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
               // `capture` on a LOOP prefix hid it silently. Counted here for the
               // same reason and by the same call as dispatcher.cpp's site.
               //
-              // Note this arm drops the block even under `capture noisily`
-              // (prefix iteration applies the capture filter regardless), so
-              // unlike the command path there is nothing for the user to see and
-              // counting it is right rather than a false positive.
+              // Under `capture noisily` the block is kept and shown instead.
+              if (showError) {
+                ojson tagged = b;
+                tagged["captured"] = true;
+                kept.push_back(std::move(tagged));
+                continue;
+              }
               piet::counters::noteSwallowedError(b.value("message", std::string()));
               continue;
             }
+            // BUG-1338: the messages of failed inline `: fn'/`=exp' in the body
+            // are silent under a capture (StataBE: `capture foreach v in a {
+            // display "`: type nosuch'" }` prints nothing), shown under capture
+            // noisily.
+            if (b.value("inline_note", false) && !showError) continue;
             kept.push_back(b);
           }
           session.eval.locals.set("_rc", errored ? errRc : "0");
           result = kept;
         }
-        // noisily: fully transparent, nothing to do.
+        // noisily: transparent; inside an enclosing quiet scope its output is
+        // the nested noisily's, which that scope keeps.
+        if (isNoisilyPrefix(*it)) markNoisily(result, session);
       }
+      settleNoisily(result, session);
       return result;
     }
   }
@@ -2194,6 +2626,19 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
   // Macro expansion of forvalues/foreach headers ONLY (while/if re-expand
   // per-iteration inside their own runners) — loops.py's has_macro_refs guard.
   std::string fw = headKeyword(hdr);
+  // wt_x01_L4/L5 (w2at_table_writers.do:834, log): Stata stores a loop body
+  // with each unquoted blank run collapsed to one blank, before macro
+  // expansion (eval::collapseUnquotedBlanks; `tex `lab' &  ``lab'_m' \\`
+  // writes `x1 & .125 \\`). The body lines are the flattened block, so an
+  // `if {}` nested in the loop is collapsed with it; a top-level `if {}` body
+  // reaches here as `if` and keeps its blanks, as Stata's does.
+  std::vector<std::string> collapsedBody;
+  const bool storesCollapsed = fw == "foreach" || fw == "forvalues" || fw == "while";
+  if (storesCollapsed) {
+    collapsedBody.reserve(bodyLinesIn.size());
+    for (const auto& l : bodyLinesIn) collapsedBody.push_back(eval::collapseUnquotedBlanks(l));
+  }
+  const std::vector<std::string>& bodyLines = storesCollapsed ? collapsedBody : bodyLinesIn;
   if ((fw == "forvalues" || fw == "foreach") && eval::hasMacroRefs(hdr)) {
     eval::ExpandResult exp = eval::expandMacros(hdr, session.eval);
     if (exp.isError) return ojson::array({exp.error});
@@ -2208,7 +2653,7 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
   // 8 papers total (open-bugs.json use_count_measured); oracle
   // fe_of_var (w2_openbugs.log) is rc 0 for `of var`.
   {
-    static const std::regex re(R"(^foreach\s+(\w+)\s+of\s+var(?:l(?:i(?:s(?:t)?)?)?)?\s+(.*))",
+    static const std::regex re(R"(^foreach\s+([\w\x80-\xff]+)\s+of\s+var(?:l(?:i(?:s(?:t)?)?)?)?\s+(.*))",
                                 std::regex::icase);
     std::smatch m;
     if (std::regex_search(hdr, m, re)) {
@@ -2222,10 +2667,8 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
       // fe_mixed: `alpha nosuchcol` never iterates `alpha`). KNOWN DISCLOSED
       // GAP: unique abbreviations (`alph` for `alpha`) are refused r(111)
       // here, while Stata resolves them (oracle fe_abbrev: rc 0, iterates
-      // `alpha`). PIET has no variable-name abbreviation anywhere, so adding
-      // it only inside foreach would be an inconsistent partial feature; the
-      // refusal is honest and named (BUGLOG BUG-544 "Known gap", selftest arm
-      // W2 loops/BUG-544 fe_abbrev), never a silent accept.
+      // `alpha`) -- resolved now by checkKnownVarTokens (selftest arm
+      // W2 loops/BUG-544 fe_abbrev).
       if (auto err = checkKnownVarTokens(vr.tokens, session)) {
         return ojson::array({*err});
       }
@@ -2234,7 +2677,7 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
   }
   // foreach VAR of numlist NUMLIST
   {
-    static const std::regex re(R"(^foreach\s+(\w+)\s+of\s+numlist\s+(.*))",
+    static const std::regex re(R"(^foreach\s+([\w\x80-\xff]+)\s+of\s+numlist\s+(.*))",
                                 std::regex::icase);
     std::smatch m;
     if (std::regex_search(hdr, m, re)) {
@@ -2245,7 +2688,7 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
   }
   // foreach VAR of local NAME
   {
-    static const std::regex re(R"(^foreach\s+(\w+)\s+of\s+local\s+(\w+)\s*$)",
+    static const std::regex re(R"(^foreach\s+([\w\x80-\xff]+)\s+of\s+local\s+([\w\x80-\xff]+)\s*$)",
                                 std::regex::icase);
     std::smatch m;
     if (std::regex_search(hdr, m, re)) {
@@ -2255,7 +2698,7 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
   }
   // foreach VAR of global NAME
   {
-    static const std::regex re(R"(^foreach\s+(\w+)\s+of\s+global\s+(\w+)\s*$)",
+    static const std::regex re(R"(^foreach\s+([\w\x80-\xff]+)\s+of\s+global\s+([\w\x80-\xff]+)\s*$)",
                                 std::regex::icase);
     std::smatch m;
     if (std::regex_search(hdr, m, re)) {
@@ -2274,7 +2717,7 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
   // here — "newlist" the literal keyword vs "in" — ordering just mirrors
   // the existing convention).
   {
-    static const std::regex re(R"(^foreach\s+(\w+)\s+of\s+newlist\s+(.*))",
+    static const std::regex re(R"(^foreach\s+([\w\x80-\xff]+)\s+of\s+newlist\s+(.*))",
                                 std::regex::icase);
     std::smatch m;
     if (std::regex_search(hdr, m, re)) {
@@ -2284,7 +2727,11 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
   }
   // foreach VAR in TOKENS  (must come AFTER the `of` forms)
   {
-    static const std::regex re(R"(^foreach\s+(\w+)\s+in\s+(.*))", std::regex::icase);
+    // BUG-920: an empty list (`foreach v in {`, the header left as
+    // `foreach v in` once the brace is stripped) runs zero times at rc 0
+    // (oracle pc_fe_empty_in); `\s+in\s+` needed a token after `in` and sent
+    // the bare header to the unrecognised-header error (rc 1).
+    static const std::regex re(R"(^foreach\s+([\w\x80-\xff]+)\s+in(?:\s+(.*))?$)", std::regex::icase);
     std::smatch m;
     if (std::regex_search(hdr, m, re)) {
       std::vector<std::string> tokens = splitForeachTokens(trim(m.str(2)));
@@ -2303,7 +2750,7 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
   // `1(3)9` form is untouched — this is a syntactically distinct header.
   {
     static const std::regex re(
-        R"(^forvalues\s+(\w+)\s*=\s*([+-]?\d+(?:\.\d+)?)\s+([+-]?\d+(?:\.\d+)?)\s*(?:to|:)\s*([+-]?\d+(?:\.\d+)?))",
+        R"(^forvalues\s+([\w\x80-\xff]+)\s*=\s*([+-]?\d+(?:\.\d+)?)\s+([+-]?\d+(?:\.\d+)?)\s*(?:to|:)\s*([+-]?\d+(?:\.\d+)?))",
         std::regex::icase);
     std::smatch m;
     if (std::regex_search(hdr, m, re)) {
@@ -2319,7 +2766,7 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
   // forvalues i=START(STEP)END
   {
     static const std::regex re(
-        R"(^forvalues\s+(\w+)\s*=\s*([+-]?\d+(?:\.\d+)?)\s*\(([+-]?\d+(?:\.\d+)?)\)\s*([+-]?\d+(?:\.\d+)?))",
+        R"(^forvalues\s+([\w\x80-\xff]+)\s*=\s*([+-]?\d+(?:\.\d+)?)\s*\(([+-]?\d+(?:\.\d+)?)\)\s*([+-]?\d+(?:\.\d+)?))",
         std::regex::icase);
     std::smatch m;
     if (std::regex_search(hdr, m, re)) {
@@ -2334,15 +2781,16 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
   // forvalues i=START/END  (step=1)
   {
     static const std::regex re(
-        R"(^forvalues\s+(\w+)\s*=\s*([+-]?\d+(?:\.\d+)?)\s*/\s*([+-]?\d+(?:\.\d+)?))",
+        R"(^forvalues\s+([\w\x80-\xff]+)\s*=\s*([+-]?\d+(?:\.\d+)?)\s*/\s*([+-]?\d+(?:\.\d+)?))",
         std::regex::icase);
     std::smatch m;
     if (std::regex_search(hdr, m, re)) {
+      // BUG-920: #1/#2 always steps by +1, so `forvalues i = 3/1` runs zero
+      // times (oracle pc_fv_empty n1 0; [P] forvalues: "#1/#2 ... in steps
+      // of 1"). It used to count down 3 2 1. A numlist's 3/1 does count down
+      // (parseNumlist), which is a different rule.
       double start = std::stod(m.str(2)), end = std::stod(m.str(3));
-      double step = start <= end ? 1.0 : -1.0;
-      if (step == 0.0) {
-        return ojson::array({errBlock("forvalues: step cannot be zero")});
-      }
+      const double step = 1.0;
       return runForvaluesRange(m.str(1), start, step, end, bodyLines, session,
                                dispatchFn);
     }
@@ -2365,8 +2813,38 @@ ojson executeLoop(const std::string& header, const std::vector<std::string>& bod
   }
   // capture { ... } (BS-015) — not a loop/branch; `fw` (computed above) is
   // already the lowered first word of the header, so no re-parsing needed.
-  if (fw == "capture" || fw == "captur" || fw == "captu" || fw == "capt" || fw == "cap") {
-    return runCaptureBlock(bodyLines, session, dispatchFn);
+  // A prefix chain that holds `capture` (`capture {`, `capture noisily
+  // [quietly] {`, `noisily capture {`) is a capture block. BUG-1434, StataBE
+  // 19.5 2026-11-03: a noisily anywhere after the capture shows the error
+  // (`capture quietly noisily {` and `capture noisily quietly {` both print
+  // it), and the LAST of the chain's words decides whether ordinary output
+  // shows -- capture and quietly hide it, noisily shows it (`quietly capture
+  // noisily {` prints, `noisily capture {` and `capture {` print nothing). A
+  // chain without capture is a quietly/noisily block by the same last word.
+  {
+    std::vector<std::string> words;
+    std::string rest = trim(hdr);
+    while (!rest.empty()) {
+      const size_t sp = rest.find_first_of(" \t");
+      words.push_back(lower(sp == std::string::npos ? rest : rest.substr(0, sp)));
+      rest = sp == std::string::npos ? std::string() : trim(rest.substr(sp));
+    }
+    size_t capAt = words.size();
+    bool allPrefixes = !words.empty();
+    for (size_t i = 0; i < words.size(); ++i) {
+      if (isCapturePrefix(words[i]) && capAt == words.size()) capAt = i;
+      allPrefixes = allPrefixes && (isCapturePrefix(words[i]) || isQuietlyPrefix(words[i]) ||
+                                    isNoisilyPrefix(words[i]));
+    }
+    if (allPrefixes && capAt < words.size()) {
+      bool showError = false;
+      for (size_t i = capAt + 1; i < words.size(); ++i) showError = showError || isNoisilyPrefix(words[i]);
+      const bool quiet = !isNoisilyPrefix(words.back());
+      return runCaptureBlock(bodyLines, session, dispatchFn, showError, quiet);
+    }
+    if (allPrefixes && words.size() > 1) {
+      return runQuietlyBlock(bodyLines, session, dispatchFn, /*quiet=*/!isNoisilyPrefix(words.back()));
+    }
   }
   // BUG-132: quietly/noisily { ... } block — not a loop/branch; suppress
   // (quietly) or pass through (noisily) the body's output, but (unlike
@@ -2397,8 +2875,13 @@ bool selftestBoolIdentScanMatchesRegex(std::string* firstDisagreement) {
       "_x9 + x_9", "abc", "", "   ", "3", "3x", "x3", "e(N) > 0", "scalar(q) != .",
       "__STR10__", "__STRx", "not x", "x or y", "8.988465674311579e+307",
       "f(1)+g2(3)", "_", "__", "___STR0__", "1_x", "x1e5", "9e", "a1b2c3",
+      // Unicode names (lane M): a UTF-8 name is one token, the mixed-script
+      // `دخل_2020` included (its ASCII tail is NOT a token of its own), and the
+      // digit / `.` exponent-tail rule applies to a high byte the same way.
+      "قيمة > 0", "دخل_2020 > 1", "x قيمة", "1ق", "ق.ب", "ق1 + _ق", "_2020 + دخل_2020",
+      "xملاحظات", "ملاحظات1x", "cond(قيمة>0,1,0)", "__STR0__ == ق",
   };
-  static const std::regex reIdentTok(R"([A-Za-z_]\w*)");
+  static const std::regex reIdentTok(R"([A-Za-z_\x80-\xff][\w\x80-\xff]*)");
   for (const auto& c : kCases) {
     // The regex arm — verbatim the loop this replaced.
     std::set<std::string> viaRegex;
@@ -2417,21 +2900,12 @@ bool selftestBoolIdentScanMatchesRegex(std::string* firstDisagreement) {
     std::set<std::string> viaScan;
     const size_t n = c.size();
     for (size_t i = 0; i < n;) {
-      const unsigned char ch = static_cast<unsigned char>(c[i]);
-      if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_')) {
+      if (!cecon::ident::isIdentStartByte(c[i])) {
         ++i;
         continue;
       }
       size_t j = i + 1;
-      while (j < n) {
-        const unsigned char d = static_cast<unsigned char>(c[j]);
-        if ((d >= 'A' && d <= 'Z') || (d >= 'a' && d <= 'z') || (d >= '0' && d <= '9') ||
-            d == '_') {
-          ++j;
-        } else {
-          break;
-        }
-      }
+      while (j < n && cecon::ident::isIdentByte(c[j])) ++j;
       const bool expTail =
           i > 0 && (std::isdigit(static_cast<unsigned char>(c[i - 1])) || c[i - 1] == '.');
       if (!expTail && c.compare(i, 5, "__STR") != 0) viaScan.insert(c.substr(i, j - i));

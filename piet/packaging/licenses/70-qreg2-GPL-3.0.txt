@@ -1,0 +1,17 @@
+qreg2 4.00 (Machado, Parente, Santos Silva) — GPL-3.0
+Adopted at: piet/native/src/handlers_e3_qreg2.cpp (derived from qreg2.ado; line cites there refer to the ado)
+
+Project:  qreg2 — Stata module to perform quantile regression with robust and clustered standard errors
+Authors:  J.A.F. Machado, Paulo M.D.C. Parente, J.M.C. Santos Silva
+Version:  "Version 4.00 - 31 Aug 2020"
+Source:   Statistical Software Components (SSC / RePEc), https://ideas.repec.org/c/boc/bocode/s457369.html
+Evidence: The licence is the GNU General Public License version 3, as stated on the SSC/RePEc listing https://ideas.repec.org/c/boc/bocode/s457369.html: "The module is made available under terms of the GPL v3 (https://www.gnu.org/licenses/gpl-3.0.txt)."
+Licence:  GNU General Public License version 3.
+
+No upstream LICENSE text ships with the package; the licence is stated in its
+SSC listing. The ado carries only an as-is warranty disclaimer ("The software is provided as is, without warranty of any kind ... In no event shall the authors be liable for any claim, damages or other liability ...") and no licence grant.
+
+The full text of the GNU General Public License version 3 or later, under which this project is distributed, ships beside this application as LICENSE.txt.
+
+Copyright remains with the package authors for the portions derived from their
+code.

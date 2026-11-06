@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // `postfile` / `post` / `postclose` — C++ port of piet/backend/piet/
 // postfile.py (S8, M3b). Stata's in-memory collector that accumulates
 // scalar rows and writes an hbin on postclose.
@@ -251,7 +253,8 @@ ojson runPostfile(const std::string& rawLine, SessionState& session) {
   }
 
   // Strip a trailing options clause (`, replace` / `, every(#)`) — comma
-  // OUTSIDE quotes.
+  // OUTSIDE quotes. `replace` is read: without it an existing file is r(602).
+  bool replaceOpt = false;
   {
     bool inQ = false;
     for (size_t i = 0; i < pathPart.size(); ++i) {
@@ -259,6 +262,10 @@ ojson runPostfile(const std::string& rawLine, SessionState& session) {
       if (ch == '"') {
         inQ = !inQ;
       } else if (ch == ',' && !inQ) {
+        std::istringstream os(lower(pathPart.substr(i + 1)));
+        for (std::string w; os >> w;) {
+          if (w == "replace") replaceOpt = true;
+        }
         pathPart = trim(pathPart.substr(0, i));
         break;
       }
@@ -269,6 +276,19 @@ ojson runPostfile(const std::string& rawLine, SessionState& session) {
     pathPart = pathPart.substr(1, pathPart.size() - 2);
   }
   if (pathPart.empty()) return engineErrorBlock("postfile: empty filename after `using`");
+  // [P] postfile: "If filename is specified without an extension, .dta is
+  // assumed", and an existing file needs `replace` -- r(602) `file X already
+  // exists` (w2d_uncovered.log postfile_exists_noreplace `602|1|1|`: the old
+  // file is untouched).
+  {
+    const size_t slash = pathPart.find_last_of('/');
+    const size_t dot = pathPart.find_last_of('.');
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) pathPart += ".dta";
+  }
+  if (!replaceOpt && cecon::native_exists(resolveUserPath(session, pathPart))) {
+    return ojson(eval::errorBlock("engine_error", "file " + pathPart + " already exists",
+                                  std::nullopt, std::nullopt, std::nullopt, "r(602)"));
+  }
 
   std::vector<std::string> names, types;
   {
@@ -319,7 +339,11 @@ ojson runPost(const std::string& rawLine, SessionState& session) {
 
   auto it = session.postfiles.find(handle);
   if (it == session.postfiles.end()) {
-    return engineErrorBlock("post: no open postfile handles (handle `" + handle + "` not found)");
+    // BUG-1079: Stata answers `post h not found`, r(111) (w2ax_t1_official.log
+    // postutil_post_after). The old text said "not found" with no rc, and the
+    // message-to-rc mapping read that as a missing FILE, r(601).
+    return ojson(eval::errorBlock("engine_error", "post " + handle + " not found", std::nullopt,
+                                  std::nullopt, std::nullopt, "r(111)"));
   }
   PostHandle& ph = it->second;
 
@@ -420,6 +444,20 @@ ojson runPostclose(const std::string& handle, SessionState& session) {
   // being pre-expanded by step-0b macro expansion: tempfile resolution
   // happens before postfile ever sees the path).
   std::string target = resolveUserPath(session, ph.target);
+  // A `.dta` target (runPostfile adds the extension Stata assumes) gets genuine
+  // Stata bytes: the posted rows are converted to a scratch hbin and written
+  // out by the engine's .dta writer, the one `save X.dta` uses, so a later
+  // `use` of the name reads what Stata would (w2d_uncovered.log
+  // postfile_new_ctl / postfile_replace_098).
+  std::string lowerTarget = target;
+  for (auto& ch : lowerTarget) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  const bool toDta =
+      lowerTarget.size() > 4 && lowerTarget.compare(lowerTarget.size() - 4, 4, ".dta") == 0;
+  const std::string finalTarget = target;
+  if (toDta) {
+    target = csvPath + ".hbin";
+    registerScratchMint(target);
+  }
 
   std::vector<std::string> args = {"convert", "--data", csvPath, "--out", target, "--delim", ","};
   if (!factorCols.empty()) {
@@ -444,6 +482,17 @@ ojson runPostclose(const std::string& handle, SessionState& session) {
   }
   if (!cecon::native_exists(target)) {
     return engineErrorBlock("postclose: error writing hbin to '" + target + "'");
+  }
+  if (toDta) {
+    CobraRunResult dr = runCobra({"export-dta", "--data", target, "--out", finalTarget});
+    cecon::native_unlink(target);
+    if (!dr.ok) {
+      cecon::native_unlink(finalTarget);
+      return engineErrorBlock("postclose: error writing '" + finalTarget +
+                              "': " + errorFromRaw(dr).what());
+    }
+    cecon::native_unlink(csvPath);
+    return ojson::array();  // Stata silent on success
   }
   // RED-fix (piet_2.1.0_gate Leg 3): record this session's own hbin write so
   // a later `use` of the SAME resolved path (the routine tempfile/postfile

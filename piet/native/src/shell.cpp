@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Implementation of piet::Shell. This is the ONLY translation unit in the
 // project allowed to #include the vendored webview.h — see shell.h's header
 // comment for why.
@@ -290,14 +292,29 @@ void Shell::setVirtualHostMapping(const std::string& host, const std::string& fo
 
 void Shell::initJs(const std::string& js) { impl_->view.init(js); }
 
+// BUG-1469: the vendored GTK backend (Linux) has no native file panels, so the
+// two forwarders below compiled only on macOS and Windows and piet/native did
+// not build on Linux. There they answer "" -- the routes' cancelled dialog --
+// until the GTK backend grows the panels.
 std::string Shell::openFileDialog(const std::string& exts) {
+#if defined(__APPLE__) || defined(_WIN32)
   return impl_->view.show_open_dialog(exts);
+#else
+  (void)exts;
+  return std::string();
+#endif
 }
 
 // N1 (P8.1-W2): thin forwarder to the vendored backend's native save panel,
 // beside openFileDialog and with the same UI-thread contract (see shell.h).
 std::string Shell::saveFileDialog(const std::string& suggestedName, const std::string& ext) {
+#if defined(__APPLE__) || defined(_WIN32)
   return impl_->view.show_save_dialog(suggestedName, ext);
+#else
+  (void)suggestedName;
+  (void)ext;
+  return std::string();
+#endif
 }
 
 // A6-01 (stabilization W3): shell.h documents evalJs/postEvent as "safe from

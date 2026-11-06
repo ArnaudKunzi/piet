@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — quantile regression (Koenker-Bassett). Frisch-Newton primal-dual
 // interior-point solver for the check-loss min Σ ρ_τ(y - Xβ); default i.i.d.
 // standard errors via the sparsity function (fitted method, Hall-Sheather

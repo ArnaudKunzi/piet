@@ -1,6 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — Newey-West HAC OLS (newey) and Prais-Winsten / Cochrane-Orcutt AR(1)
-// FGLS (prais). Single time series, data assumed in time order; lags index by the
-// TIME value (gaps break pairing), matching Stata's tsset operators.
+// FGLS (prais). Lags index by the TIME value (gaps break pairing), matching Stata's
+// tsset operators; with a panel column (xtset) a lag pairs rows of the same panel
+// only, so every panel change is a gap (BUG-1503 / BUG-1507).
 //   newey: β = OLS; Var = (X'X)^-1 · Ω · (X'X)^-1 · n/(n-k), where
 //          Ω = Γ0 + Σ_{l=1}^m (1-l/(m+1))(Γl + Γl'),  Γl = Σ_t e_t e_{t-l} x_t x_{t-l}'.
 //          lag(0) == regress, vce(robust) (HC1).
@@ -10,6 +13,7 @@
 #include <cmath>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/linalg.h"
@@ -22,12 +26,32 @@ struct NeweyResult {
     int lag = 0;
     std::vector<double> beta, se, vcov;
     bool ok = false;
+    // Rows paired at the first lag 1..m that pairs fewer than two (-1: none does):
+    // newey.ado stops there, 0 -> r(2000), 1 -> r(2001).
+    int64_t short_lag_pairs = -1;
 };
 
+namespace detail {
+// (panel, time) -> row: the row a lag operator reaches. `panel` null = one series.
+using TsKey = std::pair<double, double>;
+inline std::map<TsKey, int64_t> ts_index(const double* time, const double* panel, int64_t n) {
+    std::map<TsKey, int64_t> m;
+    for (int64_t i = 0; i < n; ++i) m[TsKey(panel ? panel[i] : 0.0, time[i])] = i;
+    return m;
+}
+inline int64_t ts_lag(const std::map<TsKey, int64_t>& m, const double* time, const double* panel,
+                      int64_t t, double back) {
+    auto it = m.find(TsKey(panel ? panel[t] : 0.0, time[t] - back));
+    return (it == m.end()) ? -1 : it->second;
+}
+}  // namespace detail
+
 // X is col-major n*k (intercept included). time is the f64 time variable, delta the
-// step. lag = Newey-West lag truncation m (lag 0 = HC1 robust).
+// step. lag = Newey-West lag truncation m (lag 0 = HC1 robust). panel (optional) is
+// the xtset panel variable: Γl then sums only pairs inside one panel.
 inline NeweyResult newey_fit(const double* X, int64_t n, int k, const double* y,
-                             const double* time, double delta, int lag) {
+                             const double* time, double delta, int lag,
+                             const double* panel = nullptr) {
     NeweyResult r;
     r.n = n; r.k = k; r.lag = lag;
     std::vector<double> XtX(static_cast<size_t>(k) * k), Xty(k);
@@ -43,8 +67,7 @@ inline NeweyResult newey_fit(const double* X, int64_t n, int k, const double* y,
         for (int p = 0; p < k; ++p) f += X[static_cast<int64_t>(p) * n + i] * r.beta[p];
         e[i] = y[i] - f;
     }
-    std::map<double, int64_t> tmap;
-    for (int64_t i = 0; i < n; ++i) tmap[time[i]] = i;
+    const auto tmap = detail::ts_index(time, panel, n);
 
     std::vector<double> meat(static_cast<size_t>(k) * k, 0.0);
     for (int64_t t = 0; t < n; ++t) {  // Γ0 = Σ e_t² x_t x_t'
@@ -58,10 +81,11 @@ inline NeweyResult newey_fit(const double* X, int64_t n, int k, const double* y,
     for (int l = 1; l <= lag; ++l) {
         double w = 1.0 - static_cast<double>(l) / (lag + 1);
         std::vector<double> Gl(static_cast<size_t>(k) * k, 0.0);
+        int64_t pairs = 0;
         for (int64_t t = 0; t < n; ++t) {
-            auto it = tmap.find(time[t] - l * delta);
-            if (it == tmap.end()) continue;
-            int64_t s = it->second;
+            const int64_t s = detail::ts_lag(tmap, time, panel, t, l * delta);
+            if (s < 0) continue;
+            ++pairs;
             double prod = e[t] * e[s];
             for (int c = 0; c < k; ++c) {
                 double xtc = X[static_cast<int64_t>(c) * n + t];
@@ -69,6 +93,10 @@ inline NeweyResult newey_fit(const double* X, int64_t n, int k, const double* y,
                     Gl[static_cast<size_t>(c) * k + d] += prod * xtc * X[static_cast<int64_t>(d) * n + s];
             }
         }
+        // newey.ado accumulates each lag with `mat vecaccum`, which stops with "no
+        // observations" when no row has its lag-l partner and "insufficient
+        // observations" when one does (StataBE 19.5: lag(7) on 8 rows, r(2001)).
+        if (pairs < 2 && r.short_lag_pairs < 0) r.short_lag_pairs = pairs;
         for (int c = 0; c < k; ++c)
             for (int d = 0; d < k; ++d)
                 meat[static_cast<size_t>(c) * k + d] += w * (Gl[static_cast<size_t>(c) * k + d] +
@@ -92,36 +120,53 @@ struct PraisResult {
     int iters = 0;
     bool converged = false;
     bool corc = false;
+    int64_t n_gaps = 0;  // rows without an in-sample lag partner, less the first (e(N_gaps))
     std::string method, rhotype;
     bool ok = false;
 };
 
 namespace detail {
-// Durbin-Watson of a residual vector (consecutive in given order).
-inline double prais_dw(const std::vector<double>& e) {
+// Durbin-Watson of residuals e (row-indexed; `used` marks the rows that have one):
+// Σ (e_t - L.e_t)² over the rows whose lag partner `pred` also has one, over Σ e_t²
+// (prais.ado DW: `(e - l.e)^2` is missing across a gap or a panel change).
+// Each square is rounded before it is summed, as prais.ado's `gen double` then
+// `summarize` do (and as the single-series loop this replaced compiled): separate
+// statements, so the products are not fused into the sums.
+template <class Pred>
+inline double prais_dw(const std::vector<double>& e, const std::vector<char>& used, Pred pred) {
     double num = 0, den = 0;
     for (size_t i = 0; i < e.size(); ++i) {
-        den += e[i] * e[i];
-        if (i > 0) { double d = e[i] - e[i - 1]; num += d * d; }
+        if (!used[i]) continue;
+        const double sq = e[i] * e[i];
+        den += sq;
+        const int64_t s = pred(static_cast<int64_t>(i));
+        if (s >= 0 && used[static_cast<size_t>(s)]) {
+            const double d = e[i] - e[static_cast<size_t>(s)];
+            const double d2 = d * d;
+            num += d2;
+        }
     }
     return (den > 0) ? num / den : 0.0;
 }
 }  // namespace detail
 
-// rhotype: "regress" (default) or "tscorr".
+// rhotype: "regress" (default) or "tscorr". panel (optional) is the xtset panel
+// variable: rho, the transform and the DW statistics restart at every panel change,
+// as at any gap (Stata's prais notes "computations for rho restarted at each gap").
 inline PraisResult prais_fit(const double* X, int64_t n, int k, const double* y,
                              const double* time, double delta, bool corc, bool twostep,
                              const std::string& rhotype, int max_iter = 100,
-                             double tol = 1e-6) {
+                             double tol = 1e-6, const double* panel = nullptr) {
     PraisResult r;
     r.k = k; r.corc = corc; r.rhotype = rhotype.empty() ? "regress" : rhotype;
     r.method = twostep ? "twostep" : "iterated";
-    std::map<double, int64_t> tmap;
-    for (int64_t i = 0; i < n; ++i) tmap[time[i]] = i;
-    auto pred = [&](int64_t t) -> int64_t {
-        auto it = tmap.find(time[t] - delta);
-        return (it == tmap.end()) ? -1 : it->second;
-    };
+    const auto tmap = detail::ts_index(time, panel, n);
+    auto pred = [&](int64_t t) -> int64_t { return detail::ts_lag(tmap, time, panel, t, delta); };
+    // tsreport's definition: a gap is an in-sample row whose lag is not, except
+    // the first row of the sample. StataBE 19.5, 40 panels of 5: 39.
+    for (int64_t t = 0; t < n; ++t)
+        if (pred(t) < 0) ++r.n_gaps;
+    if (r.n_gaps > 0) --r.n_gaps;
 
     auto ols_resid = [&](const std::vector<double>& beta, std::vector<double>& e) {
         e.resize(n);
@@ -200,7 +245,7 @@ inline PraisResult prais_fit(const double* X, int64_t n, int k, const double* y,
     la::matvec(XtX.data(), k, Xty.data(), beta.data());
     std::vector<double> e;
     ols_resid(beta, e);
-    r.dw_0 = detail::prais_dw(e);
+    r.dw_0 = detail::prais_dw(e, std::vector<char>(static_cast<size_t>(n), 1), pred);
 
     int maxit = twostep ? 1 : max_iter;
     double rho = 0, lastrho = 2;
@@ -226,7 +271,8 @@ inline PraisResult prais_fit(const double* X, int64_t n, int k, const double* y,
     // transformed-residual DW (DWdiff): transform with final rho, resid = ty - T·β
     {
         double s1 = std::sqrt(std::max(0.0, 1.0 - rho * rho));
-        std::vector<double> u;
+        std::vector<double> u(static_cast<size_t>(n), 0.0);
+        std::vector<char> used(static_cast<size_t>(n), 0);
         for (int64_t t = 0; t < n; ++t) {
             int64_t s = pred(t);
             double tyv, res;
@@ -242,9 +288,10 @@ inline PraisResult prais_fit(const double* X, int64_t n, int k, const double* y,
             } else {
                 continue;
             }
-            u.push_back(res);
+            u[static_cast<size_t>(t)] = res;
+            used[static_cast<size_t>(t)] = 1;
         }
-        r.dw = detail::prais_dw(u);
+        r.dw = detail::prais_dw(u, used, pred);
     }
     r.ok = true;
     return r;

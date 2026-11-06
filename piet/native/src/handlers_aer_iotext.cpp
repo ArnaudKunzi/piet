@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // AER-SCOPE1 bundle G (IO-TEXT, 2026-09-04) -- the older text I/O verbs, plus
 // `putexcel`, plus the three file commands that had no home:
 //
@@ -63,9 +65,9 @@
 //  4. ECHOED PATHS. Nothing here echoes a RESOLVED absolute path. Every
 //     message and every echo names the spelling the user typed, because a
 //     resolved path bakes the build machine's workdir into any golden that
-//     captures it -- which has shipped once already. `runExportDelimited`
-//     still builds its own success line from the resolved path, so `outsheet`
-//     rewrites that line rather than passing it through (see reEchoPath).
+//     captures it -- which has shipped once already. The shared delimited
+//     writer names DelimWriteSpec::shown, and runSaveData names its own
+//     spelling, so `saveold` passes its refusals through untouched.
 //  5. R-CLASS. `filefilter` publishes r(occurrences) from the handler; its arm
 //     has no table block to capture from.
 //
@@ -89,6 +91,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -97,14 +100,18 @@
 #include <utility>
 #include <vector>
 
+#include "data/missing.h"  // cecon::missing_kind -- insheet's float columns carry `.` only
 #include "io/win_compat.h"  // cecon::to_native_path / native_exists / native_unlink
 #include "piet/cobra_runner.h"
 #include "piet/datastore.h"
+#include "piet/delimited_io.h"  // insheet: the one native delimited reader
 #include "piet/display_hardening.h"  // evalScalarExpr -- `putexcel A1 = (expr)`
 #include "piet/eval/errors.h"
+#include "piet/eval/exprfns.h"  // applyStataFmt -- outfile writes through display formats
 #include "piet/eval/pyvalue.h"  // pythonFloatRepr -- round-trippable numerics
 #include "piet/eval/session.h"
 #include "piet/eval/tokenizer.h"
+#include "piet/inrange_filter.h"  // infix `in`: parseInRangeBounds
 #include "piet/mutation_result.h"
 #include "piet/scratch_seq.h"
 #include "piet/session_state.h"
@@ -124,35 +131,35 @@
 // apparatus exists to prevent.
 namespace {
 
-// `double` asks for double storage, which is what this build's frame already
-// is throughout -- honoured by construction, not ignored. `clear` is read in
+// `double` asks for double storage: it keeps the numbers as read, where the
+// default stores a non-integer column as float (delimited::typeColumn).
+// Under `set type double` the default is double, and `nodouble` asks for the
+// float columns (insheet's help). `clear` is read in
 // the only sense it has here: an `insheet` always replaces what is in memory.
 // `case` is read (it suppresses the lower-casing pass).
 const piet::eval::OptVocab& kVocabInsheet = piet::eval::registerOptVocab(
     {"insheet"}, {{"clear", "names", "nonames", "comma", "tab", "delimiter", "delim", "case",
-                   "double"},
+                   "double", "nodouble"},
                   {}});
 
-// `nonames` suppresses the header row. runExportDelimited has no such switch
-// (`export delimited, novarnames` is itself unimplemented), so asking for it
-// here would mean writing the header anyway -- accepted and answered wrongly.
-// `names` IS the default and is therefore honoured by construction. `noquote`
-// is honoured in the sense that matters: PIET quotes a field only when the
-// delimiter/quote/newline forces it, so a `noquote` request already gets an
-// unquoted field for every value that can legally go unquoted (a value that
-// cannot would be unreadable, which is not what the option asks for).
+// outsheet writes through writeDelimitedFile with its own switches: `nonames`
+// drops the header row (w2ar dx_outs_noname, log:893), `noquote` drops the
+// quotes it otherwise puts round every string (log:865). `names` IS the
+// default and is therefore honoured by construction.
 const piet::eval::OptVocab& kVocabOutsheet = piet::eval::registerOptVocab(
-    {"outsheet"}, {{"comma", "replace", "noquote", "nolabel", "names", "delimiter", "delim"},
-                   {"nonames", "double"}});
+    {"outsheet"}, {{"comma", "replace", "noquote", "nolabel", "names", "nonames", "delimiter",
+                    "delim"},
+                   {"double"}});
 
 // `automatic` asks infile to build value labels from the string values it
 // reads, and `byvariable()` changes the record ORDER (all of v1, then all of
 // v2). Both change what the dataset IS, so neither may be accepted unread.
+// `using(data)` is the dictionary form's data file (runDictionaryRead).
 const piet::eval::OptVocab& kVocabInfile =
-    piet::eval::registerOptVocab({"infile"}, {{"clear"}, {"automatic", "byvariable", "using"}});
+    piet::eval::registerOptVocab({"infile"}, {{"clear", "using"}, {"automatic", "byvariable"}});
 
 const piet::eval::OptVocab& kVocabInfix =
-    piet::eval::registerOptVocab({"infix"}, {{"clear"}, {"using"}});
+    piet::eval::registerOptVocab({"infix"}, {{"clear", "using"}, {}});
 
 // `wide` asks for one observation per output line, which is exactly and only
 // what this writer does -- honoured by construction. `dictionary` writes a
@@ -409,6 +416,23 @@ bool splitUsing(const std::vector<std::string>& words, std::vector<std::string>*
   return !pathArg->empty();
 }
 
+// Remove an `if`/`in` qualifier's words from a command's pre-comma words:
+// each run starts at an `if` or `in` word and ends before `using` (or at the
+// end), so both `outsheet using f if g != 0` and `outfile s g if year == 2001
+// using f` keep their varlist and file. The qualifier itself reaches the
+// handler parsed (parsed.ifExpr / parsed.inRange).
+std::vector<std::string> dropQualifierWords(const std::vector<std::string>& words) {
+  std::vector<std::string> out;
+  bool inQual = false;
+  for (const auto& w : words) {
+    const std::string lw = lowerOf(w);
+    if (lw == "using") inQual = false;
+    else if (lw == "if" || lw == "in") inQual = true;
+    if (!inQual) out.push_back(w);
+  }
+  return out;
+}
+
 // ===========================================================================
 // Files
 // ===========================================================================
@@ -444,12 +468,26 @@ std::optional<ojson> refuseIfSessionHbin(SessionState& session, const std::strin
 }
 
 // The shared "may I create this output?" check. NAMES THE SPELLING THE USER
-// TYPED, never the resolved path (defect class 4). r(602) is Stata's own code
-// for an existing file, stated through the reason channel.
-std::optional<ojson> refuseExisting(const std::string& verb, const std::string& resolved,
-                                    const std::string& spelling, bool replace) {
+// TYPED, never the resolved path (defect class 4), in Stata's own words and
+// code: `file o.out already exists` r(602) for outsheet, outfile, filefilter and
+// copy alike (StataBE 19.5, BUG-410).
+std::optional<ojson> refuseExisting(const std::string& resolved, const std::string& spelling,
+                                    bool replace) {
   if (replace || !pathExists(resolved)) return std::nullopt;
-  return ioErrorRc(verb + ": file " + spelling + " already exists (specify option `replace`)", 602);
+  return ioErrorRc("file " + spelling + " already exists", 602);
+}
+
+// A file named without a suffix is NAME<suffix>, in the path and in every
+// message: .out for outsheet, .raw for outfile and for the data infile and
+// infix read, .dct for a dictionary. StataBE 19.5 `infile y using bare` is
+// `file bare.raw not found` r(601) even beside a file called bare, and
+// `infile using d1` reads d1.dct. A dot before the last '/' names a directory.
+void assumeSuffix(std::string* resolved, std::string* spelling, const char* suffix) {
+  const size_t slash = resolved->find_last_of('/');
+  const size_t dot = resolved->find_last_of('.');
+  if (dot != std::string::npos && (slash == std::string::npos || dot > slash)) return;
+  *resolved += suffix;
+  *spelling += suffix;
 }
 
 // Write `bytes` to `resolved` through a SIBLING temp + rename(2), so a failure
@@ -461,7 +499,9 @@ std::optional<ojson> commitBytes(const std::string& verb, const std::string& res
   const std::string tmp = resolved + ".piet_tmp";
   {
     std::ofstream f(cecon::to_native_path(tmp), std::ios::binary | std::ios::trunc);
-    if (!f) return ioError(verb + ": cannot write " + spelling, "data_io");
+    // A file Stata cannot create (its directory missing): `file nodir/o.raw
+    // could not be opened` r(603), outfile and filefilter alike (BUG-410).
+    if (!f) return ioErrorRc("file " + spelling + " could not be opened", 603);
     f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     f.flush();
     if (!f) {
@@ -578,9 +618,22 @@ std::optional<ojson> writeAndConvert(SessionState& session, const CsvTable& t,
     }
     f << "\n";
     for (const auto& row : t.rows) {
+      // BUG-1078: a row whose every cell is missing would be a BLANK line, and
+      // cobra's CSV reader skips blank lines (BUG-697's pad rows, same reader),
+      // so a one-variable `input` with a `""` or `.` row lost it and stopped on
+      // the row-count assert. A quoted empty first field keeps the row; convert
+      // reads it as missing for a factor and for an f64 column alike.
+      bool allEmpty = true;
+      for (size_t c = 0; c < t.names.size() && allEmpty; ++c) {
+        if (c < row.size() && !row[c].empty()) allEmpty = false;
+      }
       for (size_t c = 0; c < t.names.size(); ++c) {
         if (c) f << ',';
-        if (c < row.size()) f << csvField(row[c], ',');
+        if (c == 0 && allEmpty) {
+          f << "\"\"";
+        } else if (c < row.size()) {
+          f << csvField(row[c], ',');
+        }
       }
       f << "\n";
     }
@@ -614,12 +667,15 @@ std::optional<ojson> writeAndConvert(SessionState& session, const CsvTable& t,
 // Adopt `hbin` as the session's dataset, exactly the way `use` does: the
 // resident chain is DROPPED (a load from disk never continues it), the display
 // metadata plane is cleared (a staged CSV declares no labels), and the source
-// the user named becomes c(filename).
+// the user named becomes c(filename). Unlike `use`, c(changed) is 1: the data
+// read have not been saved (StataBE 19.5, BUG-1478: 1 after `infile a b using
+// f.raw, clear`, as after import delimited).
 void adoptLoadedFrame(SessionState& session, const std::string& hbin,
                       const std::string& sourceResolved) {
   session.load(hbin, SessionState::LoadIntent::FreshRead);
   session.clearMetadata();
   session.setCurrentFile(sourceResolved);
+  session.datasetChanged = true;
   session.invalidateDatastore();
 }
 
@@ -656,56 +712,6 @@ bool readDelimiterOpt(const std::vector<std::pair<std::string, eval::OptValue>>&
   return false;
 }
 
-// Split one delimited LINE, honouring double quotes and the doubled-quote
-// escape -- the same rule the CSV writer above produces.
-std::vector<std::string> splitDelimited(const std::string& line, char delim) {
-  std::vector<std::string> out;
-  std::string cur;
-  bool inQuote = false;
-  for (size_t i = 0; i < line.size(); ++i) {
-    const char c = line[i];
-    if (inQuote) {
-      if (c == '"') {
-        if (i + 1 < line.size() && line[i + 1] == '"') {
-          cur.push_back('"');
-          ++i;
-        } else {
-          inQuote = false;
-        }
-      } else {
-        cur.push_back(c);
-      }
-      continue;
-    }
-    if (c == '"') {
-      inQuote = true;
-      continue;
-    }
-    if (c == delim) {
-      out.push_back(cur);
-      cur.clear();
-      continue;
-    }
-    if (c == '\r') continue;
-    cur.push_back(c);
-  }
-  out.push_back(cur);
-  return out;
-}
-
-// The first non-empty line of a file, without its newline. "" when there is
-// none (an empty file).
-std::string firstLineOf(const std::string& resolved) {
-  std::ifstream f(cecon::to_native_path(resolved), std::ios::binary);
-  if (!f) return std::string();
-  std::string line;
-  while (std::getline(f, line)) {
-    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-    if (!line.empty()) return line;
-  }
-  return std::string();
-}
-
 // ===========================================================================
 // Reading the loaded dataset (the two writers)
 // ===========================================================================
@@ -732,64 +738,6 @@ const std::string* labelTextFor(const std::map<std::string, std::string>* labels
   }
   if (it == labels->end()) return nullptr;
   return &it->second;
-}
-
-// ===========================================================================
-// `if`/`in` on the two writers
-// ===========================================================================
-//
-// `outsheet` and `outfile` carry allowIf/allowInRange = true in the registry,
-// so the tokenizer hands a qualifier straight through to the handler. Neither
-// writer can honour one: `outsheet` delegates to runExportDelimited, which
-// writes the whole frame, and `outfile` reads the same materialized head. A
-// qualifier that is parsed and then dropped writes MORE ROWS than the user
-// asked for and reports success, which is the silent-wrong-answer shape this
-// campaign exists to prevent -- so it is refused, at rc 198, by name.
-std::optional<ojson> refuseQualifiers(const eval::ParsedCommand& parsed, const std::string& verb) {
-  if (parsed.ifExpr.has_value()) {
-    return ioError(verb + ": an `if` qualifier is not implemented for this command in this build "
-                          "— the whole dataset would be written. Subset first (`preserve` / `keep "
-                          "if ...` / `restore`) and write the result.",
-                   "unsupported_option");
-  }
-  if (parsed.inRange.has_value()) {
-    return ioError(verb + ": an `in` qualifier is not implemented for this command in this build "
-                          "— the whole dataset would be written. Subset first (`preserve` / `keep "
-                          "in ...` / `restore`) and write the result.",
-                   "unsupported_option");
-  }
-  return std::nullopt;
-}
-
-// ===========================================================================
-// Echo repair (defect class 4)
-// ===========================================================================
-//
-// runExportDelimited builds its success line, and runSaveData several of its
-// failure messages, from the RESOLVED path (BUG-410 -- a pre-existing defect in
-// those handlers, filed and NOT fixed here: both are outside this bundle's
-// write manifest). A shim that forwarded either would bake this build machine's
-// absolute workdir into any golden that captures it.
-//
-// Two different repairs, deliberately:
-//   * the SUCCESS line is not forwarded at all. `outsheet` writes its own,
-//     naming the spelling the user typed, so the confirmation does not depend
-//     on a substring match against another handler's wording.
-//   * a FAILURE message IS forwarded (its diagnosis is the point) with the
-//     resolved path substituted back out. Best-effort by construction: a miss
-//     leaves the message exactly as the other handler wrote it.
-ojson reEchoPath(ojson block, const std::string& resolved, const std::string& spelling) {
-  if (!block.is_object()) return block;
-  // A success line carries "text"; an error block carries "message". Both can
-  // name the resolved path, and neither may reach a golden that way.
-  for (const char* key : {"text", "message"}) {
-    if (!block.contains(key) || !block[key].is_string()) continue;
-    std::string text = block[key].get<std::string>();
-    const size_t at = text.find(resolved);
-    if (at == std::string::npos) continue;
-    block[key] = text.substr(0, at) + spelling + text.substr(at + resolved.size());
-  }
-  return block;
 }
 
 // ===========================================================================
@@ -843,46 +791,65 @@ std::string addrOf(int row, int col) { return colRefOf(col) + std::to_string(row
 // insheet
 // ===========================================================================
 //
-// Decision 1. The loader is `cobra convert` -- the SAME converter `use` and
-// `import delimited` run -- so a file read through `insheet` and the same file
-// read through `import delimited` produce byte-identical columns. What insheet
-// adds is Stata's own option layer on top: the delimiter (tab first, then
-// comma), the header question (including Stata's automatic "the first row is
-// all numbers, so it is data") and the lower-casing of variable names that
-// `case` suppresses.
-//
-// Deliberately NOT routed through runImportDelimited: that entry point calls
-// runUse, whose delimiter is chosen by FILE EXTENSION (.tsv -> tab, everything
-// else -> comma), and `insheet using data.txt, tab` is precisely the case that
-// gets wrong. The converter is called directly with the delimiter this command
-// decided.
+// insheet reads through the one native delimited module (delimited_io.cpp) in
+// its own mode: the delimiter from the first line (tab, else comma, else the
+// line is one field), trimmed fields with the untrimmed width, Stata's naming
+// rule (lower case unless `case`, illegal characters removed, the cell as the
+// label) and the storage types import delimited uses (w2ar log:3526-3690).
+
 ojson runInsheet(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabInsheet.known,
                                             kVocabInsheet.unimplemented)) {
     return ojson(*err);
   }
+  if (hasFlag(parsed.opts, "double") && hasFlag(parsed.opts, "nodouble"))
+    return ioSyntax("options double and nodouble may not be combined");
 
   std::vector<std::string> varlist;
   std::string pathArg;
   if (!splitUsing(quoteAwareWords(preCommaArgs(parsed.raw)), &varlist, &pathArg)) {
-    return ioSyntax("insheet: missing the file. Usage: insheet using \"file\" [, clear names "
-                    "nonames comma tab delimiter(D) case]");
+    return ioSyntax("insheet: missing the file. Usage: insheet [varlist] using \"file\" [, clear "
+                    "names nonames comma tab delimiter(D) case double]");
   }
-  if (!varlist.empty()) {
-    // `insheet v1 v2 using f` names the variables in the command. That form is
-    // a different naming rule from every branch below (it also implies
-    // `nonames`), and reading it as a varlist we then ignore would load the
-    // file under the WRONG column names at rc 0.
-    return ioError("insheet: naming the variables in the command (`insheet " + varlist.front() +
-                       " ... using ...`) is not implemented in this build — read the file and "
-                       "`rename` the columns, or give the file a header row.",
-                   "unsupported_option");
+  for (const auto& v : varlist) {
+    if (!strutil::isValidStataIdentifier(v)) return ioSyntax(v + ": invalid variable name");
+  }
+
+  // insheet reads into an EMPTY dataset: without `clear` over data in memory
+  // it is r(18) and the data stay (w2ar dx_ins_noclear, log:3678); with
+  // `clear` the data go first, so a missing file leaves k=0 (dx_ins_missing
+  // 601 k=0, log:3690).
+  const bool clear = hasFlag(parsed.opts, "clear");
+  if (!clear && session.hasData()) {
+    Datastore* ds = nullptr;
+    try {
+      ds = session.datastore();
+    } catch (const std::exception&) {
+      ds = nullptr;
+    }
+    if (ds != nullptr && ds->nCols() > 0) {
+      return ioErrorRc("you must start with an empty dataset", 18);
+    }
+  }
+  if (clear && session.hasData()) {
+    ojson cleared = runClear("", session);
+    if (isErrorBlock(cleared)) return cleared;
   }
 
   const std::string resolved = resolveUserPath(session, pathArg);
-  if (!pathExists(resolved)) return ioErrorRc("insheet: file " + pathArg + " not found", 601);
+  if (!pathExists(resolved)) return ioErrorRc("file " + typedUserPath(pathArg) + " not found", 601);
+  std::string text;
+  {
+    std::ifstream f(cecon::to_native_path(resolved), std::ios::binary);
+    if (!f) return ioError("insheet: cannot read " + pathArg, "data_io");
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    text = ss.str();
+  }
 
-  // -- the delimiter -------------------------------------------------------
+  // -- the delimiter: delimiter()/comma/tab, else the first line's own -- tab
+  // when it holds one, else comma when it holds one, else none (the whole
+  // line is one variable: dx_ins_028_names, log:3630).
   char delim = 0;
   {
     std::string derr;
@@ -890,196 +857,91 @@ ojson runInsheet(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   if (hasFlag(parsed.opts, "comma")) delim = ',';
   if (hasFlag(parsed.opts, "tab")) delim = '\t';
-  const std::string head = firstLineOf(resolved);
   if (delim == 0) {
-    // Stata's own sniff: a tab anywhere in the first line means tab-separated,
-    // otherwise comma.
-    delim = (head.find('\t') != std::string::npos) ? '\t' : ',';
-  }
-  if (delim != ',' && delim != '\t') {
-    return ioError(std::string("insheet: this build reads comma- and tab-separated files "
-                               "(delimiter(") +
-                       delim + ") is not implemented)",
-                   "unsupported_option");
+    const size_t eol = text.find('\n');
+    const std::string head = text.substr(0, eol == std::string::npos ? text.size() : eol);
+    if (head.find('\t') != std::string::npos) delim = '\t';
+    else if (head.find(',') != std::string::npos) delim = ',';
   }
 
-  // -- the header question -------------------------------------------------
+  const delimited::InsheetRows rows = delimited::parseInsheet(text, delim);
+  if (rows.fields.empty()) {
+    // An empty file: Stata answers r(612) (dx_ins_empty, log:3668).
+    return ioErrorRc("file " + pathArg + " is empty -- unexpected end of file", 612);
+  }
+
+  // -- the header: `names`/`nonames`, a varlist (implies nonames), else
+  // Stata's automatic rule: a first row whose every field is a number is data.
   const bool wantNames = hasFlag(parsed.opts, "names");
-  const bool wantNoNames = hasFlag(parsed.opts, "nonames");
-  if (wantNames && wantNoNames) {
+  const bool wantNoNames = hasFlag(parsed.opts, "nonames") || !varlist.empty();
+  if (wantNames && wantNoNames && varlist.empty()) {
     return ioSyntax("insheet: `names` and `nonames` cannot both be given");
   }
-  std::vector<std::string> headFields = head.empty()
-                                            ? std::vector<std::string>()
-                                            : splitDelimited(head, delim);
-  bool headerPresent = true;
+  bool header = true;
   if (wantNoNames) {
-    headerPresent = false;
+    header = false;
   } else if (!wantNames) {
-    // Stata's automatic rule: if EVERY field of the first row parses as a
-    // number, the row is data and the variables are named v1..vk.
-    if (!headFields.empty()) {
-      bool allNumeric = true;
-      for (const auto& f : headFields) {
-        double d = 0.0;
-        const std::string t = trimOf(f);
-        if (t.empty() || !parseStrictDouble(t, &d)) {
-          allNumeric = false;
-          break;
-        }
+    bool allNumeric = true;
+    for (const auto& f : rows.fields[0]) {
+      double d = 0.0;
+      if (f.empty() || !delimited::parseNumber(f, &d)) {
+        allNumeric = false;
+        break;
       }
-      headerPresent = !allNumeric;
     }
+    header = !allNumeric;
   }
 
-  // -- ragged rows -----------------------------------------------------------
-  // MEASURED 2026-09-04, and it corrects the plan: this bundle's edge-case list
-  // says "ragged rows -> convert error -> insheet: row # has k fields". `cobra
-  // convert` does NOT error. A file whose header is `a,b` and whose third line
-  // is `3,4,5` converts at rc 0 with two columns and the `5` DISCARDED --
-  // silent data loss, on `import delimited` as much as here (filed BUG-414;
-  // the engine fix is not this lane's).
-  //
-  // So the check happens here, before the converter is handed the file. It
-  // costs one extra pass over a text file the converter is about to read in
-  // full anyway, and it buys the difference between "your file had a problem on
-  // line 3" and a frame that is quietly missing a column's worth of values.
-  {
-    const size_t want = headFields.size();
-    if (want > 0) {
-      std::ifstream scan(cecon::to_native_path(resolved), std::ios::binary);
-      std::string line;
-      long long lineNo = 0;
-      while (std::getline(scan, line)) {
-        ++lineNo;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        // A trailing blank line is not a row; neither is a wholly empty one.
-        if (line.empty()) continue;
-        const size_t got = splitDelimited(line, delim).size();
-        if (got != want) {
-          return ioError("insheet: line " + std::to_string(lineNo) + " of " + pathArg + " has " +
-                             std::to_string(got) + " field" + (got == 1 ? "" : "s") +
-                             ", but the file's first line has " + std::to_string(want) +
-                             ". Fix the file, or the extra values would be dropped without a "
-                             "word.",
-                         "syntax_error");
-        }
-      }
-    }
+  const size_t first = header ? 1 : 0;
+  // A data row with MORE fields than the names row widens the dataset, as
+  // import delimited does: the extra columns are v<column>, missing on the
+  // shorter rows (BUG-414: `a,b,c` over `4,5` and `6,7,8,9,10` reads a b c v4
+  // v5, 3 obs, StataBE insheet rc 0). Where a header name already holds
+  // v<column>, insheet takes the lowest free v# (`v3,b` over `3,4,5` reads v3 b
+  // v1) and import delimited refuses (delimited::Fallback).
+  size_t k = header ? rows.fields[0].size() : 0;
+  for (size_t r = first; r < rows.fields.size(); ++r) k = std::max(k, rows.fields[r].size());
+  std::vector<std::string> headerCells(k);
+  if (header) {
+    for (size_t c = 0; c < rows.fields[0].size() && c < k; ++c) headerCells[c] = rows.fields[0][c];
   }
+  delimited::NameResult nr = delimited::legalNames(
+      headerCells, hasFlag(parsed.opts, "case") ? delimited::Case::kPreserve : delimited::Case::kLower,
+      delimited::Fallback::kLowestFree);
+  if (!header) {
+    for (auto& l : nr.labels) l.clear();
+  }
+  if (varlist.size() > k) return ioErrorRc("too many variables specified", 103);
+  for (size_t i = 0; i < varlist.size(); ++i) nr.names[i] = varlist[i];
 
-  // -- the file the converter reads ----------------------------------------
-  std::string convSource = resolved;
-  if (!headerPresent) {
-    if (headFields.empty()) {
-      return ioError("insheet: " + pathArg + " has no rows to read", "data_io");
+  delimited::Table table;
+  table.names = nr.names;
+  table.labels = nr.labels;
+  std::vector<size_t> widthFloor(k, 0);
+  for (size_t r = first; r < rows.fields.size(); ++r) {
+    std::vector<std::string> row(k);
+    for (size_t c = 0; c < rows.fields[r].size() && c < k; ++c) {
+      row[c] = rows.fields[r][c];
+      widthFloor[c] = std::max(widthFloor[c], rows.widths[r][c]);
     }
-    // No header in the source, so one is synthesised into a staged copy. The
-    // copy is a single streaming pass; the converter reads it once and it is
-    // reaped at the dispatch boundary with every other projection.
-    const std::string staged = nextPath(session.workdir(), "insheet") + ".csv";
-    registerScratchMint(staged);            // BUG-389
-    session.noteProjectionScratch(staged);  // read once by `convert`, then dead
-    {
-      std::ifstream in(cecon::to_native_path(resolved), std::ios::binary);
-      std::ofstream out(cecon::to_native_path(staged), std::ios::binary | std::ios::trunc);
-      if (!in || !out) {
-        return ioError("insheet: cannot stage a header for " + pathArg, "data_io");
-      }
-      for (size_t i = 0; i < headFields.size(); ++i) {
-        if (i) out << delim;
-        out << "v" << (i + 1);
-      }
-      out << "\n";
-      std::vector<char> buf(1 << 20);
-      while (in) {
-        in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
-        const std::streamsize got = in.gcount();
-        if (got > 0) out.write(buf.data(), got);
-        if (!out) break;
-      }
-      out.flush();
-      if (!out || in.bad()) {
-        out.close();
-        cecon::native_unlink(staged);
-        return ioError("insheet: failed staging " + pathArg + " (disk full or I/O error)",
-                       "data_io");
-      }
-    }
-    convSource = staged;
+    table.rows.push_back(std::move(row));
   }
-
-  const std::string hbin = nextPath(session.workdir(), "insheet");
-  if (auto err = runVerb({"convert", "--data", convSource, "--out", hbin, "--delim",
-                          std::string(1, delim)})) {
-    cecon::native_unlink(hbin);
-    return *err;
+  // Float columns unless double storage is asked for: by `double`, or by the
+  // c(type) default `set type double` sets with no `nodouble` to undo it
+  // (insheet's help; w2k_binscatter.log:1477 BS_077_data_o1 reads
+  // float(1.6209999)).
+  const bool asDouble =
+      !hasFlag(parsed.opts, "nodouble") &&
+      (hasFlag(parsed.opts, "double") || session.defaultStorageType != "float");
+  table.types.resize(k);
+  for (size_t c = 0; c < k; ++c) {
+    std::vector<const std::string*> cells;
+    cells.reserve(table.rows.size());
+    for (const auto& row : table.rows) cells.push_back(&row[c]);
+    table.types[c] = delimited::typeColumn(cells, false, false, asDouble, widthFloor[c],
+                                           /*precisionToDouble=*/false);
   }
-  // -- Stata's naming rule -------------------------------------------------
-  // Names are lower-cased unless `case` asks for them verbatim. A collision the
-  // fold would create is an ERROR, never a silent merge: `ID` and `id` are two
-  // columns and one of them would otherwise vanish.
-  //
-  // The names are read off the CONVERTED FILE, before it is adopted, so a
-  // collision leaves the session's previous dataset exactly as it was. Adopting
-  // first and erroring afterwards would half-apply the command: the old data
-  // gone, the new data named wrongly, and an error saying so.
-  std::string finalHbin = hbin;
-  if (!hasFlag(parsed.opts, "case")) {
-    std::vector<std::string> names;
-    try {
-      Datastore probe(hbin);
-      names = probe.names();
-    } catch (const std::exception& e) {
-      cecon::native_unlink(hbin);
-      return ioError(std::string("insheet: the converted file could not be opened — ") + e.what(),
-                     "data_io");
-    }
-    std::vector<std::pair<std::string, std::string>> pairs;
-    std::set<std::string> targets;
-    for (const auto& n : names) {
-      const std::string lo = lowerOf(n);
-      if (lo == n) {
-        if (!targets.insert(n).second) {
-          cecon::native_unlink(hbin);
-          return ioError("insheet: variable name `" + n + "` appears twice in " + pathArg);
-        }
-        continue;
-      }
-      if (!targets.insert(lo).second) {
-        cecon::native_unlink(hbin);
-        return ioError("insheet: lower-casing the variable names collides on `" + lo +
-                       "` — add `case` to keep the names as written in " + pathArg);
-      }
-      pairs.emplace_back(n, lo);
-    }
-    for (const auto& [from, to] : pairs) {
-      if (std::find(names.begin(), names.end(), to) != names.end()) {
-        cecon::native_unlink(hbin);
-        return ioError("insheet: lower-casing `" + from + "` collides with the existing column `" +
-                       to + "` — add `case` to keep the names as written in " + pathArg);
-      }
-    }
-    if (!pairs.empty()) {
-      std::string spec;
-      for (const auto& [from, to] : pairs) {
-        if (!spec.empty()) spec += ",";
-        spec += from + "=" + to;
-      }
-      const std::string out = nextPath(session.workdir(), "insheet");
-      if (auto err = runVerb({"rename", "--data", hbin, "--out", out, "--pairs", spec})) {
-        cecon::native_unlink(out);
-        cecon::native_unlink(hbin);
-        return *err;
-      }
-      finalHbin = out;
-    }
-  }
-  adoptLoadedFrame(session, finalHbin, resolved);
-
-  // No new/dropped/rewritten list: `insheet` replaces the WHOLE dataset, so
-  // there is no delta for seedNMissForPureAdd to carry forward -- the three
-  // slots describe a mutation of an existing frame, which this is not.
+  if (auto err = delimited::stageAndAdopt(session, table, "insheet", resolved)) return *err;
   return mutationResult(session, "insheet");
 }
 
@@ -1097,48 +959,46 @@ ojson runOutsheet(const eval::ParsedCommand& parsed, SessionState& session) {
                                             kVocabOutsheet.unimplemented)) {
     return ojson(*err);
   }
-  if (auto err = refuseQualifiers(parsed, "outsheet")) return *err;
   if (!session.hasData()) return ojson(eval::noDataLoaded());
 
   std::vector<std::string> varlist;
   std::string pathArg;
-  if (!splitUsing(quoteAwareWords(preCommaArgs(parsed.raw)), &varlist, &pathArg)) {
+  if (!splitUsing(dropQualifierWords(quoteAwareWords(preCommaArgs(parsed.raw))), &varlist,
+                  &pathArg)) {
     return ioSyntax("outsheet: missing the file. Usage: outsheet [varlist] using \"file\" "
-                    "[, comma replace noquote nolabel delimiter(D)]");
+                    "[, comma replace noquote nolabel nonames delimiter(D)]");
   }
 
-  char delim = '\t';  // Stata's own default for this command
+  // outsheet's own rules (w2ar log:810-929): TAB by default (`comma`,
+  // `delimiter()` change it), every numeric through its display format
+  // (`1.235e+10` for a %10.0g double), strings and label texts ALWAYS quoted
+  // with an inner quote left as is (`"q"r"`, log:815), dates formatted and
+  // bare; `noquote` drops the quotes (log:865) and `nonames` the header
+  // (log:893). `if` restricts the rows (dx_outs_if, log:838).
+  DelimWriteSpec spec;
+  spec.verb = "outsheet";
+  spec.delim = '\t';
   {
     std::string derr;
-    if (!readDelimiterOpt(parsed.opts, &delim, &derr)) return ioError(derr, "unsupported_option");
+    if (!readDelimiterOpt(parsed.opts, &spec.delim, &derr)) return ioError(derr, "unsupported_option");
   }
-  if (hasFlag(parsed.opts, "comma")) delim = ',';
+  if (hasFlag(parsed.opts, "comma")) spec.delim = ',';
+  spec.noLabel = hasFlag(parsed.opts, "nolabel");
+  spec.header = !hasFlag(parsed.opts, "nonames");
+  spec.dataFmt = true;
+  spec.quote = hasFlag(parsed.opts, "noquote") ? DelimWriteSpec::Quote::kNone
+                                               : DelimWriteSpec::Quote::kAllVerbatim;
 
   const bool replace = hasFlag(parsed.opts, "replace");
-  const std::string resolved = resolveUserPath(session, pathArg);
-  if (auto err = refuseExisting("outsheet", resolved, pathArg, replace)) return *err;
+  std::string resolved = resolveUserPath(session, pathArg);
+  // "If filename is specified without a suffix, .out is assumed" (outsheet
+  // help).
+  assumeSuffix(&resolved, &pathArg, ".out");
+  if (auto err = refuseExisting(resolved, pathArg, replace)) return *err;
   if (auto err = refuseIfSessionHbin(session, "outsheet", resolved, pathArg)) return *err;
 
-  // The option vector runExportDelimited reads. Built here rather than passed
-  // through, because the DEFAULT is this command's own decision: forwarding
-  // `parsed.opts` unchanged would write commas whenever `delimiter()` was
-  // absent, which is `export delimited`'s default and not this one's.
-  std::vector<std::pair<std::string, eval::OptValue>> outOpts;
-  outOpts.emplace_back("delimiter", eval::OptValue::ofString(delim == '\t' ? std::string("tab")
-                                                                          : std::string(1, delim)));
-  if (hasFlag(parsed.opts, "nolabel")) {
-    outOpts.emplace_back("nolabel", eval::OptValue::ofBool(true));
-  }
-  // `replace` is always passed: this handler has already made the
-  // does-it-exist decision, with the user's own spelling in the message.
-  outOpts.emplace_back("replace", eval::OptValue::ofBool(true));
-
-  ojson block = runExportDelimited(varlist, pathArg, outOpts, session);
-  if (isErrorBlock(block)) return reEchoPath(std::move(block), resolved, pathArg);
-  // The success line is THIS command's own, not the delegate's: forwarding
-  // runExportDelimited's would put the resolved absolute path in front of the
-  // user and into the freeze fixture (BUG-410).
-  return displayBlock("file " + pathArg + " saved");
+  spec.shown = pathArg;  // the writer names the file as typed (BUG-410)
+  return writeDelimitedFile(varlist, resolved, spec, parsed.ifExpr, parsed.inRange, session);
 }
 
 // ===========================================================================
@@ -1218,7 +1078,416 @@ std::vector<std::string> freeFormatValues(const std::string& bytes, std::vector<
 
 }  // namespace
 
-ojson runInfile(const eval::ParsedCommand& parsed, SessionState& session) {
+// ===========================================================================
+// infix / infile dictionaries (fixed columns)
+// ===========================================================================
+//
+// One fixed-column reader behind `infix` (command-line and dictionary specs)
+// and `infile`'s dictionary form. The rules are the oracle's (w2ar
+// log:3755-4064):
+//   * an untyped numeric is float, its values rounded to float (log:3772);
+//   * a bare `str` takes its column range's width, and a declared `str#`
+//     narrower than its range is widened to it (`str3 name 8-12` -> str5,
+//     log:3801); the width is the range's, not the data's (`8-40` -> str33);
+//   * a string field ends at a NUL byte and is trimmed of blanks, except an
+//     infile `%#S` field, which keeps them (log:4011 `[b c  ]`);
+//   * a blank, `.` or unreadable numeric field is missing; a range past the
+//     end of a line reads "" / missing (log:3838);
+//   * `if`/`in` keep the records they select (log:3826);
+//   * the reader wants an empty dataset: without `clear` over data, r(18)
+//     with the data kept; with `clear` the data go first, so a missing or
+//     unreadable dictionary leaves k=0 (log:3876-3900, 4052-4064).
+namespace {
+
+// `using ("data")` with a blank before the parenthesis is the same option as
+// `using("data")` in Stata (w2ar dx_inf_030_space rc 0, log:3968); the
+// tokenizer hands it over as a bare `using` followed by a key `"data")`.
+eval::ParsedCommand joinSpacedOptionValues(const eval::ParsedCommand& parsed) {
+  eval::ParsedCommand out = parsed;
+  out.opts.clear();
+  const auto& o = parsed.opts;
+  for (size_t i = 0; i < o.size(); ++i) {
+    if (o[i].second.isBool && i + 1 < o.size()) {
+      const std::string& nk = o[i + 1].first;
+      if (nk.size() >= 2 && (nk[0] == '(' || nk[0] == '"') && nk.back() == ')') {
+        std::string v = nk.substr(0, nk.size() - 1);
+        if (!v.empty() && v[0] == '(') v.erase(0, 1);
+        out.opts.emplace_back(o[i].first, eval::OptValue::ofString(v));
+        ++i;
+        continue;
+      }
+    }
+    out.opts.push_back(o[i]);
+  }
+  return out;
+}
+
+struct FixSlot {
+  std::string name;
+  int from = 1;  // 1-based, inclusive
+  int to = 1;
+  bool isString = false;
+  bool keepBlanks = false;  // infile %#S
+  std::string declaredType;  // "" untyped numeric, "str" bare, "strN", or a numeric type
+  std::string label;
+};
+
+// The storage type a slot's column takes.
+std::string fixSlotType(const FixSlot& s) {
+  if (!s.isString) return s.declaredType.empty() ? std::string("float") : s.declaredType;
+  const int width = std::max(1, s.to - s.from + 1);
+  if (lowerOf(s.declaredType) == "strl") return "strL";
+  int declared = 0;
+  if (s.declaredType.size() > 3) declared = std::atoi(s.declaredType.c_str() + 3);
+  return "str" + std::to_string(std::max(width, declared));
+}
+
+// The empty-dataset rule both readers share; nullopt = go on.
+std::optional<ojson> requireEmptyOrClear(const eval::ParsedCommand& parsed, SessionState& session) {
+  const bool clear = hasFlag(parsed.opts, "clear");
+  if (!session.hasData()) return std::nullopt;
+  if (!clear) {
+    Datastore* ds = nullptr;
+    try {
+      ds = session.datastore();
+    } catch (const std::exception&) {
+      ds = nullptr;
+    }
+    if (ds != nullptr && ds->nCols() > 0) {
+      return ioErrorRc("you must start with an empty dataset", 18);
+    }
+    return std::nullopt;
+  }
+  ojson cleared = runClear("", session);
+  if (isErrorBlock(cleared)) return cleared;
+  return std::nullopt;
+}
+
+// Read `bytes` through `slots`, stage it, adopt it and apply if/in.
+ojson readFixedAndAdopt(const std::string& verb, const std::string& bytes,
+                        const std::vector<FixSlot>& slots, const std::string& source,
+                        const eval::ParsedCommand& parsed, SessionState& session) {
+  delimited::Table table;
+  for (const auto& s : slots) {
+    table.names.push_back(s.name);
+    table.labels.push_back(s.label);
+    delimited::ColumnType ct;
+    ct.isString = s.isString;
+    ct.stataType = fixSlotType(s);
+    table.types.push_back(ct);
+  }
+  size_t start = 0;
+  const size_t n = bytes.size();
+  while (start < n) {
+    size_t eol = bytes.find('\n', start);
+    if (eol == std::string::npos) eol = n;
+    std::string line = bytes.substr(start, eol - start);
+    start = eol + 1;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) continue;  // a blank line is not a record
+    if (line.find('\t') != std::string::npos) {
+      // Columns are counted with tabs expanded to stops every 8 (w2ar
+      // dx_fx_fb16_L1map `1_______5___` for "1<tab>5<tab>2.5", log:2512).
+      std::string expanded;
+      for (char ch : line) {
+        if (ch == '\t') {
+          do expanded += ' ';
+          while (expanded.size() % 8 != 0);
+        } else {
+          expanded += ch;
+        }
+      }
+      line = std::move(expanded);
+    }
+    std::vector<std::string> row;
+    row.reserve(slots.size());
+    for (const auto& s : slots) {
+      std::string field;
+      if (static_cast<size_t>(s.from) <= line.size()) {
+        const size_t begin = static_cast<size_t>(s.from) - 1;
+        const size_t end = std::min(static_cast<size_t>(s.to), line.size());
+        field = line.substr(begin, end - begin);
+      }
+      if (s.isString) {
+        const size_t nul = field.find('\0');
+        if (nul != std::string::npos) field.resize(nul);
+        if (!s.keepBlanks) {
+          field = trimOf(field);
+          // A string field that opens with a double quote loses that quote
+          // (w2ar dx_outf_if_L1 `"b c"  "two"` reads `b c"  "two"`, log:4990;
+          // a lone `"` reads "", dx_fx_fd17_L1map).
+          if (!field.empty() && field.front() == '"') field.erase(0, 1);
+        }
+        row.push_back(field);
+        continue;
+      }
+      field = trimOf(field);
+      double d = 0.0;
+      if (field.empty() || field == "." || !parseStrictDouble(field, &d)) {
+        row.emplace_back();
+      } else {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.17g", d);
+        row.push_back(buf);
+      }
+    }
+    table.rows.push_back(std::move(row));
+  }
+  if (parsed.inRange.has_value() && !parsed.inRange->empty()) {
+    // `in` names RECORDS to read: a range past the last record reads what
+    // there is (an empty file `in 1` is N=0 at rc 0, w2ar dx_fx_fc15_L1map).
+    const int64_t nRec = static_cast<int64_t>(table.rows.size());
+    InRangeBounds rr = parseInRangeBounds(*parsed.inRange, nRec);
+    if (!rr.ok && parsed.inRange->find_first_of("lL-") == std::string::npos) {
+      rr = parseInRangeBounds(*parsed.inRange, std::numeric_limits<int32_t>::max());
+    }
+    if (!rr.ok) {
+      InRangeFilterResult fr;
+      fr.ok = false;
+      fr.refusal = rr.refusal;
+      return inRangeRejectError(fr, *parsed.inRange, verb);
+    }
+    const int64_t a = std::min<int64_t>(rr.a - 1, nRec);
+    const int64_t b = std::min<int64_t>(rr.b, nRec);
+    std::vector<std::vector<std::string>> kept(table.rows.begin() + static_cast<std::ptrdiff_t>(a),
+                                               table.rows.begin() + static_cast<std::ptrdiff_t>(std::max(a, b)));
+    table.rows = std::move(kept);
+  }
+  if (auto err = delimited::stageAndAdopt(session, table, verb, source)) return *err;
+  if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) {
+    InRangeFilterResult fr;
+    try {
+      fr = applyIfAndInFilter(session, *session.currentHbin(), parsed.ifExpr, std::nullopt);
+    } catch (const CobraError& ce) {
+      return ioError(cobraErrorMessage(ce), ce.code);
+    }
+    if (fr.dataPath != *session.currentHbin()) {
+      session.load(fr.dataPath);
+      session.invalidateDatastore();
+    }
+  }
+  return mutationResult(session, verb);
+}
+
+// One dictionary file: its optional `using` data file, its entries, and the
+// data lines that follow `}` when it names no file.
+struct Dictionary {
+  std::string usingFile;
+  std::vector<std::string> entries;  // the lines between { and }
+  std::string trailingData;
+  bool ok = false;
+};
+
+Dictionary readDictionary(const std::string& text) {
+  Dictionary d;
+  const size_t open = text.find('{');
+  if (open == std::string::npos) return d;
+  const size_t close = text.find('}', open);
+  if (close == std::string::npos) return d;
+  const std::string head = trimOf(text.substr(0, open));
+  // [infix|infile] dictionary [using FILE]
+  std::vector<std::string> hw = quoteAwareWords(head);
+  size_t i = 0;
+  if (i < hw.size() && (lowerOf(hw[i]) == "infix" || lowerOf(hw[i]) == "infile")) ++i;
+  if (i >= hw.size() || lowerOf(hw[i]) != "dictionary") return d;
+  ++i;
+  if (i < hw.size()) {
+    if (lowerOf(hw[i]) != "using" || i + 1 >= hw.size()) return d;
+    d.usingFile = hw[i + 1];
+    i += 2;
+  }
+  if (i != hw.size()) return d;
+  const std::string body = text.substr(open + 1, close - open - 1);
+  size_t p = 0;
+  while (p <= body.size()) {
+    size_t e = body.find('\n', p);
+    if (e == std::string::npos) e = body.size();
+    std::string line = trimOf(body.substr(p, e - p));
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    p = e + 1;
+    if (line.empty() || line[0] == '*' || line.compare(0, 2, "//") == 0) continue;
+    d.entries.push_back(line);
+  }
+  size_t after = close + 1;
+  if (after < text.size() && text[after] == '\r') ++after;
+  if (after < text.size() && text[after] == '\n') ++after;
+  d.trailingData = after < text.size() ? text.substr(after) : std::string();
+  d.ok = true;
+  return d;
+}
+
+// `#[-#]` -> from/to.
+bool parseColRange(const std::string& spec, int* from, int* to) {
+  long long a = 0, b = 0;
+  const size_t dash = spec.find('-');
+  if (dash == std::string::npos) {
+    if (!parseStrictInt(spec, &a) || a < 1) return false;
+    b = a;
+  } else if (!parseStrictInt(spec.substr(0, dash), &a) || !parseStrictInt(spec.substr(dash + 1), &b) ||
+             a < 1 || b < a) {
+    return false;
+  }
+  *from = static_cast<int>(a);
+  *to = static_cast<int>(b);
+  return true;
+}
+
+// infix's command-line / dictionary spec: `[type] name #[-#]` repeated.
+std::optional<ojson> parseInfixSpec(const std::vector<std::string>& words, std::vector<FixSlot>* slots) {
+  std::string pendingType;
+  bool pendingIsString = false;
+  std::string pendingName;
+  for (const auto& w : words) {
+    bool isStr = false;
+    if (pendingName.empty() && (isTypeToken(w, &isStr) || lowerOf(w) == "str")) {
+      if (lowerOf(w) == "str") isStr = true;
+      pendingType = lowerOf(w);
+      pendingIsString = isStr;
+      continue;
+    }
+    if (!w.empty() && std::isdigit(static_cast<unsigned char>(w[0]))) {
+      if (pendingName.empty()) {
+        return ioSyntax("infix: column range `" + w + "` does not follow a variable name");
+      }
+      FixSlot s;
+      if (!parseColRange(w, &s.from, &s.to)) {
+        return ioSyntax("infix: `" + w + "` is not a column range (expected #-# with the first "
+                        "column no greater than the last)");
+      }
+      s.name = pendingName;
+      s.isString = pendingIsString;
+      s.declaredType = pendingType;
+      slots->push_back(s);
+      pendingName.clear();
+      pendingType.clear();
+      pendingIsString = false;
+      continue;
+    }
+    if (!pendingName.empty()) return ioSyntax("infix: variable " + pendingName + " has no column range");
+    if (!strutil::isValidStataIdentifier(w)) {
+      return ioSyntax("infix: invalid variable name `" + w + "' — " +
+                      strutil::stataIdentifierRuleText());
+    }
+    pendingName = w;
+  }
+  if (!pendingName.empty()) return ioSyntax("infix: variable " + pendingName + " has no column range");
+  if (slots->empty()) return ioSyntax("infix: no variables named");
+  std::set<std::string> seen;
+  for (const auto& s : *slots) {
+    if (!seen.insert(s.name).second) return ioSyntax("infix: variable " + s.name + " named twice");
+  }
+  return std::nullopt;
+}
+
+// infile's dictionary entries: `[_column(#)] [type] name [%fmt] ["label"]`.
+// The field starts at _column(#) (else where the previous one ended) and is
+// as wide as the input format says (%4f, %5s, %5S).
+std::optional<ojson> parseInfileDictionary(const std::vector<std::string>& entries,
+                                           std::vector<FixSlot>* slots) {
+  int nextCol = 1;
+  for (const auto& line : entries) {
+    std::vector<std::string> w = quoteAwareWords(line);
+    size_t i = 0;
+    FixSlot s;
+    int col = nextCol;
+    if (i < w.size() && lowerOf(w[i]).compare(0, 8, "_column(") == 0 && w[i].back() == ')') {
+      long long c = 0;
+      if (!parseStrictInt(w[i].substr(8, w[i].size() - 9), &c) || c < 1)
+        return ioSyntax("infile: invalid dictionary entry `" + line + "`");
+      col = static_cast<int>(c);
+      ++i;
+    }
+    bool isStr = false;
+    if (i < w.size() && isTypeToken(w[i], &isStr)) {
+      s.declaredType = lowerOf(w[i]);
+      s.isString = isStr;
+      ++i;
+    }
+    if (i >= w.size() || !strutil::isValidStataIdentifier(w[i]))
+      return ioSyntax("infile: invalid dictionary entry `" + line + "`");
+    s.name = w[i++];
+    int width = 0;
+    if (i < w.size() && !w[i].empty() && w[i][0] == '%') {
+      const std::string f = w[i++];
+      size_t k = 1;
+      while (k < f.size() && std::isdigit(static_cast<unsigned char>(f[k]))) ++k;
+      width = std::atoi(f.substr(1, k - 1).c_str());
+      // `%#S` keeps the field's blanks.
+      if (k < f.size() && f[k] == 'S') s.keepBlanks = true;
+    }
+    if (i < w.size()) {
+      const std::string lab = w[i++];
+      if (lab.size() >= 2 && lab.front() == '"' && lab.back() == '"')
+        s.label = lab.substr(1, lab.size() - 2);
+      else
+        return ioSyntax("infile: invalid dictionary entry `" + line + "`");
+    }
+    if (i != w.size()) return ioSyntax("infile: invalid dictionary entry `" + line + "`");
+    if (width <= 0 && s.isString && s.declaredType.size() > 3)
+      width = std::atoi(s.declaredType.c_str() + 3);
+    if (width <= 0) return ioSyntax("infile: dictionary entry `" + line + "` has no field width");
+    s.from = col;
+    s.to = col + width - 1;
+    nextCol = s.to + 1;
+    if (s.isString) {
+      // An infile string keeps its DECLARED width (str5 over %5s, log:3958).
+      if (s.declaredType.size() <= 3) s.declaredType = "str" + std::to_string(width);
+      s.to = s.from + width - 1;
+    }
+    slots->push_back(s);
+  }
+  if (slots->empty()) return ioSyntax("infile: the dictionary declares no variables");
+  return std::nullopt;
+}
+
+// Reads the dictionary at `dictPath` and the data it points to (the using()
+// option, the dictionary's own `using FILE`, or the lines after `}`).
+ojson runDictionaryRead(const std::string& verb, const std::string& dictArg,
+                        const eval::ParsedCommand& parsed, SessionState& session) {
+  std::string dictPath = resolveUserPath(session, dictArg);
+  std::string dictShown = typedUserPath(dictArg);
+  assumeSuffix(&dictPath, &dictShown, ".dct");
+  session.materializeVirtualSave(dictPath);
+  if (!pathExists(dictPath)) return ioErrorRc("file " + dictShown + " not found", 601);
+  auto dictBytes = readWholeFile(dictPath);
+  if (!dictBytes.has_value()) return ioError(verb + ": cannot read " + dictShown, "data_io");
+  const Dictionary d = readDictionary(*dictBytes);
+  if (!d.ok) return ioSyntax(verb + ": " + dictShown + " is not a dictionary");
+  std::vector<FixSlot> slots;
+  if (verb == "infix") {
+    std::vector<std::string> words;
+    for (const auto& e : d.entries)
+      for (const auto& w : quoteAwareWords(e)) words.push_back(w);
+    if (auto err = parseInfixSpec(words, &slots)) return *err;
+  } else {
+    if (auto err = parseInfileDictionary(d.entries, &slots)) return *err;
+  }
+  std::string dataArg;
+  if (auto u = optStrAny(parsed.opts, {"using"})) dataArg = *u;
+  else if (!d.usingFile.empty()) dataArg = dequote(d.usingFile);
+  std::string bytes;
+  std::string source = dictPath;
+  if (!dataArg.empty()) {
+    std::string dataPath = resolveUserPath(session, dataArg);
+    std::string dataShown = typedUserPath(dataArg);
+    assumeSuffix(&dataPath, &dataShown, ".raw");
+    session.materializeVirtualSave(dataPath);
+    if (!pathExists(dataPath)) return ioErrorRc("file " + dataShown + " not found", 601);
+    auto b = readWholeFile(dataPath);
+    if (!b.has_value()) return ioError(verb + ": cannot read " + dataShown, "data_io");
+    bytes = *b;
+    source = dataPath;
+  } else {
+    bytes = d.trailingData;
+  }
+  return readFixedAndAdopt(verb, bytes, slots, source, parsed, session);
+}
+
+}  // namespace
+
+
+ojson runInfile(const eval::ParsedCommand& parsedIn, SessionState& session) {
+  const eval::ParsedCommand parsed = joinSpacedOptionValues(parsedIn);
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabInfile.known,
                                             kVocabInfile.unimplemented)) {
     return ojson(*err);
@@ -1229,12 +1498,12 @@ ojson runInfile(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!splitUsing(quoteAwareWords(preCommaArgs(parsed.raw)), &words, &pathArg)) {
     return ioSyntax("infile: missing the file. Usage: infile varlist using \"file\" [, clear]");
   }
+  if (auto err = requireEmptyOrClear(parsed, session)) return *err;
   if (words.empty()) {
-    // `infile using dict.dct` -- the DICTIONARY form, which is a whole second
-    // grammar (a .dct file describing the layout). Refused by name.
-    return ioRefusal("infile", "no_dictionary_reader",
-                     "infile: the dictionary form (`infile using file.dct`) is not implemented in "
-                     "this build — give the variable list on the command line instead.");
+    // `infile using dict [, using(data)]` -- the dictionary form, 166 of the
+    // corpus's 168 infile lines (w2ar dx_inf_010_dict log:3953, the dictionary
+    // naming its data file dx_inf_037 log:4007).
+    return runDictionaryRead("infile", pathArg, parsed, session);
   }
 
   // -- the varlist spec ----------------------------------------------------
@@ -1289,10 +1558,12 @@ ojson runInfile(const eval::ParsedCommand& parsed, SessionState& session) {
     }
   }
 
-  const std::string resolved = resolveUserPath(session, pathArg);
-  if (!pathExists(resolved)) return ioErrorRc("infile: file " + pathArg + " not found", 601);
+  std::string resolved = resolveUserPath(session, pathArg);
+  std::string shown = typedUserPath(pathArg);
+  assumeSuffix(&resolved, &shown, ".raw");
+  if (!pathExists(resolved)) return ioErrorRc("file " + shown + " not found", 601);
   auto bytes = readWholeFile(resolved);
-  if (!bytes.has_value()) return ioError("infile: cannot read " + pathArg, "data_io");
+  if (!bytes.has_value()) return ioError("infile: cannot read " + shown, "data_io");
 
   std::vector<char> quoted;
   const std::vector<std::string> values = freeFormatValues(*bytes, &quoted);
@@ -1363,15 +1634,8 @@ ojson runInfile(const eval::ParsedCommand& parsed, SessionState& session) {
   return out;
 }
 
-// ===========================================================================
-// infix (fixed columns)
-// ===========================================================================
-//
-// Decision 3, the fixed-column half. `infix [type] var #[-#] ... using f`.
-// Column numbers are 1-BASED and INCLUSIVE, counted in bytes; a range that runs
-// past the end of a line yields missing rather than an error, and so does a
-// field that is blank. A `str#` prefix makes the variable a string column.
-ojson runInfix(const eval::ParsedCommand& parsed, SessionState& session) {
+ojson runInfix(const eval::ParsedCommand& parsedIn, SessionState& session) {
+  const eval::ParsedCommand parsed = joinSpacedOptionValues(parsedIn);
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabInfix.known,
                                             kVocabInfix.unimplemented)) {
     return ojson(*err);
@@ -1379,144 +1643,29 @@ ojson runInfix(const eval::ParsedCommand& parsed, SessionState& session) {
 
   std::vector<std::string> words;
   std::string pathArg;
-  if (!splitUsing(quoteAwareWords(preCommaArgs(parsed.raw)), &words, &pathArg)) {
+  if (!splitUsing(dropQualifierWords(quoteAwareWords(preCommaArgs(parsed.raw))), &words,
+                  &pathArg)) {
     return ioSyntax("infix: missing the file. Usage: infix [type] var #-# [...] using \"file\" "
                     "[, clear]");
   }
-  if (words.empty()) {
-    return ioRefusal("infix", "no_dictionary_reader",
-                     "infix: the dictionary form (`infix using file.dct`) is not implemented in "
-                     "this build — give the column specification on the command line instead.");
-  }
-
-  struct FixSlot {
-    std::string name;
-    int from = 1;  // 1-based, inclusive
-    int to = 1;
-    bool isString = false;
-    std::string declaredType;
-  };
   std::vector<FixSlot> slots;
-  {
-    std::string pendingType;
-    bool pendingIsString = false;
-    std::string pendingName;
-    auto flushRange = [&](const std::string& spec) -> std::optional<ojson> {
-      if (pendingName.empty()) {
-        return ioSyntax("infix: column range `" + spec + "` does not follow a variable name");
-      }
-      long long a = 0, b = 0;
-      const size_t dash = spec.find('-');
-      if (dash == std::string::npos) {
-        if (!parseStrictInt(spec, &a) || a < 1) {
-          return ioSyntax("infix: `" + spec + "` is not a column number");
-        }
-        b = a;
-      } else {
-        if (!parseStrictInt(spec.substr(0, dash), &a) ||
-            !parseStrictInt(spec.substr(dash + 1), &b) || a < 1 || b < a) {
-          return ioSyntax("infix: `" + spec + "` is not a column range (expected #-# with the "
-                          "first column no greater than the last)");
-        }
-      }
-      FixSlot s;
-      s.name = pendingName;
-      s.from = static_cast<int>(a);
-      s.to = static_cast<int>(b);
-      s.isString = pendingIsString;
-      s.declaredType = pendingType;
-      slots.push_back(s);
-      pendingName.clear();
-      pendingType.clear();
-      pendingIsString = false;
-      return std::nullopt;
-    };
-    for (const auto& w : words) {
-      bool isStr = false;
-      if (pendingName.empty() && isTypeToken(w, &isStr)) {
-        pendingType = lowerOf(w);
-        pendingIsString = isStr;
-        continue;
-      }
-      const bool looksLikeRange =
-          !w.empty() && (std::isdigit(static_cast<unsigned char>(w[0])) != 0);
-      if (looksLikeRange) {
-        if (auto err = flushRange(w)) return *err;
-        continue;
-      }
-      if (!pendingName.empty()) {
-        return ioSyntax("infix: variable " + pendingName + " has no column range");
-      }
-      if (!strutil::isValidStataIdentifier(w)) {
-        return ioSyntax("infix: invalid variable name `" + w + "' — " +
-                        strutil::stataIdentifierRuleText());
-      }
-      pendingName = w;
-    }
-    if (!pendingName.empty()) {
-      return ioSyntax("infix: variable " + pendingName + " has no column range");
-    }
+  if (!words.empty()) {
+    if (auto err = parseInfixSpec(words, &slots)) return *err;
   }
-  if (slots.empty()) return ioSyntax("infix: no variables named");
-  {
-    std::set<std::string> seen;
-    for (const auto& s : slots) {
-      if (!seen.insert(s.name).second) return ioSyntax("infix: variable " + s.name + " named twice");
-    }
+  if (auto err = requireEmptyOrClear(parsed, session)) return *err;
+  if (words.empty()) {
+    // `infix using dict [, using(data)]` -- the dictionary form (w2ar
+    // dx_ifx_dict, log:3857).
+    return runDictionaryRead("infix", pathArg, parsed, session);
   }
-
-  const std::string resolved = resolveUserPath(session, pathArg);
-  if (!pathExists(resolved)) return ioErrorRc("infix: file " + pathArg + " not found", 601);
-
-  CsvTable table;
-  for (const auto& s : slots) {
-    table.names.push_back(s.name);
-    table.isFactor.push_back(s.isString ? 1 : 0);
-  }
-  {
-    std::ifstream f(cecon::to_native_path(resolved), std::ios::binary);
-    if (!f) return ioError("infix: cannot read " + pathArg, "data_io");
-    std::string line;
-    while (std::getline(f, line)) {
-      while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-      if (line.empty()) continue;  // a blank line is not a record
-      std::vector<std::string> row;
-      for (const auto& s : slots) {
-        std::string field;
-        if (static_cast<size_t>(s.from) <= line.size()) {
-          const size_t begin = static_cast<size_t>(s.from) - 1;
-          const size_t end = std::min(static_cast<size_t>(s.to), line.size());
-          field = line.substr(begin, end - begin);
-        }
-        field = trimOf(field);
-        if (s.isString) {
-          row.push_back(field);
-          continue;
-        }
-        double d = 0.0;
-        // Blank, or unreadable as a number, is MISSING -- Stata's own
-        // fixed-column behaviour, and the reason infix has no "bad field"
-        // error: a column range is a guess about a layout, and a wrong guess
-        // must not silently become a number.
-        if (field.empty() || field == "." || !parseStrictDouble(field, &d)) {
-          row.emplace_back();
-        } else {
-          row.push_back(eval::pythonFloatRepr(d));
-        }
-      }
-      table.rows.push_back(std::move(row));
-    }
-    if (f.bad()) return ioError("infix: failed reading " + pathArg, "data_io");
-  }
-
-  std::string hbin;
-  if (auto err = writeAndConvert(session, table, "infix", &hbin)) return *err;
-  adoptLoadedFrame(session, hbin, resolved);
-  for (const auto& s : slots) {
-    if (s.declaredType.empty()) continue;
-    session.varMeta[s.name].stataType = s.declaredType;
-  }
-  return mutationResult(session, "infix");
+  std::string resolved = resolveUserPath(session, pathArg);
+  std::string shown = typedUserPath(pathArg);
+  assumeSuffix(&resolved, &shown, ".raw");
+  session.materializeVirtualSave(resolved);  // BUG-125: a save_virtual'd tempfile becomes real
+  if (!pathExists(resolved)) return ioErrorRc("file " + shown + " not found", 601);
+  auto bytes = readWholeFile(resolved);
+  if (!bytes.has_value()) return ioError("infix: cannot read " + shown, "data_io");
+  return readFixedAndAdopt("infix", *bytes, slots, resolved, parsed, session);
 }
 
 // ===========================================================================
@@ -1533,93 +1682,225 @@ ojson runOutfile(const eval::ParsedCommand& parsed, SessionState& session) {
                                             kVocabOutfile.unimplemented)) {
     return ojson(*err);
   }
-  if (auto err = refuseQualifiers(parsed, "outfile")) return *err;
   if (!session.hasData()) return ojson(eval::noDataLoaded());
 
   std::vector<std::string> varlist;
   std::string pathArg;
-  if (!splitUsing(quoteAwareWords(preCommaArgs(parsed.raw)), &varlist, &pathArg)) {
+  if (!splitUsing(dropQualifierWords(quoteAwareWords(preCommaArgs(parsed.raw))), &varlist,
+                  &pathArg)) {
     return ioSyntax("outfile: missing the file. Usage: outfile [varlist] using \"file\" "
-                    "[, replace comma noquote nolabel]");
+                    "[, replace comma noquote nolabel wide]");
   }
 
   const bool replace = hasFlag(parsed.opts, "replace");
   const bool noQuote = hasFlag(parsed.opts, "noquote");
   const bool noLabel = hasFlag(parsed.opts, "nolabel");
-  const char sep = hasFlag(parsed.opts, "comma") ? ',' : ' ';
+  const bool comma = hasFlag(parsed.opts, "comma");
+  const bool wide = hasFlag(parsed.opts, "wide");
 
-  const std::string resolved = resolveUserPath(session, pathArg);
-  if (auto err = refuseExisting("outfile", resolved, pathArg, replace)) return *err;
+  std::string resolved = resolveUserPath(session, pathArg);
+  // "If filename is specified without a suffix, .raw is assumed" (outfile
+  // help; StataBE `outfile using o2` names `o2.raw`).
+  assumeSuffix(&resolved, &pathArg, ".raw");
+  if (auto err = refuseExisting(resolved, pathArg, replace)) return *err;
   if (auto err = refuseIfSessionHbin(session, "outfile", resolved, pathArg)) return *err;
 
-  Datastore* ds = nullptr;
+  Datastore* base = nullptr;
   try {
-    ds = session.datastore();
+    base = session.datastore();
   } catch (const std::exception& e) {
     return ioError(std::string("outfile: the dataset in memory could not be read — ") + e.what(),
                    "data_io");
   }
-  if (ds == nullptr) return ojson(eval::noDataLoaded());
+  if (base == nullptr) return ojson(eval::noDataLoaded());
   std::vector<std::string> cols = varlist;
-  if (cols.empty()) cols = ds->names();
+  if (cols.empty()) cols = base->names();
   for (const auto& v : cols) {
-    if (!ds->has(v)) return ioError("variable " + v + " not found", "unknown_variable");
+    if (!base->has(v)) return ioError("variable " + v + " not found", "unknown_variable");
   }
 
+  // Each variable's field, laid out the way Stata's outfile does (w2ar
+  // log:941-999): a numeric right-aligned in its display format's width, a
+  // string `"quoted"` and left-aligned in its str# width plus the two quotes,
+  // a date (or a value label) quoted as text; fields two blanks apart; a
+  // record wider than 80 columns continues on the next line unless `wide`.
+  // `noquote` drops the quotes but the line keeps its quoted length.
   struct OutCol {
-    const cecon::Column* col = nullptr;
     const std::map<std::string, std::string>* labels = nullptr;
+    std::string fmt;
+    char dateFamily = 0;
+    bool isString = false;
+    int width = 0;   // the field's width, quotes included
   };
   std::vector<OutCol> oc;
   oc.reserve(cols.size());
   for (const auto& name : cols) {
     OutCol o;
-    o.col = &ds->col(name);
-    if (!noLabel) o.labels = labelsFor(session, name);
+    const cecon::Column& col = base->col(name);
+    if (col.dtype == cecon::DType::Factor) {
+      o.isString = true;
+      int w = 0;
+      auto vm = session.varMeta.find(name);
+      if (vm != session.varMeta.end() && vm->second.stataType.has_value() &&
+          vm->second.stataType->size() > 3 && vm->second.stataType->compare(0, 3, "str") == 0 &&
+          std::isdigit(static_cast<unsigned char>((*vm->second.stataType)[3]))) {
+        w = std::atoi(vm->second.stataType->c_str() + 3);
+      }
+      for (const auto& lv : col.levels) w = std::max(w, static_cast<int>(lv.size()));
+      o.width = std::max(w, 1) + 2;
+    } else {
+      if (!noLabel) o.labels = labelsFor(session, name);
+      o.fmt = session.displayFormat(base->varinfo(name));
+      std::string f = o.fmt;
+      if (!f.empty() && f[0] == '%') f.erase(0, 1);
+      if (!f.empty() && f[0] == '-') f.erase(0, 1);
+      int w = std::atoi(f.c_str());
+      if (w <= 0) w = 9;
+      if (f.size() >= 2 && f[0] == 't') {
+        o.dateFamily = f.size() >= 2 ? f[1] : 0;
+        w += 2;  // a date is written quoted
+      }
+      if (o.labels != nullptr) {
+        // A labeled numeric is written quoted: its field is the wider of the
+        // format and the longest label, plus the quotes.
+        int lw = 0;
+        for (const auto& kv : *o.labels) lw = std::max(lw, static_cast<int>(kv.second.size()));
+        w = std::max(w, lw) + 2;
+      }
+      o.width = w;
+    }
     oc.push_back(o);
   }
 
-  // Quote a string exactly the way Stata's `outfile` does: wrap it, and double
-  // an embedded quote so the value survives being read back.
-  auto quoteText = [&](const std::string& s) {
-    if (noQuote) return s;
-    std::string out = "\"";
-    for (char c : s) {
-      if (c == '"') out += "\"";
-      out += c;
+  Datastore* ds = base;
+  std::unique_ptr<Datastore> filtered;
+  // `outfile s g if year == 2001 using f` puts the qualifier BEFORE `using`;
+  // the expression ends where `using` begins (w2ar dx_outf_if, log:4990).
+  std::optional<std::string> ifExpr = parsed.ifExpr;
+  if (ifExpr.has_value()) {
+    static const std::regex reUsingTail(R"(\s+using\s.*$)");
+    ifExpr = std::regex_replace(*ifExpr, reUsingTail, "");
+  }
+  if ((ifExpr.has_value() && !ifExpr->empty()) ||
+      (parsed.inRange.has_value() && !parsed.inRange->empty())) {
+    InRangeFilterResult fr;
+    try {
+      fr = applyIfAndInFilter(session, base->path(), ifExpr, parsed.inRange);
+    } catch (const CobraError& ce) {
+      return ioError(cobraErrorMessage(ce), ce.code);
     }
-    out += "\"";
-    return out;
+    if (!fr.ok) return inRangeRejectError(fr, parsed.inRange.value_or(std::string()), "outfile");
+    filtered = std::make_unique<Datastore>(fr.dataPath);
+    ds = filtered.get();
+  }
+  std::vector<const cecon::Column*> colp;
+  for (const auto& name : cols) colp.push_back(&ds->col(name));
+
+  auto quoted = [&](const std::string& t) { return noQuote ? t : "\"" + t + "\""; };
+  auto rtrim = [](std::string t) {
+    while (!t.empty() && t.back() == ' ') t.pop_back();
+    return t;
   };
 
   std::string body;
   const int64_t n = ds->nRows();
-  body.reserve(static_cast<size_t>(n) * cols.size() * 12 + 64);
   for (int64_t r = 0; r < n; ++r) {
+    size_t budget = 0;  // each field costs its width plus 2 against the 80 columns
+    if (comma) {
+      // The comma form: values only, comma-separated.
+      for (size_t c = 0; c < oc.size(); ++c) {
+        if (c) body += ',';
+        const cecon::Column& col = *colp[c];
+        if (col.dtype == cecon::DType::Factor) {
+          const int32_t code = col.codes()[r];
+          body += quoted(code < 0 ? std::string() : col.levels[static_cast<size_t>(code)]);
+          continue;
+        }
+        const double v = col.f64()[r];
+        if (const std::string* lbl = labelTextFor(oc[c].labels, v)) {
+          body += quoted(*lbl);
+          continue;
+        }
+        body += std::isnan(v) ? std::string(".") : fmt::general(v, 10, 0);
+      }
+      body += '\n';
+      continue;
+    }
+    std::string line, layout;  // `layout` = the line as quoted mode would lay it out
     for (size_t c = 0; c < oc.size(); ++c) {
-      if (c) body += sep;
-      const cecon::Column& col = *oc[c].col;
+      const OutCol& o = oc[c];
+      const cecon::Column& col = *colp[c];
+      std::string text;     // the field's characters
+      bool leftAlign = false;
+      bool isQuotedKind = false;
       if (col.dtype == cecon::DType::Factor) {
         const int32_t code = col.codes()[r];
-        if (code < 0 || static_cast<size_t>(code) >= col.levels.size()) {
-          // A genuinely missing STRING cell. Stata writes an empty quoted
-          // string there, not `.` -- `.` is the numeric missing token and
-          // would read back as the one-character text ".".
-          body += quoteText(std::string());
+        text = code < 0 ? std::string() : col.levels[static_cast<size_t>(code)];
+        leftAlign = true;
+        isQuotedKind = true;
+      } else {
+        const double v = col.f64()[r];
+        if (const std::string* lbl = labelTextFor(o.labels, v)) {
+          text = *lbl;
+          leftAlign = true;
+          isQuotedKind = true;
+        } else if (std::isnan(v)) {
+          text = ".";
+        } else if (o.dateFamily != 0) {
+          std::string d;
+          try {
+            d = eval::applyStataFmt(v, o.fmt);
+          } catch (...) {
+            d.clear();
+          }
+          text = trimOf(d);
+          leftAlign = true;
+          isQuotedKind = true;
         } else {
-          body += quoteText(col.levels[static_cast<size_t>(code)]);
+          std::string t;
+          try {
+            t = eval::applyStataFmt(v, o.fmt);
+          } catch (...) {
+            t = fmt::general(v, 10, 0);
+          }
+          text = trimOf(t);
         }
-        continue;
       }
-      const double v = col.f64()[r];
-      if (const std::string* lbl = labelTextFor(oc[c].labels, v)) {
-        body += quoteText(*lbl);
-        continue;
+      const std::string shown = isQuotedKind ? quoted(text) : text;
+      const std::string laid = isQuotedKind ? "\"" + text + "\"" : text;
+      const size_t w = static_cast<size_t>(o.width);
+      auto pad = [&](const std::string& t, size_t width) {
+        if (t.size() >= width) return t;
+        return leftAlign ? t + std::string(width - t.size(), ' ')
+                         : std::string(width - t.size(), ' ') + t;
+      };
+      const size_t fieldW = std::max(w, laid.size());
+      // A record continues on a new line once its fields (each with its 2
+      // separator columns) would pass 80 (dx_outf_all writes the date of
+      // every record on its own line, log:969-978).
+      if (!layout.empty() && !wide && budget + fieldW + 2 > 80) {
+        const std::string lt = rtrim(layout);
+        std::string ln = rtrim(line);
+        if (ln.size() < lt.size()) ln += std::string(lt.size() - ln.size(), ' ');
+        body += ln + "\n";
+        line.clear();
+        layout.clear();
+        budget = 0;
       }
-      // Missing is `.`, never 0 -- in every cell this file writes.
-      body += std::isnan(v) ? std::string(".") : fmt::general(v, 10, 0);
+      budget += fieldW + 2;
+      if (!layout.empty()) {
+        line += "  ";
+        layout += "  ";
+      }
+      // noquote: the field is two narrower, the line keeps its length at the
+      // end (dx_outf_noquote_wide `       2  b c             2.02  `).
+      line += pad(shown, isQuotedKind && noQuote ? (w >= 2 ? w - 2 : 0) : w);
+      layout += pad(laid, w);
     }
-    body += '\n';
+    const std::string lt = rtrim(layout);
+    std::string ln = rtrim(line);
+    if (ln.size() < lt.size()) ln += std::string(lt.size() - ln.size(), ' ');
+    body += ln + "\n";
   }
 
   if (auto err = commitBytes("outfile", resolved, pathArg, body)) return *err;
@@ -1660,37 +1941,36 @@ ojson runSaveold(const eval::ParsedCommand& parsed, SessionState& session) {
   if (version.has_value() && version->empty()) {
     return ioSyntax("saveold: version() needs a value, e.g. version(12)");
   }
-
-  // The characteristic is written BEFORE the save so the sidecar carries it
-  // into the produced .dta, and removed again if the save fails -- a note about
-  // a file that does not exist would be a lie the next `describe` repeated.
-  std::vector<DtaCharacteristic> restore = session.characteristics;
   if (version.has_value()) {
-    auto& chars = session.characteristics;
-    chars.erase(std::remove_if(chars.begin(), chars.end(),
-                               [](const DtaCharacteristic& c) {
-                                 return c.varname == "_dta" &&
-                                        c.charname == "_piet_saveold_version";
-                               }),
-                chars.end());
-    chars.push_back(DtaCharacteristic{"_dta", "_piet_saveold_version", *version});
+    // saveold writes releases for Stata 11 through 14 only; any other
+    // version() is r(198) and no file is written (w2ar dx_svo_v10
+    // `version(10)` 198 conf=601, log:4219).
+    long long v = 0;
+    if (!parseStrictInt(*version, &v) || v < 11 || v > 14) {
+      return ioErrorRc("version(" + *version + ") invalid; saveold writes Stata 11 through 14 "
+                       "datasets",
+                       198);
+    }
   }
 
-  const std::string resolved = resolveUserPath(session, spelling);
-  ojson saved = runSaveData(spelling, hasFlag(parsed.opts, "replace"), session);
-  if (isErrorBlock(saved)) {
-    session.characteristics = std::move(restore);
-    // runSaveData's SUCCESS echo already names the spelling it was handed
-    // (`effectiveFp`), so it needs no repair -- but several of its failure
-    // messages name the resolved destination (BUG-410).
-    return reEchoPath(std::move(saved), resolved, spelling);
+  // The release follows version(): 11 and 12 write format 115, 13 (and the
+  // bare form) 117, 14 format 118 -- genuine bytes of that release, whatever
+  // the file's extension (a tempfile included), as Stata's saveold does
+  // (w2ar_data_io_family.log dx_svo_019 rel 117, dx_svo_017_v12 / dx_svo_v11
+  // first byte 115, dx_svo_075_v13 117, dx_svo_v14 118).
+  int release = 117;
+  if (version.has_value()) {
+    long long v = 0;
+    (void)parseStrictInt(*version, &v);
+    release = v <= 12 ? 115 : (v == 13 ? 117 : 118);
   }
+  // runSaveData names the spelling it was handed (`effectiveFp`) in its echo
+  // and in every refusal (BUG-410), so its block goes out as it is.
+  ojson saved = runSaveData(spelling, hasFlag(parsed.opts, "replace"), session, release);
+  if (isErrorBlock(saved)) return saved;
 
   // EXACT text, pinned by the pangram section and by a do-file stdout check.
-  const std::string note =
-      version.has_value()
-          ? "(saveold: PIET writes Stata format 118; version(" + *version + ") recorded as a note)"
-          : "(saveold: PIET writes Stata format 118)";
+  const std::string note = "(saveold: PIET writes Stata format " + std::to_string(release) + ")";
   ojson out = ojson::array();
   out.push_back(std::move(saved));
   // `display`, NOT `echo`: type "echo" is the channel that renders the typed
@@ -2227,15 +2507,14 @@ ojson runFilefilter(const eval::ParsedCommand& parsed, SessionState& session) {
   const std::string inPath = resolveUserPath(session, inSpelling);
   const std::string outPath = resolveUserPath(session, outSpelling);
   if (!pathExists(inPath)) {
-    return ioErrorRc("filefilter: file " + inSpelling + " not found", 601);
+    return ioErrorRc("file " + typedUserPath(inSpelling) + " not found", 601);
   }
   // "Is the destination also a source?" -- here it can be, and must not be.
   if (sameFile(inPath, outPath)) {
     return ioError("filefilter: the input and the output must be different files (" + inSpelling +
                    " names both) — filter into a new file and rename it afterwards.");
   }
-  if (auto err = refuseExisting("filefilter", outPath, outSpelling,
-                                hasFlag(parsed.opts, "replace"))) {
+  if (auto err = refuseExisting(outPath, outSpelling, hasFlag(parsed.opts, "replace"))) {
     return *err;
   }
   if (auto err = refuseIfSessionHbin(session, "filefilter", outPath, outSpelling)) return *err;
@@ -2311,7 +2590,7 @@ ojson runCopy(const eval::ParsedCommand& parsed, SessionState& session) {
   const std::string src = resolveUserPath(session, srcSpelling);
   std::string dstSpell = dstSpelling;
   std::string dst = resolveUserPath(session, dstSpelling);
-  if (!pathExists(src)) return ioErrorRc("copy: file " + srcSpelling + " not found", 601);
+  if (!pathExists(src)) return ioErrorRc("file " + typedUserPath(srcSpelling) + " not found", 601);
   {
     std::error_code ec;
     if (std::filesystem::is_directory(cecon::to_native_path(dst), ec) && !ec) {
@@ -2324,9 +2603,7 @@ ojson runCopy(const eval::ParsedCommand& parsed, SessionState& session) {
     return ioError("copy: the source and the destination are the same file (" + srcSpelling + ")");
   }
   const bool replace = hasFlag(parsed.opts, "replace");
-  if (pathExists(dst) && !replace) {
-    return ioErrorRc("copy: file " + dstSpell + " already exists (specify option `replace`)", 602);
-  }
+  if (auto err = refuseExisting(dst, dstSpell, replace)) return *err;
   if (auto err = refuseIfSessionHbin(session, "copy", dst, dstSpell)) return *err;
 
   // Sibling temp + rename, so a failed copy never leaves a half file where a

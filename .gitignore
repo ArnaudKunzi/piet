@@ -1,9 +1,137 @@
-build*/
-**/build*/
+# ───────── CoBrA / cecon .gitignore ─────────
+# Build & distribution artifacts
+build/
+# build-wip and any sibling build tree, at ANY depth — 1,145 files of it were
+# TRACKED until 2026-09-01. (Inline comments are NOT gitignore syntax; the first
+# version of these two patterns carried one and matched nothing.)
+build-*/
+**/build-*/
+dist/
+/bin/          # engine binaries are git-external in the private coordination tree's releases/ (release standard, from 0.14.0)
+*.plugin
+*.o
+*.a
+*.dylib
+*.so
+*.dSYM/
+
+# OS / editor / scratch logs
 .DS_Store
+*.log
+*.tmp
+*.Rhistory
+.claude/
+# The project-scope Claude Code settings ARE law (deny list + PreToolUse guard,
+# GATES.md "Mechanical enforcement" 2026-09-02) and travel with the repo; local/ stays private.
+!.claude/
+.claude/*
+!.claude/settings.json
+/CLAUDE.md
+
+
+# ───────── Python artifacts
 __pycache__/
 *.pyc
-.env
-.env.*
-*.log
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.venv-gate/
+
+# ───────── DATA — NEVER commit datasets (privacy: KOWEPS / Wind / any research data) ─────────
+# Binary / columnar data anywhere in the tree
+*.hbin
+*.dta
+*.parquet
+*.sav
+*.arrow
+*.feather
+*.pkl
+*.npy
+# CSV: ignore ALL by default; allow ONLY the public eval goldens we author under tests/eval/golden/
+*.csv
+!tests/eval/golden/*.csv
+# ...including the wave subdirectories. `!tests/eval/golden/*.csv` matches one
+# level only, so an oracle that writes its renders into a per-wave folder (the
+# aer_b4/tables and aer_w1/w1b_tables shape) had its .csv silently dropped
+# while its .txt siblings landed -- and a table writer picks its format FROM
+# the extension, so the missing file is exactly the csv-mode pin. Same class as
+# the lane-symlink fix above: the intent was always "goldens we author under
+# tests/eval/golden/", and the pattern just could not spell a subdirectory.
+!tests/eval/golden/**/*.csv
+# GA sweep 2026-08-22 (leg ⑤, clonable build). The blanket `*.csv` above is a
+# PRIVACY rule — never commit datasets — and it was also swallowing the unit
+# tests' own ORACLE files. Measured on a clean clone with no coordination tree above it:
+# both binaries built, but ctest failed 80 of 92 with bare FileNotFoundErrors on
+# `tests/validate/*_golden.csv`. The tests were not broken; their answers had
+# never been committed, so a stranger who cloned this repo could verify 13% of it.
+# Whitelisted here because a golden IS the test — it is authored output, not data.
+# The one exception is deliberate and named below.
+!tests/validate/*_golden.csv
+# tsma_golden.csv is 39 MB — 99.7% of all golden bytes, against <100 KB for the
+# other forty combined. It stays ignored rather than quietly pushing a 39 MB blob
+# into every future clone; the tsma test therefore still needs a provisioned
+# fixture, which is a named gap, not a silent one.
+tests/validate/tsma_golden.csv
+!piet/packaging/sample/fatalities.csv
+# BUGLOG probe fixtures: tiny, hand-written, read by name
+!**/buglog_probes/BUG-*.csv
+# ...and their RUN OUTPUTS, which are not fixtures. `tools/buglog_probes.py` runs each
+# probe with cwd = that directory (`subprocess.run(..., cwd=PROBES)`), so a probe that
+# writes a file — the only way to assert on a table WRITER's bytes — drops it there on
+# every run. Two of those (bug486.txt, bug487.txt) were committed on 2026-09-14 by a
+# `git add -A` taken right after a probe run, which makes the tree DIRTY after every
+# `probes` leg — and a dirty tree is precisely what merge_gate.sh refuses before it will
+# gate anything. Outputs are ignored; an INPUT fixture keeps landing under the same
+# `BUG-*` spelling the CSV rule uses.
+**/buglog_probes/*.txt
+**/buglog_probes/*.tex
+!**/buglog_probes/BUG-*.txt
+!**/buglog_probes/BUG-*.tex
+# (BUG-464's probe used to leave a .stbcal here, which this file used to ignore.
+# The probe now erases it BEFORE the assert that stops it, so there is nothing
+# to ignore -- and no rule sitting here to hide the NEXT probe's residue.)
+# hbin: synthetic panel datasets for golden validation are tracked exceptions
+!tests/validate/panel_synth.hbin
+!tests/validate/csdid_cluster_synth.hbin
+# dta: MI-216 — in-leg drdid 2x2 fixture, a v118 (pandas round-trip, bit-identical)
+# conversion of the public/synthetic drdid2x2 doubly-robust-DiD example dataset (id/t/Y/x1/x2/treat,
+# 600 rows) so piet_d2d3's d3h case can load it (engine's dta reader rejects the original's legacy
+# v114 format); no research/privacy data. See tests/eval/piet_d2d3/README.md item 4.
+!tests/eval/piet_d2d3/drdid2x2_v118.dta
+# csdid-cluster golden provenance: StataBE truth dumps (regenerable from csdid_cluster_golden.do)
+!tests/validate/csdid_cluster_synth_TRUTH.csv
+!tests/validate/csdid_cluster_synth_TRUTH_V.csv
+!tests/validate/csdid_cluster_synth_SIMPLE.csv
+.audit-2026-06-22/
+
+# WebView2 Evergreen bootstrapper — Microsoft's binary, downloaded at package time (piet_setup.iss), never vendored
+piet/packaging/MicrosoftEdgeWebview2Setup.exe
 dist/
+piet/packaging/Output/
+piet/packaging/MicrosoftEdgeWebview2Setup.exe
+
+# pangram run artifacts written to the repo root by graph export / postfile.
+# Run evidence, regenerated on every pangram run — never source.
+pg_fig.svg
+pg_s19_named.svg
+pg_post
+pg_scratch_dir/
+build-prof/
+
+# node test deps — never a repo artifact (2026-09-09: a `git add -A` committed this tree once).
+# No trailing slash: in every lane worktree this path is a SYMLINK to the main checkout's
+# tree, and a directory-only pattern does not match a symlink — `git status` in wt/piet-2
+# listed it as untracked until 2026-09-10.
+piet/frontend/test/node_modules
+
+# GEO-IO capture (X1, harvested 2026-09-14 from codex/geo-io @0f5a350c). Only
+# the two lines that change behaviour are kept: `*.log` (line 20) would swallow
+# the round-trip probe's OWN committed log, and the two dot-directories are
+# Stata-minted scratch from the falsification run. The branch also carried six
+# `!…/{fixture,point}.{shp,shx,dbf}` negations; measured with `git check-ignore`,
+# every one of those paths is NOT-IGNORED to begin with, so they overrode
+# nothing and are dropped rather than committed as decoration.
+!**/aer/geo/stata_roundtrip_check.log
+**/aer/geo/.oracle/
+**/aer/geo/.roundtrip/

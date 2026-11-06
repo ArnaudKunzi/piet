@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "estimators/posthest.h"
 
 #include <algorithm>
@@ -56,12 +58,16 @@ static double gammq(double a, double x) {
 
 // P(F_{df1,df2} > f) = I_{df2/(df2+df1 f)}(df2/2, df1/2).
 double f_pvalue(double f, double df1, double df2) {
+    if (std::isnan(f)) return std::nan("");  // a missing F has a missing p (wald_test's V = 0)
     if (f <= 0 || df1 <= 0 || df2 <= 0) return 1.0;
     double x = df2 / (df2 + df1 * f);
     return betai(df2 / 2.0, df1 / 2.0, x);
 }
 
-double chi2_pvalue(double x, double dof) { return gammq(dof / 2.0, x / 2.0); }
+double chi2_pvalue(double x, double dof) {
+    if (std::isnan(x)) return std::nan("");  // a missing chi2 has a missing p (wald_test's V = 0)
+    return gammq(dof / 2.0, x / 2.0);
+}
 
 // Regularized LOWER incomplete gamma P(a,x); accurate in the left tail (used for
 // the lower-tail χ² probability in sdtest, where 1−gammq would cancel).
@@ -86,21 +92,11 @@ double chi2_cdf(double x, double dof) { return gammp(dof / 2.0, x / 2.0); }
 
 
 
-WaldResult wald_test(const double* beta, const double* V, int k,
-                     const double* R, const double* q, int J) {
-    WaldResult w;
-    w.J = J;
-    if (J <= 0 || J > k) { w.ok = false; w.error = "invalid restriction count"; return w; }
-    // d = R beta - q   (length J)
-    std::vector<double> d(static_cast<size_t>(J), 0.0);
-    for (int r = 0; r < J; ++r) {
-        double s = 0;
-        for (int c = 0; c < k; ++c) s += R[static_cast<size_t>(r) * k + c] * beta[c];
-        d[static_cast<size_t>(r)] = s - (q ? q[r] : 0.0);
-    }
-    // M = R V R'   (J*J, column-major). VR' first: (k*J), then R*(VR').
-    // Compute VRt[c, r] = sum_j V[c,j] R[r,j]   (V column-major: V[c*k+j... ] —
-    // V is symmetric so indexing order is fine).
+namespace {
+// M = R V R'   (J*J, column-major). VR' first: (k*J), then R*(VR').
+// Compute VRt[c, r] = sum_j V[c,j] R[r,j]   (V column-major: V[c*k+j... ] —
+// V is symmetric so indexing order is fine).
+std::vector<double> restriction_variance(const double* V, int k, const double* R, int J) {
     std::vector<double> VRt(static_cast<size_t>(k) * J, 0.0);  // k rows, J cols (col-major)
     for (int r = 0; r < J; ++r)
         for (int c = 0; c < k; ++c) {
@@ -115,6 +111,35 @@ WaldResult wald_test(const double* beta, const double* V, int k,
             for (int c = 0; c < k; ++c) s += R[static_cast<size_t>(a) * k + c] * VRt[static_cast<size_t>(b) * k + c];
             M[static_cast<size_t>(b) * J + a] = s;
         }
+    return M;
+}
+}  // namespace
+
+WaldResult wald_test(const double* beta, const double* V, int k,
+                     const double* R, const double* q, int J) {
+    WaldResult w;
+    w.J = J;
+    if (J <= 0 || J > k) { w.ok = false; w.error = "invalid restriction count"; return w; }
+    // d = R beta - q   (length J)
+    std::vector<double> d(static_cast<size_t>(J), 0.0);
+    for (int r = 0; r < J; ++r) {
+        double s = 0;
+        for (int c = 0; c < k; ++c) s += R[static_cast<size_t>(r) * k + c] * beta[c];
+        d[static_cast<size_t>(r)] = s - (q ? q[r] : 0.0);
+    }
+    const std::vector<double> M = restriction_variance(V, k, R, J);
+    // R V R' exactly zero: the tested combinations have no sampling variance (an
+    // exact `regress` fit posts V = 0). Stata's `test` answers F, chi2 and p
+    // missing at rc 0 there (StataBE: `regress yx x` with yx = 3 + 2x, then
+    // `test x`: F(1, 48) = ., Prob > F = ., r(F) = r(p) = .), not an error.
+    bool m_zero = true;
+    for (double v : M)
+        if (v != 0.0) { m_zero = false; break; }
+    if (m_zero) {
+        w.chi2 = std::nan("");
+        w.F = std::nan("");
+        return w;
+    }
     // Invert M with a PSD-projection fallback (mirrors hausman_test).
     std::vector<double> Minv(M);
     if (la::spd_inverse(Minv.data(), J) != 0) {
@@ -133,6 +158,58 @@ WaldResult wald_test(const double* beta, const double* V, int k,
     w.chi2 = chi2;
     w.F = chi2 / J;
     return w;
+}
+
+// StataBE 19.5 (2026-11-03), `test` after regress and after `ereturn post b V`:
+//   (x1=0) (2*x1=0) drops 1, (2*x1=0) (x1=0) drops 2, (x1=0) (x1=0) drops 2: the
+//     row with the larger variance stays, the earlier on a tie;
+//   V = diag(1,4,9), (a) (bb) (a+2*bb) drops 2 (a+2*bb first, then a: 16/17 of its
+//     variance remains against bb's 4/17); V = I(3), (a) (bb) (2*a+bb) drops 1;
+//   V = I(3), (a) (a+s*bb) drops 1 while s^2 < 1e-9 and keeps both above it, and
+//     (4*a) (a+s*bb) keeps both at s^2 = 1e-9: the floor is relative to the row's
+//     own variance, not to the pivot's or the largest;
+//   V_aa = 9.9e-20 drops `test a` and 1e-19 keeps it, whatever the other entries,
+//     while (1e10*a) with V_aa = 6e-20 is kept: an absolute floor on R V R';
+//   regress y x i.c: (1.c = 1) (x = 0) drops 1 (the base level, a zero row).
+// Where two open rows' remaining variances agree mathematically -- (x1=0) (x2=0)
+// (x1+x2=0), once x1+x2 is kept -- Stata's choice follows its own rounding (its
+// invsym(R*V*R') zeroes x2 there, its test drops x1); this keeps the earlier one
+// on an exact tie and otherwise goes by this arithmetic's last digits. Which
+// constraint goes can differ there; the statistic and its df cannot.
+std::vector<int> wald_dropped_rows(const double* V, int k, const double* R, int J) {
+    std::vector<double> M = restriction_variance(V, k, R, J);
+    std::vector<double> own(static_cast<size_t>(J));
+    for (int i = 0; i < J; ++i) own[static_cast<size_t>(i)] = M[static_cast<size_t>(i) * J + i];
+    enum : char { kOpen, kKept, kDropped };
+    std::vector<char> state(static_cast<size_t>(J), kOpen);
+    for (;;) {
+        int p = -1;
+        for (int i = 0; i < J; ++i) {
+            if (state[static_cast<size_t>(i)] != kOpen) continue;
+            const double v = M[static_cast<size_t>(i) * J + i];
+            if (v < 1e-19 || v < 1e-9 * own[static_cast<size_t>(i)]) {
+                state[static_cast<size_t>(i)] = kDropped;
+                continue;
+            }
+            if (p < 0 || v > M[static_cast<size_t>(p) * J + p]) p = i;
+        }
+        if (p < 0) break;
+        state[static_cast<size_t>(p)] = kKept;
+        // Take row p's part out of every open row (one elimination step on M).
+        const double mpp = M[static_cast<size_t>(p) * J + p];
+        for (int i = 0; i < J; ++i) {
+            if (state[static_cast<size_t>(i)] != kOpen) continue;
+            const double mip = M[static_cast<size_t>(p) * J + i];
+            for (int j = 0; j < J; ++j) {
+                if (state[static_cast<size_t>(j)] != kOpen) continue;
+                M[static_cast<size_t>(j) * J + i] -= mip * M[static_cast<size_t>(j) * J + p] / mpp;
+            }
+        }
+    }
+    std::vector<int> dropped;
+    for (int i = 0; i < J; ++i)
+        if (state[static_cast<size_t>(i)] == kDropped) dropped.push_back(i);
+    return dropped;
 }
 
 HausmanResult hausman_test(const double* b_FE, const double* V_FE,
@@ -389,6 +466,7 @@ inline double glm_g(GlmLink link, double eta) {
         case GlmLink::Logit: return 1.0 / (1.0 + std::exp(-eta));
         case GlmLink::Probit: return 0.5 * std::erfc(-eta * 0.7071067811865476);
         case GlmLink::Poisson: return std::exp(eta);
+        case GlmLink::Cloglog: return -std::expm1(-std::exp(eta));
     }
     return 0.0;
 }
@@ -397,6 +475,7 @@ inline double glm_gprime(GlmLink link, double eta, double g) {
         case GlmLink::Logit: return g * (1.0 - g);
         case GlmLink::Probit: return 0.3989422804014327 * std::exp(-0.5 * eta * eta);
         case GlmLink::Poisson: return g;  // d/deta exp(eta) == exp(eta)
+        case GlmLink::Cloglog: return std::exp(eta - std::exp(eta));
     }
     return 0.0;
 }
@@ -405,6 +484,7 @@ inline double glm_gsecond(GlmLink link, double eta, double g, double gp) {
         case GlmLink::Logit: return gp * (1.0 - 2.0 * g);
         case GlmLink::Probit: return -eta * gp;
         case GlmLink::Poisson: return gp;
+        case GlmLink::Cloglog: return gp * (1.0 - std::exp(eta));
     }
     return 0.0;
 }
@@ -549,7 +629,7 @@ AmeResult margins_ame(GlmLink link, const double* X, int64_t n, int k,
                     }
                     // else: d mentions reqvar at a DIFFERENT level -> X_hi[d]=X_lo[d]=0, J[d]=0.
                 }
-                R.rows.push_back({L + "." + reqvar, ame, se_from_jacobian(J)});
+                R.rows.push_back({L + "." + reqvar, ame, se_from_jacobian(J), J});
             }
         } else {
             // ---- Chain-rule slope (continuous variable) --------------------------
@@ -597,7 +677,7 @@ AmeResult margins_ame(GlmLink link, const double* X, int64_t n, int k,
                     J[static_cast<size_t>(d)] += weighted_mean(term2);
                 }
             }
-            R.rows.push_back({reqvar, ame, se_from_jacobian(J)});
+            R.rows.push_back({reqvar, ame, se_from_jacobian(J), J});
         }
     }
     return R;

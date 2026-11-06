@@ -1,0 +1,94 @@
+{
+  "coefs": [
+    {
+      "b": -0.39751672088634693,
+      "n": 336,
+      "name": "income~beertax"
+    },
+    {
+      "b": 0.4521399753899074,
+      "n": 336,
+      "name": "income~spirits"
+    },
+    {
+      "b": -0.08946943017873825,
+      "n": 336,
+      "name": "beertax~spirits"
+    }
+  ],
+  "coeftable": [
+    {
+      "b": -0.39751672088634693,
+      "ci_hi": null,
+      "ci_lo": null,
+      "name": "income~beertax",
+      "p": null,
+      "se": null,
+      "t": null
+    },
+    {
+      "b": 0.4521399753899074,
+      "ci_hi": null,
+      "ci_lo": null,
+      "name": "income~spirits",
+      "p": null,
+      "se": null,
+      "t": null
+    },
+    {
+      "b": -0.08946943017873825,
+      "ci_hi": null,
+      "ci_lo": null,
+      "name": "beertax~spirits",
+      "p": null,
+      "se": null,
+      "t": null
+    }
+  ],
+  "depvar": "",
+  "estimator": "corr",
+  "method": "pwcorr",
+  "n_obs": 336,
+  "nobs": [
+    [
+      336,
+      336,
+      336
+    ],
+    [
+      336,
+      336,
+      336
+    ],
+    [
+      336,
+      336,
+      336
+    ]
+  ],
+  "pairwise": true,
+  "r": [
+    [
+      1.0,
+      -0.39751672088634693,
+      0.4521399753899074
+    ],
+    [
+      -0.39751672088634693,
+      1.0,
+      -0.08946943017873825
+    ],
+    [
+      0.4521399753899074,
+      -0.08946943017873825,
+      1.0
+    ]
+  ],
+  "sig": false,
+  "type": "estimation",
+  "variables": [
+    "income",
+    "beertax",
+    "spirits"
+  ]
+}

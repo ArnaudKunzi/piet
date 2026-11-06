@@ -1,4 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "piet/eval/errors.h"
+
+#include "core/expr_blanks.h"  // bracket_imbalance: Stata's r(132) pairing rule
+#include "data/stata_dates.h"  // literal_scale_for: the date-literal pseudo-functions
 
 #include <atomic>
 #include <cctype>
@@ -122,10 +127,122 @@ nlohmann::json noDataLoaded(std::optional<int> lineNumber) {
                      std::nullopt, lineNumber);
 }
 
+// BUG-1269: nl's refusal of an empty sample, r(2000) "estimation sample indicator
+// variable eliminates all observations", and of one with fewer rows than
+// parameters, r(2001) "cannot have fewer observations (1) than parameters (2)"
+// (StataBE 19.5), as the engine tags them: the rc, else "".
+static std::string nlSampleRc(const std::string& message) {
+  if (message == "[no_obs] estimation sample indicator variable eliminates all observations")
+    return "2000";
+  if (message.rfind("[no_obs] cannot have fewer observations (", 0) == 0) return "2001";
+  return std::string();
+}
+
 nlohmann::json engineError(const std::string& message, const std::string& code,
                             std::optional<int> lineNumber, std::optional<std::string> context) {
+  // BUG-1269: the engine's sample-size refusal (src/core/error.h require_sample)
+  // prints as Stata prints it, without the `[no_obs] ` tag, and carries its rc.
+  for (const auto& [text, rc] : {std::pair<const char*, const char*>{"no observations", "r(2000)"},
+                                 {"insufficient observations", "r(2001)"}}) {
+    if (message == std::string("[no_obs] ") + text)
+      return errorBlock("engine_error", text, std::nullopt, lineNumber, context, std::string(rc));
+  }
+  // ... and nl's own words for the same two refusals (apps/cmds/cmds_nlgmm.cpp).
+  if (const std::string rc = nlSampleRc(message); !rc.empty())
+    return errorBlock("engine_error", message.substr(9), std::nullopt, lineNumber, context,
+                      "r(" + rc + ")");
+  // BUG-1247: so does nlcom's refusal of a combination missing at e(b)
+  // (src/estimators/nlcom.h): "expression (ln(_b[x] - 2)) evaluates to missing", r(498).
+  static const std::string kNlcomTag = "[engine_error] expression (";
+  static const std::string kNlcomTail = ") evaluates to missing";
+  if (message.rfind(kNlcomTag, 0) == 0 && message.size() > kNlcomTag.size() + kNlcomTail.size() &&
+      message.compare(message.size() - kNlcomTail.size(), kNlcomTail.size(), kNlcomTail) == 0)
+    return errorBlock("engine_error", message.substr(15), std::nullopt, lineNumber, context,
+                      std::string("r(498)"));
   return errorBlock(isKnownErrorCode(code) ? code : std::string("engine_error"), message, std::nullopt,
                      lineNumber, context);
+}
+
+// The expression text of one of the engine Parser's syntax errors (src/data/
+// frame.cpp Parser::err, "expr: <what> in '<expression>'"), else "". `commaOrParen`
+// says the parser stopped on "expected , or )" -- `max(a b)`, the one balanced
+// shape Stata answers r(111).
+static std::string parserSyntaxExpr(const std::string& msg, bool* commaOrParen) {
+  const std::string::size_type at = msg.find("expr: ");
+  if (at == std::string::npos) return std::string();
+  static const char* const kSyntax[] = {"unexpected token in '", "trailing input in '",
+                                        "expected ) in '", "expected , or ) in '",
+                                        "expected ] in '", "too few ')' or ']' in '",
+                                        "too many ')' or ']' in '"};
+  const std::string tail = msg.substr(at + 6);
+  std::string expr;
+  for (const char* k : kSyntax) {
+    const std::string key(k);
+    if (tail.compare(0, key.size(), key) == 0) {
+      expr = tail.substr(key.size());
+      *commaOrParen = key == "expected , or ) in '";
+      break;
+    }
+  }
+  if (expr.empty() && tail.compare(0, 25, "invalid numeric literal '") == 0) {
+    // the literal is a numeric token (no quote), then "' in '<expression>'"
+    const std::string::size_type in = tail.find("' in '", 25);
+    if (in != std::string::npos) expr = tail.substr(in + 6);
+  }
+  // FU-875: "expected ) after <fn>(" (tin()/twithin() and the date-literal
+  // functions, frame.cpp) is a call left open, so the balance test answers it:
+  // `count if tin(2010q2, 2010q3` and `gen g = tq(2010q1` are Stata's r(132)
+  // "too few ')' or ']'".
+  if (expr.empty() && tail.compare(0, 17, "expected ) after ") == 0) {
+    const std::string::size_type in = tail.find("( in '", 17);
+    if (in != std::string::npos) expr = tail.substr(in + 6);
+  }
+  if (expr.empty() || expr.back() != '\'') return std::string();
+  expr.pop_back();
+  return expr;
+}
+
+std::string unbalancedExpr(const std::string& msg) {
+  bool commaOrParen = false;
+  const std::string expr = parserSyntaxExpr(msg, &commaOrParen);
+  return expr.empty() ? std::string() : cecon::bracket_imbalance(expr);
+}
+
+std::string invalidDateLiteral(const std::string& msg) {
+  const size_t from = msg.rfind("expr: ", 0) == 0 ? 6 : 0;
+  const size_t open = msg.find('(', from);
+  if (open == std::string::npos) return std::string();
+  cecon::LiteralScale ls;
+  if (!cecon::literal_scale_for(msg.substr(from, open - from), ls)) return std::string();
+  const size_t close = msg.find(") invalid", open);
+  if (close == std::string::npos) return std::string();
+  const size_t end = close + 9;
+  if (end != msg.size() && msg.compare(end, 5, " in '") != 0) return std::string();
+  return msg.substr(from, close + 1 - from);
+}
+
+std::string timeSpanRefusal(const std::string& msg, std::string* rc) {
+  const size_t at = msg.find("expr: t");
+  if (at == std::string::npos) return std::string();
+  const std::string tail = msg.substr(at + 6);
+  const size_t open = tail.find('(');
+  const std::string fn = tail.substr(0, open);
+  if (open == std::string::npos || (fn != "tin" && fn != "twithin")) return std::string();
+  const size_t in = tail.find(" in '");
+  if (in == std::string::npos) return std::string();
+  const std::string what = tail.substr(0, in);
+  static const std::string kScale = ") does not match the tsset scale";
+  if (what == fn + "() requires tsset") {
+    *rc = "101";
+    return "time-series operators not allowed";
+  }
+  if (what == fn + "() takes two arguments" ||
+      (what.size() > kScale.size() &&
+       what.compare(what.size() - kScale.size(), kScale.size(), kScale) == 0)) {
+    *rc = "198";
+    return "invalid syntax";
+  }
+  return std::string();
 }
 
 // BS-100: see errors.h's doc comment for the full mapping + rationale.
@@ -141,13 +258,19 @@ std::string coarseRc(const nlohmann::ordered_json& block) {
   const std::string reason = block.value("reason", std::string());
   if (reason.size() > 3 && reason.compare(0, 2, "r(") == 0 && reason.back() == ')') {
     const std::string digits = reason.substr(2, reason.size() - 3);
+    // A leading minus is `exit -1`'s own code (StataBE leaves _rc -1).
+    const size_t from = digits.size() > 1 && digits[0] == '-' ? 1 : 0;
     if (!digits.empty() &&
-        digits.find_first_not_of("0123456789") == std::string::npos) {
+        digits.find_first_not_of("0123456789", from) == std::string::npos) {
       return digits;
     }
   }
   std::string code = block.value("code", std::string());
   if (code == "unsupported_command") return "199";
+  // The engine's factor-variable value check (src/core/model.cpp, code
+  // factor_values): Stata's r(452) "factor variables may not contain noninteger
+  // values" / "... negative values" (StataBE 19.5, `regress y i.x` with x in quarters).
+  if (code == "factor_values") return "452";
   if (code == "syntax_error" || code == "unsupported_option" || code == "unsupported_macro" ||
       code == "unsupported_loop" || code == "unsupported_program" ||
       code == "unsupported_delimiter") {
@@ -191,6 +314,47 @@ std::string coarseRc(const nlohmann::ordered_json& block) {
     // happens to also mention "file" still wins 601/602 as before).
     if (lower.find("variable") != std::string::npos && lower.find("not found") != std::string::npos) {
       return "111";
+    }
+    // FU-35 (w2n_followups E12 E13 E16-E22): the engine's row-expression
+    // evaluators name an unresolved identifier "unknown variable X in '...'"
+    // (src/data/frame.cpp) or "unknown variable 'X'" (src/core/expr_eval.h),
+    // never "variable ... not found", so `count/assert/generate/replace/keep/
+    // drop/summarize ... nosuchvar` fell to the generic "1". Stata answers
+    // r(111) for all of them. These are the only producers of the phrase.
+    if (lower.find("unknown variable") != std::string::npos) return "111";
+    if (lower.find("factor variables may not contain") != std::string::npos) return "452";
+    // The engine's missing-column refusals: "[missing_column] column not found:
+    // X" (feols/fepois/iv), "[missing_column] logit: column 'X' not found in
+    // dataset", collapse's "no column: X". Stata: "variable X not found" r(111)
+    // (w2_eststo_prefix.log:295-311 A8_named_inner_fails `regress y nosuchvar`;
+    // FU-1079 w2ak_estout_family.log:219, :227).
+    if (lower.find("[missing_column]") != std::string::npos ||
+        lower.find("column not found") != std::string::npos ||
+        lower.find("no column: ") != std::string::npos)
+      return "111";
+    // The engine's row-expression arity check (src/data/frame.cpp: "wrong
+    // number of arguments to inlist in 'inlist(v)'") is a syntax error in
+    // Stata: `count if inlist(v)` is r(198) (w2x_fn_string_math fx_inlist_one).
+    if (lower.find("wrong number of arguments to ") != std::string::npos) return "198";
+    // FU-862: the engine Parser's "expr: invalid syntax: a sign after `!`"
+    // (src/data/frame.cpp eatNot, its only producer) is Stata's r(198):
+    // `generate g = !-t` and `count if ! -t` (w2ac_expr_valueref gen_not_neg_sp,
+    // count_not_neg; w2ac_expr_relational gen_not_neg).
+    if (lower.find("expr: invalid syntax") != std::string::npos) return "198";
+    // FU-854: the engine Parser's other syntax errors (src/data/frame.cpp
+    // Parser::err, "expr: <what> in '<expression>'") fell to the generic "1".
+    // Stata answers r(132) "too many ( or )" when the expression's parentheses
+    // or brackets do not balance, whatever the parser tripped on, and r(198)
+    // otherwise; `max(a b)` (the one balanced "expected , or )" arm) is r(111).
+    // w2ac_expr_syntaxrc: gen_open_paren/gen_close_paren/gen_fn_open/
+    // gen_subscr_open/rep_open_paren/count_open_paren/count_close_paren/
+    // drop_open_paren 132; gen_fn_nosep 111; the other 21 arms 198.
+    // FU-875: the rewritten text (cobraErrorMessage) arrives here as well.
+    if (msg == "too few ')' or ']'" || msg == "too many ')' or ']'") return "132";
+    bool commaOrParen = false;
+    if (const std::string expr = parserSyntaxExpr(msg, &commaOrParen); !expr.empty()) {
+      if (!cecon::bracket_imbalance(expr).empty()) return "132";
+      return commaOrParen ? "111" : "198";
     }
     // P6 wave (frames): `frame drop NOSUCHFRAME` / a frlink into an unknown
     // frame -> Stata's own r(111) as well, same "named thing does not exist"
@@ -238,6 +402,50 @@ std::string coarseRc(const nlohmann::ordered_json& block) {
     if (lower.find("predicts data perfectly") != std::string::npos) {
       return "2000";
     }
+    // FU-835: the engine's sample-size refusal in Stata's own words (src/core/
+    // error.h require_sample): an empty estimation sample is r(2000) "no
+    // observations", a one-row one r(2001) "insufficient observations" (`regress
+    // y x if x > 20` / `if x == 1`, and ivregress, poisson, areg alike). Keyed on
+    // the engine's `no_obs` tag: PIET's own "no observations" texts carry their
+    // rc where they are raised or are not this refusal.
+    if (lower.rfind("[no_obs] no observations", 0) == 0) return "2000";
+    if (lower.rfind("[no_obs] insufficient observations", 0) == 0) return "2001";
+    if (const std::string rc = nlSampleRc(msg); !rc.empty()) return rc;
+    // FU-871: nlcom's refusals (src/estimators/nlcom.h) are all
+    // Stata's r(498): a combination that is missing at e(b) ("expression (ln(_b[x]
+    // - 2)) evaluates to missing") and the two numerical-derivative failures.
+    if (lower.find("evaluates to missing") != std::string::npos ||
+        lower.find("nlcom: could not calculate numerical derivative") != std::string::npos ||
+        lower.find("nlcom: maximum number of iterations exceeded") != std::string::npos) {
+      return "498";
+    }
+    // FU-852: an impossible date literal in any command's expression, "tq(2010q5)
+    // invalid" (cobraErrorMessage words the engine Parser's refusal so), is
+    // Stata's r(198) -- `count if x == tq(2010q5)`, `summarize ... if`, `regress
+    // ... if`; generate's own pre-check (dispatcher.cpp preResolveGenExpr) already
+    // answered it so.
+    if (!invalidDateLiteral(msg).empty()) return "198";
+    // FU-875: so is a tin()/twithin() call the engine could not expand, r(198)
+    // "invalid syntax", or r(101) "time-series operators not allowed" with no
+    // tsset (cobraErrorMessage gives the text, timeSpanRefusal both).
+    {
+      std::string spanRc;
+      if (!timeSpanRefusal(msg, &spanRc).empty()) return spanRc;
+      if (msg == "invalid syntax") return "198";
+      if (msg == "time-series operators not allowed") return "101";
+    }
+    // A frequency weight that is not an integer: Stata's r(401) "may not use
+    // noninteger frequency weights" (w2aj_qualifiers qf_sw_fw_frac, qf_hd_w_sp).
+    // The engine's producers say "fweight '<v>' has a non-integer value"
+    // (src/core/model.cpp, src/data/frame.cpp summarize/collapse, apps/cmds/
+    // cmds_summary.cpp tabulate) and PIET's native tabulate "frequency weights
+    // (fweight) must be integer" (tabulate.cpp); all were rc 1 (FU-1129).
+    if ((lower.find("fweight") != std::string::npos &&
+         lower.find("non-integer value") != std::string::npos) ||
+        lower.find("frequency weights (fweight) must be integer") != std::string::npos ||
+        lower.find("noninteger frequency weights") != std::string::npos) {
+      return "401";
+    }
     // P1 wave (`isid`): Stata answers a failed uniqueness assertion with its
     // own r(459) — oracle-pinned on StataBE 19.5 (`isid foreign` on auto.dta →
     // "variable foreign does not uniquely identify the observations", rc 459).
@@ -272,7 +480,7 @@ std::string coarseRc(const nlohmann::ordered_json& block) {
       return "111";
     }
     // BUG-657: a time-series operator with no time variable declared is Stata's
-    // r(111) "time variable not set" (_ts.ado; w2_eststo_prefix.log:444-447
+    // r(111) "time variable not set" (the time-series helper; w2_eststo_prefix.log:444-447
     // `gen L.x`, w2d_uncovered.log:376-381). The engine refuses it with its own
     // text from two producers -- src/data/frame.cpp (expression path: "... used
     // but no time variable is set") and src/core/model.cpp (model path: "... used
@@ -280,6 +488,19 @@ std::string coarseRc(const nlohmann::ordered_json& block) {
     if (lower.find("time-series operator") != std::string::npos &&
         lower.find("no time variable") != std::string::npos) {
       return "111";
+    }
+    // BUG-1368: the engine's unknown-variable text now reaches this point as
+    // Stata's own sentence, `NAME not found` (cobraErrorMessage), alone or after
+    // a handler's `cmd: ` prefix. Stata answers r(111) for it.
+    static const std::string kNotFound = " not found";
+    if (msg.size() > kNotFound.size() &&
+        msg.compare(msg.size() - kNotFound.size(), kNotFound.size(), kNotFound) == 0) {
+      const std::string head = msg.substr(0, msg.size() - kNotFound.size());
+      const size_t colon = head.rfind(": ");
+      const std::string name = colon == std::string::npos ? head : head.substr(colon + 2);
+      bool ident = !name.empty() && !std::isdigit(static_cast<unsigned char>(name[0]));
+      for (unsigned char c : name) ident = ident && (std::isalnum(c) || c == '_' || c >= 0x80);
+      if (ident) return "111";
     }
   }
   return "1";  // historical default — every other class (BS-118: post-beta)

@@ -1,0 +1,19 @@
+{
+  "type": "browse",
+  "offset": 0,
+  "limit": 5,
+  "n_rows_total": 74,
+  "columns": [
+    { "name": "make",    "dtype": "factor", "index": 1, "levels": ["Alder Coupe", "Birch Sedan", "Cedar Wagon", "Dogwood Van"] },
+    { "name": "foreign", "dtype": "f64",    "index": 2 },
+    { "name": "price",   "dtype": "f64",    "index": 3 },
+    { "name": "mpg",     "dtype": "f64",    "index": 4 }
+  ],
+  "rows": [
+    [0, 0, 5230, 24],
+    [1, 0, 6115, 19],
+    [2, 1, 4870, 26],
+    [3, 0, 7340, 16],
+    [4, 1, 8420, 21]
+  ]
+}

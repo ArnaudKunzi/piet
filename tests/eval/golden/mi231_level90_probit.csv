@@ -1,0 +1,9 @@
+key,value
+n_obs,7.40000000000000e+01
+coeftable[mpg].b,-1.03950331051677e-01
+coeftable[mpg].se,5.15688926938471e-02
+coeftable[mpg].ci_lo,-1.88773611237022e-01
+coeftable[mpg].ci_hi,-1.91270508663310e-02
+coeftable[mpg].p,4.38254434824075e-02
+coeftable[weight].ci_lo,-3.26661411741911e-03
+coeftable[weight].ci_hi,-1.40447515797308e-03

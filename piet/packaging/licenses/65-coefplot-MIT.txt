@@ -1,0 +1,32 @@
+coefplot 1.8.8 (Ben Jann) — MIT
+Adopted at: piet/native/src/handlers_coefplot.cpp (the coefplot data pipeline; line citations there refer to coefplot.ado)
+
+Project:  coefplot — Stata module to plot regression coefficients and other results
+Authors:  Ben Jann
+Version:  1.8.8 (22aug2025)
+Source:   https://github.com/benjann/coefplot (SSC: ssc install coefplot)
+Evidence: https://raw.githubusercontent.com/benjann/coefplot/master/LICENSE (the licence file below, fetched verbatim);
+          the SSC listing https://ideas.repec.org/c/boc/bocode/s457686.html separately states GPL v3.
+Licence:  MIT. The upstream LICENSE text follows verbatim.
+
+MIT License
+
+Copyright (c) 2019 Ben Jann
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

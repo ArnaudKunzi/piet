@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // P9 automode · L1 + predicate + L4. See parallel_auto.h.
 #include "piet/parallel_auto.h"
 

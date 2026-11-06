@@ -1,5 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "hdfe/dof.h"
 
+#include <algorithm>
 #include <numeric>
 #include <unordered_set>
 
@@ -34,6 +37,30 @@ int connected_components(const Factor& f1, const Factor& f2) {
 
 }  // namespace
 
+AbsorbedDof absorbed_dof(const std::vector<Factor>& fe, const std::vector<char>& nested) {
+    const size_t G = fe.size();
+    std::vector<int> M(G, 0);
+    std::vector<size_t> free_fe;  // effects not nested in a cluster, in order
+    AbsorbedDof out;
+    for (size_t g = 0; g < G; ++g) {
+        if (g < nested.size() && nested[g]) {
+            M[g] = fe[g].n_levels;
+            out.df_a_nested += M[g];
+        } else {
+            free_fe.push_back(g);
+        }
+    }
+    if (free_fe.size() > 1 || (!free_fe.empty() && out.df_a_nested > 0))
+        for (size_t i = (out.df_a_nested > 0 ? 0 : 1); i < free_fe.size(); ++i) M[free_fe[i]] = 1;
+    for (size_t i = 0; i < free_fe.size(); ++i)
+        for (size_t j = i + 1; j < free_fe.size(); ++j) {
+            const int c = connected_components(fe[free_fe[i]], fe[free_fe[j]]);
+            M[free_fe[j]] = std::max(M[free_fe[j]], c);
+        }
+    for (size_t g = 0; g < G; ++g) out.df_a += fe[g].n_levels - M[g];
+    return out;
+}
+
 DofInfo compute_dof(int64_t n, int k_vars, const std::vector<Factor>& fe) {
     DofInfo d;
     d.n = n;
@@ -43,20 +70,10 @@ DofInfo compute_dof(int64_t n, int k_vars, const std::vector<Factor>& fe) {
     int sum_levels = 0;
     for (int L : d.fe_levels) sum_levels += L;
 
-    if (fe.empty()) {
-        d.k_fe = 0;
-    } else if (fe.size() == 1) {
-        d.k_fe = fe[0].n_levels;  // absorbs intercept too
-    } else if (fe.size() == 2) {
-        int c = connected_components(fe[0], fe[1]);
-        d.k_fe = fe[0].n_levels + fe[1].n_levels - c;  // exact rank of 2-way dummies
-        d.fe_exact = true;
-    } else {
-        // 3+ FE: conservative reghdfe-style estimate, flagged inexact.
-        d.k_fe = fe[0].n_levels;
-        for (size_t g = 1; g < fe.size(); ++g) d.k_fe += fe[g].n_levels - 1;
-        d.fe_exact = false;
-    }
+    // 1 and 2 effects are exact; from the third on reghdfe's pairwise components
+    // only bound the redundancy (its "?" rows), and so does this.
+    d.k_fe = absorbed_dof(fe, {}).df_a;
+    d.fe_exact = fe.size() <= 2;
 
     d.fe_redundant = sum_levels - d.k_fe;
     d.dof_resid = n - k_vars - d.k_fe;

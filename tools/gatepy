@@ -1,0 +1,23 @@
+#!/bin/sh
+# gatepy — the ONE interpreter every repository Python gate runs under (GATES.md, 2026-09-02).
+# BUG-362 class: /opt/homebrew/bin/python3 is a moving symlink; a brew bump dropped numpy and
+# run_eval reported 106/131 on a clean tree. The gate interpreter is therefore pinned to the
+# repo-local venv `.venv-gate` (create/repair: tools/make_venv_gate.sh). Absence or a numpy-less
+# interpreter is an ENVIRONMENT FAULT (exit 2), never a content verdict.
+#   tools/gatepy --where          print the resolved interpreter + versions
+#   tools/gatepy <script> [args]  exec the script under it
+#   GATEPY_PYTHON=<path>          override (tests / a deliberately different interpreter)
+here=$(cd "$(dirname "$0")/.." && pwd)
+py="${GATEPY_PYTHON:-$here/.venv-gate/bin/python3}"
+if [ ! -x "$py" ]; then
+  echo "gatepy: ENVIRONMENT FAULT — interpreter missing: $py  (run tools/make_venv_gate.sh)" >&2
+  exit 2
+fi
+if ! "$py" -c 'import numpy, openpyxl' 2>/dev/null; then
+  echo "gatepy: ENVIRONMENT FAULT — $py cannot import numpy + openpyxl  (run tools/make_venv_gate.sh)" >&2
+  exit 2
+fi
+if [ "${1:-}" = "--where" ]; then
+  exec "$py" -c 'import sys,numpy;print("gatepy:",sys.executable,"python",sys.version.split()[0],"numpy",numpy.__version__)'
+fi
+exec "$py" "$@"

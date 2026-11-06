@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 
@@ -85,7 +87,7 @@ int cmd_mixed(const std::vector<std::string>& a) {
     const bool sep_cluster = (vce == "cluster" && cluster_var != group);
     if (sep_cluster) cluster_names.push_back(cluster_var);
     GlmInputs g = load_glm(ds, "mixed", y, split_csv(xcsv), cluster_names);
-    if (g.n == 0) { std::fprintf(stderr, "mixed: no rows after dropping missing.\n"); return 1; }
+    require_sample(g.n);  // BUG-1269: r(2000) "no observations" / r(2001) for one row
     if (g.cluster.empty())
         throw EngineError("bad_input", "mixed: could not build the group factor for '" + group + "'.");
     const Factor& gf = g.cluster[0];

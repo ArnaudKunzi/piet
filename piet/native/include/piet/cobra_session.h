@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // CobraSession — persistent `cobra serve` worker client (MAXPERF Stage 1b,
 // contract_A §25 stateless serve + §26 resident-frame data plane).
 //

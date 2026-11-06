@@ -1,4 +1,4 @@
-name: macOS source beta
+name: macOS build and self-test
 on:
   push:
     branches: [main]
@@ -9,10 +9,12 @@ permissions:
 jobs:
   build:
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Build and test public source
+      - name: Build and test the public source
+        env:
+          BUILD_JOBS: 3
         run: sh scripts/build-macos.sh

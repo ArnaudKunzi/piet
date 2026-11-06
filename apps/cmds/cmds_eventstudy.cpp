@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 
@@ -62,7 +64,8 @@ int cmd_eventstudyinteract(const std::vector<std::string>& a) {
         std::fprintf(stderr,
             "usage: cobra eventstudyinteract --data f.hbin --y Y --rel F2,F3,L2,L3 "
             "--absorb ID,T --cohort G --control_cohort NEVER --cluster ID "
-            "[--vce cluster] [--level 95] [--keepif EXPR] [--out f.json]\n");
+            "[--vce cluster] [--weight W --wtype aw|pw] [--level 95] [--keepif EXPR] "
+            "[--out f.json]\n");
         return 2;
     }
     // Honest reject BY NAME: the IW variance combines the saturated stage's
@@ -92,6 +95,21 @@ int cmd_eventstudyinteract(const std::vector<std::string>& a) {
     if (relvars.empty())
         throw cecon::EngineError("bad_input",
                                  "eventstudyinteract: --rel names no variable", "--rel");
+    // BUG-1283: [aweight=] / [pweight=] (identical answers under vce(cluster); see
+    // sunab.h for the weighted estimator). fw/iw are refused by name.
+    const std::string wvar = opt(a, "--weight"), wtype = opt(a, "--wtype");
+    if (!wvar.empty() || !wtype.empty()) {
+        if (wvar.empty())
+            throw cecon::EngineError("bad_input", "eventstudyinteract: --wtype requires --weight",
+                                     "--wtype");
+        if (!(wtype.empty() || wtype == "aw" || wtype == "aweight" || wtype == "pw" ||
+              wtype == "pweight"))
+            throw cecon::EngineError(
+                "unsupported",
+                "eventstudyinteract: --wtype must be aw or pw (got '" + wtype +
+                    "'); fweight and iweight are not implemented",
+                "--wtype");
+    }
 
     data = maybe_keepif(data, opt(a, "--keepif"));
     const Dataset& ds = acquire_data(data);
@@ -104,22 +122,34 @@ int cmd_eventstudyinteract(const std::vector<std::string>& a) {
     const double* cl = require_num(ds, "eventstudyinteract", clvar);
     std::vector<const double*> rv;
     for (const auto& nm : relvars) rv.push_back(require_num(ds, "eventstudyinteract", nm));
+    const double* wv = wvar.empty() ? nullptr : require_num(ds, "eventstudyinteract", wvar);
 
-    // One listwise deletion over everything the estimator reads.
+    // One listwise deletion over everything the estimator reads but the cohort: a
+    // missing cohort() value is data (BUG-1525, StataBE 19.5: `gen first = g if g > 0`
+    // leaves the never-treated missing and cohort(first) keeps them, e(N) 180;
+    // sunab_run says what a missing cohort means on a treated row).
     std::vector<int64_t> keep;
     keep.reserve(static_cast<size_t>(n_raw));
     for (int64_t i = 0; i < n_raw; ++i) {
-        if (std::isnan(yv[i]) || std::isnan(gv[i]) || std::isnan(cv[i]) ||
+        if (std::isnan(yv[i]) || std::isnan(cv[i]) ||
             std::isnan(fu[i]) || std::isnan(ft[i]) || std::isnan(cl[i])) continue;
         bool bad = false;
         for (const double* c : rv) if (std::isnan(c[i])) { bad = true; break; }
+        if (wv) {
+            // A missing or zero weight marks the row out; a negative one is an error.
+            if (std::isnan(wv[i]) || wv[i] == 0.0) bad = true;
+            else if (wv[i] < 0.0)
+                throw cecon::EngineError("bad_input", "eventstudyinteract: weight '" + wvar +
+                                                          "' has a negative value", "--weight");
+        }
         if (!bad) keep.push_back(i);
     }
     const int64_t n = static_cast<int64_t>(keep.size());
     const int L = static_cast<int>(relvars.size());
     std::vector<double> yy(static_cast<size_t>(n)), gg(static_cast<size_t>(n)),
         cc(static_cast<size_t>(n)), uu(static_cast<size_t>(n)), tt(static_cast<size_t>(n)),
-        clc(static_cast<size_t>(n)), rel(static_cast<size_t>(n) * L);
+        clc(static_cast<size_t>(n)), rel(static_cast<size_t>(n) * L), ww;
+    if (wv) ww.resize(static_cast<size_t>(n));
     for (int64_t r = 0; r < n; ++r) {
         const int64_t i = keep[static_cast<size_t>(r)];
         yy[static_cast<size_t>(r)] = yv[i];
@@ -128,6 +158,7 @@ int cmd_eventstudyinteract(const std::vector<std::string>& a) {
         uu[static_cast<size_t>(r)] = fu[i];
         tt[static_cast<size_t>(r)] = ft[i];
         clc[static_cast<size_t>(r)] = cl[i];
+        if (wv) ww[static_cast<size_t>(r)] = wv[i];
         for (int l = 0; l < L; ++l)
             rel[static_cast<size_t>(l) * n + r] = rv[static_cast<size_t>(l)][i];
     }
@@ -137,7 +168,7 @@ int cmd_eventstudyinteract(const std::vector<std::string>& a) {
     cfg.level = level;
     const auto t0 = std::chrono::steady_clock::now();
     SunabResult R = sunab_run(yy.data(), rel.data(), L, gg.data(), cc.data(), uu.data(),
-                              tt.data(), clc.data(), n, cfg);
+                              tt.data(), clc.data(), n, cfg, wv ? ww.data() : nullptr);
     const auto t1 = std::chrono::steady_clock::now();
 
     json coef = json::object(), se = json::object(), tst = json::object(),
@@ -149,6 +180,14 @@ int cmd_eventstudyinteract(const std::vector<std::string>& a) {
         lo[nm] = c.ci_lo; hi[nm] = c.ci_hi;
         wts[nm] = c.cohort_weight; cco[nm] = c.cohort_coef;
     }
+    // e(V_iw) (BUG-1524): rows and columns in `rel` order.
+    json viw = json::array();
+    if (R.V_iw.size() == relvars.size() * relvars.size())
+        for (size_t l = 0; l < relvars.size(); ++l) {
+            json row = json::array();
+            for (size_t m = 0; m < relvars.size(); ++m) row.push_back(R.V_iw[l * relvars.size() + m]);
+            viw.push_back(row);
+        }
     json out = {
         {"estimator", "eventstudyinteract"},
         {"y", y},
@@ -182,10 +221,18 @@ int cmd_eventstudyinteract(const std::vector<std::string>& a) {
         {"ci_hi", hi},
         {"iw_weight", wts},
         {"cohort_coef", cco},
+        {"V_iw", viw},
         {"time_ms", std::chrono::duration<double, std::milli>(t1 - t0).count()},
         {"ok", R.ok},
         {"error", R.error},
     };
+    // Weighted only, so an unweighted reply is unchanged: e(wtype), e(sumweights)
+    // and the "(sum of wgt is ...)" line's sum over the share rows.
+    if (wv)
+        out["weight"] = {{"var", wvar},
+                         {"type", (wtype == "pw" || wtype == "pweight") ? "pw" : "aw"},
+                         {"sum_w", R.sum_w},
+                         {"sum_w_weights", R.sum_w_weights}};
     emit(out, opt(a, "--out"));
     return R.ok ? 0 : 1;
 }

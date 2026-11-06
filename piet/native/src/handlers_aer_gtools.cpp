@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // gtools / ftools -- AER-SCOPE1 bundle C (2026-09-03).
 //
 // Ten community command names that are drop-in FAST replacements for commands
@@ -185,9 +187,9 @@ struct AliasPolicy {
   // (the option resolves to nothing, the reject net still accepts the prefix,
   // and the handler's canonical-key compare never matches), so the copy is the
   // safe side of that trade. Sources, to be edited in step with these:
-  //   collapse   -- no registration at all; runCollapse reads by() off the raw
-  //                 line (handlers_data_verbs.cpp) and its dispatch arm has no
-  //                 reject net, so `by` is its whole read surface.
+  //   collapse   -- dispatcher.cpp's kVocabCollapse; the collapse arm runs a
+  //                 net of its own per flavor, and runCollapse reads the
+  //                 option keys the dispatcher resolved.
   //   egen       -- egen.cpp:38
   //   duplicates, levelsof, xtile -- dispatcher.cpp's file-scope block
   //   isid       -- dispatcher.cpp's arm rejects every option (empty vocabulary)
@@ -213,27 +215,45 @@ const std::unordered_map<std::string, AliasPolicy>& aliasPolicies() {
     // BACK onto the uncollapsed data, so the row count after it is the row count
     // before, which is the opposite of what every consumer of a collapse assumes.
     //
-    // `double` is on this list and its absence would be INVISIBLE, which is why
-    // it is called out here. collapse is the one native target with no reject
-    // net of its own (see nativeKnown's note below), so an option this table
-    // does not name is not merely unrenamed -- it is ACCEPTED and never read,
-    // with no diagnostic. That is the `ivreg, ro` shape, and for a key that
-    // asks for a different storage width of the collapsed results it is a
-    // silent answer change rather than a silent speed change. Refused by name
-    // rather than dropped: PIET cannot honour a storage-width request, and
-    // dropping it would report success for something it did not do.
+    // `double` asks for a different storage width of the collapsed results,
+    // which PIET cannot honour. It is refused by name rather than dropped:
+    // dropping it would report success for something it did not do, a silent
+    // answer change rather than a silent speed change.
+    // `cw` is casewise deletion in all three (gcollapse.ado and fcollapse.ado
+    // both declare it); runCollapse reads it off the option keys
+    // (w2au_collapse_family.log cz_g_cw rc 0). `fast` and `verbose` reach the
+    // collapse arm, which reads neither but answers either given an argument
+    // r(198), as gtools does (BUG-1100, StataBE 19.5: `option fast()
+    // incorrectly specified`, `option verbose() incorrectly specified`).
     const AliasPolicy collapseLike{
         "collapse",
-        {"by"},
-        {},
-        {},
+        {"by", "cw"},
         {},
         {"fast", "verbose"},
         {},
-        {"merge", "labelformat", "labelprogram", "freq", "rawstat", "unsorted", "missing", "cw",
+        {},
+        {},
+        {"merge", "labelformat", "labelprogram", "freq", "rawstat", "unsorted", "missing",
          "wild", "sumcheck", "double", "pool", "register"}};
     t.emplace("gcollapse", collapseLike);
-    t.emplace("fcollapse", collapseLike);
+    // fcollapse (ftools, fcollapse) is its own row (BUG-1100): `fast`
+    // reaches the collapse arm, where `smart` reads it, and nocompress (and its
+    // positive spelling `compress`, the default), append and smart are served
+    // there; merge, freq/freqvar(), register(), pool() and method() are refused
+    // by name. gtools' own words are no fcollapse options at all, so the
+    // collapse arm's net answers them r(198), as fcollapse does. No option
+    // abbreviates below its syntax-line minimum (dispatcher.cpp
+    // kOptMinCompleteLater), so a key reaches this row spelled in full.
+    // `verbose` reaches the arm too, which prints nothing for it and answers
+    // `verbose(1)` or `v(1)` r(198), as fcollapse does.
+    t.emplace("fcollapse", AliasPolicy{"collapse",
+                                       {"by", "cw", "fast"},
+                                       {},
+                                       {"nocompress", "compress", "append", "smart", "verbose"},
+                                       {},
+                                       {},
+                                       {},
+                                       {"merge", "freq", "freqvar", "register", "pool", "method"}});
 
     // gegen -> egen. `replace` overwrites an existing target, `counts`/`fill`
     // change what is computed; none of the three is a speed knob.

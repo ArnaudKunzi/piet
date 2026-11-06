@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "piet/bcal.h"
 
 #include <algorithm>
@@ -7,10 +9,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <map>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 
 #include "piet/strutil.h"
@@ -345,16 +347,6 @@ std::string renderUnderDateformat(std::int64_t td, const std::string& dateformat
     else out += db;
   }
   return out;
-}
-
-bool parseDailyDate(const std::string& token, const std::string& order, std::int64_t* out) {
-  static const std::set<std::string> kOrders = {"ymd", "ydm", "myd", "mdy", "dym", "dmy"};
-  PartialDate date;
-  if (out == nullptr || kOrders.count(order) == 0 ||
-      !parseDateToken(token, order, false, &date))
-    return false;
-  *out = daysFromCivil(date.y, date.m, date.d);
-  return true;
 }
 
 namespace {
@@ -788,93 +780,136 @@ double dofb(const BusinessCalendar& cal, double i) {
   return static_cast<double>(cal.days[static_cast<size_t>(pos)]);
 }
 
+std::optional<std::int64_t> readWholeDate(const std::string& token, const std::string& dateformat) {
+  PartialDate parsed;
+  if (!parseDateToken(token, dateformat, /*allowStar=*/false, &parsed)) return std::nullopt;
+  return daysFromCivil(parsed.y, parsed.m, parsed.d);
+}
+
 // --- `bcal create` ----------------------------------------------------------
-InduceResult induceFromDates(const std::vector<double>& values, const InduceOpts& opts) {
-  InduceResult r;
-  auto fail = [&](const std::string& message, int rc = 198) {
-    r.rc = rc;
-    r.message = message;
-    return r;
+namespace {
+
+// The %td day a date value displays as. A value need not be whole.
+std::int64_t dayOfValue(double value) { return static_cast<std::int64_t>(std::floor(value)); }
+
+// `omit dayofweek` writes its codes Monday first and Sunday last.
+constexpr struct {
+  int dow;
+  const char* code;
+} kWeekOrder[] = {{1, "Mo"}, {2, "Tu"}, {3, "We"}, {4, "Th"}, {5, "Fr"}, {6, "Sa"}, {0, "Su"}};
+
+// What the sample says about the days between its values. Holes are read off the
+// differences between neighbouring sorted values, so on non-whole data a day can
+// be a "hole" although a value falls on it, and the reverse.
+class HoleFinder {
+ public:
+  explicit HoleFinder(std::int64_t maxgap) : widest_(static_cast<double>(maxgap) + 1.0) {}
+
+  // Every day inside the hole of `width` days that ends at `anchor`, nearest the
+  // earlier edge first. The anchor's own day is a business day.
+  void addHole(double anchor, double width) {
+    if (width > widest_) {
+      tooWide_ = true;
+      return;
+    }
+    for (double back = width; back > 1.0; back -= 1.0) days_.push_back(dayOfValue(anchor - back + 1.0));
+  }
+
+  bool tooWide() const { return tooWide_; }
+  const std::vector<std::int64_t>& days() const { return days_; }
+
+ private:
+  double widest_;
+  bool tooWide_ = false;
+  std::vector<std::int64_t> days_;
+};
+
+}  // namespace
+
+InduceResult induceFromDates(const std::vector<double>& valuesIn, const InduceOpts& opts) {
+  InduceResult result;
+  const auto refused = [&result](int rc, std::string message) {
+    result.rc = rc;
+    result.message = std::move(message);
+    return result;
   };
-  if (!isValidCalName(opts.calName)) return fail("invalid business calendar name");
-  static const std::set<std::string> kOrders = {"ymd", "ydm", "myd", "mdy", "dym", "dmy"};
-  if (kOrders.count(opts.dateformat) == 0) return fail("invalid dateformat()");
-  if (opts.purpose.size() > 63) return fail("purpose() is limited to 63 characters");
-  if (opts.purpose.find_first_of("\r\n") != std::string::npos)
-    return fail("purpose() must be on one line");
-  if (opts.maxgap < 1) return fail("maxgap() should be at least 1");
-  if (values.empty()) return fail("no observations found for calendar", 2000);
+  if (opts.maxgap < 1) return refused(198, "maxgap() should be at least 1");
+  if (valuesIn.empty()) return refused(2000, "no observations found for calendar");
 
-  // Independent construction from the observed date set: its complement is
-  // the holiday set. Duplicated observations and source row order do not add
-  // business days. Fractions identify their containing integer daily date.
-  // The caller has already applied if/in/excludemissing.
-  const std::int64_t minDate = daysFromCivil(100, 1, 1);
-  const std::int64_t maxDate = daysFromCivil(9999, 12, 31);
-  std::set<std::int64_t> dates;
-  for (double value : values) {
-    if (!std::isfinite(value)) return fail("dates cannot be after Dec 31, 9999");
-    const double day = std::floor(value);
-    if (day > static_cast<double>(maxDate))
-      return fail("dates cannot be after Dec 31, 9999");
-    if (day < static_cast<double>(minDate)) return fail("dates cannot be before Jan 1, 0100");
-    r.fractionalNote = r.fractionalNote || value != day;
-    dates.insert(static_cast<std::int64_t>(day));
+  // Ascending with missing last; a missing value then fails the upper bound.
+  std::vector<double> dates = valuesIn;
+  const auto firstMissing =
+      std::partition(dates.begin(), dates.end(), [](double v) { return !std::isnan(v); });
+  std::sort(dates.begin(), firstMissing);
+  const double earliest = dates.front(), latest = dates.back();
+
+  // Measured bounds. The lower one is not the 01jan0100 the message names.
+  if (earliest < -676350.0) return refused(198, "Stata date cannot be before Jan 1, 0100");
+  if (std::isnan(latest) || latest > 2936549.0)
+    return refused(198, "Stata date cannot be after Dec 31, 9999");
+
+  const std::string order = opts.dateformat.empty() ? std::string("ymd") : opts.dateformat;
+  const std::int64_t rangeStart = opts.haveRangeLo ? opts.rangeLo : dayOfValue(earliest);
+  const std::int64_t rangeEnd = opts.haveRangeHi ? opts.rangeHi : dayOfValue(latest);
+  if (opts.haveRangeLo && static_cast<double>(rangeStart) > earliest)
+    return refused(198, "first date in range() cannot be after first business date in dataset");
+  if (opts.haveRangeHi && static_cast<double>(rangeEnd) < latest)
+    return refused(198, "second date in range() cannot be before last business date in dataset");
+  const std::int64_t center = opts.haveCenter ? opts.center : rangeStart;
+  if (center < rangeStart || center > rangeEnd)
+    return refused(198, "centerdate " + renderUnderDateformat(center, order) + " out of range");
+
+  HoleFinder holes(opts.maxgap);
+  const double lowEdge = static_cast<double>(rangeStart), highEdge = static_cast<double>(rangeEnd);
+  if (earliest > lowEdge) holes.addHole(earliest, earliest - lowEdge);
+  for (size_t i = 1; i < dates.size(); ++i) {
+    // Only a non-whole last value with no range end can lie past the range; it
+    // then takes no part in the walk at all.
+    if (dates[i] < lowEdge || dates[i] > highEdge) continue;
+    holes.addHole(dates[i], dates[i] - dates[i - 1]);
+  }
+  if (highEdge > latest) holes.addHole(highEdge, highEdge - latest);
+  if (holes.tooWide()) {
+    return refused(198, "gap in business calendar too large; maxgap() currently set to " +
+                            std::to_string(opts.maxgap));
   }
 
-  const std::int64_t first = *dates.begin(), last = *dates.rbegin();
-  bool observedWeekday[7] = {};
-  for (std::int64_t day : dates) observedWeekday[dowOf(day)] = true;
-  const std::int64_t lo = opts.haveRangeLo ? opts.rangeLo : first;
-  const std::int64_t hi = opts.haveRangeHi ? opts.rangeHi : last;
-  if (lo < minDate || hi > maxDate) return fail("range() dates out of supported bounds");
-  if (lo > first) return fail("range() cannot start after the first business date in the data");
-  if (hi < last) return fail("range() cannot end before the last business date in the data");
-  if (hi == lo) return fail("calendar requires at least two distinct business dates", 197);
-
-  // An outward range introduces its explicit endpoints as business dates, not
-  // every intervening day. Weekdays absent from the original source remain
-  // holidays throughout the requested span, including at its endpoints.
-  dates.insert(lo);
-  dates.insert(hi);
-  std::set<std::int64_t> omitted;
-  std::int64_t preceding = lo;
-  for (auto it = std::next(dates.begin()); it != dates.end(); ++it) {
-    const std::int64_t gap = *it - preceding - 1;
-    if (gap > opts.maxgap)
-      return fail("gap of " + std::to_string(gap) + " consecutive holidays exceeds maxgap()");
-    for (std::int64_t day = preceding + 1; day < *it; ++day) omitted.insert(day);
-    preceding = *it;
+  bool weekdaySeen[7] = {false, false, false, false, false, false, false};
+  for (double v : dates) weekdaySeen[dowOf(dayOfValue(v))] = true;
+  std::string absentCodes;
+  for (const auto& weekday : kWeekOrder) {
+    if (weekdaySeen[weekday.dow]) continue;
+    if (!absentCodes.empty()) absentCodes += ' ';
+    absentCodes += weekday.code;
   }
-  if (!observedWeekday[dowOf(lo)] || !observedWeekday[dowOf(hi)])
-    return fail("range() endpoint falls on an inferred nonbusiness weekday", 197);
 
-  const std::int64_t center = opts.haveCenter ? opts.center : lo;
-  if (center < lo || center > hi) return fail("centerdate() is outside range()");
-  if (omitted.count(center) != 0) return fail("centerdate() is a business holiday", 197);
+  std::string version = std::to_string(opts.stataVersion10 / 10);
+  if (opts.stataVersion10 % 10 != 0) version += "." + std::to_string(opts.stataVersion10 % 10);
 
-  std::ostringstream out;
-  out << "* Business calendar " << opts.calName << " generated by PIET\n";
-  if (!opts.todayLine.empty()) out << opts.todayLine << '\n';
-  out << "version " << opts.stataVersion10 / 10;
-  if (opts.stataVersion10 % 10 != 0) out << '.' << opts.stataVersion10 % 10;
-  out << "\npurpose `\"" << opts.purpose << "\"'\n";
-  out << "dateformat " << opts.dateformat << '\n';
-  out << "range " << renderUnderDateformat(lo, opts.dateformat) << ' '
-      << renderUnderDateformat(hi, opts.dateformat) << '\n';
-  out << "centerdate " << renderUnderDateformat(center, opts.dateformat) << '\n';
-  for (std::int64_t day : omitted)
-    out << "omit date " << renderUnderDateformat(day, opts.dateformat) << '\n';
-  r.text = out.str();
-  r.leadNote = lo < first;
-  r.trailNote = hi > last;
-  r.ok = true;
-  return r;
+  std::ostringstream file;
+  file << "* Business calendar \"" << opts.calName << "\" created by -bcal create-\n"
+       << opts.todayLine << "\n\nversion " << version << "\n";
+  if (!opts.purpose.empty()) file << "purpose \"" << opts.purpose << "\"\n";
+  file << "dateformat " << order << "\n\nrange " << renderUnderDateformat(rangeStart, order) << " "
+       << renderUnderDateformat(rangeEnd, order) << "\ncenterdate "
+       << renderUnderDateformat(center, order) << "\n\n";
+  if (!absentCodes.empty()) file << "omit dayofweek (" << absentCodes << ")\n";
+  for (std::int64_t day : holes.days()) {
+    if (!weekdaySeen[dowOf(day)]) continue;  // the weekday line already omits it
+    file << "omit date " << renderUnderDateformat(day, order) << "\n";
+  }
+
+  result.ok = true;
+  result.text = file.str();
+  result.leadNote = earliest > lowEdge;
+  result.trailNote = highEdge > latest;
+  return result;
 }
 
 bool isValidCalName(const std::string& name) {
-  // [D] bcal defines a calendar name as a valid name of at most 10 characters.
-  // Share that check with the reader and expression lookup paths.
+  // The calendar-name rule ([D] bcal: a valid Stata name of at most 10
+  // characters). Stata applies it on the read path as well as on create
+  // (see bcal.h for the measurement table).
   return strutil::isValidStataIdentifier(name) && name.size() <= 10;
 }
 
@@ -904,10 +939,6 @@ std::map<std::string, std::shared_ptr<const BusinessCalendar>>& cacheStorage() {
   static std::map<std::string, std::shared_ptr<const BusinessCalendar>> m;
   return m;
 }
-std::string& personalDirStorage() {
-  static std::string dir;
-  return dir;
-}
 // Stata's cache is keyed by NAME ALONE, measured both directions (this
 // review, /private/tmp/fix-bcal/st/cap.log): create `cdcal` in the cwd, then
 // `cd sub` -> bofd is still 1 (B_in_sub), and after a `bcal create cdcal` in
@@ -928,8 +959,6 @@ std::string joinDir(const std::string& dir, const std::string& file) {
 
 void setSearchDir(std::string dir) { searchDirStorage() = std::move(dir); }
 const std::string& searchDir() { return searchDirStorage(); }
-void setPersonalDir(std::string dir) { personalDirStorage() = std::move(dir); }
-const std::string& personalDir() { return personalDirStorage(); }
 void clearCache() { cacheStorage().clear(); }
 
 std::string calNameFromFormat(const std::string& spec) {
@@ -958,7 +987,7 @@ void install(const std::string& name, std::shared_ptr<const BusinessCalendar> ca
 
 std::shared_ptr<const BusinessCalendar> loadFile(const std::string& name, const std::string& path,
                                                  StbcalError* errOut) {
-  std::ifstream in(std::filesystem::u8path(path), std::ios::binary);
+  std::ifstream in(path, std::ios::binary);
   if (!in) {
     if (errOut) {
       errOut->rc = 601;
@@ -979,8 +1008,7 @@ std::shared_ptr<const BusinessCalendar> loadFile(const std::string& name, const 
   return sp;
 }
 
-std::shared_ptr<const BusinessCalendar> lookup(const std::string& nameIn, bool forceReload,
-                                                StbcalError* errOut) {
+std::shared_ptr<const BusinessCalendar> lookup(const std::string& nameIn) {
   std::string name = nameIn;
   // A leading %tb (with or without a width) names the same calendar.
   if (!name.empty() && name[0] == '%') {
@@ -997,14 +1025,9 @@ std::shared_ptr<const BusinessCalendar> lookup(const std::string& nameIn, bool f
   if (!isValidCalName(name)) return nullptr;
   auto& cache = cacheStorage();
   auto it = cache.find(cacheKey(name));
-  if (!forceReload && it != cache.end()) return it->second;
+  if (it != cache.end()) return it->second;
   StbcalError err;
-  auto loaded = loadFile(name, joinDir(searchDirStorage(), name + ".stbcal"), &err);
-  if (!loaded && err.rc == 601 && !personalDirStorage().empty() &&
-      personalDirStorage() != searchDirStorage())
-    loaded = loadFile(name, joinDir(personalDirStorage(), name + ".stbcal"), &err);
-  if (!loaded && errOut != nullptr) *errOut = err;
-  return loaded;
+  return loadFile(name, joinDir(searchDirStorage(), name + ".stbcal"), &err);
 }
 
 }  // namespace piet::bcal

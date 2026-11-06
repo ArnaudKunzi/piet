@@ -1,0 +1,38 @@
+{
+ "xtlogit": {
+  "a_median_s": 0.985,
+  "rc_a": 0
+ },
+ "xtpois": {
+  "a_median_s": 0.19,
+  "rc_a": 0
+ },
+ "nbreg": {
+  "a_median_s": 2.168,
+  "rc_a": 0
+ },
+ "zip": {
+  "a_median_s": 7.625,
+  "rc_a": 0
+ },
+ "ivprobit": {
+  "a_median_s": 13.012,
+  "rc_a": 0
+ },
+ "ivtobit": {
+  "a_median_s": 21.054,
+  "rc_a": 0
+ },
+ "mixed": {
+  "a_median_s": 19.73,
+  "rc_a": 0
+ },
+ "qreg": {
+  "a_median_s": 7.197,
+  "rc_a": 0
+ },
+ "chow20": {
+  "a_median_s": 2.077,
+  "rc_a": 0
+ }
+}

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // panes.js — drag-resizable pane handles (col 2 = left rule, col 4 = right rule).
 // Updates --col-vars / --col-history on #app so the Mondrian grid adapts live.
 

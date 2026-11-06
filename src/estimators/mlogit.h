@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — multinomial (polytomous) logit MLE, matching Stata `mlogit`.
 //
 // Outcomes are recoded to 0..K-1 by SORTED DISTINCT VALUE. One outcome is the

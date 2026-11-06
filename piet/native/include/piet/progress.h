@@ -1,5 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Synthetic run-progress generator for M0. Produces JSON objects matching
-// the B1 schema FROZEN in plans/piet/CONTRACT.md (contract_B v1.11.0,
+// the B1 schema FROZEN in internal note piet/CONTRACT.md (contract_B v1.11.0,
 // `GET /api/run_progress`) field-for-field:
 //
 //   { running, current_line, total_lines, current_cmd, elapsed_ms,

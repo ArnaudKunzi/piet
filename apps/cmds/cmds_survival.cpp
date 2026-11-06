@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 #include "core/distributions.h"
@@ -10,8 +12,8 @@
 // "Survival-time data settings" report as JSON on stdout. `stcox`/`streg` then
 // read those four as ordinary columns — no session state, no hidden coupling.
 //
-// Oracle for every number: StataBE 19.5, tests/kitchensink/pangram/waves/
-// _oracle/p7_stata.log (the `preserve / sort id exit / stset exit,
+// Oracle for every number: StataBE 19.5, internal capture
+// p7_stata.log (the `preserve / sort id exit / stset exit,
 // failure(fail) id(id)` block of p7.do). Assertions in tests/unit/test_survival.cpp.
 
 namespace cecon {

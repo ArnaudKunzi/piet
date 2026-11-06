@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 
 // Estimator headers needed only by the definitions in this TU (run_feols/run_iv/
@@ -7,12 +9,14 @@
 #include "core/eng_counters.h"  // W0: provenance-hash + write-plane ledger (P2PERF §W0)
 #include "core/verb_diag.h"  // COBRA_VERB_DIAG: maybe_keepif scratch-write phase timing (measurement-only)
 #include "io/dta_reader.h"  // read_dta — open_using_frame's .dta branch (WS-D2)
+#include <algorithm>  // std::min/std::max (fe_group_sizes)
 #include <cstring>  // strlen — open_using_frame's extension match
 #include "estimators/feols.h"
 #include "estimators/fepois.h"
 #include "estimators/iv2sls.h"
 #include "estimators/iv_weakid.h"
 #include "vcov/svy_vcov.h"
+#include "vcov/vcov.h"
 
 namespace cecon {
 namespace cli {
@@ -534,8 +538,16 @@ void add_e_v(json& out, const std::vector<std::string>& names, const std::vector
     out["e_V"] = {{"names", std::move(nm)}, {"matrix", std::move(rows)}};
 }
 
-void add_omitted(json& out, const std::vector<std::string>& omitted,
+void add_omitted(json& out, const std::vector<std::string>& omitted_in,
                  const std::vector<std::string>& full_names) {
+    // BUG-1067: a continuous regressor repeated in the design (`x x`, or the c.x of
+    // `c.x##i.t c.x##i.s`) is two columns under ONE name; the collinearity pass
+    // keeps the first and omits the second (Stata: `x o.x`). The omitted copy must
+    // not overwrite the kept coefficient with 0 under the shared key, so a name a
+    // survivor already holds is left to the survivor.
+    std::vector<std::string> omitted;
+    for (const auto& nm : omitted_in)
+        if (!(out.contains("coef") && out["coef"].contains(nm))) omitted.push_back(nm);
     if (omitted.empty()) return;
     for (const auto& nm : omitted) {
         if (out.contains("coef")) out["coef"][nm] = 0.0;
@@ -872,9 +884,9 @@ bool varlist_has_ts(const std::vector<std::string>& names) {
 // The E1 routing decision for one `--keepif`-bearing estimator call. `data` stays
 // the ORIGINAL path and `active`/`mask` carry the `if` restriction when TS tokens
 // are actually in play (tsset known, keepif non-empty, and at least one of
-// `token_lists` — the TS-eligible varlists for this estimator, e.g. {&xs} for feols
-// or {&exog,&endog,&instruments} for iv; y is never TS-eligible, see
-// build_model/build_iv_model) carries an operator. Every other case (no keepif, no
+// `token_lists` — the TS-eligible varlists for this estimator, e.g. {&xs, &ys} for
+// feols or {&exog,&endog,&instruments,&ys} for iv; build_model/build_iv_model take
+// the depvar through ts_prepass too, BUG-1277) carries an operator. Every other case (no keepif, no
 // TS token, or no tsset — the last mirrors ts_prepass's own ts_no_tsset guard, so
 // that error still surfaces exactly as before) falls back to maybe_keepif's plain
 // physical pre-filter, byte-identical to pre-E1 cobra.
@@ -1046,7 +1058,8 @@ GlmInputs load_glm(const Dataset& ds, const char* cmd, const std::string& y,
                    const std::vector<std::string>& xs,
                    const std::vector<std::string>& cluster_names,
                    const std::string& weight_var, cecon::WeightKind weight_kind,
-                   const std::string& offset_var) {
+                   const std::string& offset_var, const cecon::TsMeta* ts,
+                   const std::vector<char>* row_mask) {
     GlmInputs g;
     // Keep the established command-qualified diagnostics for ordinary y/x names.
     // Factor/interaction/TS expressions are intentionally left to build_model,
@@ -1059,7 +1072,7 @@ GlmInputs load_glm(const Dataset& ds, const char* cmd, const std::string& y,
     // weights (build_model's own machinery) — a missing offset drops the row,
     // exactly like a missing regressor, which is what Stata does.
     if (!offset_var.empty()) (void)require_num(ds, cmd, offset_var);
-    ModelData md = build_model(ds, y, xs, {}, cluster_names, offset_var, false, nullptr, nullptr,
+    ModelData md = build_model(ds, y, xs, {}, cluster_names, offset_var, false, ts, row_mask,
                                weight_var, weight_kind);
     g.n = md.dm.n;
     g.n_dropped = md.dm.n_dropped;
@@ -1141,12 +1154,27 @@ struct PanelMeans {
 // md must be pre-feols_fit (md.dm still raw). Single absorbed FE only.
 PanelMeans capture_panel_means(const ModelData& md) {
     PanelMeans pm;
-    if (md.fe.size() != 1 || !md.weights.empty()) return pm;
+    if (md.fe.size() != 1) return pm;
     const Factor& F = md.fe[0];
     const int64_t n = md.dm.n;
     const int k = md.dm.k;
     const int ng = F.n_levels;
     if (n <= 0 || k <= 0 || ng <= 0 || static_cast<int64_t>(F.codes.size()) != n) return pm;
+    // BUG-1292: `xtreg, fe` takes only a weight constant within the panel
+    // (r(199) otherwise), and then computes its panel scalars
+    // from the weighted fit's xb with UNweighted summaries (`summ U`, `corr`): the
+    // panel means below are the same either way. A weight varying within a level
+    // (areg/reghdfe) has no xtreg scalars: emit nothing, as before.
+    if (!md.weights.empty()) {
+        std::vector<double> wg(static_cast<size_t>(ng), std::nan(""));
+        for (int64_t i = 0; i < n; ++i) {
+            const int g = F.codes[static_cast<size_t>(i)];
+            if (g < 0 || g >= ng) return pm;
+            double& v = wg[static_cast<size_t>(g)];
+            if (std::isnan(v)) v = md.weights[static_cast<size_t>(i)];
+            else if (v != md.weights[static_cast<size_t>(i)]) return pm;
+        }
+    }
     pm.kd = k;
     pm.cnt.assign(static_cast<size_t>(ng), 0);
     pm.ybar.assign(static_cast<size_t>(ng), 0.0);
@@ -1225,10 +1253,23 @@ void add_panel_scalars(json& out, const ModelData& md, const PanelMeans& pm, con
     const double sigma_u2 = s2 / static_cast<double>(ng - 1);
 
     // sigma_e: RMSE of the within regression, dof = N − n_g − k (xtreg.cpp's
-    // convention, feols.cpp line 158's twin). Oracle .77958951 — exact.
-    const double dof_e = static_cast<double>(n) - static_cast<double>(ng) - static_cast<double>(k);
+    // convention, feols.cpp line 158's twin). Oracle .77958951 — exact. Weighted, N is
+    // Stata's e(N) (rows under aw/pw, sum(w) under fw) and r.ssr the weighted RSS.
+    const double n_obs = r.n_eff > 0.0 ? r.n_eff : static_cast<double>(n);
+    const double dof_e = n_obs - static_cast<double>(ng) - static_cast<double>(k);
     if (!(dof_e > 0)) return;
     const double sigma_e2 = r.ssr / dof_e;
+    // BUG-1292: a weighted fit left md.dm demeaned AND scaled by sqrt(w~) (feols_fit,
+    // w~ = w * n_eff/sum_w); undo the scale to get the demeaned rows back. The weight
+    // is constant within the panel here (capture_panel_means).
+    std::vector<double> inv_s;
+    if (!md.weights.empty()) {
+        if (!(r.sum_w > 0.0) || !(r.n_eff > 0.0)) return;
+        const double c = r.n_eff / r.sum_w;
+        inv_s.resize(static_cast<size_t>(n));
+        for (int64_t i = 0; i < n; ++i)
+            inv_s[static_cast<size_t>(i)] = 1.0 / std::sqrt(md.weights[static_cast<size_t>(i)] * c);
+    }
 
     // corr(u_i, Xb): Stata computes this at the OBSERVATION level — û_i repeated
     // across the panel's rows against the per-ROW Xβ_it — NOT as a per-group
@@ -1248,6 +1289,7 @@ void add_panel_scalars(json& out, const ModelData& md, const PanelMeans& pm, con
     }
     for (int64_t i = 0; i < n; ++i) {
         const int g = F.codes[static_cast<size_t>(i)];
+        if (!inv_s.empty()) xrow[static_cast<size_t>(i)] *= inv_s[static_cast<size_t>(i)];
         xrow[static_cast<size_t>(i)] += xbg[static_cast<size_t>(g)];
         sa += u[static_cast<size_t>(g)];
         sb += xrow[static_cast<size_t>(i)];
@@ -1288,7 +1330,9 @@ void add_panel_scalars(json& out, const ModelData& md, const PanelMeans& pm, con
     std::vector<double> yrow(static_cast<size_t>(n));
     for (int64_t i = 0; i < n; ++i)
         yrow[static_cast<size_t>(i)] =
-            md.dm.y[static_cast<size_t>(i)] + pm.ybar[static_cast<size_t>(F.codes[static_cast<size_t>(i)])];
+            (inv_s.empty() ? md.dm.y[static_cast<size_t>(i)]
+                           : md.dm.y[static_cast<size_t>(i)] * inv_s[static_cast<size_t>(i)]) +
+            pm.ybar[static_cast<size_t>(F.codes[static_cast<size_t>(i)])];
     out["r2_overall"] = corr2(xrow, yrow);
 
     std::vector<double> mxb, myy;
@@ -1323,10 +1367,23 @@ json run_feols_svy(const std::string& data, const std::string& y,
     // PSU and stratum ride in as clustering dimensions so they join the SINGLE
     // listwise-deletion pass — a design column that is missing must drop the row
     // from the estimation sample, exactly as it does for a regressor.
-    std::vector<std::string> design_cols = {psu_var, strata_var};
+    // An empty strata_var is a design without strata(): Stata treats it as ONE
+    // stratum (`svy` header "Number of strata = 1", design df = #PSU - 1;
+    // w2t_boottest_family.log:2455 H1). The constant stratum is appended after
+    // build_model, so it drops no row and the PSU alone joins the deletion pass.
+    const bool one_stratum = strata_var.empty();
+    std::vector<std::string> design_cols = {psu_var};
+    if (!one_stratum) design_cols.push_back(strata_var);
     ModelData md = build_model(ds, y, xs, /*fenames=*/{}, design_cols, "", /*drop_singleton=*/true, ts,
                                if_mask, weight_var, cecon::WeightKind::Probability);
     if (esample) { esample->keep = md.keep; esample->loaded = &ds; }  // e(sample) T1a
+    if (one_stratum && !md.cluster.empty()) {
+        Factor st;
+        st.n_levels = 1;
+        st.codes.assign(static_cast<size_t>(md.dm.n), 0);
+        st.count.assign(1, static_cast<double>(md.dm.n));
+        md.cluster.push_back(std::move(st));
+    }
     if (md.cluster.size() < 2)
         throw EngineError("bad_input", "svy: could not resolve both --psu and --strata columns");
 
@@ -1438,6 +1495,16 @@ json run_feols_svy(const std::string& data, const std::string& y,
     return out;
 }
 
+// e(kcluster) / e(cluster1..): one entry per multiway cluster combination
+// (multiway_cluster_combos order) under `kcluster`, {"name", "levels"} each. Absent
+// key when empty, so every other reply is byte-identical.
+static void add_kcluster(json& out, const std::vector<ClusterCombo>& combos) {
+    if (combos.empty()) return;
+    json arr = json::array();
+    for (const auto& c : combos) arr.push_back({{"name", c.name}, {"levels", c.levels}});
+    out["kcluster"] = std::move(arr);
+}
+
 json run_feols(const std::string& data, const std::string& y,
                const std::vector<std::string>& xs, const std::vector<std::string>& fes,
                const std::string& vcov_type, const std::vector<std::string>& clusters,
@@ -1445,14 +1512,33 @@ json run_feols(const std::string& data, const std::string& y,
                const std::vector<char>* if_mask, bool no_intercept, double level,
                bool level_set, const std::string& weight_var,
                cecon::WeightKind weight_kind, EsampleRows* esample,
-               bool keep_nested_fe_dof, bool emit_v) {
+               bool keep_nested_fe_dof, bool emit_v, bool multiway_subset_factors,
+               bool fe_nested_in_clusters, bool regress_exact_fit, bool collinear_forward) {
     auto t0 = std::chrono::steady_clock::now();
     const Dataset& ds = acquire_data(data);
     auto t1 = std::chrono::steady_clock::now();
     ModelData md = build_model(ds, y, xs, fes, clusters, "", drop_singleton, ts, if_mask,
                                weight_var, weight_kind);
+    md.collinear_forward = collinear_forward;  // BUG-1067
     if (esample) { esample->keep = md.keep; esample->loaded = &ds; }  // e(sample) T1a
     auto t2 = std::chrono::steady_clock::now();
+    // FU-401/FU-407: xtreg,fe checks every cluster variable, in the
+    // order given, over the estimation sample: a cluster
+    // that varies within a panel is "panels are not nested within clusters", r(498),
+    // and with two or more cluster variables the failing one is named
+    // (w2s_multiway_class.log:630-632 `vce(cluster id id2)`, :774 `vce(cluster id2)`).
+    // The cluster variable equal to the panel variable passes.
+    if (fe_nested_in_clusters) {
+        if (md.fe.empty() || md.cluster.empty())
+            throw EngineError("bad_input",
+                "feols: --fe-nested-in-clusters requires --fe and a cluster VCE");
+        for (const Factor& c : md.cluster) {
+            if (c.name == md.fe[0].name || fe_nested_in_cluster(md.fe[0], c)) continue;
+            std::string msg = "panels are not nested within clusters";
+            if (md.cluster.size() > 1) msg += "\ncluster variable " + c.name;
+            throw EngineError("bad_input", msg, "panels_not_nested");
+        }
+    }
 
     Vcov vt = Vcov::IID;
     if (vcov_type == "hc1" || vcov_type == "HC1") vt = Vcov::HC1;
@@ -1460,10 +1546,11 @@ json run_feols(const std::string& data, const std::string& y,
     else if (vcov_type == "twoway" || vcov_type == "multiway") vt = Vcov::Multiway;
     // §35 xtreg,fe variance components: the raw-scale group means must be taken
     // before feols_fit demeans md.dm in place. No-op unless there is exactly one
-    // absorbed FE and no weights: under weights the panel scalars are omitted
-    // (their weighted definitions are not implemented), never computed unweighted.
+    // absorbed FE and any weight is constant within its levels (xtreg,fe's own
+    // requirement; BUG-1292).
     const PanelMeans panel_means = capture_panel_means(md);
-    FeolsResult r = feols_fit(md, vt, 0, no_intercept, keep_nested_fe_dof);
+    FeolsResult r = feols_fit(md, vt, 0, no_intercept, keep_nested_fe_dof, multiway_subset_factors,
+                              regress_exact_fit);
     auto t3 = std::chrono::steady_clock::now();
 
     auto ms = [](auto x, auto y2) {
@@ -1483,7 +1570,7 @@ json run_feols(const std::string& data, const std::string& y,
     // through the SAME "n_obs" key either way — that is the number the header prints
     // as "Number of obs", and reporting rows there under fw would contradict Stata.
     json n_obs = r.n;
-    if (r.n_eff > 0.0) n_obs = static_cast<int64_t>(std::llround(r.n_eff));
+    if (r.n_eff > 0.0) n_obs = static_cast<int64_t>(std::floor(r.n_eff + 1e-9));  // Stata truncates
     json out = {
         {"estimator", "feols"},
         {"depvar", y},
@@ -1542,16 +1629,83 @@ json run_feols(const std::string& data, const std::string& y,
         for (const auto& c : md.cluster) by.push_back(c.n_levels);
         out["n_clusters_by"] = by;
     }
+    // Stata's built-in multiway convention only (FU-388): e(rank) of the clipped
+    // variance and the e(kcluster) combinations, in Stata's column order.
+    if (r.vcov_rank >= 0) out["vcov_rank"] = r.vcov_rank;
+    add_kcluster(out, r.kcluster);
+    // The rest of that built-in multiway e() (new keys, multiway_subset_factors fits
+    // only; e_Vmb also after a one-way robust/cluster fit, BUG-1043 -- unweighted or
+    // fw without FE, unweighted with FE): e(V_modelbased) as `e_Vmb` in e_V's shape
+    // (under --emit-v), and under a
+    // single absorbed FE the sums of squares and group sizes areg/xtreg,fe post
+    // (e(tss)/e(tss_w)/e(mss_w), and
+    // e(Tbar)/e(g_min)/e(g_avg)/e(g_max) over the panel sizes).
+    if (emit_v && !r.vcov_modelbased.empty()) {
+        json tmp;
+        add_e_v(tmp, r.names, r.vcov_modelbased);
+        out["e_Vmb"] = std::move(tmp["e_V"]);
+    }
+    // BUG-1041: every absorbed fit carries both sums, because areg and reghdfe
+    // post e(mss) = e(tss) - e(rss) about the overall mean and e(tss) (reghdfe also
+    // e(tss_within)) under every VCE, not only the built-in multiway one.
+    if (!md.fe.empty()) {
+        out["tss_total"] = r.tss_total;
+        out["tss_within"] = r.tss_within;
+        // The panel group sizes come from the one producer below (fe_group_sizes,
+        // estimation-sample row counts); a second writer here used to be overwritten
+        // by it, silently, with different keys.
+    }
+    // Stata `regress`'s e(beta) (unweighted no-FE OLS only; absent otherwise).
+    if (!r.beta_std.empty()) {
+        json b = json::object();
+        for (const auto& [nm, v] : r.beta_std) b[nm] = v;
+        out["beta_std"] = std::move(b);
+    }
     add_model_f(out, r.f_stat, r.df_m, r.df_r_exact);  // {"F", ...},{"p_F", ...} (null if undefined)
     // Single-FE panel models (Stata xtreg,fe / areg): the six header scalars —
     // r2_between/r2_overall (since 1.5.1, §19; factor-expansion hole closed in §35 /
     // BUG-156) and sigma_u/sigma_e/rho/corr_u_xb (since §35). One producer for all six.
     if (fes.size() == 1) add_panel_scalars(out, md, panel_means, r);
+    // xtreg, fe's e(g_min)/e(g_avg)/e(g_max): the row counts of the panels in the
+    // estimation sample (observations per panel). One
+    // absorbed factor only; the consumer (PIET's xtreg, fe route) copies them to
+    // e(). Additive key, absent otherwise.
+    if (fes.size() == 1 && md.fe.size() == 1 && md.fe[0].n_levels > 0) {
+        const Factor& f = md.fe[0];
+        std::vector<int64_t> cnt(static_cast<size_t>(f.n_levels), 0);
+        for (int32_t c : f.codes)
+            if (c >= 0 && c < f.n_levels) ++cnt[static_cast<size_t>(c)];
+        int64_t gmin = -1, gmax = 0, tot = 0, ng = 0;
+        for (int64_t c : cnt) {
+            if (c <= 0) continue;
+            gmin = gmin < 0 ? c : std::min(gmin, c);
+            gmax = std::max(gmax, c);
+            tot += c;
+            ++ng;
+        }
+        if (ng > 0)
+            out["fe_group_sizes"] = {{"min", gmin}, {"avg", static_cast<double>(tot) / static_cast<double>(ng)},
+                                     {"max", gmax}};
+    }
     if (level_set) out["level"] = level;  // emitted only when --level was passed (byte-stable default)
     {
         double dof = (r.n_clusters > 0) ? (r.n_clusters - 1.0)
                                         : static_cast<double>(r.dof.dof_resid);
         add_inference(out, r.names, r.beta, r.se, dof, false, level);
+    }
+    // Stata `regress` on an exact fit (feols_fit's exact-fit rule): V is 0, and
+    // the coefficient table carries t, P>|t| and the interval as missing
+    // (StataBE `regress yx x` with yx = 3 + 2x: r(table) se/t/pvalue/ll/ul `.`).
+    // tstat() and add_inference would post t 0, p 1 and ll = ul = b instead.
+    if (r.exact_fit) {
+        for (int j = 0; j < r.k; ++j) {
+            if (r.se[static_cast<size_t>(j)] != 0.0) continue;
+            const std::string& nm = r.names[static_cast<size_t>(j)];
+            out["tstat"][nm] = nullptr;
+            out["pvalue"][nm] = nullptr;
+            out["ci_lo"][nm] = nullptr;
+            out["ci_hi"][nm] = nullptr;
+        }
     }
     add_omitted(out, r.omitted, r.full_names);
     if (emit_v) add_e_v(out, r.names, r.vcov_matrix);  // opt-in: absent key by default
@@ -1582,13 +1736,24 @@ static std::vector<size_t> iv_display_order(const std::vector<std::string>& name
     return ord;
 }
 
+// BUG-1225: the included regressors the FE absorption annihilated, as omitted rows
+// (b 0, se 0) at their varlist place in the display order -- StataBE ivreghdfe's
+// e(b) is `x1 x2 x3` with x2 "(omitted)". Call after add_inference. No-op otherwise.
+static void add_iv_omitted_exog(json& out, const cecon::IvResult& r,
+                                const std::vector<std::string>& endog) {
+    if (r.omitted_exog.empty()) return;
+    std::vector<std::string> full;
+    for (size_t idx : iv_display_order(r.full_names, endog)) full.push_back(r.full_names[idx]);
+    add_omitted(out, r.omitted_exog, full);
+}
+
 // ---- ivreg2 `savefirst` JSON ------------------------------------------------
 // The stored-estimate NAME ivreg2 mints for endogenous regressor `v`
-// (ivreg2.ado:1457-1459), measured by tests/eval/golden/aer_b4/ivreg2-savefirst.log:
+// (as ivreg2 mints it), measured by tests/eval/golden/aer_b4/ivreg2-savefirst.log:
 //   * with savefprefix(fs_)     -> "fs_mpg"                (arm A: e(firsteqs) = "fs_mpg fs_turn")
 //   * with no prefix            -> "_ivreg2_" + v          (arm B: "_ivreg2_L_mpg")
 //   * every "." becomes "_"     -> `L.mpg` -> `L_mpg`      (arm B, same cell)
-//   * longer than 32 characters -> Stata's `est store` is `capture`d at :1459, so the
+//   * longer than 32 characters -> Stata's `est store` is `capture`d by ivreg2, so the
 //     equation is SILENTLY NOT STORED and drops out of e(firsteqs) (arm G: a 30-char
 //     prefix + "mpg" = 33 gives e(firsteqs) EMPTY and rc 111 on restore).
 // The length rule is reproduced rather than papered over: a consumer that registered
@@ -1629,19 +1794,57 @@ void add_first_stage(json& out, const cecon::IvResult& r, const std::string& pre
             {"rss", f.rss},
             {"vcov_type", f.vcov_type},
             {"n_clusters", f.n_clusters},
-            // ivreg2.ado:3153-3155 metadata, so a consumer can post an estimate that
+            // ivreg2 metadata, so a consumer can post an estimate that
             // answers e(cmd)/e(model) the way a restored ivreg2 first stage does.
             {"cmd", "ivreg2"},
             {"model", "first"},
         };
-        // t/p/CI off df_r — which under cluster() is N-K, NOT M-1 (ivreg2.ado:3143;
+        // t/p/CI off df_r — which under cluster() is N-K, NOT M-1 (as ivreg2 posts it;
         // arm E measured dfr_fs = 70 against `regress, cluster()`'s 8 on the same fit).
         add_inference(e, f.names, f.beta, f.se, static_cast<double>(f.df_r), /*use_z=*/false);
+        // The stored estimate's e(V), in `names` order, and ivreg2's e(first) column
+        // (ivreg2_first_stat_rows() order; absent where it was not computed).
+        add_e_v(e, f.names, f.vcov_matrix);
+        if (!f.ffirst.empty()) e["ffirst"] = f.ffirst;
         fs[f.depvar] = std::move(e);
         if (eqname.size() <= 32) eqs.push_back(eqname);
     }
     out["first_stage"] = std::move(fs);
     out["firsteqs"] = std::move(eqs);
+}
+
+// The iv weight column and its sample mask (see run_iv); nullptr when unweighted.
+static const double* iv_weight_mask(const Dataset& ds, const std::string& weight_var,
+                                    cecon::WeightKind weight_kind,
+                                    const std::vector<char>*& if_mask, std::vector<char>& wmask) {
+    if (weight_var.empty()) return nullptr;
+    if (weight_kind != cecon::WeightKind::Analytic && weight_kind != cecon::WeightKind::Probability)
+        throw EngineError("bad_input", "iv: only --wtype aw and pw are implemented");
+    if (!ds.has(weight_var))
+        throw EngineError("bad_input", "iv: weight variable '" + weight_var + "' not found");
+    const cecon::Column& wc = ds.col(weight_var);
+    if (wc.dtype != cecon::DType::F64)
+        throw EngineError("bad_input", "iv: weight variable '" + weight_var + "' must be numeric");
+    const double* wcol = wc.f64();
+    const int64_t nr = ds.n_rows();
+    wmask.assign(static_cast<size_t>(nr), 1);
+    for (int64_t i = 0; i < nr; ++i) {
+        if (if_mask && !(*if_mask)[static_cast<size_t>(i)]) { wmask[static_cast<size_t>(i)] = 0; continue; }
+        const double w = wcol[i];
+        if (std::isnan(w) || w == 0.0) { wmask[static_cast<size_t>(i)] = 0; continue; }
+        if (w < 0)
+            throw EngineError("bad_input", "iv: weight '" + weight_var + "' has a negative value");
+    }
+    if_mask = &wmask;
+    return wcol;
+}
+
+static void iv_attach_weights(IvModelData& md, const double* wcol, cecon::WeightKind kind) {
+    if (!wcol) return;
+    md.weights.resize(static_cast<size_t>(md.n));
+    for (int64_t r = 0; r < md.n; ++r)
+        md.weights[static_cast<size_t>(r)] = wcol[md.keep[static_cast<size_t>(r)]];
+    md.weight_kind = kind;
 }
 
 json run_iv(const std::string& data, const std::string& y,
@@ -1651,18 +1854,52 @@ json run_iv(const std::string& data, const std::string& y,
             const std::vector<std::string>& clusters, bool gmm,
             const cecon::TsMeta* ts, bool drop_singleton,
             const std::vector<char>* if_mask, bool small, bool savefirst,
-            const std::string& savefprefix, EsampleRows* esample, bool emit_v) {
+            const std::string& savefprefix, EsampleRows* esample, bool emit_v,
+            bool multiway_subset_factors, bool no_intercept, const std::string& weight_var,
+            cecon::WeightKind weight_kind, bool multiway_no_psd_fix, bool dofminus_fe) {
     auto t0 = std::chrono::steady_clock::now();
     const Dataset& ds = acquire_data(data);
     auto t1 = std::chrono::steady_clock::now();
-    IvModelData md = build_iv_model(ds, y, exog, endog, instruments, fes, clusters, ts, drop_singleton, if_mask);
+    // [aw=]/[pw=]: a missing or zero weight leaves the row out of the sample (Stata's
+    // marksample), a negative one is an error, and the surviving weights ride on md
+    // for iv2sls_fit. The mask joins --keepif's, so e(sample) and every count follow.
+    std::vector<char> wmask;
+    const double* wcol = iv_weight_mask(ds, weight_var, weight_kind, if_mask, wmask);
+    IvModelData md = build_iv_model(ds, y, exog, endog, instruments, fes, clusters, ts,
+                                    drop_singleton, if_mask, no_intercept);
+    iv_attach_weights(md, wcol, weight_kind);
+    md.multiway_no_psd_fix = multiway_no_psd_fix;
+    md.dofminus_fe = dofminus_fe;
     if (esample) { esample->keep = md.keep; esample->loaded = &ds; }  // e(sample) T1a
     auto t2 = std::chrono::steady_clock::now();
     Vcov vt = Vcov::IID;
     if (vcov_type == "hc1" || vcov_type == "HC1") vt = Vcov::HC1;
     else if (vcov_type == "cluster") vt = Vcov::Cluster;
     else if (vcov_type == "twoway" || vcov_type == "multiway") vt = Vcov::Multiway;
-    IvResult r = iv2sls_fit(md, vt, 0, gmm, small, savefirst);
+    // xtivreg2: "cluster option not supported if a panel spans more than one
+    // cluster" (r(198)), checked on the estimation sample (after singletons).
+    if (dofminus_fe && vt == Vcov::Cluster && !md.cluster.empty())
+        for (const auto& f : md.fe)
+            if (!cecon::fe_nested_in_cluster(f, md.cluster[0]))
+                throw EngineError("cluster_spans_panel",
+                                  "cluster option not supported if a panel spans more than one cluster");
+    // e(tss), which ivregress posts hidden: the centred sum of squares of the depvar
+    // over the estimation sample. Only for the plain fit (no absorbed effect, no
+    // weights), the one PIET posts it for, and read here because the fit may
+    // transform md.y in place. PIET used to sum it from its working frame, writing
+    // the whole frame to disk to read two columns (BUG-1088). Sent as
+    // `tss_centred`, not `tss`: PIET falls back from e(name) to the result key of
+    // the same name, so a `tss` key would surface as e(tss) after the fits PIET
+    // posts none for (noconstant takes the uncentred sum; ivreg2 posts none).
+    double tss = std::numeric_limits<double>::quiet_NaN();
+    if (md.fe.empty() && md.weights.empty() && md.n > 0) {
+        double sum = 0;
+        for (double v : md.y) sum += v;
+        const double ybar = sum / static_cast<double>(md.n);
+        tss = 0;
+        for (double v : md.y) tss += (v - ybar) * (v - ybar);
+    }
+    IvResult r = iv2sls_fit(md, vt, 0, gmm, small, savefirst, multiway_subset_factors);
     auto t3 = std::chrono::steady_clock::now();
     auto ms = [](auto x, auto y2) {
         return std::chrono::duration<double, std::milli>(y2 - x).count();
@@ -1722,6 +1959,7 @@ json run_iv(const std::string& data, const std::string& y,
     // Model Wald chi2 + rmse (Stata ivregress e(chi2)/e(rmse)); NaN-guarded like
     // hansen_j/kp_lm/eff_F below.
     if (!std::isnan(r.rmse)) out["rmse"] = r.rmse;
+    if (!std::isnan(tss)) out["tss_centred"] = tss;
     if (!std::isnan(r.chi2)) { out["chi2"] = r.chi2; out["chi2_df"] = r.chi2_df; }
     // Hansen J overidentification test (efficient 2-step GMM objective), matches
     // ivreg2/ivreghdfe e(j)/e(jdf)/e(jp) to ~1e-12 for robust and cluster vcov.
@@ -1744,12 +1982,36 @@ json run_iv(const std::string& data, const std::string& y,
         double cd = cragg_donald_F(md.Xendog, md.kendog, md.Xexog, md.kexog, md.Zinst, md.kinst, md.n);
         if (cd >= 0) out["cragg_donald_F"] = cd;
     }
+    // FU-387/FU-403: ivregress's multiway e(rank) (the
+    // rank of the clipped variance) and e(kcluster). Multiway only, new keys only.
+    // Each dimension's own G, in --cluster order (ivreg2 e(N_clust1), e(N_clust2)),
+    // as feols emits it; "n_clusters" stays the smallest. Multiway only, a new key.
+    if (vt == Vcov::Multiway) {
+        json by = json::array();
+        for (const auto& c : md.cluster) by.push_back(c.n_levels);
+        out["n_clusters_by"] = by;
+    }
+    if (vt == Vcov::Multiway && !gmm) {
+        out["vcov_rank"] = multiway_vcov_rank(r.vcov_matrix, r.k);
+        add_kcluster(out, multiway_cluster_combos(md.cluster));
+        // e(p) of the multiway Wald chi2 (StataBE e(p) 1.5107017713e-183 on the
+        // w2s_multiway_class fixture). New key, multiway only.
+        if (!std::isnan(r.chi2)) out["chi2_p"] = chi2_pvalue(r.chi2, r.chi2_df);
+    }
     {
         double dof = (r.n_clusters > 0) ? (r.n_clusters - 1.0)
                                         : static_cast<double>(r.dof.dof_resid);
         // GMM's SEs are always the asymptotic sandwich regardless of --small, so
         // z inference is the coherent match; 2SLS is asymptotic unless --small.
         add_inference(out, pnames, pbeta, pse, dof, gmm || !small);
+    }
+    add_iv_omitted_exog(out, r, endog);
+    // ivreghdfe counts such a regressor among the dropped instruments too, so the
+    // §35 list above keeps its instruments and gains the regressors.
+    if (!r.omitted_exog.empty() && !r.omitted.empty()) {
+        std::vector<std::string> all = r.omitted;
+        all.insert(all.end(), r.omitted_exog.begin(), r.omitted_exog.end());
+        out["omitted"] = all;
     }
     add_first_stage(out, r, savefprefix);   // absent key unless --savefirst
     if (emit_v) add_e_v(out, r.names, r.vcov_matrix, &ord);  // reply's coef order; absent by default
@@ -1769,11 +2031,15 @@ json run_iv_multi(const std::string& data, const std::vector<std::string>& ys,
                   const std::vector<std::string>& clusters, bool gmm,
                   const cecon::TsMeta* ts, bool drop_singleton,
                   const std::vector<char>* if_mask, bool small, bool savefirst,
-                  const std::string& savefprefix, EsampleRows* esample) {
+                  const std::string& savefprefix, EsampleRows* esample,
+                  const std::string& weight_var, cecon::WeightKind weight_kind) {
     auto t0 = std::chrono::steady_clock::now();
     const Dataset& ds = acquire_data(data);
     auto t1 = std::chrono::steady_clock::now();
+    std::vector<char> wmask;  // as in run_iv
+    const double* wcol = iv_weight_mask(ds, weight_var, weight_kind, if_mask, wmask);
     IvModelData md = build_iv_model(ds, ys[0], exog, endog, instruments, fes, clusters, ts, drop_singleton, if_mask);
+    iv_attach_weights(md, wcol, weight_kind);
     // The batch refuses (common_sample) unless every outcome is present on these rows,
     // so ys[0]'s kept rows ARE the sample of every outcome in the response.
     if (esample) { esample->keep = md.keep; esample->loaded = &ds; }  // e(sample) T1a
@@ -1836,6 +2102,7 @@ json run_iv_multi(const std::string& data, const std::vector<std::string>& ys,
         }
         double dof = (r.n_clusters > 0) ? (r.n_clusters - 1.0) : static_cast<double>(r.dof.dof_resid);
         add_inference(oj, pnames, pbeta, pse, dof, gmm || !small);
+        add_iv_omitted_exog(oj, r, endog);  // BUG-1225
         outcomes.push_back(oj);
     }
 
@@ -1886,9 +2153,10 @@ json run_feols_multi(const std::string& data, const std::vector<std::string>& ys
                      const std::string& vcov_type, const std::vector<std::string>& clusters,
                      bool drop_singleton, const cecon::TsMeta* ts,
                      const std::vector<char>* if_mask, bool no_intercept, double level,
-                     bool level_set, EsampleRows* esample) {
+                     bool level_set, EsampleRows* esample, bool collinear_forward) {
     const Dataset& ds = acquire_data(data);
     ModelData md = build_model(ds, ys[0], xs, fes, clusters, "", drop_singleton, ts, if_mask);
+    md.collinear_forward = collinear_forward;  // BUG-1067
     // Same common-sample rule as run_iv_multi: ys[0]'s kept rows are every outcome's.
     if (esample) { esample->keep = md.keep; esample->loaded = &ds; }  // e(sample) T1a
     int64_t n = md.dm.n;
@@ -1947,15 +2215,46 @@ json run_feols_multi(const std::string& data, const std::vector<std::string>& ys
     return out;
 }
 
+json run_fepois_emit_v(const std::string& data, const std::string& y,
+                       const std::vector<std::string>& xs, const std::vector<std::string>& fes,
+                       const std::string& offset, const std::string& vcov_type,
+                       const std::vector<std::string>& clusters, bool drop_zero_fe,
+                       bool scale_x2, const std::string& weight_var, cecon::WeightKind weight_kind,
+                       bool emit_v, const std::string& d_out = std::string(),
+                       const std::string& d_name = std::string(),
+                       const cecon::TsMeta* ts = nullptr,
+                       const std::vector<char>* if_mask = nullptr);
+
 json run_fepois(const std::string& data, const std::string& y,
                 const std::vector<std::string>& xs, const std::vector<std::string>& fes,
                 const std::string& offset, const std::string& vcov_type,
                 const std::vector<std::string>& clusters, bool drop_zero_fe,
                 bool scale_x2, const std::string& weight_var, cecon::WeightKind weight_kind) {
+    return run_fepois_emit_v(data, y, xs, fes, offset, vcov_type, clusters, drop_zero_fe, scale_x2,
+                             weight_var, weight_kind, false);
+}
+
+// run_fepois plus the opt-in `--emit-v` (FU-859, the T-E1/BUG-808 shape): with
+// emit_v the reply carries `e_V`, the fitted covariance (after the scale(x2)
+// dispersion, so it is the matrix the reported se came from), over the design's
+// coefficient names. Without it the key is absent and the reply is byte-identical
+// to run_fepois's. Only cmd_fepois passes emit_v (cmds_linear.cpp declares this
+// function locally; common.h is outside its change set). Absorbed fits retain
+// the recovered `_cons` covariance in full_vcov_matrix, including its slope
+// cross-covariances; pooled fits keep their original vcov_matrix.
+json run_fepois_emit_v(const std::string& data, const std::string& y,
+                       const std::vector<std::string>& xs, const std::vector<std::string>& fes,
+                       const std::string& offset, const std::string& vcov_type,
+                       const std::vector<std::string>& clusters, bool drop_zero_fe,
+                       bool scale_x2, const std::string& weight_var, cecon::WeightKind weight_kind,
+                       bool emit_v, const std::string& d_out, const std::string& d_name,
+                       const cecon::TsMeta* ts, const std::vector<char>* if_mask) {
     auto t0 = std::chrono::steady_clock::now();
     const Dataset& ds = acquire_data(data);
     auto t1 = std::chrono::steady_clock::now();
-    ModelData md = build_model(ds, y, xs, fes, clusters, offset, true, nullptr, nullptr,
+    // ts / if_mask (BUG-1484): `poisson cnt L.x1 x2 [if]` after xtset -- the operators
+    // read the full series, the `if` applies after (cmd_fepois's plan_keepif).
+    ModelData md = build_model(ds, y, xs, fes, clusters, offset, true, ts, if_mask,
                                weight_var, weight_kind);
     // ppmlhdfe-parity "fe" separation: drop all-zero FE cells (default on).
     int64_t n_dropped_separation = drop_zero_fe ? drop_zero_outcome_fe_cells(md) : 0;
@@ -1964,7 +2263,20 @@ json run_fepois(const std::string& data, const std::string& y,
     if (vcov_type == "hc1" || vcov_type == "HC1" || vcov_type == "robust") vt = Vcov::HC1;
     else if (vcov_type == "cluster") vt = Vcov::Cluster;
     else if (vcov_type == "twoway" || vcov_type == "multiway") vt = Vcov::Multiway;
-    FepoisResult r = fepois_fit(md, vt);
+    // --d-out: ppmlhdfe's `d` (the sum of the absorbed effects) on the fit's rows.
+    std::vector<double> fe_sum;
+    FepoisResult r = fepois_fit(md, vt, 0, d_out.empty() || md.fe.empty() ? nullptr : &fe_sum);
+    if (!d_out.empty()) {
+        std::vector<double> dcol(static_cast<size_t>(ds.n_rows()), std::nan(""));
+        for (int64_t i = 0; i < md.dm.n; ++i)
+            dcol[static_cast<size_t>(md.keep[static_cast<size_t>(i)])] =
+                md.fe.empty() ? 0.0 : fe_sum[static_cast<size_t>(i)];
+        Frame fr = frame_from_acquired(ds);
+        fr.set_f64_column(d_name, std::move(dcol));
+        // Always a real file, never commit_frame's resident stage: a fit is a
+        // read-only call, and staging would swap the caller's resident head.
+        fr.write_hbin(d_out);
+    }
     // glm family(poisson) scale(x2): quasi-Poisson — same coefs, SEs scaled by the
     // Pearson dispersion phi = Σ(y-μ)²/μ / (n-k). Pooled only (μ reconstructable).
     double pearson_scale = 1.0;
@@ -1998,7 +2310,7 @@ json run_fepois(const std::string& data, const std::string& y,
     auto ms = [](auto x, auto y2) {
         return std::chrono::duration<double, std::milli>(y2 - x).count();
     };
-    json coef, se, tst;
+    json coef = json::object(), se = json::object(), tst = json::object();  // --no-x --fe: k = 0
     for (int j = 0; j < r.k; ++j) {
         coef[r.names[j]] = r.beta[j];
         se[r.names[j]] = r.se[j];
@@ -2013,10 +2325,18 @@ json run_fepois(const std::string& data, const std::string& y,
     }
     json absorbed = json::object();
     for (size_t g = 0; g < md.fe.size(); ++g) absorbed[md.fe[g].name] = r.dof.fe_levels[g];
+    // e(N) under an fweight is the observations the rows stand for (BUG-1538:
+    // StataBE 19.5 `poisson cnt x z [fw=wi]` e(N) 150 on 60 rows).
+    int64_t n_obs = r.n;
+    if (md.weight_kind == cecon::WeightKind::Frequency && !md.weights.empty()) {
+        double sw = 0;
+        for (double w : md.weights) sw += w;
+        n_obs = static_cast<int64_t>(sw);
+    }
     json out = json{
         {"estimator", "fepois"},
         {"depvar", y},
-        {"n_obs", r.n},
+        {"n_obs", n_obs},
         {"n_dropped", r.n_dropped},
         {"n_dropped_singletons", md.n_singletons_dropped},
         {"n_dropped_separation", n_dropped_separation},
@@ -2052,6 +2372,24 @@ json run_fepois(const std::string& data, const std::string& y,
         add_inference(out, r.names, r.beta, r.se, dof);
     }
     add_warnings(out, md.warnings);  // BUG-112(8): absent-key when empty
+    // Multiway clustering: each dimension's own G, in --cluster order (ppmlhdfe's
+    // e(N_clust1..k), BUG-1481), as feols and iv emit it; "n_clusters" stays the
+    // smallest. Emitted only under --vcov twoway/multiway, so every other reply is
+    // byte-identical.
+    if (vt == Vcov::Multiway) {
+        json by = json::array();
+        for (const auto& c : md.cluster) by.push_back(c.n_levels);
+        out["n_clusters_by"] = by;
+    }
+    if (emit_v) {
+        if (r.has_cons) {
+            std::vector<std::string> names = r.names;
+            names.push_back("_cons");
+            add_e_v(out, names, r.full_vcov_matrix);
+        } else {
+            add_e_v(out, r.names, r.vcov_matrix);
+        }
+    }
     return out;
 }
 

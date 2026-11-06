@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // do-executor — C++ port of piet/backend/piet/doexec.py: preprocess + brace-
 // aggregate + replay .do source through the dispatcher, one top-level item
 // (command line or aggregated loop/if block) at a time.

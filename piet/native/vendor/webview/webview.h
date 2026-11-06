@@ -1209,7 +1209,7 @@ private:
     // real isolation for the storage layer and worth keeping.
     //
     // It is NOT a fix for BUG-197's actual finding, and callers must not treat
-    // it as one: the confirmed injector (Grammarly Desktop, tests/kitchensink/
+    // it as one: the confirmed injector (Grammarly Desktop, internal notes
     // BUGLOG.md BUG-197 / piet/README.md "Known issues") attaches through the
     // macOS Accessibility API and/or a global input-event tap, a layer that
     // sits below WebKit's content-loading pipeline entirely and has no

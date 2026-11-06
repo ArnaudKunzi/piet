@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // varstats.js — B14(a): passive per-variable summary-stats cache.
 //
 // Populated by console.js's appendBlock() whenever a `summarize` block is

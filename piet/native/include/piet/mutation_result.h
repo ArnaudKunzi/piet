@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Shared `mutationResult` builder — the varlist_after / n_rows_after
 // data_mutation envelope every handler TU that mutates the loaded dataset
 // returns (mirrors piet/backend/piet/mutate.py's `_mutation_result`).

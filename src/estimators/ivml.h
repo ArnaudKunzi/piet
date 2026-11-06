@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — instrumental-variables MLE: `ivprobit` and `ivtobit`, Stata's
 // full-information maximum-likelihood "model with endogenous regressors".
 //
@@ -39,11 +41,6 @@
 // compact ∂m/∂athrho = (v/σ_v + ρ·Xs·δ)/√(1−ρ²); the gradient self-check at the top
 // of tests/unit/test_ivml.cpp is what certifies it (and every other partial)
 // against a central difference of the very same log-likelihood.
-//
-// Optimizer follows the house new-MLE recipe (estimators/tobit.h, oglm.h):
-// analytic gradient, central-difference numerical Hessian OF THAT GRADIENT,
-// symmetrize, spd_inverse(−H) for the model-based VCE, 40-halving backtracking
-// line search, maxit 200, convergence |ΔLL| < 1e-9·(|LL|+1e-9).
 #pragma once
 #include <algorithm>
 #include <cmath>

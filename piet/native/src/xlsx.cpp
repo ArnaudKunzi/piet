@@ -1,4 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "xlsx.h"
+#include "zip_io.h"
 
 #include <algorithm>
 #include <cmath>
@@ -8,6 +11,7 @@
 #include <filesystem>
 #include <map>
 #include <stdexcept>
+#include <utility>
 
 #include "piet/eval/pyvalue.h"  // pythonFloatRepr — shortest round-trip decimal
 #include "io/win_compat.h"      // cecon::to_native_path
@@ -110,10 +114,17 @@ const int kDistBase[30] = {1,    2,    3,    4,    5,    7,     9,     13,    17
 const int kDistExtra[30] = {0, 0, 0,  0,  1,  1,  2,  2,  3,  3,  4,  4,  5,  5,  6,
                             6, 7, 7,  8,  8,  9,  9,  10, 10, 11, 11, 12, 12, 13, 13};
 
+// `expected` is the entry's declared uncompressed size, and the output may not
+// grow past it: a stream that would is corrupt or a decompression bomb, and is
+// refused before it can exhaust memory (AER tier-1 review of unzipfile).
 std::string inflate(const uint8_t* data, size_t len, size_t expected) {
   BitReader br(data, len);
   std::string out;
   if (expected) out.reserve(expected);
+  auto overrun = [&](size_t add) {
+    if (out.size() + add > expected)
+      throw std::runtime_error("compressed entry inflates past its declared size");
+  };
 
   Huffman fixedLit, fixedDist;
   {
@@ -136,6 +147,7 @@ std::string inflate(const uint8_t* data, size_t len, size_t expected) {
       uint16_t blockLen = static_cast<uint16_t>(br.p[br.pos] | (br.p[br.pos + 1] << 8));
       br.pos += 4;  // LEN + NLEN
       if (br.pos + blockLen > br.n) throw std::runtime_error("xlsx: truncated stored block");
+      overrun(blockLen);
       out.append(reinterpret_cast<const char*>(br.p + br.pos), blockLen);
       br.pos += blockLen;
     } else if (type == 1 || type == 2) {
@@ -182,6 +194,7 @@ std::string inflate(const uint8_t* data, size_t len, size_t expected) {
       for (;;) {
         int sym = lit->decode(br);
         if (sym < 256) {
+          overrun(1);
           out.push_back(static_cast<char>(sym));
         } else if (sym == 256) {
           break;
@@ -195,6 +208,7 @@ std::string inflate(const uint8_t* data, size_t len, size_t expected) {
                             static_cast<size_t>(br.bits(kDistExtra[dsym]));
           if (distance > out.size()) throw std::runtime_error("xlsx: distance past start");
           size_t start = out.size() - distance;
+          overrun(static_cast<size_t>(length));
           for (int i = 0; i < length; ++i) out.push_back(out[start + static_cast<size_t>(i)]);
         }
       }
@@ -220,11 +234,16 @@ uint32_t rd32(const std::string& b, size_t o) {
          (static_cast<uint32_t>(static_cast<unsigned char>(b[o + 3])) << 24);
 }
 
-std::map<std::string, std::string> readZip(const std::string& path) {
+// Every entry in central-directory order. `kind` only names the file in the
+// two not-a-ZIP messages (".xlsx" for the workbook reader, ".zip" for
+// piet::zipio), so the workbook reader's messages are the ones it always had.
+std::vector<std::pair<std::string, std::string>> readZipOrdered(const std::string& path,
+                                                                const char* kind) {
   std::ifstream f(cecon::to_native_path(path), std::ios::binary);
   if (!f) throw std::runtime_error("cannot open " + path);
   std::string buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-  if (buf.size() < 22) throw std::runtime_error(path + " is not a .xlsx file (too small)");
+  if (buf.size() < 22)
+    throw std::runtime_error(path + " is not a " + kind + " file (too small)");
 
   // End of central directory: scan back for the signature.
   size_t eocd = std::string::npos;
@@ -233,15 +252,24 @@ std::map<std::string, std::string> readZip(const std::string& path) {
     if (rd32(buf, i) == 0x06054b50u) { eocd = i; break; }
   }
   if (eocd == std::string::npos)
-    throw std::runtime_error(path + " is not a .xlsx file (no ZIP directory found)");
+    throw std::runtime_error(path + " is not a " + kind + " file (no ZIP directory found)");
 
   uint16_t nEntries = rd16(buf, eocd + 10);
   uint32_t cdOff = rd32(buf, eocd + 16);
+  // AER tier-1 review: a ZIP64 archive saturates these fields (65,535 entries,
+  // 0xFFFFFFFF offsets) and keeps the real values in records this reader does
+  // not walk; reading the saturated ones silently returned a partial archive.
+  if (nEntries == 0xFFFFu || cdOff == 0xFFFFFFFFu)
+    throw std::runtime_error(path + " is a ZIP64 archive — not supported");
 
-  std::map<std::string, std::string> parts;
+  std::vector<std::pair<std::string, std::string>> parts;
   size_t p = cdOff;
   for (uint16_t e = 0; e < nEntries; ++e) {
-    if (p + 46 > buf.size() || rd32(buf, p) != 0x02014b50u) break;
+    // A damaged directory or local header used to `break`/`continue` and the
+    // archive read as a smaller one at rc 0 (StataBE: r(603) "invalid LOC
+    // header"). Every one of these now throws.
+    if (p + 46 > buf.size() || rd32(buf, p) != 0x02014b50u)
+      throw std::runtime_error(path + ": damaged ZIP central directory");
     uint16_t method = rd16(buf, p + 10);
     uint32_t compSize = rd32(buf, p + 20);
     uint32_t rawSize = rd32(buf, p + 24);
@@ -254,22 +282,36 @@ std::map<std::string, std::string> readZip(const std::string& path) {
     p += 46u + nameLen + extraLen + commentLen;
 
     if (flags & 0x1) throw std::runtime_error(path + " is encrypted — not supported");
-    if (localOff + 30 > buf.size() || rd32(buf, localOff) != 0x04034b50u) continue;
+    if (compSize == 0xFFFFFFFFu || rawSize == 0xFFFFFFFFu || localOff == 0xFFFFFFFFu)
+      throw std::runtime_error(path + " is a ZIP64 archive — not supported");
+    // size_t arithmetic: in uint32 a local offset near 4 GiB wrapped past the
+    // bounds check and the read below left the buffer (a crash, AER tier-1 review).
+    if (static_cast<size_t>(localOff) + 30 > buf.size() || rd32(buf, localOff) != 0x04034b50u)
+      throw std::runtime_error(path + ": invalid ZIP local header for " + name);
     uint16_t lNameLen = rd16(buf, localOff + 26);
     uint16_t lExtraLen = rd16(buf, localOff + 28);
-    size_t dataOff = localOff + 30u + lNameLen + lExtraLen;
-    if (dataOff + compSize > buf.size()) continue;
+    size_t dataOff = static_cast<size_t>(localOff) + 30u + lNameLen + lExtraLen;
+    if (dataOff + compSize > buf.size())
+      throw std::runtime_error(path + ": truncated ZIP entry " + name);
 
     if (method == 0) {
-      parts[name] = buf.substr(dataOff, compSize);
+      parts.emplace_back(name, buf.substr(dataOff, compSize));
     } else if (method == 8) {
-      parts[name] = inflate(reinterpret_cast<const uint8_t*>(buf.data()) + dataOff, compSize,
-                            rawSize);
+      parts.emplace_back(name, inflate(reinterpret_cast<const uint8_t*>(buf.data()) + dataOff,
+                                       compSize, rawSize));
     } else {
       throw std::runtime_error(path + ": ZIP compression method " + std::to_string(method) +
                                " is not supported (this build reads stored and deflated entries)");
     }
   }
+  return parts;
+}
+
+// The workbook reader's view: by name, a later duplicate entry winning, exactly
+// as when this function filled the map itself.
+std::map<std::string, std::string> readZip(const std::string& path) {
+  std::map<std::string, std::string> parts;
+  for (auto& [name, data] : readZipOrdered(path, ".xlsx")) parts[name] = std::move(data);
   return parts;
 }
 
@@ -559,9 +601,18 @@ std::vector<SheetInfo> workbookSheets(const std::map<std::string, std::string>& 
 // The row grid of one worksheet part, positioned by each cell's own r= ref.
 // Extracted from read() so `sheets()` (which needs each sheet's used range) and
 // the load path agree by construction rather than by a second parser.
+// One cellXfs entry's number format: the numFmtId and, for a custom id, the
+// format code from <numFmts>.
+struct XfFormat {
+  int numFmtId = 0;
+  std::string code;
+  bool isDate = false;
+};
+
 std::vector<std::vector<Cell>> parseSheetRows(const std::string& sheetXml,
                                               const std::vector<std::string>& shared,
-                                              size_t* maxColsOut);
+                                              size_t* maxColsOut,
+                                              const std::vector<XfFormat>* xfs = nullptr);
 
 }  // namespace
 
@@ -589,7 +640,8 @@ namespace {
 
 std::vector<std::vector<Cell>> parseSheetRows(const std::string& sheetXml,
                                               const std::vector<std::string>& shared,
-                                              size_t* maxColsOut) {
+                                              size_t* maxColsOut,
+                                              const std::vector<XfFormat>* xfs) {
   std::vector<std::vector<Cell>> rows;
   size_t maxCols = 0;
 
@@ -652,6 +704,17 @@ std::vector<std::vector<Cell>> parseSheetRows(const std::string& sheetXml,
         int colIdx = colIndexFromRef(attr(cTag, "r"));
         std::string type = attr(cTag, "t");
         Cell cell;
+        if (xfs != nullptr) {
+          const std::string sAttr = attr(cTag, "s");
+          if (!sAttr.empty() && sAttr.find_first_not_of("0123456789") == std::string::npos) {
+            const size_t xi = static_cast<size_t>(std::stoul(sAttr));
+            if (xi < xfs->size()) {
+              cell.numFmtId = (*xfs)[xi].numFmtId;
+              cell.numFmtCode = (*xfs)[xi].code;
+              cell.isDate = (*xfs)[xi].isDate;
+            }
+          }
+        }
         if (!cSelfClosing) {
           std::string body = sheetXml.substr(cGt + 1, cEnd - cGt - 1);
           if (type == "s") {  // shared string index
@@ -674,7 +737,13 @@ std::vector<std::vector<Cell>> parseSheetRows(const std::string& sheetXml,
               cell.text = unescapeXml(body.substr(vOpen + 3, vClose - vOpen - 3));
               cell.blank = cell.text.empty();
             }
-          } else {  // number (or boolean/error, both read as their literal text)
+          } else if (type == "e") {
+            // An error cell (#N/A, #DIV/0!, #VALUE! ...) is MISSING to Stata, not
+            // the text of the error: 007's baseline sheet has 33 `#N/A` ids that
+            // `drop if new_id == ""` removes in StataBE, after which `destring
+            // new_id` finds every value numeric (probe nid.do, scratch-r150/t7-007).
+            // Left blank.
+          } else {  // number (or boolean, read as its literal text)
             size_t vOpen = body.find("<v>");
             size_t vClose = body.find("</v>");
             if (vOpen != std::string::npos && vClose != std::string::npos) {
@@ -710,6 +779,81 @@ std::vector<std::vector<Cell>> parseSheetRows(const std::string& sheetXml,
   for (auto& r : rows) r.resize(maxCols);
   if (maxColsOut != nullptr) *maxColsOut = maxCols;
   return rows;
+}
+
+// True for a number format that renders a date: the built-in date ids, or a
+// custom code with a day/month/year letter outside its quoted literals and
+// [bracketed] sections.
+bool isDateFormat(int id, const std::string& code) {
+  if ((id >= 14 && id <= 22) || (id >= 27 && id <= 36) || (id >= 45 && id <= 47) ||
+      (id >= 50 && id <= 58))
+    return true;
+  if (code.empty()) return false;
+  bool inQ = false, inB = false;
+  for (size_t i = 0; i < code.size(); ++i) {
+    const char c = code[i];
+    if (c == '"') { inQ = !inQ; continue; }
+    if (inQ) continue;
+    if (c == '[') { inB = true; continue; }
+    if (c == ']') { inB = false; continue; }
+    if (inB) continue;
+    if (c == '\\') { ++i; continue; }
+    const char l = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (l == 'd' || l == 'y' || l == 'm') return true;
+  }
+  return false;
+}
+
+// The workbook's cellXfs, in order (a cell's s="i" indexes it).
+std::vector<XfFormat> cellXfsOf(const std::map<std::string, std::string>& parts) {
+  std::vector<XfFormat> out;
+  auto it = parts.find("xl/styles.xml");
+  if (it == parts.end()) return out;
+  const std::string& xml = it->second;
+  std::map<int, std::string> custom;
+  {
+    const size_t a = xml.find("<numFmts");
+    const size_t b = a == std::string::npos ? std::string::npos : xml.find("</numFmts>", a);
+    size_t p = a;
+    while (a != std::string::npos && b != std::string::npos) {
+      p = xml.find("<numFmt ", p + 1);
+      if (p == std::string::npos || p > b) break;
+      const size_t gt = xml.find('>', p);
+      if (gt == std::string::npos) break;
+      const std::string tag = xml.substr(p, gt - p + 1);
+      const std::string id = attr(tag, "numFmtId");
+      try {
+        custom[std::stoi(id)] = unescapeXml(attr(tag, "formatCode"));
+      } catch (...) {
+      }
+    }
+  }
+  const size_t a = xml.find("<cellXfs");
+  if (a == std::string::npos) return out;
+  const size_t b = xml.find("</cellXfs>", a);
+  if (b == std::string::npos) return out;
+  size_t p = a;
+  while (true) {
+    p = xml.find("<xf", p + 1);
+    if (p == std::string::npos || p > b) break;
+    const char after = xml[p + 3];
+    if (!(after == ' ' || after == '>' || after == '/')) continue;
+    const size_t gt = xml.find('>', p);
+    if (gt == std::string::npos) break;
+    const std::string tag = xml.substr(p, gt - p + 1);
+    XfFormat f;
+    try {
+      const std::string id = attr(tag, "numFmtId");
+      f.numFmtId = id.empty() ? 0 : std::stoi(id);
+    } catch (...) {
+      f.numFmtId = 0;
+    }
+    auto c = custom.find(f.numFmtId);
+    if (c != custom.end()) f.code = c->second;
+    f.isDate = isDateFormat(f.numFmtId, f.code);
+    out.push_back(f);
+  }
+  return out;
 }
 
 // The shared-string table, or an empty one when the workbook has none.
@@ -812,8 +956,9 @@ Sheet read(const std::string& path, const ReadOptions& opts) {
   if (sheetXml == nullptr) throw std::runtime_error(path + " contains no worksheet");
 
   const std::vector<std::string> shared = sharedStringsOf(parts);
+  const std::vector<XfFormat> xfs = cellXfsOf(parts);
   size_t maxCols = 0;
-  std::vector<std::vector<Cell>> rows = parseSheetRows(*sheetXml, shared, &maxCols);
+  std::vector<std::vector<Cell>> rows = parseSheetRows(*sheetXml, shared, &maxCols, &xfs);
 
   // The `cellrange` window, applied to the ABSOLUTE grid before anything else
   // consumes it: rows are already positioned by their own r= index and cells by
@@ -926,7 +1071,15 @@ void commitZip(const std::string& path, const std::string& zip) {
     std::ofstream f(cecon::to_native_path(tmp), std::ios::binary);
     if (!f) throw std::runtime_error("cannot write " + path);
     f.write(zip.data(), static_cast<std::streamsize>(zip.size()));
-    if (!f) throw std::runtime_error("failed writing " + path + " (disk full?)");
+    // The close flushes; a full disk or a file-size limit shows up only there,
+    // and the rename below would then replace the user's file with a truncated
+    // one at rc 0 (AER tier-1 review: `unzipfile ..., replace` under ulimit -f).
+    f.close();
+    if (f.fail()) {
+      std::error_code rmEc;
+      std::filesystem::remove(cecon::to_native_path(tmp), rmEc);
+      throw std::runtime_error("failed writing " + path + " (disk full?)");
+    }
   }
   std::error_code ec;
   std::filesystem::rename(cecon::to_native_path(tmp), cecon::to_native_path(path), ec);
@@ -939,8 +1092,40 @@ void commitZip(const std::string& path, const std::string& zip) {
 
 // Package one complete worksheet part as a .xlsx at `path`, under the sheet
 // name `sheetName`. Throws std::runtime_error on an I/O failure.
+// The styles part this writer authors when a column carries a number format:
+// cellXfs 0 = General, 1 = numFmtId 14 (m/d/yyyy), 2 = numFmtId 2 (0.00).
+const char kStylesXml[] =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+    "<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+    "<fonts count=\"1\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts>"
+    "<fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill>"
+    "<fill><patternFill patternType=\"gray125\"/></fill></fills>"
+    "<borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders>"
+    "<cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/>"
+    "</cellStyleXfs>"
+    "<cellXfs count=\"3\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>"
+    "<xf numFmtId=\"14\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" "
+    "applyNumberFormat=\"1\"/>"
+    "<xf numFmtId=\"2\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" "
+    "applyNumberFormat=\"1\"/></cellXfs>"
+    "<cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>"
+    "</styleSheet>";
+
+const char kStylesContentType[] =
+    "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-"
+    "officedocument.spreadsheetml.styles+xml\"/>";
+
+bool needsStyles(const std::vector<OutColumn>& cols) {
+  for (const auto& c : cols)
+    if (c.numFmtId != 0) return true;
+  return false;
+}
+
+// numFmtId -> cellXfs index in kStylesXml.
+std::map<int, int> ownXfIndex() { return {{14, 1}, {2, 2}}; }
+
 void packageWorkbook(const std::string& path, const std::string& sheetName,
-                     const std::string& sheet) {
+                     const std::string& sheet, bool withStyles = false) {
   std::vector<ZipEntry> entries = {
       {"[Content_Types].xml",
        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
@@ -973,6 +1158,17 @@ void packageWorkbook(const std::string& path, const std::string& sheetName,
        "</Relationships>"},
       {"xl/worksheets/sheet1.xml", sheet},
   };
+  if (withStyles) {
+    // Three parts learn about the styles part: the content types, the
+    // workbook's relationships, and the part itself.
+    std::string& ct = entries[0].data;
+    ct.insert(ct.rfind("</Types>"), kStylesContentType);
+    std::string& rels = entries[3].data;
+    rels.insert(rels.rfind("</Relationships>"),
+                "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/"
+                "officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>");
+    entries.push_back({"xl/styles.xml", kStylesXml});
+  }
 
   commitZip(path, buildZip(entries));
 }
@@ -997,7 +1193,8 @@ void appendCell(std::string& sheet, const std::string& ref, bool isNumber, doubl
 // The rectangle `export excel` writes, as one worksheet part. Extracted from
 // write() so writeSheetInto() emits the SAME bytes rather than a second
 // description of the same table.
-std::string rectSheetXml(const std::vector<OutColumn>& cols, bool writeHeader) {
+std::string rectSheetXml(const std::vector<OutColumn>& cols, bool writeHeader,
+                         const std::map<int, int>& xfOf = {}) {
   size_t nRows = 0;
   for (const auto& c : cols) nRows = std::max(nRows, c.isNumber.size());
   const size_t nCols = cols.size();
@@ -1026,6 +1223,14 @@ std::string rectSheetXml(const std::vector<OutColumn>& cols, bool writeHeader) {
       if (blank) continue;  // an absent cell IS the blank cell
       std::string ref = colRef(static_cast<int>(c)) + std::to_string(rowNo);
       const bool isNum = r < oc.isNumber.size() && oc.isNumber[r];
+      if (isNum && oc.numFmtId != 0 && !std::isnan(oc.numbers[r])) {
+        auto xf = xfOf.find(oc.numFmtId);
+        if (xf != xfOf.end()) {
+          sheet += "<c r=\"" + ref + "\" s=\"" + std::to_string(xf->second) + "\"><v>" +
+                   eval::pythonFloatRepr(oc.numbers[r]) + "</v></c>";
+          continue;
+        }
+      }
       appendCell(sheet, ref, isNum, isNum ? oc.numbers[r] : 0.0,
                  r < oc.strings.size() ? oc.strings[r] : std::string());
     }
@@ -1051,8 +1256,10 @@ bool insertBefore(std::string* xml, const std::string& closeTag, const std::stri
 
 void write(const std::string& path, const std::vector<OutColumn>& cols, bool writeHeader,
            const std::string& sheetName) {
+  const bool styled = needsStyles(cols);
   packageWorkbook(path, sheetName.empty() ? std::string("Sheet1") : sheetName,
-                  rectSheetXml(cols, writeHeader));
+                  rectSheetXml(cols, writeHeader, styled ? ownXfIndex() : std::map<int, int>()),
+                  styled);
 }
 
 // `export excel ..., sheet("S") sheetreplace` — AER scope-2 W3a.
@@ -1076,7 +1283,76 @@ void writeSheetInto(const std::string& path, const std::string& sheetName,
   if (parts.find("xl/workbook.xml") == parts.end()) {
     throw std::runtime_error(path + " has no xl/workbook.xml — refusing to rewrite it");
   }
-  const std::string sheetXml = rectSheetXml(cols, writeHeader);
+  // A column with a number format needs a cellXfs entry for it: reuse the
+  // workbook's own when it has one with that numFmtId, else append one (and
+  // author the whole styles part when the workbook has none).
+  std::map<int, int> xfOf;
+  if (needsStyles(cols)) {
+    auto st = parts.find("xl/styles.xml");
+    if (st == parts.end()) {
+      const std::string relsPath = "xl/_rels/workbook.xml.rels";
+      auto rels = parts.find(relsPath);
+      auto ct = parts.find("[Content_Types].xml");
+      if (rels == parts.end() || ct == parts.end()) {
+        throw std::runtime_error(path + " lacks the parts a styles part must be registered in");
+      }
+      size_t rid = 1;
+      while (rels->second.find("\"rId" + std::to_string(rid) + "\"") != std::string::npos) ++rid;
+      std::string relsXml = rels->second;
+      std::string ctXml = ct->second;
+      if (!insertBefore(&relsXml, "</Relationships>",
+                        "<Relationship Id=\"rId" + std::to_string(rid) +
+                            "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/"
+                            "relationships/styles\" Target=\"styles.xml\"/>") ||
+          !insertBefore(&ctXml, "</Types>", kStylesContentType)) {
+        throw std::runtime_error(path + " has malformed package parts — refusing to rewrite it");
+      }
+      parts[relsPath] = std::move(relsXml);
+      parts["[Content_Types].xml"] = std::move(ctXml);
+      parts["xl/styles.xml"] = kStylesXml;
+      xfOf = ownXfIndex();
+    } else {
+      std::string styles = st->second;
+      const size_t a = styles.find("<cellXfs");
+      const size_t b = a == std::string::npos ? std::string::npos : styles.find("</cellXfs>", a);
+      if (a == std::string::npos || b == std::string::npos) {
+        throw std::runtime_error("xl/styles.xml has no cellXfs — refusing to rewrite " + path);
+      }
+      std::vector<int> ids;
+      for (size_t p = a; (p = styles.find("<xf", p + 1)) != std::string::npos && p < b;) {
+        const char after = styles[p + 3];
+        if (!(after == ' ' || after == '>' || after == '/')) continue;
+        const size_t gt = styles.find('>', p);
+        const std::string id = attr(styles.substr(p, gt - p + 1), "numFmtId");
+        ids.push_back(id.empty() ? 0 : std::atoi(id.c_str()));
+      }
+      std::string added;
+      int next = static_cast<int>(ids.size());
+      for (const auto& c : cols) {
+        if (c.numFmtId == 0 || xfOf.count(c.numFmtId)) continue;
+        int found = -1;
+        for (size_t i = 0; i < ids.size(); ++i)
+          if (ids[i] == c.numFmtId) { found = static_cast<int>(i); break; }
+        if (found < 0) {
+          added += "<xf numFmtId=\"" + std::to_string(c.numFmtId) +
+                   "\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/>";
+          found = next++;
+        }
+        xfOf[c.numFmtId] = found;
+      }
+      if (!added.empty()) {
+        styles.insert(b, added);
+        const size_t cnt = styles.find("count=\"", a);
+        const size_t gt = styles.find('>', a);
+        if (cnt != std::string::npos && cnt < gt) {
+          const size_t q = styles.find('"', cnt + 7);
+          styles.replace(cnt + 7, q - (cnt + 7), std::to_string(next));
+        }
+        parts["xl/styles.xml"] = std::move(styles);
+      }
+    }
+  }
+  const std::string sheetXml = rectSheetXml(cols, writeHeader, xfOf);
 
   const std::vector<SheetInfo> existing = workbookSheets(parts);
   std::string targetPart;
@@ -1203,3 +1479,25 @@ void writeCells(const std::string& path, const std::string& sheetName,
 }
 
 }  // namespace piet::xlsx
+
+// AER tier-1: the zip verbs' window onto the primitives above (zip_io.h).
+namespace piet::zipio {
+
+std::vector<Entry> readEntries(const std::string& path) {
+  std::vector<Entry> out;
+  for (auto& [name, data] : xlsx::readZipOrdered(path, ".zip")) {
+    out.push_back(Entry{name, std::move(data)});
+  }
+  return out;
+}
+
+std::string build(const std::vector<Entry>& entries) {
+  std::vector<xlsx::ZipEntry> ze;
+  ze.reserve(entries.size());
+  for (const auto& e : entries) ze.push_back(xlsx::ZipEntry{e.name, e.data});
+  return xlsx::buildZip(ze);
+}
+
+void commit(const std::string& path, const std::string& bytes) { xlsx::commitZip(path, bytes); }
+
+}  // namespace piet::zipio

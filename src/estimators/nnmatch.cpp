@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "estimators/nnmatch.h"
 
 #include <algorithm>
@@ -35,7 +37,7 @@ namespace {
 //             number when the class distance is exactly 0, DESCENDING otherwise.
 //
 // H2 is a HYPOTHESIS about a mechanism that ships as Mata bytecode; it is
-// recorded as a named divergence RISK in plans/METHOD-RECEIPTS.md. Production
+// recorded as a named divergence RISK in internal note METHOD-RECEIPTS.md. Production
 // paper 076 matches on exact indicator cells (d = 0), where H2 and the report
 // rule coincide, so the 076 pairing does not depend on the open part.
 //
@@ -232,7 +234,7 @@ NnmatchResult nnmatch_fit(const double* y, const double* t,
         throw EngineError("bad_input", "nnmatch: at least one matching variable is required",
                           "r(198)");
 
-    // ---- _rmcoll (ado:121-122): drop perfectly collinear matching columns --
+    // ---- _rmcoll: drop perfectly collinear matching columns --
     // Measured (INFO|nn_rmcoll, i.b(4) with a == b>=2, so 1.a == 2.b + 3.b):
     // e(fvdvarlist) = `0b.a 1.a 0b.b 1.b 2.b 3o.b` — the sweep runs LEFT TO
     // RIGHT in design order and drops the LATER redundant column, 3.b, keeping

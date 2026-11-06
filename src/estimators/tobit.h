@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — tobit (censored-normal regression) MLE, matching Stata `tobit, ll() ul()`.
 // Left-censored obs (y<=ll) contribute logΦ((ll-xβ)/σ); right-censored (y>=ul)
 // contribute log(1-Φ((ul-xβ)/σ)); uncensored contribute the normal log-density.
@@ -116,6 +118,68 @@ inline double ll_grad(const double* X, int64_t n, int k, const double* y,
     }
     return LL;
 }
+
+// Weighted twin of ll_grad (BUG-1544), a separate function so ll_grad's arithmetic
+// is untouched. Row i's log-likelihood, gradient and score are multiplied by lw[i]
+// (Stata's fweight/iweight/pweight), and sc[i] makes its residual scale sigma/sc[i]:
+// Stata's tobit (gsem) reads an aweight as a precision weight normalized to sum to
+// N, the caller's sc = sqrt(w*N/Sum w) -- z = sc(y - xb)/sigma for an uncensored
+// row, whose density gains log(sc), a = sc(limit - xb)/sigma for a censored one
+// (StataBE 19.5, scratch-laneA2/agents/wml/x1.log: `tobit yc x z [aw=wf], ll(1.2)`
+// is intreg on sc-scaled y, x and limits, _b[x] 2.1872269167863312 vs
+// 2.1872269167898426, and its e(ll) -20.05669596174878 is intreg's
+// -14.174204192960611 plus Sum_unc log(sc) -5.8824917687881664). nullptr = 1.
+inline double ll_grad_w(const double* X, int64_t n, int k, const double* y,
+                        const std::vector<int8_t>& cls, double ll_lim, double ul_lim,
+                        const std::vector<double>& theta, std::vector<double>* grad,
+                        std::vector<double>* scores, const double* lw, const double* sc) {
+    double g = theta[k];
+    double sigma = std::exp(g);
+    double LL = 0;
+    int np = k + 1;
+    if (grad) std::fill(grad->begin(), grad->end(), 0.0);
+    if (scores) scores->assign(static_cast<size_t>(n) * np, 0.0);
+    double* S = scores ? scores->data() : nullptr;
+    const double log2pi = 1.8378770664093454836;
+    for (int64_t i = 0; i < n; ++i) {
+        const double wl = lw ? lw[i] : 1.0, si = sc ? sc[i] : 1.0;
+        double xb = 0;
+        for (int p = 0; p < k; ++p) xb += X[static_cast<int64_t>(p) * n + i] * theta[p];
+        double lli, c, gk;  // row log-likelihood, its derivative in xb and in ln(sigma)
+        if (cls[i] == 0) {  // uncensored
+            double z = si * (y[i] - xb) / sigma;
+            lli = -g - 0.5 * log2pi - 0.5 * z * z + std::log(si);
+            c = si * z / sigma;
+            gk = z * z - 1.0;
+        } else if (cls[i] == 1) {  // left-censored
+            double a = si * (ll_lim - xb) / sigma;
+            double Phi = ncdf(a);
+            if (Phi < 1e-300) Phi = 1e-300;
+            lli = std::log(Phi);
+            double lam = npdf(a) / Phi;
+            c = -lam * si / sigma;
+            gk = -lam * a;
+        } else {  // right-censored
+            double a = si * (ul_lim - xb) / sigma;
+            double Sv = 1.0 - ncdf(a);
+            if (Sv < 1e-300) Sv = 1e-300;
+            lli = std::log(Sv);
+            double del = npdf(a) / Sv;
+            c = del * si / sigma;
+            gk = del * a;
+        }
+        LL += wl * lli;
+        if (grad) {
+            for (int p = 0; p < k; ++p) (*grad)[p] += wl * c * X[static_cast<int64_t>(p) * n + i];
+            (*grad)[k] += wl * gk;
+        }
+        if (S) {
+            for (int p = 0; p < k; ++p) S[static_cast<int64_t>(p) * n + i] = wl * c * X[static_cast<int64_t>(p) * n + i];
+            S[static_cast<int64_t>(k) * n + i] = wl * gk;
+        }
+    }
+    return LL;
+}
 }  // namespace tob
 
 // Robust (sandwich) VCE for a converged tobit_fit result. V = factor * bread *
@@ -126,9 +190,13 @@ inline double ll_grad(const double* X, int64_t n, int k, const double* y,
 // which one matches Stata `tobit ..., vce(robust)` — verified against the P5
 // oracle rather than assumed). Returns an empty vector if r.vcov is empty (fit
 // failed) or the meat is not invertible-compatible with bread's shape.
+// mw/sc (BUG-1544): a weighted fit's per-row score multipliers -- w under an
+// iweight or pweight, sqrt(w) under an fweight (its copies are separate terms) --
+// and ll_grad_w's aweight scale. nullptr for both is the unweighted meat.
 inline std::vector<double> tobit_robust_vcov(const double* X, int64_t n, int k, const double* y,
                                              bool has_ll, double ll_lim, bool has_ul, double ul_lim,
-                                             const TobitResult& r, double factor) {
+                                             const TobitResult& r, double factor,
+                                             const double* mw = nullptr, const double* sc = nullptr) {
     const int np = k + 1;
     if (static_cast<int>(r.vcov.size()) != np * np || !r.ok) return {};
     std::vector<int8_t> cls(static_cast<size_t>(n), 0);
@@ -139,7 +207,10 @@ inline std::vector<double> tobit_robust_vcov(const double* X, int64_t n, int k, 
     std::vector<double> theta(r.beta.begin(), r.beta.end());
     theta.push_back(std::log(r.sigma));
     std::vector<double> S;
-    tob::ll_grad(X, n, k, y, cls, ll_lim, ul_lim, theta, nullptr, &S);
+    if (mw || sc)
+        tob::ll_grad_w(X, n, k, y, cls, ll_lim, ul_lim, theta, nullptr, &S, mw, sc);
+    else
+        tob::ll_grad(X, n, k, y, cls, ll_lim, ul_lim, theta, nullptr, &S);
     std::vector<double> meat(static_cast<size_t>(np) * np, 0.0);
     la::xtx(S.data(), n, np, meat.data());
     std::vector<double> V(static_cast<size_t>(np) * np, 0.0), tmp(static_cast<size_t>(np) * np, 0.0);
@@ -148,8 +219,11 @@ inline std::vector<double> tobit_robust_vcov(const double* X, int64_t n, int k, 
 }
 
 // X is col-major n*k (intercept included). has_ll/has_ul gate left/right censoring.
+// lw/sc (BUG-1544): a weighted fit's likelihood weights and aweight scale, as
+// tob::ll_grad_w reads them; nullptr for both is the unweighted fit.
 inline TobitResult tobit_fit(const double* X, int64_t n, int k, const double* y,
-                             bool has_ll, double ll_lim, bool has_ul, double ul_lim) {
+                             bool has_ll, double ll_lim, bool has_ul, double ul_lim,
+                             const double* lw = nullptr, const double* sc = nullptr) {
     TobitResult r;
     std::vector<int8_t> cls(n, 0);
     for (int64_t i = 0; i < n; ++i) {
@@ -159,29 +233,52 @@ inline TobitResult tobit_fit(const double* X, int64_t n, int k, const double* y,
     }
     r.n = n;
     int np = k + 1;
-    // start: OLS β over all obs, σ = sd of residuals
+    // start: OLS β over all obs, σ = sd of residuals. A weighted fit starts from the
+    // least squares on rows scaled by sqrt(lw*sc^2), its precision-weighted fit.
+    const bool weighted = lw != nullptr || sc != nullptr;
     std::vector<double> theta(np, 0.0);
     {
+        std::vector<double> Xv, yv;
+        const double* Xs = X;
+        const double* ys = y;
+        double sv = static_cast<double>(n);
+        if (weighted) {
+            Xv.assign(X, X + static_cast<size_t>(n) * k);
+            yv.assign(y, y + n);
+            sv = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                const double si = sc ? sc[i] : 1.0, v = (lw ? lw[i] : 1.0) * si * si, rt = std::sqrt(v);
+                sv += v;
+                yv[static_cast<size_t>(i)] *= rt;
+                for (int p = 0; p < k; ++p) Xv[static_cast<size_t>(p) * n + i] *= rt;
+            }
+            Xs = Xv.data();
+            ys = yv.data();
+        }
         std::vector<double> XtX(static_cast<size_t>(k) * k), Xty(k);
-        la::xtx(X, n, k, XtX.data());
-        la::xtv(X, n, k, y, Xty.data());
+        la::xtx(Xs, n, k, XtX.data());
+        la::xtv(Xs, n, k, ys, Xty.data());
         if (la::spd_inverse(XtX.data(), k) != 0) return r;
         la::matvec(XtX.data(), k, Xty.data(), theta.data());
         double rss = 0;
         for (int64_t i = 0; i < n; ++i) {
             double f = 0;
-            for (int p = 0; p < k; ++p) f += X[static_cast<int64_t>(p) * n + i] * theta[p];
-            double e = y[i] - f; rss += e * e;
+            for (int p = 0; p < k; ++p) f += Xs[static_cast<int64_t>(p) * n + i] * theta[p];
+            double e = ys[i] - f; rss += e * e;
         }
-        theta[k] = 0.5 * std::log(rss / n);  // ln(sigma)
+        theta[k] = 0.5 * std::log(rss / sv);  // ln(sigma)
     }
+    // The likelihood and gradient: ll_grad_w on a weighted fit, ll_grad otherwise.
+    auto llg = [&](const std::vector<double>& th, std::vector<double>* gr) {
+        return weighted ? tob::ll_grad_w(X, n, k, y, cls, ll_lim, ul_lim, th, gr, nullptr, lw, sc)
+                        : tob::ll_grad(X, n, k, y, cls, ll_lim, ul_lim, th, gr);
+    };
 
     std::vector<double> grad(np);
-    double prevLL = -1e300;
     int it = 0;
     std::vector<double> H(static_cast<size_t>(np) * np);
     for (; it < 200; ++it) {
-        double LL = tob::ll_grad(X, n, k, y, cls, ll_lim, ul_lim, theta, &grad);
+        double LL = llg(theta, &grad);
         // numerical Hessian = d(grad)/d(theta), central difference.
         // Column j reads only theta and j and writes only H[:, j] -- no accumulator is
         // shared between columns -- so evaluating them concurrently returns the
@@ -195,8 +292,8 @@ inline TobitResult tobit_fit(const double* X, int64_t n, int k, const double* y,
             double h = 1e-6 * (std::fabs(theta[j]) + 1.0);
             tp = theta; tm = theta;
             tp[j] += h; tm[j] -= h;
-            tob::ll_grad(X, n, k, y, cls, ll_lim, ul_lim, tp, &gp);
-            tob::ll_grad(X, n, k, y, cls, ll_lim, ul_lim, tm, &gm);
+            llg(tp, &gp);
+            llg(tm, &gm);
             for (int i = 0; i < np; ++i)
                 H[static_cast<size_t>(i) * np + j] = (gp[i] - gm[i]) / (2 * h);
         }, threads_for_work(static_cast<int64_t>(np) * n));
@@ -212,23 +309,34 @@ inline TobitResult tobit_fit(const double* X, int64_t n, int k, const double* y,
         if (la::spd_inverse(negHinv.data(), np) != 0) break;
         std::vector<double> step(np);
         la::matvec(negHinv.data(), np, grad.data(), step.data());  // step = (-H)^{-1} grad
-        // backtracking line search
-        double t = 1.0;
+        // The fit runs to the MLE (BUG-1550): StataBE 19.5's tobit -- gsem's iterate,
+        // 3.8e-11 from the MLE on that entry's data -- posts _b[x1] .90660640598888398;
+        // the old stop, a 1e-9 relative change in ll, left it at .90660639743563098.
+        // A Newton step of at most 1e-6 (ml's mreldif metric) is taken whole: ll's
+        // changes that close to the maximum fall below its rounding, so the line search
+        // cannot judge them, and Newton's quadratic convergence needs none. The fit
+        // stops after a step of at most 1e-10.
+        double smax = 0;
+        for (int i = 0; i < np; ++i) smax = std::max(smax, std::fabs(step[i]) / (std::fabs(theta[i]) + 1.0));
         std::vector<double> cand(np);
-        double candLL = LL;
-        for (int bt = 0; bt < 40; ++bt) {
-            for (int i = 0; i < np; ++i) cand[i] = theta[i] + t * step[i];
-            candLL = tob::ll_grad(X, n, k, y, cls, ll_lim, ul_lim, cand, nullptr);
-            if (std::isfinite(candLL) && candLL >= LL) break;
-            t *= 0.5;
+        if (smax <= 1e-6) {
+            for (int i = 0; i < np; ++i) cand[i] = theta[i] + step[i];
+        } else {
+            // backtracking line search
+            double t = 1.0;
+            for (int bt = 0; bt < 40; ++bt) {
+                for (int i = 0; i < np; ++i) cand[i] = theta[i] + t * step[i];
+                const double candLL = llg(cand, nullptr);
+                if (std::isfinite(candLL) && candLL >= LL) break;
+                t *= 0.5;
+            }
         }
         theta = cand;
-        if (std::fabs(candLL - prevLL) < 1e-9 * (std::fabs(prevLL) + 1e-9)) { prevLL = candLL; ++it; r.converged = true; break; }
-        prevLL = candLL;
+        if (smax <= 1e-10) { ++it; r.converged = true; break; }
     }
     r.iters = it;
     // final LL + observed-information VCE in (β, lnσ)
-    double LL = tob::ll_grad(X, n, k, y, cls, ll_lim, ul_lim, theta, &grad);
+    double LL = llg(theta, &grad);
     parallel_for(np, [&](int64_t jj) {  // same column-independence as the loop's Hessian
         const int j = static_cast<int>(jj);
         thread_local std::vector<double> gp, gm, tp, tm;
@@ -237,8 +345,8 @@ inline TobitResult tobit_fit(const double* X, int64_t n, int k, const double* y,
         double h = 1e-6 * (std::fabs(theta[j]) + 1.0);
         tp = theta; tm = theta;
         tp[j] += h; tm[j] -= h;
-        tob::ll_grad(X, n, k, y, cls, ll_lim, ul_lim, tp, &gp);
-        tob::ll_grad(X, n, k, y, cls, ll_lim, ul_lim, tm, &gm);
+        llg(tp, &gp);
+        llg(tm, &gm);
         for (int i = 0; i < np; ++i) H[static_cast<size_t>(i) * np + j] = (gp[i] - gm[i]) / (2 * h);
     }, threads_for_work(static_cast<int64_t>(np) * n));
     for (int i = 0; i < np; ++i)

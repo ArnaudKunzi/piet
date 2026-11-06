@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Internal seam between the evalcase driver core (evalcase.cpp) and the
 // module-specific case handlers that land in later M1 commits
 // (exprfns/macros). evalcase_ext.cpp owns handleExtendedCase(); it returns a

@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>PIET — VirtualizedGrid browse-past-50-rows regression test</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; background: #f9f7f4; color: #333; margin: 0; padding: 16px; }
+    h1 { font-size: 14px; font-weight: 600; margin: 0 0 16px; }
+    .suite { margin-bottom: 18px; }
+    .suite h2 { font-size: 12px; font-weight: 600; color: #555; margin: 0 0 4px; }
+    .pass { color: #2e7d32; font-size: 12px; margin: 2px 0; }
+    .fail { color: #d93b3b; font-size: 12px; font-weight: 600; margin: 2px 0; }
+    .note { color: #777; font-size: 11px; margin: 2px 0 8px; }
+    /* The grid uses scrollTop/clientHeight to compute the visible window, so the
+       host container must have a real, bounded height for _syncScroll to render
+       rows. Keep it offscreen but laid out. */
+    #grid-host { position: absolute; left: -10000px; top: 0; width: 600px; height: 400px; }
+  </style>
+</head>
+<body>
+<h1>PIET — VirtualizedGrid: rows past the 50-row preview render real data (regression for browse "." bug)</h1>
+<p class="note">
+  Backend GET /api/browse on auto.dta (74 rows) returns ALL rows; the bug was purely frontend:
+  grid.js load() unconditionally seeded window 0 with only the 50-row command preview, so
+  _ensureWindow(0) saw window 0 as cached and never fetched rows 51–74 → they rendered as ".".
+  This test drives the REAL VirtualizedGrid with a mock fetchPage that mimics the backend.
+</p>
+<div id="output"></div>
+<div id="grid-host"></div>
+
+<script type="module">
+import { VirtualizedGrid } from '../js/grid.js';
+
+const out = document.getElementById('output');
+
+function report(suite, results) {
+  const section = document.createElement('div');
+  section.className = 'suite';
+  const h2 = document.createElement('h2');
+  h2.textContent = suite;
+  section.appendChild(h2);
+  for (const r of results) {
+    const div = document.createElement('div');
+    div.className = r.ok ? 'pass' : 'fail';
+    div.textContent = (r.ok ? '✓ ' : '✕ ') + r.msg;
+    section.appendChild(div);
+  }
+  out.appendChild(section);
+  return results.every(r => r.ok);
+}
+
+// ── auto.dta fixture: `browse make foreign price` (a column-SUBSET browse) ────
+// 74 rows total. The COMMAND block embeds only the first 50 rows as a preview.
+// The backend, given GET /api/browse?vars=make,foreign,price, returns the full
+// requested window in the requested column order. Row 74 (index 73) is the well-
+// known last row of auto.dta: Volvo 260, Foreign, 11995.
+const COLUMNS = [
+  { name: 'make',    dtype: 'str' },
+  { name: 'foreign', dtype: 'str' },
+  { name: 'price',   dtype: 'f64' },
+];
+const N_ROWS = 74;
+const LAST_ROW = ['Volvo 260', 'Foreign', 11995.0];
+
+function makeRow(i) {
+  // index 73 is the real Volvo 260 row; others are synthetic but realistic-shaped.
+  if (i === 73) return LAST_ROW.slice();
+  return [`car ${i + 1}`, i % 2 === 0 ? 'Domestic' : 'Foreign', 3000 + i * 10];
+}
+const ALL_ROWS = Array.from({ length: N_ROWS }, (_, i) => makeRow(i));
+
+// The `browse` command block: n_rows_total=74 but ONLY a 50-row preview embedded.
+const browseCommandBlock = {
+  type: 'browse',
+  columns: COLUMNS,
+  n_rows_total: N_ROWS,
+  rows: ALL_ROWS.slice(0, 50),   // 50-row preview — the heart of the bug
+};
+
+// Mock backend: returns the requested window, honouring the requested column
+// order via `vars` (so we also verify _ensureWindow passes vars correctly).
+let lastFetchArgs = null;
+async function mockFetchPage(offset, limit, vars) {
+  lastFetchArgs = { offset, limit, vars };
+  // Reorder/subset columns per `vars` to mirror the real backend contract.
+  const names = vars ? (Array.isArray(vars) ? vars : String(vars).split(',')) : COLUMNS.map(c => c.name);
+  const colIdx = names.map(n => COLUMNS.findIndex(c => c.name === n));
+  const cols = colIdx.map(ci => COLUMNS[ci]);
+  const rows = ALL_ROWS.slice(offset, offset + limit).map(r => colIdx.map(ci => r[ci]));
+  return { type: 'browse', columns: cols, n_rows_total: N_ROWS, offset, limit, rows };
+}
+
+async function run() {
+  const host = document.getElementById('grid-host');
+  const grid = new VirtualizedGrid(host, mockFetchPage, null);
+  grid.show?.();
+  await grid.load(browseCommandBlock);
+
+  // Wait for the async _ensureWindow(0) fetch + re-render to settle.
+  await new Promise(r => setTimeout(r, 50));
+  // Scroll to the bottom so row 74 is in the rendered viewport, then settle again.
+  grid._container.scrollTop = grid._container.scrollHeight;
+  grid._syncScroll();
+  await new Promise(r => setTimeout(r, 50));
+
+  const results = [];
+
+  // 1. The cache for window 0 must have been populated from the FULL fetch, not
+  //    the 50-row preview — i.e. it must contain row index 73.
+  const win0 = grid._cache.get(0);
+  results.push({
+    ok: !!win0 && win0.rows.length === N_ROWS,
+    msg: `window 0 cache holds all ${N_ROWS} rows (got ${win0 ? win0.rows.length : 'no window'}) — preview did not falsely seed it`,
+  });
+
+  // 2. The fetch must have requested the browsed columns in order (vars forwarded).
+  results.push({
+    ok: !!lastFetchArgs && String(lastFetchArgs.vars) === 'make,foreign,price' || (Array.isArray(lastFetchArgs?.vars) && lastFetchArgs.vars.join(',') === 'make,foreign,price'),
+    msg: `_ensureWindow forwarded vars in browsed order (got ${JSON.stringify(lastFetchArgs?.vars)})`,
+  });
+
+  // 3. Row 74 (index 73) in the cache must be the REAL data, column-aligned.
+  const cachedLast = win0 && win0.rows[73];
+  results.push({
+    ok: !!cachedLast && cachedLast[0] === 'Volvo 260' && cachedLast[1] === 'Foreign' && Number(cachedLast[2]) === 11995,
+    msg: `cached row 74 = ${JSON.stringify(cachedLast)} (expected ${JSON.stringify(LAST_ROW)})`,
+  });
+
+  // 4. The RENDERED DOM cell for row 74 must show real data, NOT the "." missing marker.
+  const cell73 = grid._container.querySelector('[data-row="73"][data-col="0"]');
+  const cellText = cell73 ? cell73.textContent : null;
+  const isMissing = cell73 ? cell73.classList.contains('cell-missing') : true;
+  results.push({
+    ok: cell73 && cellText === 'Volvo 260' && !isMissing,
+    msg: `rendered row 74 col 0 = ${JSON.stringify(cellText)} (missing-class=${isMissing}) — expected "Volvo 260", not "."`,
+  });
+
+  const allOk = report('browse auto.dta (74 rows) — rows 51–74 render real data', results);
+
+  const summary = document.createElement('div');
+  summary.className = allOk ? 'pass' : 'fail';
+  summary.style.fontSize = '13px';
+  summary.style.marginTop = '12px';
+  summary.textContent = allOk ? 'ALL CHECKS PASSED' : 'REGRESSION TEST FAILED';
+  out.appendChild(summary);
+}
+
+run().catch(err => {
+  const pre = document.createElement('pre');
+  pre.style.color = '#d93b3b';
+  pre.textContent = 'ERROR: ' + err.message + '\n' + (err.stack || '');
+  out.appendChild(pre);
+});
+</script>
+</body>
+</html>

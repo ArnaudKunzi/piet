@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — build a dense column-major design matrix from a Dataset, with
 // listwise deletion of rows that have a missing value in y or any regressor.
 #pragma once

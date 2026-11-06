@@ -1,7 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // winsor2 — C++ port of piet/backend/piet/winsor2.py's run_winsor2 (row-wise
 // winsorization at the given percentiles). Each variable is winsorized via `cobra eval --winsor`;
-// trim mode additionally NaNs out the clamped boundary values via a second
-// `cobra eval --gen cond(...)` pass, matching the oracle's two-step pipeline.
+// trim mode instead keeps each value inside the cutoffs and sets the rest to
+// missing, in one `cobra eval --gen cond(...)` pass over the original values.
 #include "piet/handlers.h"
 
 #include <algorithm>
@@ -14,6 +16,9 @@
 #include "piet/eval/errors.h"
 #include "piet/mutation_result.h"
 #include "piet/scratch_seq.h"
+#include "piet/storage_type.h"
+
+#include "core/stata_pctile.h"
 
 namespace piet::handlers {
 
@@ -52,14 +57,9 @@ std::pair<double, double> clampBoundaries(Datastore& ds, const std::string& src,
   }
   if (valid.empty()) return {std::nan(""), std::nan("")};
   std::sort(valid.begin(), valid.end());
-  int64_t nv = static_cast<int64_t>(valid.size());
-  auto idxFor = [&](double p) -> int64_t {
-    int64_t idx = static_cast<int64_t>(p / 100.0 * static_cast<double>(nv));
-    return std::max<int64_t>(0, std::min(idx, nv - 1));
-  };
-  int64_t loIdx = idxFor(plo);
-  int64_t hiIdx = idxFor(phi);
-  return {valid[static_cast<size_t>(loIdx)], valid[static_cast<size_t>(hiIdx)]};
+  // Stata's _pctile, the rule the engine's --winsor uses too (core/stata_pctile.h);
+  // the old x[floor(p*n)] index matched it only where the two happen to agree.
+  return {cecon::stata_pctile_sorted(valid, plo), cecon::stata_pctile_sorted(valid, phi)};
 }
 
 // Formats a double the way Python's f-string embeds it in a cobra expr
@@ -125,7 +125,12 @@ ojson runWinsor2(SessionState& session, const std::vector<std::string>& varlist,
     std::string winsorSpec = outName + "=" + src + "," + fmtNum(cutLo) + "," + fmtNum(cutHi);
     std::vector<std::string> args = {"eval", "--data", currentHbin, "--winsor", winsorSpec,
                                       "--out", outPath};
-    {
+    // The new variable keeps the source's storage type, as winsor2's clonevar
+    // does (StataBE wq.do: float -> float, double -> double, byte -> byte, a
+    // byte cutoff 2.5 stored as 2); PIET made every one a float.
+    const std::string srcType = storage::resolveReplaceType(session, src);
+    storage::appendStoreTypeArg(args, srcType);
+    if (!trim) {
       std::optional<SessionState::ResidentEligible> winsorResident;
       if (residentWinsor) winsorResident.emplace(session);
       try {
@@ -136,19 +141,30 @@ ojson runWinsor2(SessionState& session, const std::vector<std::string>& varlist,
     }
 
     if (trim) {
-      // Compute clamp boundaries from the PRE-winsorized source data
-      // (currentHbin still has the original src values at this point).
+      // Only a value strictly outside the cutoffs goes missing: StataBE keeps
+      // the values AT them (uni-oracle/tm.do on AER 007's expectcomm_ehai_amount,
+      // `cuts(0 95) trim`: 10 trimmed, max 80 = p95, min 5 = p0), where the old
+      // pass dropped every clamped value and so both cutoffs (22). Read from the
+      // original values, so `replace` trims its own variable the same way.
       Datastore preDs(currentHbin);
       auto [loVal, hiVal] = clampBoundaries(preDs, src, cutLo, cutHi);
       if (!std::isnan(loVal) && !std::isnan(hiVal)) {
-        std::string trimExpr = outName + "=cond((" + outName + ">" + fmtNum(loVal) + "&" +
-                                outName + "<" + fmtNum(hiVal) + ")," + outName + ",.)";
+        std::string trimExpr = outName + "=cond((" + src + ">=" + fmtNum(loVal) + "&" + src +
+                                "<=" + fmtNum(hiVal) + ")," + src + ",.)";
         std::string trimPath = nextPathW(session.workdir(), "winsor2_trim");
-        std::vector<std::string> trimArgs = {"eval", "--data", outPath, "--gen", trimExpr, "--out",
-                                              trimPath};
+        std::vector<std::string> trimArgs = {"eval", "--data", currentHbin, "--gen", trimExpr,
+                                              "--out", trimPath};
+        storage::appendStoreTypeArg(trimArgs, srcType);
         try {
           runCobraJson(trimArgs);
           outPath = trimPath;
+        } catch (const CobraError& ce) {
+          return engineErrorBlockW(cobraErrorStrW(ce), ce.code);
+        }
+      } else {
+        // No cutoffs (no nonmissing value): the winsor pass makes the copy.
+        try {
+          runCobraJson(args);
         } catch (const CobraError& ce) {
           return engineErrorBlockW(cobraErrorStrW(ce), ce.code);
         }
@@ -157,6 +173,7 @@ ojson runWinsor2(SessionState& session, const std::vector<std::string>& varlist,
 
     currentHbin = outPath;
     newVars.push_back(outName);
+    if (outName != src) storage::carryTypeClaim(session, src, outName, false);
   }
 
   session.load(currentHbin);

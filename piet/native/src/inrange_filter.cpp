@@ -1,15 +1,20 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "piet/inrange_filter.h"
 #include "piet/translate.h"
 
 #include <cctype>
 #include <cstdio>
 #include <ctime>
+#include <string>
+#include <vector>
 
 #include "piet/cobra_runner.h"
 #include "piet/datastore.h"
 #include "piet/eval/errors.h"
 #include "piet/scratch_seq.h"
 #include "piet/session_state.h"
+#include "piet/strmutate.h"
 #include "piet/strutil.h"
 
 namespace piet::handlers {
@@ -63,6 +68,42 @@ std::string nextInRangePath(const std::string& workdir, const std::string& prefi
 // identically — the cache's producer writes it and the per-slice consumer
 // drops it again.
 const char* const kIdxVar = "__piet_inidx__";
+// addIfMaskColumn's 0/1 column, beside kIdxVar on the same cached base.
+const char* const kIfMaskVar = "__piet_inif__";
+// addIfMaskColumn's group-relative `_n`/`_N` for the row evaluator; they live
+// only on its scratch frame.
+const char* const kGroupObsVar = "__piet_byobs__";
+const char* const kGroupNObsVar = "__piet_bynobs__";
+
+// `_n` -> kGroupObsVar and `_N` -> kGroupNObsVar wherever they stand as names:
+// not inside a string literal, not part of a longer name.
+std::string renameObsNumbers(const std::string& expr) {
+  auto isName = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+  std::string out;
+  bool inStr = false;
+  for (size_t i = 0; i < expr.size(); ++i) {
+    const char c = expr[i];
+    if (c == '"') inStr = !inStr;
+    if (!inStr && c == '_' && i + 1 < expr.size() && (expr[i + 1] == 'n' || expr[i + 1] == 'N') &&
+        (i == 0 || !isName(expr[i - 1])) && (i + 2 == expr.size() || !isName(expr[i + 2]))) {
+      out += expr[i + 1] == 'n' ? kGroupObsVar : kGroupNObsVar;
+      ++i;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
+bool namesObsNumber(const std::string& expr) { return renameObsNumbers(expr) != expr; }
+
+// `, by(k1 k2)` for an engine --bygen spec; empty without keys.
+std::string byOption(const std::vector<std::string>& groupKeys) {
+  if (groupKeys.empty()) return std::string();
+  std::string byOpt = ", by(";
+  for (size_t i = 0; i < groupKeys.size(); ++i) byOpt += (i ? " " : "") + groupKeys[i];
+  return byOpt + ")";
+}
 
 // Stata's two range refusals, verbatim (w2d_uncovered.log:5240 for the first;
 // the second is StataBE 19.5's answer to `keep in 0` / `keep in -13/-1` on 12
@@ -161,10 +202,16 @@ InRangeBounds parseInRangeBounds(const std::string& raw, int64_t nRowsTotal) {
   return res;
 }
 
-InRangeFilterResult applyIfAndInFilter(SessionState& session, const std::string& basePath,
-                                       const std::optional<std::string>& ifExpr,
-                                       const std::optional<std::string>& inRange, bool complement,
-                                       const RowIndexCache* idx) {
+namespace {
+
+// applyIfAndInFilter's body. `keepIndex` (e(sample) T2, applyIfAndInFilterKeepingIndex
+// below) leaves kIdxVar -- each surviving row's 1-based position in basePath --
+// on the filtered copy instead of dropping it; nullptr/false is the historical
+// call, byte for byte.
+InRangeFilterResult filterIfAndIn(SessionState& session, const std::string& basePath,
+                                  const std::optional<std::string>& ifExpr,
+                                  const std::optional<std::string>& inRange, bool complement,
+                                  const RowIndexCache* idx, bool keepIndex) {
   InRangeFilterResult res;
   bool haveIf = ifExpr.has_value() && !ifExpr->empty();
   bool haveIn = inRange.has_value() && !inRange->empty();
@@ -206,8 +253,18 @@ InRangeFilterResult applyIfAndInFilter(SessionState& session, const std::string&
     std::string pred = complement ? ("(" + *ifExpr + ")==0") : *ifExpr;
     // BUG-369: `keep if L.x > 3` — see handlers.cpp::runGen for why the tsset
     // metadata has to ride the call rather than come from the file.
-    runCobraJson(translate::injectTsContextForExpr(
-        {"eval", "--data", basePath, "--keepif", pred, "--out", outPath}, pred, session));
+    std::vector<std::string> argv = {"eval", "--data", basePath};
+    if (keepIndex) {
+      // cmd_eval applies its ops in argv order (C1-② below), so the index is
+      // numbered BEFORE --keepif removes rows: the position in basePath.
+      argv.push_back("--bygen");
+      argv.push_back(std::string(kIdxVar) + "=_n");
+    }
+    argv.push_back("--keepif");
+    argv.push_back(pred);
+    argv.push_back("--out");
+    argv.push_back(outPath);
+    runCobraJson(translate::injectTsContextForExpr(argv, pred, session));
     res.dataPath = outPath;
     return res;
   }
@@ -275,10 +332,21 @@ InRangeFilterResult applyIfAndInFilter(SessionState& session, const std::string&
   if (usePreIndexed) {
     // C1-①: the index column is GROUP-INVARIANT, so a per-group loop builds it
     // once (buildRowIndexCache) and every slice below is a single --keepif over
-    // the already-indexed copy.
+    // the already-indexed copy. A pre-evaluated `if` column leaves the same way.
+    std::vector<std::string> argv = {"eval", "--data", indexedPath, "--keepif", combinedIf,
+                                     "--drop", kIdxVar};
+    if (!idx->maskVar.empty()) {
+      argv.push_back("--drop");
+      argv.push_back(idx->maskVar);
+    }
+    argv.push_back("--out");
+    argv.push_back(finalPath);
+    runCobraJson(translate::injectTsContextForExpr(argv, combinedIf, session));
+  } else if (keepIndex) {
+    // e(sample) T2: the same single call, minus the --drop.
     runCobraJson(translate::injectTsContextForExpr(
-        {"eval", "--data", indexedPath, "--keepif", combinedIf, "--drop", kIdxVar, "--out",
-         finalPath},
+        {"eval", "--data", basePath, "--bygen", std::string(kIdxVar) + "=_n", "--keepif",
+         combinedIf, "--out", finalPath},
         combinedIf, session));
   } else {
     runCobraJson(translate::injectTsContextForExpr(
@@ -288,6 +356,41 @@ InRangeFilterResult applyIfAndInFilter(SessionState& session, const std::string&
   }
 
   res.dataPath = finalPath;
+  return res;
+}
+
+}  // namespace
+
+InRangeFilterResult applyIfAndInFilter(SessionState& session, const std::string& basePath,
+                                       const std::optional<std::string>& ifExpr,
+                                       const std::optional<std::string>& inRange, bool complement,
+                                       const RowIndexCache* idx) {
+  return filterIfAndIn(session, basePath, ifExpr, inRange, complement, idx, /*keepIndex=*/false);
+}
+
+// e(sample) T2 (internal note esample/TASKS.md T2 item 3; SPEC §3.1).
+// DESIGN DECISION: an estimation command that pre-filters its `if`/`in` sample
+// into a scratch copy (runRegress's regressDataPath) and asks the engine for its
+// estimation sample (`--esample-out`) needs each scratch row's position in the
+// working frame, so the engine can scatter the admitted rows back onto it
+// (`--esample-index COL --esample-n N`). This is applyIfAndInFilter with
+// complement=false and the row-index column the `in` path already materializes
+// (kIdxVar, the RowIndexCache mechanism) KEPT on the copy -- added on the if-only
+// path too, in the same single engine call. When neither `if` nor `in` is given
+// the result is basePath itself and `*indexVar` is left empty: the fit reads the
+// working frame and needs no index. The extra column rides along on the copy
+// only; the copy is never adopted as the working frame. Declared at its one
+// caller (handlers.cpp) because piet/inrange_filter.h is outside the task's
+// write manifest.
+InRangeFilterResult applyIfAndInFilterKeepingIndex(SessionState& session,
+                                                   const std::string& basePath,
+                                                   const std::optional<std::string>& ifExpr,
+                                                   const std::optional<std::string>& inRange,
+                                                   std::string* indexVar) {
+  InRangeFilterResult res = filterIfAndIn(session, basePath, ifExpr, inRange,
+                                          /*complement=*/false, nullptr, /*keepIndex=*/true);
+  if (indexVar != nullptr) indexVar->clear();
+  if (res.ok && res.dataPath != basePath && indexVar != nullptr) *indexVar = kIdxVar;
   return res;
 }
 
@@ -306,6 +409,67 @@ RowIndexCache buildRowIndexCache(SessionState& session, const std::string& baseP
       {"eval", "--data", basePath, "--bygen", std::string(kIdxVar) + "=_n", "--out", idxPath});
   cache.path = idxPath;
   return cache;
+}
+
+std::optional<std::string> groupObsNumberFrame(SessionState& session, const std::string& dataPath,
+                                              const std::string& cond,
+                                              const std::vector<std::string>& groupKeys,
+                                              const std::string& outPath) {
+  if (groupKeys.empty() || !namesObsNumber(cond)) return std::nullopt;
+  const std::string byOpt = byOption(groupKeys);
+  SessionState::ResidentSuspend statelessChain(session);
+  runCobraJson({"eval", "--data", dataPath, "--bygen", std::string(kGroupObsVar) + "=_n" + byOpt,
+                "--bygen", std::string(kGroupNObsVar) + "=_N" + byOpt, "--out", outPath});
+  return renameObsNumbers(cond);
+}
+
+std::optional<nlohmann::ordered_json> addIfMaskColumn(SessionState& session, RowIndexCache& cache,
+                                                      const std::string& ifExpr,
+                                                      const std::vector<std::string>& groupKeys) {
+  SessionState::ResidentSuspend statelessChain(session);
+  const std::string byOpt = byOption(groupKeys);
+  std::string maskPath = nextInRangePath(session.workdir(), "inidx_if");
+  try {
+    if (strmutate::needsConditionMask(session, ifExpr)) {
+      std::string framePath = cache.path;
+      std::string cond = ifExpr;
+      if (!groupKeys.empty() && namesObsNumber(ifExpr)) {
+        framePath = nextInRangePath(session.workdir(), "inidx_byn");
+        cond = *groupObsNumberFrame(session, cache.path, ifExpr, groupKeys, framePath);
+      }
+      strmutate::ConditionMaskInstall mi =
+          strmutate::writeConditionMaskColumn(session, framePath, cond, kIfMaskVar, maskPath);
+      if (!mi.ok) return mi.error;
+      if (framePath != cache.path) {
+        std::string dropped = nextInRangePath(session.workdir(), "inidx_if");
+        runCobraJson({"eval", "--data", maskPath, "--drop", kGroupObsVar, "--drop",
+                      kGroupNObsVar, "--out", dropped});
+        maskPath = dropped;
+      }
+    } else {
+      // `!=0` turns the condition into 0/1 by Stata's rule: a missing value is
+      // not 0, so it selects the row (FU-197).
+      const std::string spec = std::string(kIfMaskVar) + "=((" + ifExpr + ")!=0)" + byOpt;
+      runCobraJson(translate::injectTsContextForExpr(
+          {"eval", "--data", cache.path, "--bygen", spec, "--out", maskPath}, ifExpr, session));
+    }
+  } catch (const CobraError& ce) {
+    return nlohmann::ordered_json(eval::engineError(cobraErrorMessage(ce), ce.code));
+  }
+  cache.path = maskPath;
+  cache.maskVar = kIfMaskVar;
+  return std::nullopt;
+}
+
+std::string sliceKeepingIfMask(SessionState& session, const RowIndexCache& cache, long long a,
+                               long long b) {
+  SessionState::ResidentSuspend statelessChain(session);
+  const std::string rangePred = std::string(kIdxVar) + ">=" + std::to_string(a) + " & " +
+                                std::string(kIdxVar) + "<=" + std::to_string(b);
+  std::string outPath = nextInRangePath(session.workdir(), "inif_final");
+  runCobraJson({"eval", "--data", cache.path, "--keepif", rangePred, "--drop", kIdxVar, "--out",
+                outPath});
+  return outPath;
 }
 
 nlohmann::ordered_json inRangeRejectError(const InRangeFilterResult& r, const std::string& inRangeRaw,

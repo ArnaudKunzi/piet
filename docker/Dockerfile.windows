@@ -1,0 +1,183 @@
+# Cross-compile cobra for Windows x64 (MinGW-w64, Debian 12 base).
+#
+# Target: Windows 10/11 x64, conservative x86-64-v2 baseline (correctness-first).
+# The demo machine's CPU spec was revised twice (i5-11300H → i5-6500 Skylake);
+# rather than chase the exact CPU, both halves use the same documented
+# Nehalem/SSE4.2 floor, because a wrong -march guess = a SILENT SIGILL crash
+# on launch (builds fine, dies on the target). Perf cost is zero on demo-sized
+# data. Two-part safe build:
+#   (a) OpenBLAS TARGET=NEHALEM → fixed SSE4.2 kernels (see the stage-1 note
+#       below for why DYNAMIC_ARCH is not usable under MinGW-w64).
+#   (b) cobra -march=x86-64-v2 via -DCECON_X86_ARCH=x86-64-v2 (the cache var
+#       CoBrA Op added, MI-058). v2 = SSE4.2 baseline — runs on everything
+#       Nehalem/2009+ (covers i5-6500 Skylake and anything older the User
+#       might use). NO AVX/AVX2 required in cobra's own code.
+#
+# Two-stage build so Docker caches the expensive OpenBLAS compile separately
+# from the cobra compile.  First run ~15 min; subsequent (cobra-only) ~3 min.
+#
+# Produces a self-contained cobra.exe with no runtime DLL deps beyond the
+# Windows system runtime (kernel32, ntdll, msvcrt — always present).
+#
+# Usage (from repo root):
+#   docker buildx build \
+#     -f docker/Dockerfile.windows \
+#     --target export \
+#     --output type=local,dest=dist/windows-amd64 \
+#     --platform linux/amd64 \
+#     .
+#
+# Or via the helper: bash docker/build-windows.sh
+
+# ── Stage 1: OpenBLAS (BLAS + CBLAS + LAPACK + LAPACKE, static) ────────────
+# Separate stage so Docker caches it; only re-runs if OPENBLAS_TAG changes.
+# v0.3.28: v0.3.26 has a DYNAMIC_ARCH cross-build bug — dynamic.c references
+# gotoblas_SAPPHIRERAPIDS which is undeclared on the MinGW-w64 path, breaking the
+# DYNAMIC_ARCH=1 build. Fixed in later releases; 0.3.28 builds clean.
+ARG OPENBLAS_TAG=v0.3.28
+FROM debian:12-slim AS build-openblas
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      --no-install-recommends \
+      g++-mingw-w64-x86-64 gfortran-mingw-w64-x86-64 \
+      build-essential git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Switch MinGW compilers to POSIX threading model.
+# The posix variant ships winpthreads, which provides <pthread.h> and
+# C++11 thread support required by src/core/threads.cpp.
+RUN update-alternatives --set x86_64-w64-mingw32-gcc \
+        /usr/bin/x86_64-w64-mingw32-gcc-posix \
+    && update-alternatives --set x86_64-w64-mingw32-g++ \
+        /usr/bin/x86_64-w64-mingw32-g++-posix
+
+ARG OPENBLAS_TAG
+RUN git clone --depth 1 --branch ${OPENBLAS_TAG} \
+      https://github.com/OpenMathLib/OpenBLAS.git /openblas
+
+# Cross-compile OpenBLAS for Windows x64.
+#   TARGET=NEHALEM  → single fixed SSE4.2 build (= x86-64-v2, exactly cobra's own
+#                     -march baseline). Runs on any Nehalem/2009+ CPU incl. the
+#                     i5-6500 Skylake demo box. No AVX/AVX2 in the BLAS → cannot
+#                     SIGILL on any plausible x86-64 Windows machine.
+#                     We do NOT use DYNAMIC_ARCH: under MinGW-w64 it unconditionally
+#                     compiles the PRESCOTT (SSE3) dynamic kernel, whose _mm_hadd_ps
+#                     intrinsic the cross-compiler refuses to inline (build error,
+#                     all OpenBLAS tags). A single NEHALEM target avoids it.
+#   HAVE_SSE3/SSSE3/SSE4_1/SSE4_2=1 → CRITICAL for cross-builds. OpenBLAS adds the
+#                     per-arch -msse3/-mssse3/-msse4.1 flags only when getarch has
+#                     DETECTED these features — but getarch can't probe a CPU under
+#                     CROSS=1, so the flags are dropped and the NEHALEM ssum/sdot
+#                     kernels' _mm_hadd_ps (SSE3) fails "target specific option
+#                     mismatch". We assert the Nehalem feature set explicitly so the
+#                     Makefile.x86_64 ADD_CPUFLAGS block emits -msse4.2 etc. (A
+#                     Nehalem CPU has all of these; this does not raise the floor
+#                     above x86-64-v2.)
+#   NO_AVX512=1     → explicit; a single NEHALEM target emits no AVX-512 anyway.
+#   NO_SHARED=1     → static .a only, no DLL.
+#   NUM_THREADS=64  → max thread pool (cobra sets its own count at runtime).
+RUN cd /openblas && make \
+      CC=x86_64-w64-mingw32-gcc \
+      FC=x86_64-w64-mingw32-gfortran \
+      AR=x86_64-w64-mingw32-ar \
+      RANLIB=x86_64-w64-mingw32-ranlib \
+      HOSTCC=gcc \
+      NO_AVX512=1 \
+      TARGET=NEHALEM \
+      HAVE_SSE3=1 HAVE_SSSE3=1 HAVE_SSE4_1=1 HAVE_SSE4_2=1 \
+      CROSS=1 \
+      CROSS_SUFFIX=x86_64-w64-mingw32- \
+      OS=Windows_NT \
+      BINARY=64 \
+      NO_SHARED=1 \
+      NUM_THREADS=64 \
+      -j"$(nproc)"
+
+RUN cd /openblas && make install \
+      PREFIX=/openblas-win \
+      NO_SHARED=1 \
+      CC=x86_64-w64-mingw32-gcc \
+      FC=x86_64-w64-mingw32-gfortran \
+      AR=x86_64-w64-mingw32-ar \
+      RANLIB=x86_64-w64-mingw32-ranlib \
+      HOSTCC=gcc \
+      NO_AVX512=1 \
+      TARGET=NEHALEM \
+      HAVE_SSE3=1 HAVE_SSSE3=1 HAVE_SSE4_1=1 HAVE_SSE4_2=1 \
+      CROSS=1 \
+      CROSS_SUFFIX=x86_64-w64-mingw32- \
+      OS=Windows_NT \
+      BINARY=64 \
+      NO_SHARED=1
+
+# ── Stage 2: cobra.exe ──────────────────────────────────────────────────────
+FROM debian:12-slim AS build-cobra
+
+# gfortran-mingw-w64 provides libgfortran.a + libquadmath.a: OpenBLAS's LAPACK
+# Fortran routines (dgesvd/dormbr/…) call the gfortran runtime (_gfortran_*),
+# which the cobra link must resolve statically. Without it the link fails with
+# "undefined reference to `_gfortran_concat_string'".
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      --no-install-recommends \
+      g++-mingw-w64-x86-64 gfortran-mingw-w64-x86-64 cmake ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --set x86_64-w64-mingw32-gcc \
+        /usr/bin/x86_64-w64-mingw32-gcc-posix \
+    && update-alternatives --set x86_64-w64-mingw32-g++ \
+        /usr/bin/x86_64-w64-mingw32-g++-posix
+
+COPY --from=build-openblas /openblas-win /openblas-win
+
+WORKDIR /src
+COPY . /src
+
+# -- mmap shim ---------------------------------------------------------------
+# src/io/columnar.cpp uses mmap/munmap via <sys/mman.h>, which MinGW-w64 does
+# not ship.  Our Win32-backed shim satisfies the include and the linker.
+# -D_FILE_OFFSET_BITS=64 must MATCH the CMake-side define (CMakeLists.txt, the
+# if(WIN32) block): mmap() takes an off_t, and a 32-bit off_t here against a
+# 64-bit one in the engine is a silent ABI mismatch on the mapping offset.
+RUN x86_64-w64-mingw32-gcc -O2 -D_FILE_OFFSET_BITS=64 \
+      -I/src/docker/windows-compat \
+      -c /src/docker/windows-compat/mman.c \
+      -o /mman_compat.o \
+    && x86_64-w64-mingw32-ar rcs /libmman_compat.a /mman_compat.o
+
+# -- libdl stub (REMOVED 2026-06-19) ----------------------------------------
+# Stale: CMakeLists.txt now guards -ldl with if(UNIX) (MSG-PO-006, main@8ce745f).
+# The empty libdl.a stub is no longer needed; MinGW-w64 WIN32 path skips -ldl.
+
+# -- cobra.exe ---------------------------------------------------------------
+# Conservative march: override CMakeLists.txt's default -march=x86-64-v3 down to
+# x86-64-v2 (SSE4.2 baseline, Nehalem/2009+) via the CECON_X86_ARCH cache var
+# (CoBrA Op, MI-058). v2 runs on the i5-6500 Skylake demo box and anything older.
+# No AVX/AVX2 in cobra's own code → cannot SIGILL on a no-AVX2 host.
+RUN set -e; \
+    OB_A=/openblas-win/lib/libopenblas.a; \
+    OB_INC=/openblas-win/include; \
+    [ -f "$OB_A" ]   || { echo "ERROR: libopenblas.a not found"; exit 1; }; \
+    [ -d "$OB_INC" ] || { echo "ERROR: openblas include dir not found"; exit 1; }; \
+    GFORTRAN_A=$(x86_64-w64-mingw32-gcc -print-file-name=libgfortran.a); \
+    QUADMATH_A=$(x86_64-w64-mingw32-gcc -print-file-name=libquadmath.a); \
+    [ -f "$GFORTRAN_A" ] || { echo "ERROR: libgfortran.a not found ($GFORTRAN_A)"; exit 1; }; \
+    [ -f "$QUADMATH_A" ] || { echo "ERROR: libquadmath.a not found ($QUADMATH_A)"; exit 1; }; \
+    echo "gfortran: $GFORTRAN_A"; echo "quadmath: $QUADMATH_A"; \
+    LIBS="${OB_A};/libmman_compat.a;${GFORTRAN_A};${QUADMATH_A}"; \
+    cmake -S /src -B /build \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_TOOLCHAIN_FILE=/src/docker/windows-toolchain.cmake \
+      -DCECON_X86_ARCH=x86-64-v2 \
+      "-DCMAKE_CXX_FLAGS=-I/src/docker/windows-compat -I${OB_INC}" \
+      "-DCMAKE_C_FLAGS=  -I/src/docker/windows-compat -I${OB_INC}" \
+      "-DCECON_STATIC_LIBS=${LIBS}" \
+      -DCMAKE_EXE_LINKER_FLAGS="-static" \
+    && ninja -C /build cobra
+
+RUN x86_64-w64-mingw32-strip /build/cobra.exe \
+    && echo "cobra.exe: $(du -sh /build/cobra.exe | cut -f1)"
+
+# ── Stage 3: export ─────────────────────────────────────────────────────────
+FROM scratch AS export
+COPY --from=build-cobra /build/cobra.exe /cobra.exe

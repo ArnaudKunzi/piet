@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — Stata time-series operators (L. F. D. S.) as a data-prep primitive.
 // Operators are linear polynomials in the lag operator B and all commute, so a
 // composed operator (e.g. LDS12.x) is applied as a sequence of single steps with

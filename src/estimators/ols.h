@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — pooled OLS (no fixed effects yet) with classic and HC1-robust SEs.
 #pragma once
 #include <cstdint>

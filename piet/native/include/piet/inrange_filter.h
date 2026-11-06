@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // BS-090 (BETA campaign, Phase G): shared row-range (`in a/b`) + `if` filter
 // composition for every command whose row-filtering ultimately goes through
 // `cobra eval --keepif` (as opposed to gen/replace's `--bygen`-native `_n`
@@ -28,6 +30,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "vendor/nlohmann/json.hpp"
 
@@ -101,9 +104,51 @@ struct InRangeFilterResult {
 struct RowIndexCache {
   std::string path;    // basePath with the row-index column materialized
   int64_t nRows = 0;   // row count of basePath (for `f`/`l` bound resolution)
+  // Set by addIfMaskColumn: a 0/1 column on `path` holding the caller's `if`,
+  // already evaluated. Every slice drops it again, like the row index.
+  std::string maskVar;
 };
 
 RowIndexCache buildRowIndexCache(SessionState& session, const std::string& basePath);
+
+// BUG-1166 / by-driver `if` (dispatcher.cpp's by: summarize/count/regress
+// loop): evaluates `ifExpr` ONCE over the cached base into a 0/1 column
+// (Stata's truth rule: a missing condition is true) and records it as
+// `cache.maskVar`; the caller then hands that name to each slice as its `if`.
+// With `groupKeys`, `_n`, `_N` and x[k] inside the condition count within each
+// group of those keys (the engine's --bygen by()), as the `if` of a built-in
+// byable command does under `by:`; with none they count over the whole base.
+// TS operators read the whole base either way, the tsset metadata riding the
+// call. A condition the engine cannot read (a string function, a compare
+// against "", a string column in any other use than `s ==/!= "text"`:
+// strmutate::needsConditionMask) is evaluated by the row evaluator instead, its
+// `_n`/`_N` read from columns the engine numbers within each group
+// (groupObsNumberFrame; BUG-1436). Returns the block to show when the condition
+// cannot be evaluated (the evaluator's or the engine's message), and leaves
+// `cache` unchanged then.
+std::optional<nlohmann::ordered_json> addIfMaskColumn(SessionState& session, RowIndexCache& cache,
+                                                      const std::string& ifExpr,
+                                                      const std::vector<std::string>& groupKeys);
+
+// BUG-1436: the row evaluator numbers `_n`/`_N` over the frame it reads, where
+// under by: they count within the group (`bysort g: count if strlen(s) > 2 & _n
+// > 1`: StataBE 19.5 counts 1 and 2 on groups of 3 and 4, measured 2026-10-29).
+// When `cond` names either, writes to `outPath` a copy of `dataPath` holding two
+// columns the engine numbers within each group of `groupKeys` (the rows stay
+// where they are) and returns `cond` with `_n`/`_N` renamed onto them;
+// std::nullopt, writing nothing, when it names neither or there are no keys. A
+// CobraError propagates.
+std::optional<std::string> groupObsNumberFrame(SessionState& session, const std::string& dataPath,
+                                              const std::string& cond,
+                                              const std::vector<std::string>& groupKeys,
+                                              const std::string& outPath);
+
+// BUG-1166: rows a..b (1-based) of the cached base, `if` NOT applied: the row
+// index leaves, the pre-evaluated `if` column (cache.maskVar) stays, for a caller
+// whose engine call applies it after its own time-series operators have read
+// the group's whole series. A CobraError propagates.
+std::string sliceKeepingIfMask(SessionState& session, const RowIndexCache& cache, long long a,
+                               long long b);
 
 InRangeFilterResult applyIfAndInFilter(SessionState& session, const std::string& basePath,
                                        const std::optional<std::string>& ifExpr,

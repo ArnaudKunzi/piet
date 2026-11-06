@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Bridge route handlers — one function per `window.pietNative.request(path,
 // body)` routing key. M0 shipped 2 demo routes (echo, cobra.version); M4b
 // (ROADMAP §2.0.0 "M4b — frontend swap + graph rendering + run-cancel")
@@ -103,7 +105,7 @@ BridgeResult summarize(SessionState& session, const std::string& body);
 
 // "legal.notices" (WI-5, legal remediation 2026-07-08) — app-shell service
 // route (no SessionState; same classification as "dialog.open": a shell
-// facility, not a Boundary-B kernel endpoint — project classifies at merge).
+// facility, not a Boundary-B kernel endpoint — the maintainer classifies at merge).
 // Returns { text: string, source: "bundle"|"dev" }: the
 // THIRD_PARTY_NOTICES.txt generated into the packaged bundle's Resources/
 // by package_native_app.sh, or (dev runs) the same content concatenated

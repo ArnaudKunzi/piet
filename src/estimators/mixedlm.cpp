@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "mixedlm.h"
 
 // Random-intercept multilevel ML fit. The log-likelihood, gradient and per-group

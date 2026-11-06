@@ -1,90 +1,137 @@
-# PIET + CoBrA — experimental public beta
+# PIET + CoBrA — a free, offline, Stata-syntax-compatible econometrics tool
 
-PIET is a local desktop interface for econometric analysis. CoBrA is its C++
-computation engine. The application accepts a subset of Stata-style commands
-and reads and writes supported data formats without requiring Stata at runtime.
+**PIET** is a desktop application for learning and doing econometrics with the
+command syntax many researchers already know. It reads `.do` scripts and `.dta`
+datasets, runs them through its own independent computation engine, and renders
+tables, regression output, and graphs — fully offline, no license server, no
+telemetry.
 
-**PIET 1.0 Beta 1.** This release is for evaluation and bug reporting.
-Compatibility is incomplete. Validate statistical results independently before
-using them in research or decisions.
+**CoBrA** (C-Oriented Bootstrap & Regression Accelerator) is the engine: a
+dependency-light C++17 library and CLI for high-dimensional fixed-effects
+econometrics — OLS/IV/2SLS/LIML, FE-Poisson (PPML), panel models, tobit,
+Heckman, quantile regression, Callaway–Sant'Anna staggered DiD, HAC/Newey–West,
+robust/cluster/wild-bootstrap inference, and a Stata-style data-preparation
+layer (`generate`/`egen`/`merge`/`joinby`/`reshape`/`collapse` …). Heavy linear
+algebra goes through the platform BLAS (Apple **Accelerate** on macOS — the AMX
+path on Apple Silicon); the engine never reimplements BLAS.
 
-## Download for macOS
+PIET is aimed at students, instructors, and researchers who want familiar
+syntax without a paid license. It is **not** a copy, port, or clone of Stata,
+and contains no Stata source code, manual text, or other StataCorp-authored
+material (see *Relationship to Stata* below).
 
-[Download PIET 1.0 Beta 1 for Apple Silicon (.dmg)](https://github.com/w4s7jksf68-ai/piet/releases/download/v1.0.0-beta.1/PIET-1.0.0-beta.1-macos-arm64.dmg)
-and drag **PIET.app** to Applications. This build is ad-hoc signed, but is not
-Apple Developer ID signed or notarized. macOS may block the first launch; use
-[Apple's Open Anyway instructions](https://support.apple.com/102445) if you
-trust this download. The app requires macOS 13.3 or newer; only macOS 26.6.2
-on Apple Silicon was tested. See the [release page](https://github.com/w4s7jksf68-ai/piet/releases/tag/v1.0.0-beta.1)
-for the SHA-256 checksum and corresponding source.
+## What works today
 
-## Build on macOS
+- **160+ commands** across the data-management, estimation, post-estimation,
+  graphics, and programming surfaces (loops, locals/globals, programs,
+  `eclass`/`sclass` returns, matrices, frames, `preserve`/`restore`).
+- **Resampling inference**: `bootstrap`, `jackknife`, `permute`, wild cluster
+  bootstrap; deterministic seeded streams.
+- **Parallel execution**: `parallel, workers(N)` fan-out with byte-identical
+  output across worker counts.
+- **File formats**: native `.dta` reader (legacy formats through 118, strL
+  included) and 118 writer, CSV/XLSX import-export, and `.hbin`, a
+  memory-mapped columnar format for fast repeated loads.
+- **Graphs**: twoway families, event-study/coefficient plots, histograms,
+  binscatter, `graph export` to PNG/SVG.
 
-Requirements: Xcode Command Line Tools (C++17), CMake 3.20+, Python 3.
-The build uses Apple's Accelerate framework and native WebKit.
-From a fresh clone:
+## Accuracy
+
+Numbers are the product. Every estimator is validated in three rings before it
+ships:
+
+1. **Synthetic exact-answer unit tests** (ctest).
+2. **Cross-engine golden fixtures** captured from real Stata runs and pinned
+   byte-for-byte; the release gate re-runs the full fixture corpus on every
+   stamp.
+3. **Cell-level parity** against a live Stata oracle on realistic workloads,
+   held to a documented tolerance ladder (baseline relative tolerance 1e-9,
+   i.e. the displayed digits plus two guard digits; see
+   `tests/eval/TOLERANCE.md`).
+
+Where PIET cannot honestly reproduce a quantity, it refuses with an error
+rather than returning a plausible number — "honest reject over silent wrong
+answer" is the project's first law, and known numerical limitations are named
+in the release notes rather than hidden.
+
+## Build
+
+Requires CMake ≥ 3.20 and a C++17 compiler. Currently macOS-first (Accelerate);
+Windows and Linux ports are in progress (`docker/` holds the cross-build recipes).
+
+The one-command path, which is also what the CI workflow runs:
 
 ```sh
-sh scripts/build-macos.sh
-COBRA_BIN="$PWD/build/cobra" ./piet/native/build/piet_native
+sh scripts/build-macos.sh      # builds both executables, runs ctest and the public smoke test
 ```
 
-Keep the repository's `piet/frontend` and sample files alongside the build.
-The command above builds both executables and runs the included tests.
-Other platforms have source branches but are not certified by this beta.
+Step by step:
 
-## Try it
+```sh
+# the engine (repo root)
+cmake --preset release
+cmake --build --preset release -j4
+ctest --preset release
 
-In the application, choose **File → Open sample dataset**, or enter:
-
-```stata
-sysuse synthetic_panel
-summarize fatal beertax unemp
-regress fatal beertax unemp, robust
+# the PIET app — a standalone CMake project with its own presets
+cd piet/native && cmake --preset release && cmake --build --preset release -j4
 ```
 
-The sample is entirely synthetic. Its names do not describe real observations.
-You can open your own CSV or supported Stata dataset through the file menu.
-Run only scripts you trust: commands can read and write local files and invoke
-system programs with your user permissions.
+Without presets the equivalent is `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release`
+and `cmake -S piet/native -B piet/native/build -DCMAKE_BUILD_TYPE=Release`.
 
-## Published Beta 1 scope
+**Tests from a fresh clone.** `ctest` (the engine's unit tests) and
+`tests/public_smoke.py` (import → regress → save → reload through the app, checked
+against an independent OLS) run self-contained; `scripts/build-macos.sh` runs both.
+`piet_native --selftest` is the maintainers' suite: most of its arms read private
+oracle fixtures (Stata captures and datasets the repo deliberately does not ship),
+so in a clone it reports those arms as failed or skipped rather than passing.
 
-- Desktop interface, native command processing, CoBrA computation engine.
-- Local build and self-contained public tests; no licensed reference software
-  or third-party research datasets are required by those tests.
-- `egen concat()`, `egen cut()`, and `bcal create` are unavailable in this
-  first public beta pending implementation-provenance clearance. They report
-  an explicit error. Existing business-calendar reading remains available.
-- The test suite covers a bounded set of numerical and data-operation checks.
-  It is not a certification of every accepted command or of full Stata parity.
-- PIET reports `1.0.0-beta.1`. CoBrA reports its own engine version `0.41.0`.
-  The public Git tag identifies the exact release; see [release notes](RELEASE_NOTES.md).
+The app finds its engine on its own when both are built in place — it looks
+beside itself, then at the repo-root `build/cobra`. Set `COBRA_BIN` to override
+that (test harnesses do, to pin an exact engine); packaged builds bundle their
+own. See `piet/README.md` for app-side details and the UI test harness.
 
-## Unreleased source changes
+## Layout
 
-The development source restores `egen concat()`, `egen cut()`, and `bcal create`
-with independent replacement implementations. These changes are not included in
-the Beta 1 download above. Labels used by `concat(), decode` and created by
-`cut(), label` are carried between the native interface and engine.
+```
+src/ apps/        CoBrA engine (io, core, estimators, vcov, inference, CLI)
+piet/native/      PIET application (C++ core, WKWebView UI, dispatcher)
+piet/frontend/    UI (HTML/CSS/JS)
+tests/            unit tests, golden fixtures, parity harnesses
+tools/            converters and audit tooling
+vendor/           vendored single-header dependencies
+```
 
-The public tests use synthetic examples and do not require Stata. Current and
-historical results are recorded separately in [VALIDATION.md](VALIDATION.md).
-See [the behavior and provenance record](docs/RESTORED_FUNCTIONS.md)
-for the implementation approach, verification command, and current limits.
-`bcal create, personal` writes to the existing `sysdir PERSONAL` directory
-(by default `~/ado/personal/`). Calendars are searched in the working directory
-and PERSONAL directory. `generate()` also supports `if` and `in`, preserving all
-rows and setting excluded observations to missing. An extended range keeps endpoints on
-weekdays represented in the source data and satisfies the maximum-gap limit.
+## Relationship to Stata
 
-## License and acknowledgments
+PIET is not affiliated with, endorsed by, or sponsored by StataCorp LLC.
+"Stata" is a registered trademark of StataCorp LLC. PIET is an independently
+developed tool that implements a compatible command syntax and reads/writes
+compatible file formats; command languages and file formats are not subject to
+copyright. See `NOTICE.txt` for the full non-affiliation statement, trademark
+rationale, and per-author credits for community-package command names.
 
-Project code: **GPL-3.0-or-later**, [LICENSE.txt](LICENSE.txt).
-Bundled dependencies retain their respective licenses; see
-[THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) and [NOTICE.txt](NOTICE.txt).
-PIET and CoBrA are not affiliated with or endorsed by StataCorp.
+## License
 
-Please report reproducible problems through GitHub Issues, using synthetic data
-and the public release tag. Do not upload credentials or private datasets.
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+**GPL-3.0-or-later.** See `LICENSE.txt`. Third-party components are listed
+with their licenses under `piet/packaging/licenses/`, including the
+adopted-code register (`40-ADOPTED-CODE.txt`), which records the provenance of
+any code adopted from GPL-compatible sources.
+
+## Citing
+
+If you use PIET's Callaway–Sant'Anna staggered difference-in-differences
+(`csdid`) estimator in published or for-credit academic work, please cite:
+
+> Callaway, Brantly, and Pedro H. C. Sant'Anna. 2021. "Difference-in-Differences
+> with Multiple Time Periods." *Journal of Econometrics* 225(2): 200-230.
+>
+> Sant'Anna, Pedro H. C., and Jun Zhao. 2020. "Doubly Robust
+> Difference-in-Differences Estimators." *Journal of Econometrics* 219(1):
+> 101-122.
+
+If you use PIET more generally in published work, please also cite the tool
+itself; the citation form will accompany the first citable public release.
+
+<!-- hook live-fire 2026-09-02: docs-only commit on main -->

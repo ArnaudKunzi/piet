@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // AER-SCOPE1 bundle F (RESHAPE, 2026-09-04) -- the seventeen shape/sample verbs
 // that change what the rows and columns of the dataset ARE:
 //
@@ -84,6 +86,7 @@
 // `session_state.h` is likewise untouched: `ScratchPin` and
 // `noteProjectionScratch` are used exactly as they already exist.
 #include "piet/handlers.h"
+#include "piet/dispatcher.h"  // dispatch(): cumul marks its if/in sample with generate
 
 #include <algorithm>
 #include <cctype>
@@ -99,6 +102,7 @@
 #include <numeric>
 #include <optional>
 #include <regex>
+#include <ctime>
 #include <set>
 #include <sstream>
 #include <string>
@@ -107,7 +111,11 @@
 #include <utility>
 #include <vector>
 
+#include "data/frame_internal.h"  // canonical numeric storage rounding for recast
+#include "data/missing.h"         // cumul's by() groups: each missing code is its own
 #include "core/rng.h"         // Philox4x32-10, the engine's own counter-based RNG
+#include "core/rng_mt64.h"    // Stata's session stream: bsample's fast path
+#include "bsample_draws.h"    // the fast path's draw, shared with the bootstrap prefix
 #include "core/rng_normal.h"  // uniform01 / normal_icdf (AS241) -- drawnorm
 #include "io/win_compat.h"    // cecon::to_native_path / native_unlink
 #include "piet/cobra_runner.h"
@@ -121,7 +129,10 @@
 #include "piet/mutation_result.h"
 #include "piet/scratch_seq.h"
 #include "piet/session_state.h"
+#include "piet/storage_type.h"  // FU-944: input's c(type) and float store
 #include "piet/strutil.h"
+#include "estimation_m4_internal.h"  // esampleHeadMask / esampleRewriteHeadMask
+#include "scratch_columns.h"          // cumul's if/in restriction and weight columns
 
 // ---------------------------------------------------------------------------
 // OPTION VOCABULARIES -- namespace scope, before any dispatch (defect class 3).
@@ -142,7 +153,11 @@ const piet::eval::OptVocab& kVocabSplit = piet::eval::registerOptVocab(
                 // the padding, `force` splits a numeric variable. None is read
                 // here, and each would change WHAT THE PARTS ARE, so none may
                 // be accepted-and-ignored.
-                {"ignore", "notrim", "force"}});
+                // `g` is split.ado's Generate() minimum (aer_w2 w2b_dataio
+                // split_p_g `p("-") g(Job)` rc 0); it prefixes both
+                // registered spellings, so it is declared.
+                {"ignore", "notrim", "force"},
+                {{"g", "generate"}, {"ge", "generate"}}});
 
 // `promote` asks for the narrowest storage type that holds the transposed
 // values. It IS read below (it produces a note), because this build's frame is
@@ -204,7 +219,9 @@ const piet::eval::OptVocab& kVocabCompare =
     piet::eval::registerOptVocab({"compare"}, {{}, {}});
 
 const piet::eval::OptVocab& kVocabCumul = piet::eval::registerOptVocab(
-    {"cumul"}, {{"gen", "generate", "equal", "freq"}, {}});
+    {"cumul"}, {{"gen", "generate", "equal", "freq", "by"},
+                {},
+                {{"g", "generate"}, {"ge", "generate"}, {"f", "freq"}}});
 
 const piet::eval::OptVocab& kVocabBsample = piet::eval::registerOptVocab(
     {"bsample"}, {{"cluster", "idcluster"}, {"strata", "weight"}});
@@ -462,9 +479,22 @@ std::optional<ojson> writeAndConvert(SessionState& session, const CsvTable& t,
     }
     f << "\n";
     for (const auto& row : t.rows) {
+      // BUG-1078: a row whose every cell is missing would be a BLANK line, and
+      // cobra's CSV reader skips blank lines (BUG-697's pad rows, same reader),
+      // so a one-variable `input` with a `""` or `.` row lost it and stopped on
+      // the row-count assert. A quoted empty first field keeps the row; convert
+      // reads it as missing for a factor and for an f64 column alike.
+      bool allEmpty = true;
+      for (size_t c = 0; c < t.names.size() && allEmpty; ++c) {
+        if (c < row.size() && !row[c].empty()) allEmpty = false;
+      }
       for (size_t c = 0; c < t.names.size(); ++c) {
         if (c) f << ',';
-        if (c < row.size()) f << csvField(row[c], ',');
+        if (c == 0 && allEmpty) {
+          f << "\"\"";
+        } else if (c < row.size()) {
+          f << csvField(row[c], ',');
+        }
       }
       f << "\n";
     }
@@ -653,6 +683,33 @@ double stataPercentile(const std::vector<double>& sorted, double p) {
   return sorted[static_cast<size_t>(idx) - 1];
 }
 
+// The weighted form of the same rule, [D] pctile "Methods and formulas"
+// (/Applications/StataNow/docs/d.pdf, pctile p.776): with x(j) ascending and
+// w(j) its weight, N = Σw, P = N p/100 and W(i) = Σ_{j<=i} w(j), take the first
+// i with W(i) > P; the percentile is (x(i-1) + x(i))/2 when W(i-1) = P, else
+// x(i). With every w(j) = 1 this is stataPercentile exactly. The weights are
+// the raw ones, never rescaled: Stata compares W(i-1) = P on the weights as
+// given, and a rescaled aweight moves that equality (w2aj_qualifiers
+// qf_pt_aw_sp r(r2) 6.875 is the tie average; rescaled sums give 7.25).
+//
+// `sorted` is ascending in x, free of missing, every weight non-zero.
+double stataWeightedPercentile(const std::vector<std::pair<double, double>>& sorted, double p) {
+  if (sorted.empty()) return std::numeric_limits<double>::quiet_NaN();
+  double total = 0.0;
+  for (const auto& e : sorted) total += e.second;
+  const double P = total * p / 100.0;
+  double W = 0.0;
+  for (size_t i = 0; i < sorted.size(); ++i) {
+    const double before = W;
+    W += sorted[i].second;
+    if (W > P) {
+      if (i > 0 && before == P) return (sorted[i - 1].first + sorted[i].first) / 2.0;
+      return sorted[i].first;
+    }
+  }
+  return sorted.back().first;
+}
+
 // ===========================================================================
 // Randomness (design decision 7)
 // ===========================================================================
@@ -719,6 +776,10 @@ ojson newVarGuard(SessionState& session, const std::string& verb, const std::str
   if (!strutil::isValidStataIdentifier(newvar))
     return rsSyntax(verb + ": invalid variable name `" + newvar + "' — " +
                     strutil::stataIdentifierRuleText());
+  // BUG-1120: nor is a reserved name one: `pctile _cons = x', `cumul x,
+  // gen(_cons)', `drawnorm a _cons' and `splitsample, gen(_cons)' are each
+  // "_cons invalid varname" r(198) (StataBE 19.5).
+  if (strutil::isReservedVarName(newvar)) return rsErrorRc(newvar + " invalid varname", 198);
   Datastore* ds = nullptr;
   try {
     ds = session.datastore();
@@ -899,6 +960,7 @@ ojson runSplit(const eval::ParsedCommand& parsed, SessionState& session) {
   }
 
   std::string cur = *session.currentHbin();
+  std::vector<std::string> partTypes(k);
   for (size_t j = 0; j < k; ++j) {
     std::vector<std::string> cells;
     cells.reserve(values.size());
@@ -922,12 +984,28 @@ ojson runSplit(const eval::ParsedCommand& parsed, SessionState& session) {
     const std::string dtype = (destring && anyValue && allNumeric) ? "f64" : "factor";
     if (dtype == "f64") {
       // read_csv_column parses the f64 payload itself; blanks stay missing.
+      // destring's storage rule: the smallest type that holds every value
+      // (aer_w2 w2b_dataio split_destring: K2 byte).
+      bool allInt = true, allFloat = true;
+      double lo = 0.0, hi = 0.0;
+      bool seen = false;
       for (auto& c : cells) {
         if (c.empty()) continue;
         double tmp = 0.0;
         parseStrictDouble(c, &tmp);
+        if (!seen) { lo = hi = tmp; seen = true; }
+        lo = std::min(lo, tmp);
+        hi = std::max(hi, tmp);
+        if (tmp != std::floor(tmp)) allInt = false;
+        if (static_cast<double>(static_cast<float>(tmp)) != tmp) allFloat = false;
         c = numCell(tmp);
       }
+      std::string t = "double";
+      if (allInt && lo >= -127 && hi <= 100) t = "byte";
+      else if (allInt && lo >= -32767 && hi <= 32740) t = "int";
+      else if (allInt && lo >= -2147483647.0 && hi <= 2147483620.0) t = "long";
+      else if (allFloat) t = "float";
+      partTypes[j] = t;
     }
     std::string out;
     if (auto err = appendColumn(session, cur, newVars[j], cells, dtype, &out)) return *err;
@@ -935,10 +1013,19 @@ ojson runSplit(const eval::ParsedCommand& parsed, SessionState& session) {
   }
 
   if (k > 0) session.load(cur);
+  for (size_t j = 0; j < k; ++j) {
+    if (!partTypes[j].empty()) {
+      session.implicitFloatVars.erase(newVars[j]);
+      session.varMeta[newVars[j]].stataType = partTypes[j];
+    }
+  }
   // r(nvars)/r(varlist), the two things a do-file reads back from split. Filled
   // HERE because the arm does not call captureRFromBlock for this command.
   session.eval.rValues.set("nvars", static_cast<double>(k));
   session.eval.rStrings.set("varlist", joinWith(newVars, " "));
+  // split's whole r() set (r(nvars) and r(varlist)), so an r() it does not post reads missing (w2b append_ge(src):
+  // r(sum) after split reads `.`).
+  eval::declareRPosted(session.eval, "split", {"nvars", "varlist"});
   if (k == 0) {
     // Zero parts (an all-empty column, or limit(0)) is not an error: it is a
     // dataset with nothing to add, and r(nvars)=0 says so.
@@ -1036,11 +1123,8 @@ ojson runXpose(const eval::ParsedCommand& parsed, SessionState& session) {
 // recast
 // ===========================================================================
 //
-// METADATA only. The frame does not move, so this deliberately does not call
-// `mutationResult`: the declared Stata storage type lives in
-// `session.varMeta[name].stataType` and travels to a .dta through the
-// export-dta `--in-meta` sidecar, which is the ONLY channel a declared type can
-// ride (IDIOMS: the hbin header has no stata_type key).
+// Exact recasts change only metadata; force narrows the actual values through
+// the same store boundary as generate/replace (w2e_float_default:1565–1637).
 ojson runRecast(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabRecast.known,
                                             kVocabRecast.unimplemented))
@@ -1094,13 +1178,56 @@ ojson runRecast(const eval::ParsedCommand& parsed, SessionState& session) {
       return rsError("recast: `" + v + "' is a numeric variable and " + type +
                      " is a string type; recast never converts between the two (use `tostring`).");
   }
+  const bool force = hasFlag(parsed.opts, "force");
+  const std::map<std::string, cecon::StoreType> storeTypes = {
+      {"byte", cecon::StoreType::Byte}, {"int", cecon::StoreType::Int},
+      {"long", cecon::StoreType::Long}, {"float", cecon::StoreType::Float},
+      {"double", cecon::StoreType::Double}};
+  // Decide each variable before mutation. Non-force loss is a successful no-op
+  // for that variable, not a declaration of a type its values cannot hold.
+  std::vector<std::string> accepted, changed;
+  std::vector<std::string> args = {"eval", "--data", *session.currentHbin()};
+  std::set<std::string> seen;
   for (size_t i = 1; i < parsed.varlist.size(); ++i) {
-    session.varMeta[parsed.varlist[i]].stataType = type;
-    // BUG-295's implicit-float claim is a DEFAULT, and an explicit recast is a
-    // declaration that outranks it.
-    session.implicitFloatVars.erase(parsed.varlist[i]);
+    const std::string& name = parsed.varlist[i];
+    if (!seen.insert(name).second) continue;
+    bool changes = false;
+    if (isNumeric) {
+      const auto& col = ds->col(name);
+      for (int64_t row = 0; row < ds->nRows(); ++row) {
+        const double old = col.f64()[row];
+        const double value = cecon::frame_detail::round_to_store(old, storeTypes.at(type));
+        if (!std::isnan(old) && (std::isnan(value) || value != old)) { changes = true; break; }
+      }
+    } else {
+      const auto& col = ds->col(name);
+      const size_t width = static_cast<size_t>(std::stoll(type.substr(3)));
+      for (const auto& value : col.levels)
+        if (value.size() > width) { changes = true; break; }
+      // A string force truncation needs a byte-preserving string store. Do not
+      // mislabel an unchanged payload as a narrower string in its absence.
+      if (changes && force)
+        return rsError("recast: forced string truncation is not implemented", "unimplemented");
+    }
+    if (changes && !force) continue;
+    accepted.push_back(name);
+    if (changes) {
+      changed.push_back(name);
+      args.insert(args.end(), {"--gen", name + " = " + name});
+    }
   }
-  // Stata prints nothing on a successful recast, and the frame is byte-identical.
+  if (!changed.empty()) {
+    storage::appendStoreTypeArg(args, type);
+    const std::string out = nextPath(session.workdir(), "recast");
+    args.insert(args.end(), {"--out", out});
+    if (auto err = runVerb(args)) return *err;
+    session.load(out);
+  }
+  for (const auto& name : accepted) {
+    session.varMeta[name].stataType = type;
+    session.implicitFloatVars.erase(name);
+  }
+  if (!changed.empty()) return mutationResult(session, "gen", {}, {}, changed);
   return silent();
 }
 
@@ -1247,11 +1374,7 @@ ojson runStack(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto q = refuseQualifiers(parsed, "stack")) return *q;
   if (!session.hasData()) return ojson(eval::noDataLoaded());
   if (parsed.varlist.empty())
-    return rsSyntax("stack: syntax is `stack varlist, into(newvars) clear [wide group(#)]`");
-  if (!hasFlag(parsed.opts, "clear"))
-    return rsErrorRc("stack: you must specify the `clear` option — stacking replaces the data in "
-                     "memory.",
-                     4);
+    return rsSyntax("stack: syntax is `stack varlist, into(newvars) [clear wide group(#)]`");
   const bool wide = hasFlag(parsed.opts, "wide");
 
   Datastore* ds = nullptr;
@@ -1265,10 +1388,22 @@ ojson runStack(const eval::ParsedCommand& parsed, SessionState& session) {
     if (!ds->has(v)) return rsError("variable " + v + " not found");
 
   const size_t nv = parsed.varlist.size();
+  // [D] stack: into(newvars) names one block's variables, so without group()
+  // the varlist is cut into blocks of as many variables as into() names
+  // (`stack x1 y x2 y, into(a b) clear` stacks (x1,y) over (x2,y);
+  // w2_esample_copies.do:281, StataBE `0|0|122|`, .log:702). Only with
+  // neither option is every variable its own block.
+  std::optional<std::string> intoOpt = optStr(parsed.opts, "into");
   long long groups = static_cast<long long>(nv);
   if (auto g = optStr(parsed.opts, "group")) {
     if (!parseStrictInt(*g, &groups) || groups < 1)
       return rsSyntax("stack: group() requires a positive whole number, got `" + *g + "'");
+  } else if (intoOpt.has_value()) {
+    const size_t k = splitWs(*intoOpt).size();
+    if (k == 0 || nv % k != 0)
+      return rsSyntax("stack: " + std::to_string(nv) + " variable(s) do not divide into blocks of " +
+                      std::to_string(k) + ", the number of into() names");
+    groups = static_cast<long long>(nv / k);
   }
   if (static_cast<size_t>(groups) > nv || nv % static_cast<size_t>(groups) != 0)
     return rsSyntax("stack: " + std::to_string(nv) + " variable(s) do not divide into " +
@@ -1276,14 +1411,14 @@ ojson runStack(const eval::ParsedCommand& parsed, SessionState& session) {
   const size_t per = nv / static_cast<size_t>(groups);
 
   std::vector<std::string> intoNames;
-  if (auto into = optStr(parsed.opts, "into")) {
-    intoNames = splitWs(*into);
+  if (intoOpt.has_value()) {
+    intoNames = splitWs(*intoOpt);
   } else if (wide) {
     return rsSyntax("stack: into() is required with `wide` — without it the stacked columns would "
                     "take the names of the variables `wide` is keeping.");
   } else {
     // Stata's own default: the new variables take the first group's names. Safe
-    // here only because `clear` is mandatory, so the originals are gone.
+    // because the stacked data replace the originals.
     intoNames.assign(parsed.varlist.begin(), parsed.varlist.begin() + static_cast<long>(per));
   }
   if (intoNames.size() != per)
@@ -1340,7 +1475,17 @@ ojson runStack(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = writeAndConvert(session, t, "stack", &outPath)) return *err;
   session.load(outPath);
   if (auto bad = assertRowCount(session, "stack", n * groups)) return *bad;
-  return mutationResult(session, "stack", t.names, before);
+  // BUG-1147: `clear` only silences stack's warning; without it Stata warns, waits
+  // for a key (a no-op in a do-file), and stacks all the same, whatever the data in
+  // memory: `stack x1 x2 y z1, into(a b)` is rc 0, _N 4 (StataBE 19.5, stack.ado
+  // never reads c(changed)). The warning comes after the varlist checks, so a
+  // refused stack does not print it, and `quietly` drops it.
+  if (hasFlag(parsed.opts, "clear")) return mutationResult(session, "stack", t.names, before);
+  ojson out = ojson::array();
+  out.push_back(displayBlock("Warning: data in memory will be lost.\n"
+                             "         Press any key to continue, Ctrl-Break to abort."));
+  out.push_back(mutationResult(session, "stack", t.names, before));
+  return out;
 }
 
 // ===========================================================================
@@ -1464,7 +1609,17 @@ ojson runMvencode(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabMvencode.known,
                                             kVocabMvencode.unimplemented))
     return ojson(*err);
-  if (auto q = refuseQualifiers(parsed, "mvencode")) return *q;
+  // `if` restricts both the override check and the recode to the marked sample
+  // (mvencode marks the sample without requiring a varlist, then every
+  // count/replace is restricted to it); 007's Wave 2 cleaning runs `mvencode ... if consentall == 1`.
+  // `in` stays refused.
+  std::string ifCond;
+  if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) ifCond = *parsed.ifExpr;
+  {
+    eval::ParsedCommand noIf = parsed;
+    noIf.ifExpr.reset();
+    if (auto q = refuseQualifiers(noIf, "mvencode")) return *q;
+  }
   if (!session.hasData()) return ojson(eval::noDataLoaded());
   if (parsed.varlist.empty())
     return rsSyntax("mvencode: syntax is `mvencode varlist | _all, mv(#) [override]`");
@@ -1512,7 +1667,7 @@ ojson runMvencode(const eval::ParsedCommand& parsed, SessionState& session) {
   // PRE-SCAN, before any write: encoding into a value the data already holds
   // makes the two indistinguishable afterwards, which is why Stata demands
   // `override` for it.
-  if (!allowOverride) {
+  if (!allowOverride && ifCond.empty()) {
     for (const auto& v : targets) {
       const double* d = ds->col(v).f64();
       for (int64_t i = 0; i < ds->nRows(); ++i) {
@@ -1520,6 +1675,19 @@ ojson runMvencode(const eval::ParsedCommand& parsed, SessionState& session) {
           return rsError("mvencode: " + v + " already contains " + eval::pythonFloatRepr(mvValue) +
                          "; specify `override` to encode missing as a value the data already uses.");
       }
+    }
+  } else if (!allowOverride) {
+    // Within the sample only: count the clashes the way the ado does.
+    for (const auto& v : targets) {
+      ojson r = dispatch("quietly count if " + v + " == " + eval::pythonFloatRepr(mvValue) +
+                             " & (" + ifCond + ")",
+                         session);
+      for (const auto& b : r)
+        if (b.is_object() && b.value("type", std::string()) == "error") return b;
+      const double* n = session.eval.rValues.find("N");
+      if (n != nullptr && *n > 0)
+        return rsError("mvencode: " + v + " already contains " + eval::pythonFloatRepr(mvValue) +
+                       "; specify `override` to encode missing as a value the data already uses.");
     }
   }
 
@@ -1531,8 +1699,9 @@ ojson runMvencode(const eval::ParsedCommand& parsed, SessionState& session) {
   SessionState::ResidentEligible resident(session);
   for (const auto& v : targets) {
     const std::string out = nextPath(session.workdir(), "mvencode");
-    const std::string expr =
-        v + "=cond(missing(" + v + ")," + eval::pythonFloatRepr(mvValue) + "," + v + ")";
+    const std::string cond =
+        ifCond.empty() ? "missing(" + v + ")" : "missing(" + v + ") & (" + ifCond + ")";
+    const std::string expr = v + "=cond(" + cond + "," + eval::pythonFloatRepr(mvValue) + "," + v + ")";
     if (auto err = runVerb({"eval", "--data", *session.currentHbin(), "--gen", expr, "--out", out}))
       return *err;
     session.load(out);
@@ -1635,6 +1804,10 @@ ojson runSplitsample(const eval::ParsedCommand& parsed, SessionState& session) {
       return rsSyntax("splitsample: nsplit() requires a whole number of at least 2, got `" + *v +
                       "'");
   }
+  // BUG-1120 review: generate() is read as a newvarlist, so a storage type is
+  // "byte invalid varname" r(198) and if/in/using/with open a qualifier the option
+  // does not take, "if not allowed" r(101) (StataBE 19.5).
+  if (auto r = strutil::newVarOptionRefusal(gen)) return rsErrorRc(r->message, r->rc);
   ojson guard = newVarGuard(session, "splitsample", gen);
   if (!guard.is_null()) return guard;
 
@@ -1896,6 +2069,8 @@ ojson runDrawnorm(const eval::ParsedCommand& parsed, SessionState& session) {
     for (const auto& nm : parsed.varlist) {
       ojson guard = newVarGuard(session, "drawnorm", nm);
       if (!guard.is_null()) return guard;
+      // BUG-1120: `drawnorm _all' is "_all not allowed" r(101) (StataBE 19.5).
+      if (nm == "_skip" || nm == "_all") return rsErrorRc(nm + " not allowed", 101);
     }
   } else {
     auto v = optStr(parsed.opts, "n");
@@ -2142,17 +2317,23 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
     }
   }
 
-  // varlist, with `str#`/`byte`/... type words binding to the NEXT name.
+  // varlist, with `str#`/`byte`/... type words binding to the NEXT name only
+  // (`input double y x1 x2` types y alone: w2e_float_default.log:2149
+  // input_double_types `double|float`).
   std::vector<std::string> names;
   std::vector<char> declaredStr;
+  std::vector<std::string> declaredNumType;  // "" = untyped (c(type) applies)
+  std::vector<std::string> declaredStrType;  // the `str#` word as declared, "" otherwise
   {
     bool pendingStr = false;
     bool pendingType = false;
+    std::string pendingWord;
     for (const auto& w : splitWs(varlistText)) {
       bool isStr = false;
       if (isStorageTypeWord(w, &isStr)) {
         pendingType = true;
         pendingStr = isStr;
+        pendingWord = strutil::lower(w);
         continue;
       }
       if (!strutil::isValidStataIdentifier(w))
@@ -2160,8 +2341,11 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
                         strutil::stataIdentifierRuleText());
       names.push_back(w);
       declaredStr.push_back(pendingType && pendingStr ? 1 : 0);
+      declaredNumType.push_back(pendingType && !pendingStr ? pendingWord : std::string());
+      declaredStrType.push_back(pendingType && pendingStr ? pendingWord : std::string());
       pendingType = false;
       pendingStr = false;
+      pendingWord.clear();
     }
     if (pendingType)
       return rsSyntax("input: a storage type must be followed by a variable name");
@@ -2185,6 +2369,7 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
                      "only (`" + joinWith(ds->names(), " ") + "`).");
     names = ds->names();
     declaredStr.assign(names.size(), 0);
+    declaredNumType.assign(names.size(), std::string());
     for (size_t c = 0; c < names.size(); ++c)
       declaredStr[c] = (ds->dtype(names[c]) == "factor") ? 1 : 0;
   } else if (names.empty()) {
@@ -2214,6 +2399,20 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
                     " variable(s))");
   const size_t nNew = tokens.size() / k;
 
+  // FU-944: the storage type each numeric column takes, and so the value it
+  // holds. Untyped is c(type) (float by default: w2e_float_default.log:2120
+  // input_default_types `+1.19999a0000000X+000|float|float` for 1.1;
+  // w2g_ebmat.log:141 e15_data_sum is the float data's sum), a declared type is
+  // its own, and rows appended to data in memory take the existing column's
+  // type. A float column stores float(v); every other type keeps the value read
+  // (an integer type's non-integer input is not captured; nothing is invented).
+  std::vector<std::string> storeType(k);
+  for (size_t c = 0; c < k; ++c) {
+    if (declaredStr[c]) continue;
+    storeType[c] = ds != nullptr ? storage::resolveReplaceType(session, names[c])
+                                 : storage::resolveCreateType(session, declaredNumType[c]);
+  }
+
   CsvTable t;
   for (size_t c = 0; c < k; ++c) {
     t.names.push_back(names[c]);
@@ -2231,6 +2430,7 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
         if (!parseStrictDouble(tok, &v))
           return rsSyntax("input: `" + tok + "' is not a number, and " + names[c] +
                           " is a numeric variable (declare it `str#` to read text)");
+        if (storeType[c] == "float") v = static_cast<double>(static_cast<float>(v));
         row[c] = numCell(v);
         continue;
       }
@@ -2245,6 +2445,25 @@ ojson runInput(const std::string& rawCmd, SessionState& session) {
   if (ds == nullptr) {
     session.load(newPath);
     if (auto bad = assertRowCount(session, "input", static_cast<int64_t>(nNew))) return *bad;
+    // The types `: type`/describe and the .dta writer read, the way gen records
+    // them (dispatcher.cpp, BUG-295): an untyped float column on the implicit
+    // plane, a declaration (or a non-float c(type)) on varMeta.
+    for (size_t c = 0; c < k; ++c) {
+      // A declared `str#` is the column's storage type (`: type` answers it:
+      // w2ar dx_inp_079_str `input str10 date`, str10 %10s, log:4625).
+      if (declaredStr[c] && c < declaredStrType.size() && !declaredStrType[c].empty()) {
+        session.varMeta[names[c]].stataType = declaredStrType[c];
+        continue;
+      }
+      if (declaredStr[c] || storeType[c].empty()) continue;
+      if (declaredNumType[c].empty() && storeType[c] == "float") {
+        session.varMeta[names[c]].stataType.reset();
+        session.implicitFloatVars.insert(names[c]);
+      } else {
+        session.implicitFloatVars.erase(names[c]);
+        session.varMeta[names[c]].stataType = storeType[c];
+      }
+    }
     // NO newVars list here: this is a whole new dataset, not columns ADDED to
     // an existing one, and `newVars` is what steers seedNMissForPureAdd's
     // carry-forward — feeding it every column of a frame that has no
@@ -2297,7 +2516,32 @@ int noteCount(SessionState& session, const std::string& var) {
   return static_cast<int>(v);
 }
 
-void noteAdd(SessionState& session, const std::string& var, const std::string& text) {
+// [D] notes: the word TS in a note's text is replaced by the date and time
+// (`notes: ..., TS` -> `..., 21 Oct 2026 14:05`; w2ao_label_family lb_notes_ts).
+std::string noteTimestamp(const std::string& text) {
+  static const std::regex reTs(R"((^|\s)TS(?=\s|$))");
+  if (!std::regex_search(text, reTs)) return text;
+  const std::time_t now = std::time(nullptr);
+  std::tm tmv{};
+#if defined(_WIN32)
+  localtime_s(&tmv, &now);
+#else
+  localtime_r(&now, &tmv);
+#endif
+  char buf[64];
+  std::strftime(buf, sizeof(buf), "%e %b %Y %H:%M", &tmv);
+  std::string out;
+  std::string rest = text;
+  std::smatch m;
+  while (std::regex_search(rest, m, reTs)) {
+    out += m.prefix().str() + m.str(1) + buf;
+    rest = m.suffix().str();
+  }
+  return out + rest;
+}
+
+void noteAdd(SessionState& session, const std::string& var, const std::string& textIn) {
+  const std::string text = noteTimestamp(textIn);
   const int n = noteCount(session, var) + 1;
   charSet(session, var, "note" + std::to_string(n), text);
   charSet(session, var, "note0", std::to_string(n));
@@ -2424,7 +2668,9 @@ ojson runNotes(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   if (splitWs(target).size() != 1)
     return rsSyntax("notes: `" + target + "` — one variable name (or `_dta`) before the colon");
-  if (text.empty()) return rsSyntax("notes: `notes " + target + ":` needs some text after the colon");
+  // An empty text after `varname:` is rc 0 and adds nothing (w2ao_label_family
+  // lb_note_empty `note h_seq:` rc 0, note count unchanged).
+  if (text.empty()) return silent();
   if (target != "_dta") {
     Datastore* ds = nullptr;
     try {
@@ -2568,80 +2814,231 @@ ojson runCompare(const eval::ParsedCommand& parsed, SessionState& session) {
 // cumul
 // ===========================================================================
 
+namespace {
+
+// One `cumul` call, once its syntax has been accepted.
+struct CumulRequest {
+  std::string source;
+  std::string target;
+  std::vector<std::string> groupVars;
+  bool frequencyUnits = false;
+  bool tiesShareValue = false;
+};
+
+size_t optionCount(const std::vector<std::pair<std::string, eval::OptValue>>& opts,
+                   std::initializer_list<const char*> spellings) {
+  size_t count = 0;
+  for (const auto& [key, value] : opts)
+    for (const char* spelling : spellings)
+      if (key == spelling) ++count;
+  return count;
+}
+
+// The syntax checks, in the order Stata answers them when several faults meet
+// (per the black-box oracle in the item's folder). `by()` comes last, so the
+// checks that need the data can run in the same pass.
+std::optional<ojson> readCumulRequest(const eval::ParsedCommand& parsed, SessionState& session,
+                                      CumulRequest* request) {
+  const Datastore* data = session.datastore();
+  if (data == nullptr) return ojson(eval::noDataLoaded());
+
+  std::vector<std::string> sourceWords = parsed.varlist;
+  if (sourceWords.empty()) return rsErrorRc("varlist required", 100);
+  if (auto ambiguous = resolveByKeyNames(session, sourceWords)) return *ambiguous;
+  if (sourceWords.size() > 1) return rsErrorRc("too many variables specified", 103);
+  request->source = sourceWords.front();
+  if (!data->has(request->source))
+    return rsErrorRc("variable " + request->source + " not found", 111);
+
+  const auto newNameWords = splitWs(optStrAny(parsed.opts, {"generate", "gen"}).value_or(""));
+  if (newNameWords.empty()) return rsErrorRc("option generate() required", 198);
+  if (auto unknown = eval::rejectUnknownOptions(parsed.opts, kVocabCumul.known,
+                                                kVocabCumul.unimplemented))
+    return ojson(*unknown);
+  if (optionCount(parsed.opts, {"generate", "gen"}) > 1)
+    return rsErrorRc("option gen() not allowed", 198);
+  if (optionCount(parsed.opts, {"by"}) > 1) return rsErrorRc("option by() not allowed", 198);
+  if (newNameWords.size() > 1) return rsErrorRc(newNameWords[1] + " not allowed", 101);
+  request->target = newNameWords.front();
+  if (auto refused = strutil::newVarNameRefusal(request->target))
+    return rsErrorRc(refused->message, refused->rc);
+  if (!strutil::isValidStataIdentifier(request->target))
+    return rsErrorRc(request->target + " invalid name", 198);
+  if (data->has(request->target))
+    return rsErrorRc("variable " + request->target + " already defined", 110);
+
+  request->groupVars = splitWs(optStr(parsed.opts, "by").value_or(""));
+  if (auto ambiguous = resolveByKeyNames(session, request->groupVars)) return *ambiguous;
+  for (const std::string& name : request->groupVars)
+    if (!data->has(name))
+      return rsErrorRc("variable " + name + " not found\n(error in option by())", 111);
+
+  request->frequencyUnits = hasFlag(parsed.opts, "freq");
+  request->tiesShareValue = hasFlag(parsed.opts, "equal");
+  return std::nullopt;
+}
+
+// One 64-bit word per observation, equal exactly when two observations belong
+// together under this by() variable. Each missing code and the empty string are
+// groups of their own; 0 and -0 are one value.
+std::vector<uint64_t> groupingWords(const Datastore& data, const std::string& name) {
+  std::vector<uint64_t> words(static_cast<size_t>(data.nRows()));
+  if (data.col(name).dtype == cecon::DType::Factor) {
+    std::map<std::string, uint64_t> seen;
+    const auto cells = columnAsStrings(data, name);
+    for (size_t row = 0; row < cells.size(); ++row)
+      words[row] = seen.emplace(cells[row], seen.size()).first->second;
+    return words;
+  }
+  const auto cells = columnAsDoubles(data, name);
+  for (size_t row = 0; row < cells.size(); ++row) {
+    double cell = cells[row] == 0.0 ? 0.0 : cells[row];
+    if (std::isnan(cell)) cell = cecon::stata_missing(cecon::missing_kind(cell));
+    std::memcpy(&words[row], &cell, sizeof cell);
+  }
+  return words;
+}
+
+// Fills `ecdf` for one by() group, given as sample rows in ascending value order.
+// Both sums are held as a float stores them: the running total is exact double
+// arithmetic rounded on its way into storage, and the share is formed from those
+// stored numbers (the arithmetic measured on StataBE, the item's oracle section B;
+// the textbook function is [R] cumul's empirical distribution).
+void fillGroupEcdf(const std::vector<int64_t>& rows, size_t begin, size_t end,
+                   const std::vector<double>& value, const std::vector<double>* weight,
+                   const CumulRequest& request, std::vector<double>* ecdf) {
+  std::vector<float> stored(end - begin);
+  double running = 0.0;
+  for (size_t k = begin; k < end; ++k) {
+    running += weight != nullptr ? (*weight)[static_cast<size_t>(rows[k])] : 1.0;
+    stored[k - begin] = static_cast<float>(running);
+  }
+  const double groupTotal = stored.back();
+  for (size_t k = begin; k < end;) {
+    size_t tieEnd = k + 1;
+    if (request.tiesShareValue)
+      while (tieEnd < end && value[static_cast<size_t>(rows[tieEnd])] == value[static_cast<size_t>(rows[k])])
+        ++tieEnd;
+    const float reached = stored[tieEnd - 1 - begin];
+    const double result =
+        request.frequencyUnits ? reached : static_cast<float>(reached / groupTotal);
+    for (; k < tieEnd; ++k) (*ecdf)[static_cast<size_t>(rows[k])] = result;
+  }
+}
+
+}  // namespace
+
+// `cumul`, [R] cumul: the empirical distribution function of a variable, as a new
+// float variable, within by() groups.
 ojson runCumul(const eval::ParsedCommand& parsed, SessionState& session) {
-  if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabCumul.known,
-                                            kVocabCumul.unimplemented))
-    return ojson(*err);
-  if (auto q = refuseQualifiers(parsed, "cumul")) return *q;
-  if (auto w = refuseWeights(parsed, "cumul")) return *w;
   if (!session.hasData()) return ojson(eval::noDataLoaded());
-  if (parsed.varlist.size() != 1)
-    return rsSyntax("cumul: syntax is `cumul varname, generate(newvar) [equal freq]`");
-  const std::string var = parsed.varlist[0];
-  const std::optional<std::string> genOpt = optStrAny(parsed.opts, {"generate", "gen"});
-  if (!genOpt.has_value() || genOpt->empty())
-    return rsSyntax("cumul: generate() is required");
-  const std::string newvar = *genOpt;
-  ojson guard = newVarGuard(session, "cumul", newvar);
-  if (!guard.is_null()) return guard;
-  const bool equal = hasFlag(parsed.opts, "equal");
-  const bool freq = hasFlag(parsed.opts, "freq");
+  CumulRequest request;
+  if (auto refusal = readCumulRequest(parsed, session, &request)) return *refusal;
 
-  ReadFrame rf(session, {var});
-  Datastore* ds = rf.get();
-  if (ds == nullptr)
-    return rsError("cumul: could not read the data" + (rf.why().empty() ? "" : " — " + rf.why()),
-                   "data_io");
-  if (!ds->has(var)) return rsError("variable " + var + " not found");
-  if (ds->dtype(var) == "factor")
-    return rsError("cumul: `" + var + "' is a string variable; cumul needs a numeric variable.");
-  const std::vector<double> x = columnAsDoubles(*ds, var);
-  const size_t n = x.size();
+  const bool haveIf = parsed.ifExpr.has_value() && !trimOf(*parsed.ifExpr).empty();
+  const bool haveIn = parsed.inRange.has_value() && !trimOf(*parsed.inRange).empty();
+  const bool inWithBy = haveIn && !request.groupVars.empty();
+  std::string qualifier;
+  if (haveIf) qualifier += " if " + *parsed.ifExpr;
+  if (haveIn && !inWithBy) qualifier += " in " + *parsed.inRange;
 
-  // Rank ascending; a tie keeps the rows' ORIGINAL order, so row i of a tied
-  // block gets rank i. `equal` gives every member of a tied block the block's
-  // HIGHEST rank instead, which is what makes the result a step function.
-  std::vector<size_t> order;
-  order.reserve(n);
-  for (size_t i = 0; i < n; ++i)
-    if (!std::isnan(x[i])) order.push_back(i);
-  std::stable_sort(order.begin(), order.end(),
-                   [&](size_t a, size_t b) { return x[a] < x[b]; });
-  const int64_t nn = static_cast<int64_t>(order.size());
-  std::vector<double> rank(n, std::numeric_limits<double>::quiet_NaN());
-  for (int64_t r = 0; r < nn; ++r) rank[order[static_cast<size_t>(r)]] = static_cast<double>(r + 1);
-  if (equal) {
-    int64_t r = 0;
-    while (r < nn) {
-      int64_t e = r;
-      while (e + 1 < nn && x[order[static_cast<size_t>(e + 1)]] == x[order[static_cast<size_t>(r)]])
-        ++e;
-      for (int64_t q = r; q <= e; ++q)
-        rank[order[static_cast<size_t>(q)]] = static_cast<double>(e + 1);
-      r = e + 1;
-    }
+  ScratchColumns scratch(session);
+  std::string restrictionColumn;
+  if (!qualifier.empty())
+    if (auto failed = scratch.add("1", qualifier, &restrictionColumn)) return *failed;
+  if (inWithBy) return rsErrorRc("in may not be combined with by()", 190);
+
+  std::string weightColumn;
+  const bool weighted = parsed.weightVar.has_value() && !parsed.weightVar->empty();
+  if (weighted)
+    if (auto failed = scratch.add(*parsed.weightVar, "", &weightColumn)) return *failed;
+
+  const auto rowCount = static_cast<size_t>(session.datastore()->nRows());
+  std::vector<char> restricted(rowCount, 1);
+  if (!restrictionColumn.empty()) {
+    const auto marks = scratch.values(restrictionColumn);
+    for (size_t row = 0; row < rowCount; ++row) restricted[row] = std::isnan(marks[row]) ? 0 : 1;
   }
 
+  // A weight only has to be valid inside the if/in restriction.
+  std::vector<double> weights;
+  if (weighted) {
+    weights = scratch.values(weightColumn);
+    const std::string kind = parsed.weightType.value_or("");
+    const bool frequencyWeight = kind == "fw" || kind == "fweight";
+    bool negative = false, fractional = false;
+    for (size_t row = 0; row < rowCount; ++row) {
+      if (!restricted[row] || std::isnan(weights[row])) continue;
+      negative = negative || weights[row] < 0.0;
+      fractional = fractional || weights[row] != std::floor(weights[row]);
+    }
+    if (negative) return rsErrorRc("negative weights encountered", 402);
+    if (frequencyWeight && fractional)
+      return rsErrorRc("may not use noninteger frequency weights", 401);
+  }
+
+  const Datastore& data = *session.datastore();
+  std::vector<double> sourceValues;  // stays empty for a string variable: no sample
+  if (data.col(request.source).dtype != cecon::DType::Factor)
+    sourceValues = columnAsDoubles(data, request.source);
+
+  std::vector<int64_t> sample;
+  for (size_t row = 0; row < sourceValues.size(); ++row) {
+    if (!restricted[row] || std::isnan(sourceValues[row])) continue;
+    if (weighted && (std::isnan(weights[row]) || weights[row] == 0.0)) continue;
+    sample.push_back(static_cast<int64_t>(row));
+  }
+
+  std::vector<std::vector<uint64_t>> groupColumns;
+  for (const std::string& name : request.groupVars) groupColumns.push_back(groupingWords(data, name));
+  const auto sameGroup = [&](int64_t a, int64_t b) {
+    return std::all_of(groupColumns.begin(), groupColumns.end(), [&](const std::vector<uint64_t>& g) {
+      return g[static_cast<size_t>(a)] == g[static_cast<size_t>(b)];
+    });
+  };
+  // Stable, so tied observations accumulate in dataset order and PIET is
+  // deterministic where Stata's tie order is unspecified.
+  std::stable_sort(sample.begin(), sample.end(), [&](int64_t a, int64_t b) {
+    for (const auto& g : groupColumns) {
+      const uint64_t wordA = g[static_cast<size_t>(a)], wordB = g[static_cast<size_t>(b)];
+      if (wordA != wordB) return wordA < wordB;
+    }
+    return sourceValues[static_cast<size_t>(a)] < sourceValues[static_cast<size_t>(b)];
+  });
+
+  std::vector<double> ecdf(rowCount, std::numeric_limits<double>::quiet_NaN());
+  for (size_t begin = 0; begin < sample.size();) {
+    size_t end = begin + 1;
+    while (end < sample.size() && sameGroup(sample[begin], sample[end])) ++end;
+    fillGroupEcdf(sample, begin, end, sourceValues, weighted ? &weights : nullptr, request, &ecdf);
+    begin = end;
+  }
+
+  scratch.dropAll();
+  (void)session.datastore();  // the head file the setcol below reads
   std::vector<std::string> cells;
-  cells.reserve(n);
-  for (size_t i = 0; i < n; ++i) {
-    if (std::isnan(rank[i])) {
-      cells.emplace_back();  // missing in, missing out
-      continue;
-    }
-    cells.push_back(numCell(freq ? rank[i] : rank[i] / static_cast<double>(nn)));
-  }
-
-  std::string out;
-  if (auto err = appendColumn(session, *session.currentHbin(), newvar, cells, "f64", &out))
-    return *err;
-  session.load(out);
-  return mutationResult(session, "cumul", {newvar});
+  cells.reserve(rowCount);
+  for (double v : ecdf) cells.push_back(numCell(v));
+  std::string written;
+  if (auto failed = appendColumn(session, *session.currentHbin(), request.target, cells, "f64", &written))
+    return *failed;
+  session.load(written);
+  session.setVarLabel(request.target, "ECDF of " + request.source);
+  session.varMeta[request.target].stataType = "float";
+  scratch.noteDataChanged();
+  return mutationResult(session, "cumul", {request.target});
 }
 
 // ===========================================================================
 // bsample
 // ===========================================================================
+
+bool bsampleIsStataFastPath(const eval::ParsedCommand& parsed) {
+  if (!parsed.varlist.empty()) return false;  // `bsample #` is the SRSWR path
+  for (const auto& [k, v] : parsed.opts)
+    if (k == "cluster" || k == "idcluster" || k == "strata" || k == "weight") return false;
+  return true;
+}
 
 ojson runBsample(const eval::ParsedCommand& parsed, SessionState& session) {
   if (auto err = eval::rejectUnknownOptions(parsed.opts, kVocabBsample.known,
@@ -2725,15 +3122,22 @@ ojson runBsample(const eval::ParsedCommand& parsed, SessionState& session) {
                      std::to_string(nGroups));
   }
 
-  const uint64_t seed = drawSeed(session, std::nullopt);
   std::vector<int64_t> idx;
   std::vector<int64_t> idcluster;
-  for (int64_t d = 0; d < draws; ++d) {
-    const uint32_t u = rowKey32(seed, d);
-    const int64_t g = static_cast<int64_t>(u % static_cast<uint32_t>(nGroups));
-    for (int64_t row : groups[static_cast<size_t>(g)]) {
-      idx.push_back(row);
-      idcluster.push_back(d + 1);
+  int64_t nKept = -1;  // the fast path's originals: rows [0, nKept) of the result
+  if (bsampleIsStataFastPath(parsed)) {
+    // Stata's own draw on the session stream (core/rng_mt64.h), so `set seed s` +
+    // bsample gives Stata's rows; shared with the bootstrap prefix (bsample_draws.h).
+    for (int64_t row : bsdraw::srswrFast(session.seed.stream(), n, &nKept)) idx.push_back(row + 1);
+  } else {
+    const uint64_t seed = drawSeed(session, std::nullopt);
+    for (int64_t d = 0; d < draws; ++d) {
+      const uint32_t u = rowKey32(seed, d);
+      const int64_t g = static_cast<int64_t>(u % static_cast<uint32_t>(nGroups));
+      for (int64_t row : groups[static_cast<size_t>(g)]) {
+        idx.push_back(row);
+        idcluster.push_back(d + 1);
+      }
     }
   }
 
@@ -2785,6 +3189,23 @@ ojson runBsample(const eval::ParsedCommand& parsed, SessionState& session) {
     return *err;
   session.load(out);
   if (auto bad = assertRowCount(session, "bsample", static_cast<int64_t>(idx.size()))) return *bad;
+  if (nKept >= 0) {
+    // e(sample) T2 (StataBE w2_esample_copies X2 `10|61|m0=20|m0_diff=10`): the
+    // marker travels with each kept original row through the sort and keep, and
+    // the rows `expand` creates are outside the sample (expand's rule,
+    // runExpandIf). The merge carried the mask onto the copies; clear them.
+    if (std::optional<std::vector<double>> cells = esampleHeadMask(session)) {
+      bool any = false;
+      for (size_t i = static_cast<size_t>(nKept); i < cells->size(); ++i) {
+        any = any || (*cells)[i] != 0.0;
+        (*cells)[i] = 0.0;
+      }
+      if (any && !esampleRewriteHeadMask(session, *cells))
+        return rsError("bsample: the sample was drawn, but the estimation-sample marker could "
+                       "not be cleared on the expanded copies; e(sample) is not reliable until "
+                       "the next estimation.");
+    }
+  }
   return mutationResult(session, "bsample", idclusterOpt.has_value()
                                                 ? std::vector<std::string>{*idclusterOpt}
                                                 : std::vector<std::string>{});
@@ -2873,6 +3294,76 @@ std::optional<std::vector<double>> sortedValues(SessionState& session, const std
   return v;
 }
 
+// pctile, _pctile and xtile parse "aweight fweight pweight"
+// (pctile's and xtile's weight syntax)
+// and mark the sample with the weight: a missing or zero weight leaves the
+// sample, a negative one is r(402), a non-integer fweight r(401). `rowWeight`
+// (when non-null) receives every row's weight, NaN where the row is out of the
+// sample, so xtile can leave those rows missing.
+struct WeightedValues {
+  std::vector<std::pair<double, double>> sorted;  // (x, w) ascending in x
+};
+
+std::optional<WeightedValues> sortedWeightedValues(SessionState& session, const std::string& verb,
+                                                   const std::string& var,
+                                                   const std::string& weightVar,
+                                                   const std::string& weightType, ojson* err,
+                                                   std::vector<double>* rowX = nullptr,
+                                                   std::vector<double>* rowWeight = nullptr) {
+  ReadFrame rf(session, {var, weightVar});
+  Datastore* ds = rf.get();
+  if (ds == nullptr) {
+    *err = rsError(verb + ": could not read the data" + (rf.why().empty() ? "" : " — " + rf.why()),
+                   "data_io");
+    return std::nullopt;
+  }
+  for (const std::string* name : {&var, &weightVar}) {
+    if (!ds->has(*name)) {
+      *err = rsError("variable " + *name + " not found");
+      return std::nullopt;
+    }
+    if (ds->dtype(*name) == "factor") {
+      *err = rsErrorRc(verb + ": `" + *name + "' is a string variable", 109);
+      return std::nullopt;
+    }
+  }
+  const std::string wt = lowerOf(weightType);
+  const bool isFreq = wt == "fw" || wt == "fweight";
+  const double* x = ds->col(var).f64();
+  const double* w = ds->col(weightVar).f64();
+  const int64_t n = ds->nRows();
+  WeightedValues out;
+  out.sorted.reserve(static_cast<size_t>(n));
+  if (rowX) rowX->assign(static_cast<size_t>(n), std::numeric_limits<double>::quiet_NaN());
+  if (rowWeight) rowWeight->assign(static_cast<size_t>(n), std::numeric_limits<double>::quiet_NaN());
+  for (int64_t i = 0; i < n; ++i) {
+    const double wi = w[i];
+    if (std::isnan(wi)) continue;
+    if (wi < 0.0) {
+      *err = rsErrorRc("negative weights encountered", 402);
+      return std::nullopt;
+    }
+    if (isFreq && wi != std::floor(wi)) {
+      *err = rsErrorRc("may not use noninteger frequency weights", 401);
+      return std::nullopt;
+    }
+    if (wi == 0.0 || std::isnan(x[i])) continue;
+    out.sorted.emplace_back(x[i], wi);
+    if (rowX) (*rowX)[static_cast<size_t>(i)] = x[i];
+    if (rowWeight) (*rowWeight)[static_cast<size_t>(i)] = wi;
+  }
+  std::stable_sort(out.sorted.begin(), out.sorted.end(),
+                   [](const std::pair<double, double>& a, const std::pair<double, double>& b) {
+                     return a.first < b.first;
+                   });
+  return out;
+}
+
+bool hasWeight(const eval::ParsedCommand& parsed) {
+  return parsed.weightType.has_value() && !parsed.weightType->empty() &&
+         parsed.weightVar.has_value() && !parsed.weightVar->empty();
+}
+
 }  // namespace
 
 ojson runPctile(const eval::ParsedCommand& parsed, SessionState& session) {
@@ -2885,7 +3376,6 @@ ojson runPctile(const eval::ParsedCommand& parsed, SessionState& session) {
   // over every row and then blank the rest -- the same bins with a different
   // name, which is a wrong number, not a missing feature.
   if (auto q = refuseQualifiers(parsed, "pctile")) return *q;
-  if (auto w = refuseWeights(parsed, "pctile")) return *w;
   if (!session.hasData()) return ojson(eval::noDataLoaded());
 
   const std::string joined = joinWith(parsed.varlist, " ");
@@ -2900,6 +3390,8 @@ ojson runPctile(const eval::ParsedCommand& parsed, SessionState& session) {
                     "[genp(newvar2)]`");
   ojson guard = newVarGuard(session, "pctile", newvar);
   if (!guard.is_null()) return guard;
+  // BUG-1120: `pctile _skip = x' is "_skip not allowed" r(101) (StataBE 19.5).
+  if (newvar == "_skip" || newvar == "_all") return rsErrorRc(newvar + " not allowed", 101);
   const std::optional<std::string> genp = optStr(parsed.opts, "genp");
   if (genp.has_value()) {
     ojson g2 = newVarGuard(session, "pctile", *genp);
@@ -2911,8 +3403,16 @@ ojson runPctile(const eval::ParsedCommand& parsed, SessionState& session) {
   ojson err;
   auto pcts = percentileList(parsed.opts, "pctile", 2, &err);
   if (!pcts.has_value()) return err;
-  auto sorted = sortedValues(session, "pctile", src, &err);
-  if (!sorted.has_value()) return err;
+  std::optional<std::vector<double>> sorted;
+  std::optional<WeightedValues> weighted;
+  if (hasWeight(parsed)) {
+    weighted = sortedWeightedValues(session, "pctile", src, *parsed.weightVar, *parsed.weightType,
+                                    &err);
+    if (!weighted.has_value()) return err;
+  } else {
+    sorted = sortedValues(session, "pctile", src, &err);
+    if (!sorted.has_value()) return err;
+  }
 
   Datastore* ds = nullptr;
   try {
@@ -2928,7 +3428,8 @@ ojson runPctile(const eval::ParsedCommand& parsed, SessionState& session) {
   std::vector<std::string> cells(static_cast<size_t>(n));
   std::vector<std::string> pcells(static_cast<size_t>(n));
   for (size_t i = 0; i < pcts->size() && static_cast<int64_t>(i) < n; ++i) {
-    cells[i] = numCell(stataPercentile(*sorted, (*pcts)[i]));
+    cells[i] = numCell(weighted ? stataWeightedPercentile(weighted->sorted, (*pcts)[i])
+                                : stataPercentile(*sorted, (*pcts)[i]));
     pcells[i] = numCell((*pcts)[i]);
   }
 
@@ -2951,7 +3452,6 @@ ojson runPctileR(const eval::ParsedCommand& parsed, SessionState& session) {
                                             kVocabPctileR.unimplemented))
     return ojson(*err);
   if (auto q = refuseQualifiers(parsed, "_pctile")) return *q;
-  if (auto w = refuseWeights(parsed, "_pctile")) return *w;
   if (!session.hasData()) return ojson(eval::noDataLoaded());
   if (parsed.varlist.size() != 1)
     return rsSyntax("_pctile: syntax is `_pctile varname, nquantiles(#) | percentiles(list)`");
@@ -2959,8 +3459,16 @@ ojson runPctileR(const eval::ParsedCommand& parsed, SessionState& session) {
   ojson err;
   auto pcts = percentileList(parsed.opts, "_pctile", 2, &err);
   if (!pcts.has_value()) return err;
-  auto sorted = sortedValues(session, "_pctile", parsed.varlist[0], &err);
-  if (!sorted.has_value()) return err;
+  std::optional<std::vector<double>> sorted;
+  std::optional<WeightedValues> weighted;
+  if (hasWeight(parsed)) {
+    weighted = sortedWeightedValues(session, "_pctile", parsed.varlist[0], *parsed.weightVar,
+                                    *parsed.weightType, &err);
+    if (!weighted.has_value()) return err;
+  } else {
+    sorted = sortedValues(session, "_pctile", parsed.varlist[0], &err);
+    if (!sorted.has_value()) return err;
+  }
 
   // r(r1)..r(rN) IS this command -- there is no column and no table. The arm
   // deliberately does not call captureRFromBlock (there is no block to capture
@@ -2974,13 +3482,47 @@ ojson runPctileR(const eval::ParsedCommand& parsed, SessionState& session) {
   }
   for (size_t i = 0; i < pcts->size(); ++i) {
     session.eval.rValues.set("r" + std::to_string(i + 1),
-                             stataPercentile(*sorted, (*pcts)[i]));
+                             weighted ? stataWeightedPercentile(weighted->sorted, (*pcts)[i])
+                                      : stataPercentile(*sorted, (*pcts)[i]));
   }
   // Deliberately NO r(N): Stata's `_pctile` stores r(r1)..r(rN) and nothing
   // else, and publishing an extra scalar would let a do-file read a number this
   // command does not promise.
   // Stata's `_pctile` prints nothing.
   return silent();
+}
+
+// xtile with [aw=]/[fw=]/[pw=]: xtile takes the cutpoints from
+// `pctile ... [weight], n(#)` (it accepts aweight fweight pweight),
+// so they are stataWeightedPercentile at 100k/nq. A row outside the weighted
+// sample (missing or zero weight: `mark touse [wt]`) stays missing. The
+// category is 1 + the number of cutpoints strictly below the value, which is
+// xtile's numbering with duplicate cutpoints kept (the engine's
+// xtile_assign rule, src/data/frame.cpp).
+ojson runXtileWeighted(const std::string& newvar, const std::string& srcvar, int nq,
+                       const std::string& weightVar, const std::string& weightType,
+                       SessionState& session) {
+  ojson err;
+  std::vector<double> rowX, rowW;
+  auto weighted =
+      sortedWeightedValues(session, "xtile", srcvar, weightVar, weightType, &err, &rowX, &rowW);
+  if (!weighted.has_value()) return err;
+  if (weighted->sorted.empty()) return rsErrorRc("no observations", 2000);
+  std::vector<double> cut;
+  for (int k = 1; k < nq; ++k)
+    cut.push_back(stataWeightedPercentile(weighted->sorted, 100.0 * k / nq));
+  std::vector<std::string> cells(rowX.size());
+  for (size_t i = 0; i < rowX.size(); ++i) {
+    if (std::isnan(rowX[i]) || std::isnan(rowW[i])) continue;
+    int g = 1;
+    for (double c : cut)
+      if (rowX[i] > c) ++g;
+    cells[i] = numCell(static_cast<double>(g));
+  }
+  std::string out;
+  if (auto e = appendColumn(session, *session.currentHbin(), newvar, cells, "f64", &out)) return *e;
+  session.load(out);
+  return mutationResult(session, "gen", {newvar});
 }
 
 }  // namespace piet::handlers

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — unit-root tests: Augmented Dickey-Fuller (dfuller) and Phillips-Perron
 // (pperron). Single time series, time-ordered; lags/diffs built via ts_apply so
 // gaps/boundaries drop the right rows. Fuller (1996) critical values (interpolated

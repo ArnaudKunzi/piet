@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "owner": "eval-harness",
+  "purpose": "Anti-mock / differential parity canary set. Single source of truth for known-answer data + tolerances. The PIET Conductor's piet-sanity gate reuses THIS file so truth lives in one place (MSG-MI-035/036).",
+  "not_a_golden": "This is a verification mechanism, NOT a Stata golden. It does not alter or live alongside tests/eval/golden/*. Tolerances here are Eval's alone (Constitution §10, Charter Core Resp #6).",
+  "tolerances": {
+    "closed_form": { "b": 1e-09, "se_is_zero": 1e-06 },
+    "ols": { "b": 1e-07, "se": 1e-06 },
+    "differential_min_sep": 1e-04
+  },
+  "closed_form": [
+    {
+      "id": "synth_linear",
+      "hbin": "synth_linear.hbin",
+      "built_by": "make_canary_data.py (deterministic, noise-free, from auto.hbin)",
+      "n_rows": 74,
+      "stata": "regress cf_y cf_x1 cf_x2",
+      "cli": ["feols", "--y", "cf_y", "--x", "cf_x1,cf_x2", "--vcov", "iid"],
+      "expect": { "cf_x1": 10.0, "cf_x2": -3.0, "(intercept)": 7.0 },
+      "tol": "closed_form",
+      "why": "Noise-free y=10*x1-3*x2+7 -> OLS must recover exactly. No mock/fixture can produce the exact answer for a freshly-built synthetic. SE ~ 0."
+    }
+  ],
+  "datasets": [
+    {
+      "id": "auto", "hbin": "auto.hbin", "n_rows": 74, "no_missing": false,
+      "kind": "cross_section",
+      "y": ["price", "mpg", "weight", "length", "turn", "displacement"],
+      "x_continuous": ["mpg", "weight", "length", "turn", "displacement", "gear_ratio", "headroom"],
+      "x_binary": ["foreign"]
+    },
+    {
+      "id": "csdid_input", "hbin": "csdid_input.hbin", "n_rows": 73081, "no_missing": true,
+      "kind": "panel",
+      "y": ["visits_w"],
+      "x_continuous": ["age_z", "edu_hi"],
+      "x_binary": ["female"],
+      "panel_id": "h_pid"
+    },
+    {
+      "id": "xtpois_in", "hbin": "xtpois_in.hbin", "n_rows": 73079, "no_missing": true,
+      "kind": "panel",
+      "y": ["y_int", "age_z"],
+      "x_continuous": ["age_z", "edu_hi"],
+      "x_binary": ["treated"],
+      "panel_id": "h_pid"
+    }
+  ],
+  "estimators": [
+    {
+      "id": "ols_iid", "family": "ols",
+      "stata": "regress {y} {x}",
+      "cli_cmd": "feols", "cli_extra": ["--vcov", "iid"],
+      "needs_y": "continuous", "min_x": 1, "max_x": 4,
+      "compare_se": true
+    },
+    {
+      "id": "ols_robust", "family": "ols",
+      "stata": "regress {y} {x}, robust",
+      "cli_cmd": "feols", "cli_extra": ["--vcov", "hc1"],
+      "needs_y": "continuous", "min_x": 1, "max_x": 4,
+      "compare_se": true
+    }
+  ],
+  "note_default_vcov": "cobra feols default vcov == iid (verified), so plain Stata `regress` (kernel emits feols with no --vcov) matches CLI ref `--vcov iid` for SE parity. `, robust` -> hc1 on both sides."
+}

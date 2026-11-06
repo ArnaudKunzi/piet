@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "estimators/feols.h"
 #include "core/error.h"
 
@@ -14,6 +16,15 @@
 namespace cecon {
 
 namespace {
+// md.late_cells as flags over the current design columns (empty when none).
+std::vector<char> late_cell_flags(const ModelData& md, const std::vector<std::string>& xnames) {
+    if (md.late_cells.empty()) return {};
+    std::vector<char> late(xnames.size(), 0);
+    for (size_t j = 0; j < xnames.size(); ++j)
+        late[j] = std::find(md.late_cells.begin(), md.late_cells.end(), xnames[j]) != md.late_cells.end();
+    return late;
+}
+
 // TSS for the reported R². When fixed effects are absorbed, y is already mean-zero
 // from the within-transform, so the within-TSS is the plain Σy² (centering would
 // subtract a ~0 mean and is a no-op). When there are NO fixed effects AND a
@@ -29,6 +40,37 @@ inline double centered_when_no_fe(const double* y, int64_t n, bool intercept) {
     return la::sumsq_dev(y, n, ybar);
 }
 
+// No-FE, unweighted intercept fit: form MSS from the fitted variation directly.
+// Subtracting RSS from TSS loses the significant digits of a small R².
+double fitted_model_ss(const double* X, const double* y, int64_t n, int k,
+                       const std::vector<double>& beta) {
+    std::vector<double> centered_fit(static_cast<size_t>(n), 0.0);
+    // build_model puts the unabsorbed intercept first. Form the centered
+    // prediction without subtracting its intercept after rounding X*b.
+    for (int j = 1; j < k; ++j) {
+        const double* x = X + static_cast<int64_t>(j) * n;
+        const double mean = la::sum(x, n) / static_cast<double>(n);
+        for (int64_t i = 0; i < n; ++i) centered_fit[i] += (x[i] - mean) * beta[j];
+    }
+    const double ybar = la::sum(y, n) / static_cast<double>(n);
+    std::vector<double> centered_y(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) centered_y[i] = y[i] - ybar;
+    // In a one-slope fit the centered projection is a scalar ratio; compute
+    // it directly so the uncentered normal-equation solve cannot bias R2.
+    if (k == 2) {
+        const double* x = X + n;
+        const double xbar = la::sum(x, n) / static_cast<double>(n);
+        std::vector<double> centered_x(static_cast<size_t>(n));
+        for (int64_t i = 0; i < n; ++i) centered_x[i] = x[i] - xbar;
+        const double sxx = la::sumsq(centered_x.data(), n);
+        const double sxy = la::dot(centered_x.data(), centered_y.data(), n);
+        return sxx > 0.0 ? sxy * (sxy / sxx) : 0.0;
+    }
+    // The least-squares projection identity MSS = fitted_centered' y_centered
+    // avoids both TSS-RSS cancellation and squaring the fit's rounding error.
+    return la::dot(centered_fit.data(), centered_y.data(), n);
+}
+
 // Fill the Stata `regress` model-fit scalars (mss/rss/r2/r2_a/rmse/f_stat/df_m/df_r)
 // from an already-fitted FeolsResult (ssr, tss_within, sigma2, dof, beta, vcov_matrix,
 // names, n_clusters all set). The F is the Wald statistic over the SLOPE coefficients
@@ -39,9 +81,9 @@ inline double centered_when_no_fe(const double* y, int64_t n, bool intercept) {
 // under cluster (where e(df_r)=G-1 but RMSE/adj-R² still divide by n-k). prob_f (Prob>F)
 // is computed by the CLI via f_pvalue() to keep the F distribution out of the estimator
 // layer. f_stat is NaN when undefined (no slopes / non-PD slope vcov).
-void fill_fit_scalars(FeolsResult& r) {
+void fill_fit_scalars(FeolsResult& r, double direct_mss = -1.0) {
     r.rss = r.ssr;
-    r.mss = r.tss_within - r.ssr;
+    r.mss = direct_mss >= 0.0 ? direct_mss : r.tss_within - r.ssr;
     if (r.mss < 0 && r.mss > -1e-9 * (std::abs(r.tss_within) + 1.0)) r.mss = 0.0;  // clamp fp noise
     // Header R²: under FE, reghdfe reports the FULL-MODEL e(r2) = 1 - RSS/TSS_total
     // (TSS_total = centered Σ(y_raw-ȳ)² on the ORIGINAL outcome, FE variation INCLUDED),
@@ -69,7 +111,7 @@ void fill_fit_scalars(FeolsResult& r) {
     }
     r.df_m = q;
     r.df_r = (r.n_clusters > 0) ? static_cast<int64_t>(r.n_clusters - 1)
-                                : static_cast<int64_t>(std::llround(dof_resid));
+                                : static_cast<int64_t>(std::floor(dof_resid + 1e-9));
     r.df_r_exact = (r.n_clusters > 0) ? static_cast<double>(r.n_clusters - 1) : dof_resid;
     r.r2_a = (dof_resid > 0) ? 1.0 - (1.0 - r.r2) * (n_obs - 1.0) / dof_resid : 0.0;
 
@@ -103,7 +145,8 @@ void fill_fit_scalars(FeolsResult& r) {
 }  // namespace
 
 FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_intercept,
-                      bool keep_nested_fe_dof) {
+                      bool keep_nested_fe_dof, bool multiway_subset_factors,
+                      bool regress_exact_fit) {
     DesignMatrix& dm = md.dm;
     // --no-intercept (Stata `regress ..., noconstant`): only meaningful with no FE
     // (the caller rejects --no-intercept + --fe); when present the intercept is
@@ -118,6 +161,7 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
     }
     const int64_t n = dm.n;
     int k = dm.k;
+    require_sample(n);
     if (n <= k) throw EngineError("no_obs", "not enough observations: n <= k");
 
     FeolsResult r;
@@ -159,8 +203,20 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
         double wsum = 0.0;
         for (int64_t i = 0; i < n; ++i) wsum += md.weights[static_cast<size_t>(i)];
         if (!(wsum > 0.0)) throw EngineError("bad_input", "sum of weights must be positive");
+        // FU-404: before its multiway cluster VCE, regress normalises an iweight to
+        // mean 1 (a documented regress behaviour), so e(N) is the row count and
+        // the per-combination (N-1)/(N-K) reads rows: w2s_multiway_class.log:1320
+        // mw_reg_c2_iw e(N) 180, se(x1) .0708771701955787 = the pweight fit's :1207.
+        // BUG-1270: the built-in fit does the same under vce(robust) and a one-way
+        // vce(cluster) (StataBE `regress yw x1 x2 [iw=w], vce(cluster id)`, sum(w) 450:
+        // e(N) 180, e(df_r) 29, se(x1) .060315098746631421, e(F) 78.699922798737177,
+        // e(rmse) 2.6347 = sqrt(.4*Σw e²/177); vce(robust): e(N) 180, e(df_r) 177).
+        const bool iw_normalized =
+            md.weight_kind == WeightKind::Importance &&
+            (vt == Vcov::HC1 || vt == Vcov::Cluster ||
+             (multiway_subset_factors && vt == Vcov::Multiway));
         const bool normalize = (md.weight_kind == WeightKind::Analytic ||
-                                md.weight_kind == WeightKind::Probability);
+                                md.weight_kind == WeightKind::Probability || iw_normalized);
         const double c = normalize ? static_cast<double>(n) / wsum : 1.0;
         r.weight_kind = md.weight_kind;
         r.sum_w = wsum;
@@ -242,6 +298,57 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
         r.tss_total = la::sumsq_dev(dm.y.data(), n, ybar);
     }
 
+    // FU-389: reghdfe builds and clips a multiway VCE on its standardised data
+    // (reghdfe's standardize_data -> compute_stdevs formula (C) on the
+    // ORIGINAL y and x, floor 1e-3) and undoes it with V :/ (s's), s = (sd_x, 1)/sd_y. The clip is not invariant to that rescaling, so the _cons row of
+    // a Gmin multiway fit is clipped in those units (compute_vcov clip_scale). Taken
+    // here, before demean() overwrites the raw columns; unweighted sums, as formula (C).
+    std::vector<double> hdfe_clip_scale;
+    if (vt == Vcov::Multiway && !multiway_subset_factors && !md.fe.empty()) {
+        auto sd_c = [n](const double* v) {
+            double ss = 0.0, s1 = 0.0;
+            for (int64_t i = 0; i < n; ++i) {
+                ss += v[i] * v[i];
+                s1 += v[i];
+            }
+            const double nd = static_cast<double>(n);
+            const double sd = std::sqrt((ss - s1 * s1 / nd) / (nd - 1.0));
+            return std::isfinite(sd) ? std::max(sd, 1e-3) : std::numeric_limits<double>::quiet_NaN();
+        };
+        const double sd_y = sd_c(dm.y.data());
+        hdfe_clip_scale.resize(static_cast<size_t>(k) + 1);
+        for (int j = 0; j < k; ++j)
+            hdfe_clip_scale[static_cast<size_t>(j)] =
+                sd_c(dm.X.data() + static_cast<int64_t>(j) * n) / sd_y;
+        hdfe_clip_scale[static_cast<size_t>(k)] = 1.0 / sd_y;
+        for (double v : hdfe_clip_scale)
+            if (!std::isfinite(v) || !(v > 0.0)) {
+                hdfe_clip_scale.clear();  // degenerate: keep the data-unit clip
+                break;
+            }
+    }
+
+    // Stata `regress`'s e(beta) ([R] regress, Stored results; posted by the built-in
+    // _regress for every unweighted OLS fit, beta option or not): b_j*sd(x_j)/sd(y)
+    // with the n-1 sample sd over the estimation rows. The sds are taken here, on the
+    // raw no-FE design (nothing below the intercept check rescales it unweighted),
+    // keyed by column name so the collinear compaction below cannot misalign them.
+    std::vector<std::pair<std::string, double>> beta_sd_x;
+    double beta_sd_y = 0.0;
+    const bool want_beta_std = md.fe.empty() && md.weights.empty() && md.has_intercept && n > 1;
+    if (want_beta_std) {
+        const double nd = static_cast<double>(n);
+        const double ym = la::sum(dm.y.data(), n) / nd;
+        beta_sd_y = std::sqrt(la::sumsq_dev(dm.y.data(), n, ym) / (nd - 1.0));
+        for (int j = 0; j < k; ++j) {
+            if (dm.xnames[static_cast<size_t>(j)] == "(intercept)") continue;
+            const double* col = dm.X.data() + static_cast<int64_t>(j) * n;
+            const double m = la::sum(col, n) / nd;
+            beta_sd_x.emplace_back(dm.xnames[static_cast<size_t>(j)],
+                                   std::sqrt(la::sumsq_dev(col, n, m) / (nd - 1.0)));
+        }
+    }
+
     // --- HDFE demean (within transform) of y and X ---
     // Weighted: subtract the weighted cell means, THEN scale by √w̃ (see above).
     const double* wdm = weighted_fe ? wt.data() : nullptr;
@@ -263,16 +370,31 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
     }
 
     // --- omit collinear regressors (Stata `regress` parity) ---
-    // Detect on the demeaned design (the matrix actually solved); drop the LATER
-    // column of each collinear set so surviving coefs match Stata coef-for-coef.
+    // Detect on the demeaned design (the matrix actually solved), retaining a
+    // norm-pivoted independent basis and the model's intercept when present, or,
+    // under md.collinear_forward (reghdfe/areg/xtreg,fe, BUG-1067), the earlier
+    // term of each collinear set (the intercept, when present, is column 0).
     // Snapshot dm.xnames BEFORE compact_columns mutates it in place — this is the
     // only point where the pre-drop design-matrix order still exists (BUG-112(6)).
     std::vector<std::string> full_names = dm.xnames;
     {
-        std::vector<char> keep = collinear_keep_mask(dm.X.data(), n, k);
+        const std::vector<char> late = late_cell_flags(md, dm.xnames);
+        std::vector<char> keep =
+            md.collinear_forward
+                ? collinear_keep_mask(dm.X.data(), n, k, 1e-7, &late)
+                : collinear_pivot_keep_mask(dm.X.data(), n, k, md.has_intercept ? 0 : -1);
         int nkeep = 0;
         for (char c : keep) nkeep += c;
         if (nkeep < k) {
+            // Means and the demeaned design must retain the same columns:
+            // absorbed factor main effects can vanish while their interactions survive.
+            if (!xbar.empty()) {
+                std::vector<double> kept;
+                kept.reserve(static_cast<size_t>(nkeep));
+                for (int j = 0; j < k; ++j)
+                    if (keep[static_cast<size_t>(j)]) kept.push_back(xbar[static_cast<size_t>(j)]);
+                xbar = std::move(kept);
+            }
             r.omitted = compact_columns(dm.X, n, k, dm.xnames, keep);
             dm.k = k;
         }
@@ -309,6 +431,11 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
     r.ssr = ssr;
     r.tss_within = tssw;
     r.r2_within = (tssw > 0) ? 1.0 - ssr / tssw : 0.0;
+    double direct_mss = -1.0;
+    if (md.fe.empty() && md.has_intercept && md.weights.empty()) {
+        direct_mss = fitted_model_ss(dm.X.data(), dm.y.data(), n, k, r.beta);
+        r.r2_within = direct_mss + ssr > 0.0 ? direct_mss / (direct_mss + ssr) : 0.0;
+    }
 
     // --- degrees of freedom (counts absorbed FE) ---
     r.dof = compute_dof(n, k, md.fe);
@@ -320,9 +447,45 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
     if (r.n_eff > 0.0) {
         dof_resid = r.n_eff - static_cast<double>(k + r.dof.k_fe);
         r.dof_resid_exact = dof_resid;
-        r.dof.dof_resid = static_cast<int64_t>(std::llround(dof_resid));
+        // Stata truncates a fractional iweight count (w2aj_qualifiers.log:1291
+        // qf_rw_iw_tight: sum w 28.5 -> e(N) 28, e(df_r) 26), never rounds.
+        r.dof.dof_resid = static_cast<int64_t>(std::floor(dof_resid + 1e-9));
     }
     if (dof_resid <= 0) throw EngineError("no_obs", "non-positive residual degrees of freedom");
+    // Stata `regress`'s exact-fit rule (closed-source builtin, identified by StataBE
+    // probes, diag g12 prop_predict_*): when e(r2) > 1 - 1e-14 in double, the fit
+    // is treated as exact. e(rss) = e(rmse) = 0, e(mss) = the total sum of squares,
+    // e(r2) = 1, e(V) = 0 and e(F) missing. The bracket is scale- and N-invariant
+    // (N 200 and N 20: RSS/TSS 9.886e-15 zeroed, 9.966e-15 kept; y*1000 alike).
+    // Under noconstant the ratio is to the uncentered total. w2e_float_default
+    // prop_predict_untyped/_double: `regress y p` with p a float/double prediction
+    // of y posts _se[p] = 0 exactly.
+    // Scope: the rule is `regress`'s own, so it runs only when the caller asks
+    // for it (regress_exact_fit, PIET's regress route). reghdfe keeps the computed
+    // RSS on the same data (StataBE `reghdfe yx x, noabsorb`: e(rss) 8.526e-28,
+    // _se[x] 1.72e-16, t 1.2e16, p 0). It was probed for the classic VCE only, so
+    // it is limited to iid. r2_within is the value fill_fit_scalars publishes as
+    // e(r2) without FE (tss_total is 0 there).
+    // BUG-1055: the built-in fit applies it under [aw]/[fw]/[iw] and to areg's
+    // absorbed fit as well (StataBE, N 50, y2 = 3 + 2x exactly: `regress y2 x [aw=w]`,
+    // `[fw=gp]`, `[iw=w]`, `areg y2 x, absorb(gp)` and areg [aw]/[fw] all post e(rss) 0,
+    // _se[x] 0; areg e(mss) = e(tss), e(F) missing). Under absorb the test is areg's
+    // full-model e(r2): `areg y3 x, absorb(gp)` with y3 = 1e7*gp + 3 + 2x + 3e-5*noise
+    // (within RSS/TSS ~4e-12, total ~2e-25) is zeroed too. A pweight implies a robust
+    // VCE, outside the rule's probed scope.
+    const double exact_r2 =
+        md.fe.empty() ? r.r2_within : (r.tss_total > 0.0 ? 1.0 - ssr / r.tss_total : 0.0);
+    if (regress_exact_fit && md.weight_kind != WeightKind::Probability && vt == Vcov::IID &&
+        exact_r2 > 1.0 - 1e-14) {
+        const double tss = direct_mss >= 0.0 ? direct_mss + ssr : tssw;
+        if (tss > 0.0) {
+            ssr = 0.0;
+            r.ssr = 0.0;
+            r.r2_within = 1.0;
+            r.exact_fit = true;
+            if (direct_mss >= 0.0) direct_mss = tss;
+        }
+    }
     r.sigma2 = ssr / dof_resid;
     const int k_full = k + r.dof.k_fe;  // total estimated params incl. FE
 
@@ -342,9 +505,20 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
                                            std::sqrt(md.weights[static_cast<size_t>(i)]);
     }
     const double* e_meat = e_fw.empty() ? e.data() : e_fw.data();
+    // FU-365: Stata's built-in multiway clip acts on the whole (slopes, _cons) matrix.
+    // With absorbed FE the _cons row is the augmented call below, which then supplies
+    // the slope block too; with omitted collinear terms that row is not built (GAP B),
+    // so the clip could only see the slopes -- refused rather than answered.
+    const bool subset_multiway = multiway_subset_factors && vt == Vcov::Multiway;
+    if (subset_multiway && !md.fe.empty() && !r.omitted.empty())
+        throw EngineError("unsupported",
+                          "multiway cluster with absorbed fixed effects and omitted collinear "
+                          "regressors is not supported (Stata's multiway variance clips the "
+                          "matrix including _cons, which is not reconstructed here)");
     VcovResult vc = compute_vcov(vt, dm.X.data(), n, k, e_meat, bread.data(), k_full,
                                  r.sigma2, md.fe, md.cluster, cluster_index,
-                                 r.n_eff > 0.0 ? r.n_eff : -1.0, false, keep_nested_fe_dof);
+                                 r.n_eff > 0.0 ? r.n_eff : -1.0, false, keep_nested_fe_dof,
+                                 multiway_subset_factors);
     r.vcov_type = vc.type;
     r.n_clusters = vc.n_clusters;
     r.cluster_dof_k = vc.cluster_dof_k;
@@ -354,14 +528,28 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
     r.se.resize(k);
     for (int j = 0; j < k; ++j) r.se[j] = std::sqrt(vc.V[j + j * k]);
     r.vcov_matrix = std::move(vc.V);
+    if (r.exact_fit) r.exact_fit_bread = bread;  // no FE here: the slopes' bread is all of it
+    // Stata's built-in multiway e(V_modelbased) is the bread inv(X'X): regress
+    // posts e(V)/s2 of its OLS fit; under FE it is
+    // the extended inverse built below. Unweighted only (the weighted bread is
+    // not what Stata divides out after its weight normalization).
+    // BUG-1043: regress posts the same bread after a one-way vce(robust) or
+    // vce(cluster), unweighted or [fw] (StataBE, the w2s fixture: e(V_modelbased)
+    // equals the plain fit's e(V)/e(rmse)^2, x1 cell +1.4cb44ed9785aeX-00b; [fw] the fw
+    // fit's (X'WX)^-1). An aweight's is a constant multiple and a pweight's none:
+    // left unsent.
+    const bool vmb_one_way = (vt == Vcov::HC1 || vt == Vcov::Cluster) &&
+                             (md.weights.empty() || md.weight_kind == WeightKind::Frequency);
+    if (md.fe.empty() && ((subset_multiway && md.weights.empty()) || vmb_one_way))
+        r.vcov_modelbased = bread;
 
     // GAP B — reghdfe reconstructed intercept (_cons) for absorb() models.
     // reghdfe reports a "regression through means" intercept when the absorbed FE
     // set carries an intercept (standard absorb). By Frisch-Waugh the slope
     // betas/SEs/F/R² are UNCHANGED; we only append one row. Gated on
-    // !md.fe.empty() (no-FE OLS already carries a real _cons column) and
-    // r.omitted.empty() (collinear renumbering of xbar is deferred; ppda has none).
-    if (!md.fe.empty() && r.omitted.empty()) {
+    // !md.fe.empty() (no-FE OLS already carries a real _cons column). xbar was
+    // compacted with the same mask as the fitted design, including after omission.
+    if (!md.fe.empty()) {
         // Point: b0 = ybar - xbar·beta   (regression-through-means intercept)
         double b0 = ybar;
         for (int j = 0; j < k; ++j) b0 -= xbar[static_cast<size_t>(j)] * r.beta[static_cast<size_t>(j)];
@@ -382,6 +570,7 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
 
         double var_cons = 0.0;
         std::vector<double> cov_cons(static_cast<size_t>(k), 0.0);
+        bool post_screen = false;  // BUG-1266: the posted matrix is a clipped composite
 
         if (vt == Vcov::IID) {
             // Under IID the slope V = scale · bread with a shared scalar; recover
@@ -428,25 +617,63 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
                 ext[static_cast<size_t>(k) + static_cast<size_t>(j) * ka] = side[static_cast<size_t>(j)];
             }
             ext[static_cast<size_t>(k) + static_cast<size_t>(k) * ka] = corner;
+            // Stata's e(V_modelbased) under FE is this extended inverse: Stata's
+            // areg e(V_modelbased) equals its conventional e(V)/e(rmse)^2 (StataBE probe,
+            // w2s_multiway_class fixture). Same (slopes, _cons) layout as Vn below.
+            // BUG-1043: also after areg's and xtreg,fe's one-way vce(robust)/vce(cluster
+            // id) (StataBE: equal to the plain fit's e(V)/s2, x1 cell
+            // +1.58e1772b1cf3fX-00b); unweighted only, as measured.
+            if (md.weights.empty() && (subset_multiway || vt == Vcov::HC1 || vt == Vcov::Cluster))
+                r.vcov_modelbased = ext;
 
             //   The same keep_nested_fe_dof as the slope call: areg's _cons SE
             //   carries areg's factor (w2b_estim.log areg_vce_cluster
             //   se[_cons] .4823829775414377).
+            //   FU-389: a Gmin multiway fit clips this matrix in reghdfe's
+            //   standardised units (hdfe_clip_scale above); only its _cons row and
+            //   column are read below, the slopes keep the k x k call's unless that
+            //   block itself needed the clip (BUG-1266).
+            const bool std_clip = hdfe_clip_scale.size() == static_cast<size_t>(ka);
             VcovResult vca = compute_vcov(vt, Xa.data(), n, ka, e_meat, ext.data(),
                                           k_full, r.sigma2, md.fe, md.cluster, cluster_index,
                                           r.n_eff > 0.0 ? r.n_eff : -1.0, false,
-                                          keep_nested_fe_dof);
+                                          keep_nested_fe_dof, multiway_subset_factors,
+                                          std_clip ? &hdfe_clip_scale : nullptr);
             var_cons = vca.V[static_cast<size_t>(k) + static_cast<size_t>(k) * ka];
             for (int j = 0; j < k; ++j)
                 cov_cons[static_cast<size_t>(j)] = vca.V[static_cast<size_t>(j) + static_cast<size_t>(k) * ka];
+            // FU-365: the clip ran on the (k+1) matrix, so its slope block -- not the
+            // k x k call's, clipped without _cons -- is the one Stata reports
+            // (w2l_vce_shape_det.log areg_vce_c2_se .0778721308909151).
+            // BUG-1266: when the slope block itself is not PSD (the k x k call clipped
+            // it), reghdfe_fix_psd puts in that block clipped on its own in reghdfe's
+            // standardised units -- which the clip does not commute with -- so the
+            // (k+1) call's block is the one reghdfe posts, as under FU-365.
+            if (subset_multiway || (std_clip && vca.npd_fix && r.vcov_npd_fix)) {
+                for (int a = 0; a < k; ++a) {
+                    for (int b = 0; b < k; ++b)
+                        r.vcov_matrix[static_cast<size_t>(a) + static_cast<size_t>(b) * k] =
+                            vca.V[static_cast<size_t>(a) + static_cast<size_t>(b) * ka];
+                    r.se[static_cast<size_t>(a)] =
+                        std::sqrt(r.vcov_matrix[static_cast<size_t>(a) + static_cast<size_t>(a) * k]);
+                }
+                if (subset_multiway) r.vcov_npd_fix = vca.npd_fix;
+            }
+            // That composite (the whole matrix clipped, its slope block replaced by the
+            // separately clipped one) need not be PSD, and reghdfe posts it through
+            // `ereturn post`, whose screen it may fail (stata_post_vcov_screen).
+            post_screen = std_clip && vca.npd_fix && !subset_multiway;
 #ifndef NDEBUG
             // Debug guard (debug builds only): the augmented slope block must equal the
             // original vc.V. If it doesn't, the re-centering / ones-append is wrong. This
             // is an invariant check, never hit in correct operation, so gating it out of
             // release changes no output value — it just stops paying the k*k compare on
             // every _cons feols call (GAP-B slice 1; the algebraic-extension rewrite that
-            // would drop the second compute_vcov stays deferred).
-            for (int a = 0; a < k; ++a)
+            // would drop the second compute_vcov stays deferred). The FU-365 subset
+            // multiway branch is exempt: its clip legitimately moves the slope block;
+            // so is a standardised-unit clip that fired (FU-389: its slope block is
+            // the separately clipped one in reghdfe's units, not the data-unit one).
+            for (int a = 0; a < k && !subset_multiway && !(std_clip && vca.npd_fix); ++a)
                 for (int b = 0; b < k; ++b) {
                     double got = vca.V[static_cast<size_t>(a) + static_cast<size_t>(b) * ka];
                     double want = r.vcov_matrix[static_cast<size_t>(a) + static_cast<size_t>(b) * k];
@@ -462,6 +689,7 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
         r.beta.push_back(b0);
         r.se.push_back(std::sqrt(var_cons));
         r.names.push_back("_cons");
+        r.full_names.push_back("_cons");  // omitted-term output ordering must retain the recovered row
         const int kn = k + 1;
         std::vector<double> Vn(static_cast<size_t>(kn) * kn, 0.0);
         for (int a = 0; a < k; ++a)
@@ -473,11 +701,34 @@ FeolsResult feols_fit(ModelData& md, Vcov vt, int cluster_index, bool no_interce
             Vn[static_cast<size_t>(k) + static_cast<size_t>(j) * kn] = cov_cons[static_cast<size_t>(j)];
         }
         Vn[static_cast<size_t>(k) + static_cast<size_t>(k) * kn] = var_cons;
+        // BUG-1266: StataBE, a non-PSD slope block (pre-clip eigenvalues .0030267 and
+        // -3.27e-6, probe BUG-1266.do part 2): the composite's corr(x2, _cons) is 1.11,
+        // so reghdfe's e(V) is posted as 0 ("variance matrix is nonsymmetric or highly
+        // singular") and every _se is 0.
+        if (post_screen && !stata_post_vcov_screen(Vn, kn))
+            std::fill(r.se.begin(), r.se.end(), 0.0);
         r.vcov_matrix = std::move(Vn);
         ++r.k;
     }
 
-    fill_fit_scalars(r);  // mss/rss/r2/r2_a/rmse/f_stat/df_m/df_r (Stata regress e())
+    // Stata's built-in multiway: e(rank) is the rank of the clipped (slopes, _cons)
+    // variance (w2s_multiway_class.log:116 two-way regress 2, :1115 three-way 1), and
+    // e(kcluster) lists every cluster combination's groups.
+    if (subset_multiway) {
+        r.vcov_rank = multiway_vcov_rank(r.vcov_matrix, r.k);
+        r.kcluster = multiway_cluster_combos(md.cluster);
+    }
+
+    fill_fit_scalars(r, direct_mss);  // Stata regress e() scalars
+    if (want_beta_std && beta_sd_y > 0.0) {
+        for (size_t j = 0; j < r.names.size(); ++j) {
+            for (const auto& [nm, sd] : beta_sd_x) {
+                if (nm != r.names[j]) continue;
+                r.beta_std.emplace_back(nm, r.beta[j] * sd / beta_sd_y);
+                break;
+            }
+        }
+    }
     return r;
 }
 
@@ -493,6 +744,7 @@ std::vector<FeolsResult> feols_fit_multi(ModelData& md, std::vector<std::vector<
     }
     const int64_t n = dm.n;
     int k = dm.k;
+    require_sample(n);
     if (n <= k) throw EngineError("no_obs", "not enough observations: n <= k");
 
     // --- shared, y-independent work: demean X once, factor (X'X)⁻¹ once, dof ---
@@ -505,7 +757,12 @@ std::vector<FeolsResult> feols_fit_multi(ModelData& md, std::vector<std::vector<
     std::vector<std::string> full_names = dm.xnames;
     std::vector<std::string> omitted;
     {
-        std::vector<char> keep = collinear_keep_mask(dm.X.data(), n, k);
+        // md.collinear_forward: the earlier term wins, as in feols_fit (BUG-1067).
+        const std::vector<char> late = late_cell_flags(md, dm.xnames);
+        std::vector<char> keep =
+            md.collinear_forward
+                ? collinear_keep_mask(dm.X.data(), n, k, 1e-7, &late)
+                : collinear_pivot_keep_mask(dm.X.data(), n, k, md.has_intercept ? 0 : -1);
         int nkeep = 0;
         for (char c : keep) nkeep += c;
         if (nkeep < k) {
@@ -550,6 +807,11 @@ std::vector<FeolsResult> feols_fit_multi(ModelData& md, std::vector<std::vector<
         tssw = centered_when_no_fe(y.data(), n, md.has_intercept);
         r.ssr = ssr; r.tss_within = tssw;
         r.r2_within = (tssw > 0) ? 1.0 - ssr / tssw : 0.0;
+        double direct_mss = -1.0;
+        if (md.fe.empty() && md.has_intercept && md.weights.empty()) {
+            direct_mss = fitted_model_ss(dm.X.data(), y.data(), n, k, r.beta);
+            r.r2_within = direct_mss + ssr > 0.0 ? direct_mss / (direct_mss + ssr) : 0.0;
+        }
         // Full-model TSS for reghdfe's e(r2): centered Σ(y_raw-ȳ)² on the ORIGINAL
         // outcome (pre-within), FE only. Mirrors feols_fit; no-FE leaves tss_total=0.
         if (!md.fe.empty()) {
@@ -565,7 +827,7 @@ std::vector<FeolsResult> feols_fit_multi(ModelData& md, std::vector<std::vector<
         r.se.resize(k);
         for (int j = 0; j < k; ++j) r.se[j] = std::sqrt(vc.V[j + j * k]);
         r.vcov_matrix = std::move(vc.V);
-        fill_fit_scalars(r);  // per-outcome Stata regress e() scalars
+        fill_fit_scalars(r, direct_mss);  // per-outcome Stata regress e() scalars
         outs.push_back(std::move(r));
     }
     return outs;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // grid.js — Virtualized data-browser grid (the Data Browser overlay).
 // Keeps ≤ ~100 DOM rows via spacer divs, REUSING those row nodes across scroll
 // frames (rebuilt in place, not torn down + recreated every frame); row height

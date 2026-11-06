@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Extended evalcase kinds: exprfn / pyexpr (expression engine) and the
 // macro-engine kinds (eval_arith / eval_macro_expr / expand_macros /
 // capture_definition / macro_script / has_macro_refs / capture_r).

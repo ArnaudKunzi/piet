@@ -1,6 +1,25 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #ifndef PIET_NATIVE_BCAL_H
 #define PIET_NATIVE_BCAL_H
-// Business calendar reader, independent date-set induction, and index operations.
+// Stata business calendars ([D] bcal, [D] Datetime business calendars) —
+// AER scope-2 B2-3, the blocker of paper 066.
+//
+// `bcal create` (induceFromDates) infers a calendar from the gaps between
+// the sorted values of a date column and writes the .stbcal text; its
+// behaviour follows [D] bcal and measured StataBE 19.5 runs.
+//
+// The reader (`parseStbcal`) is the OTHER half and has a different authority:
+// the .stbcal loader is Stata's built-in `_bcalendar`, whose behaviour was
+// measured probe-by-probe (REPORT.md §4, 85 grammar probes in capture4.log).
+// Two manual statements are contradicted by that measurement and the
+// measurement wins: the loader's default `dateformat` is dmy (the manual says
+// ymd), and a `from _ to _:` window on an `omit date` carrying a FULL date is
+// rc 197, not accepted (REFUTE-0 T6).
+//
+// bofd()/dofb() are integer index arithmetic over the resulting business-day
+// list; both answer MISSING for a calendar that cannot be found, which is what
+// Stata itself answers (rc 0, measured).
 
 #include <cstdint>
 #include <memory>
@@ -53,7 +72,7 @@ ParseResult parseStbcal(const std::string& text, const std::string& name);
 double bofd(const BusinessCalendar& cal, double d);
 double dofb(const BusinessCalendar& cal, double i);
 
-// --- `bcal create` induction ([D] bcal, documented options and file format) ---
+// --- `bcal create` induction ([D] bcal, bcal create) -----------------------
 struct InduceOpts {
   std::string calName;
   std::string dateformat = "ymd";  // bcal create ALWAYS writes it explicitly
@@ -72,17 +91,15 @@ struct InduceResult {
   int rc = 0;
   std::string message;
   std::string text;  // the .stbcal bytes, when ok
-  // The requested range extends beyond the source data's observed dates.
+  // Whether create prints the two range() Notes (range() starts before the
+  // first data date / ends after the last).
   bool leadNote = false, trailNote = false;
-  bool fractionalNote = false;  // noninteger source dates were floored
 };
 
 // `values` are the from() column's values for the observations that pass
-// if/in/excludemissing, in any order. The induction uses distinct dates after
-// flooring fractional values. The caller applies exclusions first.
-// Explicit ranges may extend the observed span but cannot truncate it. Their
-// endpoints must fall on weekdays represented in the original business dates;
-// other absent dates remain holidays, and all gaps are subject to maxgap().
+// if/in/excludemissing, in ANY order. NaN is Stata missing (it sorts after
+// every number), so a missing value trips the "cannot be after Dec 31, 9999"
+// bound.
 InduceResult induceFromDates(const std::vector<double>& values, const InduceOpts& opts);
 
 // --- the process's calendar cache ------------------------------------------
@@ -116,8 +133,6 @@ InduceResult induceFromDates(const std::vector<double>& values, const InduceOpts
 // directory sitting in the key.
 void setSearchDir(std::string dir);
 const std::string& searchDir();
-void setPersonalDir(std::string dir);
-const std::string& personalDir();
 void clearCache();
 
 // The calendar-NAME rule, and the ONE place it lives. A calendar name is a
@@ -135,7 +150,8 @@ void clearCache();
 //                                        OTHER refusal and keeps its own rc)
 // `bcal dir` does NOT apply it: an eleven-character .stbcal in the directory is
 // still listed (measured, r(calendars) = "elevenchars elevenchar").
-// `bcal create` reports invalid names and excessive length separately.
+// `bcal create` reports the two halves of the same predicate with two
+// different messages, so it tests them separately rather than calling this.
 bool isValidCalName(const std::string& name);
 
 // The search directory a session's cwd names. An UNSET or empty session cwd
@@ -145,17 +161,12 @@ bool isValidCalName(const std::string& name);
 // expression surface reads it under another (review finding, non-blocking 3).
 std::string searchDirFor(const std::string& sessionCwd);
 
-// The one loader every surface goes through: cwd first, then PERSONAL.
-// forceReload bypasses the name cache and reports the first matching file's
-// parse error rather than falling through to a same-named personal calendar.
-// `name` may carry a leading
+// The one loader every surface goes through. `name` may carry a leading
 // "%tb"; a ".stbcal" SUFFIX is rejected (measured: `bofd("a_wk.stbcal", d)`
 // is missing); a name outside isValidCalName() is rejected too. Returns
 // nullptr for "not found, unreadable, or not a legal calendar name", which
 // every expression caller turns into Stata missing with rc 0.
-std::shared_ptr<const BusinessCalendar> lookup(const std::string& name,
-                                                bool forceReload = false,
-                                                StbcalError* errOut = nullptr);
+std::shared_ptr<const BusinessCalendar> lookup(const std::string& name);
 
 // `bcal load` / `bcal create ..., replace` refresh: parse the file at `path`
 // under `name` and install it, replacing any cached entry. `errOut` carries
@@ -176,12 +187,13 @@ std::string calNameFromFormat(const std::string& spec);
 std::int64_t daysFromCivil(std::int64_t y, unsigned m, unsigned d);
 // Stata dow(): 0 = Sunday. 01jan1960 (day 0) is a Friday.
 int dowOf(std::int64_t td);
-// Parse one complete daily date using the calendar reader's six date orders.
-// No calendar is constructed, and '*' years are not accepted.
-bool parseDailyDate(const std::string& token, const std::string& order, std::int64_t* out);
 // Render `td` under a bcal-create dateformat ("ymd".."dmy") the way Stata's
 // derived %td display format does (2020jan02 for ymd, 02jan2020 for dmy).
 std::string renderUnderDateformat(std::int64_t td, const std::string& dateformat);
+// A complete date token under a dateformat, by the reader's own date rules, so
+// that bcal create's range() and centerdate() and the file they end up in cannot
+// disagree. nullopt when it does not read as a date in that order.
+std::optional<std::int64_t> readWholeDate(const std::string& token, const std::string& dateformat);
 
 }  // namespace piet::bcal
 

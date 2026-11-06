@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // SessionState — full C++ port of piet/backend/piet/session.py's kernel
 // state object (the M2 "session/datastore" milestone; replaces the M1
 // EvalSession stub as the dispatcher-facing state).
@@ -19,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -40,10 +43,12 @@
 #include <utility>
 #include <vector>
 
+#include "core/rng_mt64.h"       // Stata-exact session RNG stream (SeedSlot::stream)
 #include "piet/cobra_session.h"  // Stage 1b: persistent `cobra serve` worker + frame metadata
 #include "piet/counters.h"       // liveNamedBytesPeakSample() save/restore of the counter globals
 #include "piet/datastore.h"
 #include "piet/eval/session.h"
+#include "piet/serset.h"  // serset-twoway SS: the graph-owned serset store
 #include "piet/strutil.h"  // W2 esttabnames: globMatch for expandEstimatesNamelist
 #include "vendor/nlohmann/json.hpp"
 
@@ -115,10 +120,21 @@ struct LastModel {
   // exactly what `ereturn list` printed before. Never read by the replay
   // machinery (test/lincom/margins/estat keep keying on cobraCmd).
   std::string stataCmd;
+  // False for an e-class program that never ran `ereturn post` (rddensity:
+  // `ereturn clear` + scalars): its e() is live, but
+  // estimates store / eststo refuse it r(301) "last estimates not found"
+  // (estimates store on an unposted e()). runEststo reads it.
+  bool ePosted = true;
   std::string y;
   std::vector<std::string> x;
   std::vector<std::string> fe;
   std::string vcov = "iid";
+  // Stata's spelling of e(vce) when it is not the engine-derived one
+  // setLastModel() publishes from `vcov` (areg/reghdfe `ols`, ivreghdfe
+  // `robust cluster`, xtpoisson/xtlogit fe `oim`; "" erases e(vce)). Carried on
+  // the model so a later setLastModel() on the same model (setEstHandleM4,
+  // reached by test/lincom/predict) republishes it instead of `iid`.
+  std::optional<std::string> eVce;
   std::vector<std::string> cluster;
   std::optional<std::string> ivar;
   std::string depvar;
@@ -141,6 +157,11 @@ struct LastModel {
   std::string fitKeepif;
   std::string fitWeight;
   std::string fitWtype;
+  // The weight expression as typed, for e(wexp) (Stata stores "= " + the text
+  // after `=`, leading blanks removed: `[aw=  wf ]` -> "= wf ", w2aj_qualifiers
+  // qf_rw_aw_wide). Empty => fitWeight. setLastModel() fills it from
+  // commandWexp when the fit left it empty.
+  std::string fitWexp;
   // csdid / DiD post-estimation context (not exercised by M2's vertical
   // slice — csdid handlers land at M3 — but the fields are ported now so
   // LastModel is a complete, not partial, struct).
@@ -149,6 +170,10 @@ struct LastModel {
   std::optional<std::string> method;
   std::optional<std::string> comparison;
   std::optional<std::string> pscoretrim;
+  // csdid `long2` (e(typebase) long2): the `estat event, window()` re-run must
+  // forward it, or the long-difference cells silently become the short ones
+  // (w2ag_csdid_drdid.log:670-683 ag_l2ny_estore/ev).
+  bool long2 = false;
   std::optional<nlohmann::ordered_json> result;  // cached raw cobra output JSON
   // IV/LIML endogenous-regressor / instrument role split (BETA Phase G,
   // estat endogenous/overid wiring). `x` above conflates endog+exog into
@@ -187,6 +212,69 @@ struct LastModel {
   // per-process nonce is the second, independent guard: a handle from an
   // earlier worker resolves nowhere rather than resolving to the wrong model.
   std::string estHandle;
+
+  // e(sample) T2 (internal note esample/SPEC.md §4.2). Whether this
+  // model's estimation sample lives on the working frame as the hidden f64
+  // column `__piet_esample__` (piet/datastore.h kEsampleColumn):
+  //   kColumn      -- the fit handler wrote the engine's admitted rows
+  //                   (--esample-out) into that column BEFORE setLastModel.
+  //                   An admitted row holds the install's SERIAL
+  //                   (esampleSerial below), any other row 0; rows added later
+  //                   carry missing. The row reading is
+  //                   `(__piet_esample__==SERIAL)`, which reads both as 0.
+  //   kUnavailable -- the handler has no engine mask (not wired, or a
+  //                   restored/used model whose mask was not carried): e(sample)
+  //                   is a named r(198), never a guess.
+  //   kStale       -- `estimates restore` of results whose `_est_NAME` variable
+  //                   is no longer on the data (T3); a named r(198).
+  //   kNone        -- the state of "no LastModel at all", whose producers are a
+  //                   fresh session and SessionState::lastModel_reset()
+  //                   (`ereturn clear`, `ereturn post`, `clear all`/`clear
+  //                   results`), and the one model state `estimates use` sets:
+  //                   results read from a file carry no e(sample) (T3). e(sample)
+  //                   is then 0 (w2_esample.log A1-A5, G11, :1531 G6 `0|0|0|28|`).
+  //                   See SessionState::esampleReading.
+  // The DEFAULT is kUnavailable: setLastModel() replaces the struct wholesale,
+  // so a fit handler that never sets the field must not answer 0 or 1.
+  enum class EsampleState { kNone, kColumn, kUnavailable, kStale };
+  EsampleState esample = EsampleState::kUnavailable;
+  // kColumn only: which install wrote the mask (SessionState::
+  // esampleColumnInstalls at that install, >= 1). The column follows the rows,
+  // so the working frame can come to carry ANOTHER fit's mask while this model
+  // is live -- a resampling prefix leaves its last replicate's model and
+  // returns to the frame it started from (handlers_resample.cpp). The serial in
+  // the cells is what tells the two apart (esampleReading refuses a mismatch).
+  unsigned long long esampleSerial = 0;
+  // kColumn only: the working frame the install produced (the fit's frame plus
+  // the mask column). dataPath stays the frame the fit READ -- the path every
+  // refit (predict/test/lincom/margins, `estimates save`/`use`) replays -- so
+  // the install does not change what those verbs see; this second path only
+  // lets predict tell "the head is still the fit's frame" (handlers' headMoved).
+  std::string esampleInstallPath;
+  // The fit kept its singleton fixed-effect groups (`--keep-singletons`): areg
+  // and xtreg,fe always do, as Stata does (w2_esample.log:897 D3 e(N) 59 / N_g
+  // 11, :925 D4 59, :1957 H8 58), and reghdfe with `keepsingletons`. Every
+  // engine refit forwards it (estimation_m4c.cpp fitConventionFlagsM4) so the
+  // refit's sample is the fit's.
+  bool keepSingletons = false;
+  // BUG-1067: the fit omitted the LATER member of each collinear set
+  // (`--collinear-forward`), which implements reghdfe, areg and xtreg,fe per StataBE
+  // probes (z = 2*x: `x o.z`; regress keeps the engine's pivoted `o.x z`). Every
+  // engine refit forwards it (fitConventionFlagsM4) so the refit's coefficients
+  // are the fit's.
+  bool collinearForward = false;
+
+  // eb-order T-P3 part 0 (internal note eb-order/SPEC.md):
+  // which fit this e() is. A fresh construction mints a new serial and a copy
+  // keeps it, so setLastModel can tell a NEW e() (a fit; clears the previous
+  // fit's estimation block and posted e(b)/e(V)) from a copy-modify-set of the
+  // live one (setEstHandleM4, the `estat event` re-run, erepost, estimates
+  // restore of the live store), which keeps them.
+  std::uint64_t fitSerial = nextFitSerial();
+  static std::uint64_t nextFitSerial() {
+    static std::atomic<std::uint64_t> seq{0};
+    return ++seq;
+  }
 };
 
 struct HistoryEntry {
@@ -200,10 +288,13 @@ struct HistoryEntry {
 //   rclass — true if declared `, rclass` (flushes returnStaging on return).
 //   body   — post-preprocess lines (continuation-joined, comment-stripped;
 //            empty lines preserved for approximate line-number context).
+//   ado    — the command whose `<ado>.ado` autoload defined it; empty for a
+//            program defined in a do-file or interactively.
 struct ProgramDef {
   std::string name;
   bool rclass = false;
   std::vector<std::string> body;
+  std::string ado;
 };
 
 // Per-variable editor metadata (session._var_meta[name]): label / format /
@@ -233,12 +324,36 @@ struct DtaCharacteristic {
 struct PreserveFrame {
   std::string hbinPath;   // clone/byte-copy fallback plane: a real file snapshot.
   std::string stashName;  // §27 resident plane: the worker's stash key (no file).
+  // BUG-1139: `preserve` with no dataset loaded preserves the empty dataset
+  // (StataBE 19.5: rc 0, and `restore` brings back _N 0 with no variables), so
+  // the frame holds no snapshot and restoring it clears what was built since.
+  bool noData = false;
   std::map<std::string, VarMeta> varMeta;
+  // The implicit float of an untyped creation (SessionState::implicitFloatVars)
+  // is the other half of a variable's type claim, so it is kept with varMeta.
+  std::set<std::string> implicitFloatVars;
   std::map<std::string, std::map<std::string, std::string>> labelDefs;
   std::map<std::string, std::string> varLblname;
   std::map<std::string, std::map<int, std::string>> valueLabels;
   std::string dataLabel;                          // dataset label (Stata `label data`)
   std::vector<DtaCharacteristic> characteristics;  // Stata `char` table
+  // BUG-922: the preserve level (SessionState::preserveLevel) that ran
+  // `preserve`. A frame belongs to that level for its whole life:
+  //   I1 only pushPreserveSnapshot writes this field, with the level of the
+  //      `preserve` (a `restore, preserve` re-arms with the popped frame's
+  //      level, never the current one);
+  //   I2 levels never decrease from the bottom of preserveStack to the top
+  //      and never exceed preserveLevel(), so "this level holds a copy" is
+  //      SessionState::ownPreserveFrame() != nullptr;
+  //   I3 when a program returns or a nested do/run file or `parallel` child
+  //      concludes, on success or error, every frame deeper than the caller's
+  //      level is restored and popped by program::restorePreservesDeeperThan,
+  //      the one unwinder.
+  // Only the owning level may restore, cancel or re-arm its frame: a deeper
+  // level's `restore` in any form is r(622) and leaves the caller's copy alone
+  // (oracle w2ad_prog_preserve_nest pn_*_restore_caller, pn_*_not_caller,
+  // pn_*_rp_caller: in1 622:4:30). 0 = the top-level run.
+  int level = 0;
 };
 
 // postfile.py's PostHandle — an open `postfile` collector. names/types are
@@ -264,12 +379,22 @@ struct PostHandle {
   size_t nCols() const { return names.size(); }
 };
 
+// What `log off` / `log on` / `log close` asked of an SMCL log. Stata records
+// the command line and only then the paused/closed footer (or, for `log on`,
+// the resumed header without the line); PIET's blocks reach logTee() AFTER the
+// handler ran, so each request waits in LogState::ops until the tee meets the
+// command's own echo line (SessionState::logTee). Text logs never use this:
+// they stop and start at once.
+enum class LogOp { Pause, Resume, Close };
+
 // BUG-028 / BS-006: one open `log using` file. path is the resolved
 // absolute path (post handlers_m3.cpp::runLog's cwd-relative resolution);
 // stream is held open for the log's whole lifetime (SessionState::openLog/
 // closeLog own it); paused mirrors Stata's `log off`/`log on` (the stream
-// stays open but writes are suspended while true). Text format only — see
-// runLog's doc comment for the SMCL honest-reject/deviation call.
+// stays open but writes are suspended while true). The text format keeps its
+// original plain transcript; the SMCL format (`smcl` below) is written by the
+// writer in session_state.cpp -- see the comment above logTee() there for the
+// byte layout and what was identified against StataBE.
 // W:P8: `name` is Stata's log name — empty for the unnamed log opened by a
 // plain `log using`, non-empty for `log using FILE, name(X)`. Several logs may
 // be open at once (Stata tees output to all of them), which is why
@@ -288,6 +413,20 @@ struct LogState {
   // are not teed separately — their blocks are already flattened into the
   // depth-`depth` frame's result, so they would double-write.
   int depth = 1;
+  // -- SMCL format only (all inert for a text log) ----------------------------
+  bool smcl = false;
+  // The {txt}/{res}/{com}/{err} mode the stream is currently in, as the
+  // letters t/r/c/e ('?' = unknown): Stata writes a mode tag only where the
+  // mode changes.
+  char smclMode = 'r';
+  // The next command echo at this log's depth is the `log using` line itself,
+  // which Stata does not record (the log was not on yet).
+  bool skipNextEcho = false;
+  // Requests from the handlers (`log off` / `log on` / `log close`) whose
+  // command line the tee has not reached. For an SMCL log `paused` is the
+  // state the TEE has written up to; the handlers' effective state is `paused`
+  // with these applied in order.
+  std::vector<LogOp> ops;
 };
 
 // BS-124 (BETA campaign C4): one `timer` stopwatch slot (Stata's own
@@ -363,7 +502,82 @@ class SessionState {
     eval.rngSeed = [this]() -> eval::EvalSession::RngSeedReading {
       return eval::EvalSession::RngSeedReading{seed.get(), seed.epoch()};
     };
+    eval.rngMt64 = [this]() -> cecon::Mt64* { return &seed.stream(); };
+    // e(sample) T2: the macro layer's observation-1 value (esampleObs1 below),
+    // same capture rationale as obsCount above.
+    eval.esampleObs1 = [this](std::string* why) -> std::optional<int> {
+      return esampleObs1(why);
+    };
+    // BUG-718: the macro layer's dataset subscript `VAR[i]` (macroVarObs below),
+    // same capture rationale as obsCount above.
+    eval.varObs = [this](const std::string& name,
+                         long long idx) -> std::optional<eval::EvalSession::VarObsReading> {
+      return macroVarObs(name, idx);
+    };
+    // BUG-719: the inline `: type VAR' refreshes the plane it reads
+    // (EvalSession::syncVarPlane), same capture rationale as obsCount above.
+    eval.syncVarPlane = [this]() { syncEvalVarLabels(); };
+    // `: label lblname #` reads the value-label sets (EvalSession::valueLabelSet),
+    // same capture rationale as obsCount above.
+    eval.valueLabelSet =
+        [this](const std::string& lblname) -> const std::map<std::string, std::string>* {
+      auto it = labelDefs.find(lblname);
+      return it == labelDefs.end() ? nullptr : &it->second;
+    };
+    // BUG-1006: the macro layer's `` `c(name)' `` (EvalSession::cValue,
+    // macroCValue below), same capture rationale as obsCount above.
+    eval.cValue = [this](const std::string& name) -> std::optional<std::string> {
+      return macroCValue(name);
+    };
+    // EM13 / LBL-CHAR: `: char NAME[CHAR]` (EvalSession::characteristic), same
+    // capture rationale as obsCount above.
+    eval.characteristic = [this](const std::string& target,
+                                 const std::string& name) -> std::optional<std::string> {
+      for (const auto& c : characteristics)
+        if (c.varname == target && c.charname == name) return c.value;
+      return std::nullopt;
+    };
+    // LBL-DATALABEL: `: data label` (EvalSession::dataLabel), same capture rationale.
+    eval.dataLabel = [this]() -> std::string { return dataLabel; };
+    // `: sortedby` (EvalSession::sortedBy): the head's engine sort claim.
+    eval.sortedBy = [this]() -> std::string {
+      if (!hasData()) return std::string();
+      try {
+        const Datastore* d = datastore();
+        return d != nullptr ? d->sortedBy() : std::string();
+      } catch (...) {
+        return std::string();
+      }
+    };
+    // eb-order T-P3: the one coefficient source (EvalSession::estBlock) and the
+    // e()-is-live signal (EvalSession::modelLive), same capture rationale as
+    // obsCount above. An `ereturn post` e() writes no block; its coeftable
+    // mirror in eval.lastModelResult (handlers_ereturn.cpp) is that e()'s own,
+    // and it is read only while the posting is live.
+    eval.estBlock = [this]() -> const nlohmann::ordered_json* {
+      if (lastEstBlock.has_value()) return blockPostsEb(*lastEstBlock) ? &*lastEstBlock : nullptr;
+      if (ePostedLive && !lastModel_.has_value() && eval.lastModelResult.has_value())
+        return &*eval.lastModelResult;
+      return nullptr;
+    };
+    eval.modelLive = [this]() -> bool {
+      return lastModel_.has_value() || lastEstBlock.has_value() || ePostedLive;
+    };
+    eval.eNameListsComplete = [this](const std::string& kind) -> bool {
+      if (ePostedLive || eval.eStrings.get("cmd") == "estpost" ||
+          (!lastModel_.has_value() && !lastEstBlock.has_value())) return true;
+      // PCA publishes its entire matrix contract, while its scalar/macro
+      // lists still have separate implicit metadata and remain unclaimed.
+      if (kind != "matrices" || eval.eStrings.get("cmd") != "pca") return false;
+      for (const char* name : {"means", "components", "C", "Psi", "Ev", "L"})
+        if (!eval.findClassMatrix('e',name)) return false;
+      return eval.eStrings.get("Ctype") != "correlation" || eval.findClassMatrix('e',"sds");
+    };
+    eval.eNameOrder = [this](const std::string& kind) { return eNameOrderFor(kind); };
+    registerLiveSession();
   }
+  // Leaves the live-session registry sweepOrphanScratch reads (below).
+  ~SessionState();
 
   // -- dataset -------------------------------------------------------------
   bool hasData() const { return currentHbin_.has_value(); }
@@ -524,6 +738,17 @@ class SessionState {
   enum class LoadIntent { ChainContinues, FreshRead };
 
   void load(const std::string& path, LoadIntent intent = LoadIntent::ChainContinues) {
+    // e(sample) T2: the mask install's own load keeps the pre-install head
+    // pinned; any later head move releases it (pinPreInstallHead below).
+    const bool installLoad = preInstallLoadPending_;
+    preInstallLoadPending_ = false;
+    struct ReleaseAfter {
+      SessionState& s;
+      bool release;
+      ~ReleaseAfter() {
+        if (release) s.releasePreInstallPins();
+      }
+    } releaseAfter{*this, !installLoad && !preInstallPins_.empty()};
     if (intent == LoadIntent::FreshRead) residentDropToken();
     std::optional<std::string> superseded = currentHbin_;
     // BUG-381 DIAGNOSTIC (PIET_SCRATCH_TRACE): head transitions, so an orphan
@@ -535,6 +760,7 @@ class SessionState {
     // mutation is not off.
     if (scratchTraceOn()) scratchTrace("LOAD", path, superseded.value_or(std::string("-")));
     currentHbin_ = path;
+    ++headLoadCount;
     {
       // ROWLOOP-RLLOAD-SUBSPLIT: ~Datastore = the munmap of the PREVIOUS frame.
       counters::RlPhaseTimer _rllClose(&counters::strmutPhases().rllCloseNs, nullptr);
@@ -915,6 +1141,36 @@ class SessionState {
     datasetChanged = false;  // BETA A4 (BS-091): nothing loaded -> nothing changed
   }
 
+  // eb-order T-P3: whether an estimation block stands for an e(b). An estpost
+  // posting is a block (esttab renders its cells(mean) from it) but Stata posts
+  // no e(b) or e(V) there: estpost fills `b`/`V` only before Stata 9
+  // (~/Library/Application Support/Stata/ado/plus/e/estpost.ado), so after
+  // `estpost summarize` `_b[x1]` is r(111), `matrix list e(b)` r(111) and
+  // `matrix b = e(b)` a 0x0 matrix (w2v_estpost_ematrix.log ep13_local_bx1,
+  // ep13_list_eb, ep13_b_shape). postPseudoEstimate marks such a block with
+  // `"posts_e_b": false`; `erepost b = M` on it posts M and drops the mark.
+  static bool blockPostsEb(const nlohmann::ordered_json& block) {
+    if (!block.is_object()) return true;
+    const auto it = block.find("posts_e_b");
+    return it == block.end() || !it->is_boolean() || it->get<bool>();
+  }
+
+  // eb-order T-P1: the fit's full covariance, as the engine sent it under
+  // `--emit-v` (`e_V` = {names, matrix}, apps/cmds/common.cpp add_e_v), joins
+  // the live estimation block -- the one source canonicalEMatrix builds e(V)
+  // from. Called right after a fit writes lastEstBlock. Only the session's
+  // block carries it: the block a handler returns to the console (and every
+  // freeze fixture pins) is a separate copy and stays byte-identical, and
+  // eststo's snapshot (makeSnapshot) copies named fields only. A reply with no
+  // `e_V` (a fit whose engine command has no --emit-v) leaves the block as it
+  // is, and e(V) is then a named refusal, never a diagonal.
+  void attachFitCovariance(const nlohmann::ordered_json& raw) {
+    if (!lastEstBlock.has_value() || !lastEstBlock->is_object() || !raw.is_object()) return;
+    const auto it = raw.find("e_V");
+    if (it == raw.end() || !it->is_object()) return;
+    (*lastEstBlock)["e_V"] = *it;
+  }
+
   // `clear all`'s macro/model-state half — resets lastModel_ (the fields
   // this milestone's handler surface actually populates; clear_data's full
   // oracle scope also touches last_graph/named_graphs/graphics_off/timers,
@@ -929,6 +1185,9 @@ class SessionState {
     // through here), not a substitute for it.
     estAddedClear();
     activeEstimatesName.clear();  // W2 esttabnames: e(_estimates_name) goes with e()
+    eOnFitNames.clear();  // W2D-T01 round 3: every caller has emptied the e() stores
+    ePostedEsampleSerial = 0;  // a posted e(sample) goes with the posted e()
+    eNameContract.reset();  // the published name lists go with e()
   }
 
   const std::string& workdir() const { return workdir_; }
@@ -947,8 +1206,8 @@ class SessionState {
   // why nested/recursive dispatch() calls, e.g. inside `capture`/`quietly`/
   // `by` prefix-stripping or a replayed do-file/loop/program body, must NOT
   // individually re-tee). All PARSING/VALIDATION (replace vs append, the
-  // smcl honest-reject, "file already exists") lives in handlers_m3.cpp's
-  // runLog — this class only owns the open stream + the render-and-write
+  // text-vs-smcl format and file-extension rule, "file already exists") lives
+  // in handlers_m3.cpp's runLog — this class only owns the open stream + the render-and-write
   // mechanics (session_state.cpp). logIsOpen() is the first thing every one
   // of these checks, so a session that never calls `log using` — the
   // overwhelming majority of fixtures — pays zero cost and stays
@@ -975,51 +1234,43 @@ class SessionState {
   // stream failed to open (bad path/permissions); the caller turns that
   // into an honest error block. Defined in session_state.cpp (needs
   // io/win_compat.h's cecon::to_native_path, kept out of this header).
+  //
+  // `smcl` selects the SMCL writer (header at open, tagged lines, footer at
+  // `log off` / `log close`); false is the plain-text transcript, unchanged.
   bool openLog(const std::string& resolvedPath, bool appendMode,
-               const std::string& name = std::string(), int depth = 1);
+               const std::string& name = std::string(), int depth = 1, bool smcl = false);
 
   // Current dispatch recursion depth (1 = outermost). runLog reads it so a
   // named log knows which frames belong to it.
   int dispatchDepth() const { return dispatchDepth_; }
 
   // Closes one log by name; returns false when no log by that name is open, so
-  // the caller can raise Stata's own "log NAME not found". ofstream's dtor
-  // flushes + closes.
-  bool closeLog(const std::string& name = std::string()) {
-    for (auto it = logs_.begin(); it != logs_.end(); ++it) {
-      if ((*it)->name == name) {
-        logs_.erase(it);
-        return true;
-      }
-    }
-    return false;
-  }
-  void closeAllLogs() { logs_.clear(); }
+  // the caller can raise Stata's own "log NAME not found". A text log closes at
+  // once (ofstream's dtor flushes + closes). An SMCL log keeps its stream until
+  // logTee() has written the command's own echo and the closed-on footer (see
+  // LogOp); a paused one closes silently, as Stata does.
+  bool closeLog(const std::string& name = std::string());
+  void closeAllLogs();
   std::vector<std::string> logNames() const {
     std::vector<std::string> out;
     out.reserve(logs_.size());
     for (const auto& l : logs_) out.push_back(l->name);
     return out;
   }
-  bool pauseLog(const std::string& name = std::string()) {
-    for (auto& l : logs_) {
-      if (l->name == name) { l->paused = true; return true; }
-    }
-    return false;
-  }
-  bool resumeLog(const std::string& name = std::string()) {
-    for (auto& l : logs_) {
-      if (l->name == name) { l->paused = false; return true; }
-    }
-    return false;
-  }
+  bool pauseLog(const std::string& name = std::string());
+  bool resumeLog(const std::string& name = std::string());
 
-  // Renders one outermost dispatch() call's full finalized blocks array to
-  // plain text and appends it to the open log stream. Silent no-op when no
-  // log is open or the log is paused (`log off`). Defined in
+  // Renders one dispatch() frame's finalized blocks array into every open log
+  // of that frame's depth -- as the plain-text transcript, or as SMCL for a log
+  // opened with the smcl format -- and appends it to the log's stream. Silent
+  // no-op when no log is open or the log is paused (`log off`). Defined in
   // session_state.cpp (the generic JSON->text renderer wants <sstream>,
   // kept out of this widely-included header).
   void logTee(const nlohmann::ordered_json& blocks, int depth = 1);
+  // tabstat's text table as Stata prints it (the dispatcher's tabstat arm
+  // renders it; the emitted block stays the structured one). logTee writes it
+  // in place of the generic dump of the next tabstat block and clears it.
+  std::string pendingTabstatLogText;
 
   // -- dispatch-depth guard (BS-006 log tee) --------------------------------
   // dispatcher.cpp's dispatch() wrapper increments this on entry and
@@ -1048,6 +1299,21 @@ class SessionState {
     popActiveSession();
     return --dispatchDepth_;
   }
+
+  // A handler's own temp-column cleanup (`capture drop __touse`) runs under
+  // this count. Stata drops an ado's tempvars without running `drop`, so the
+  // cleanup leaves r() as the handler left it: the dispatcher's drop/keep r()
+  // posting (BUG-1417) skips while it is positive.
+  int tempDropDepth = 0;
+  struct TempDropScope {
+    explicit TempDropScope(SessionState& s) : s_(s) { ++s_.tempDropDepth; }
+    ~TempDropScope() { --s_.tempDropDepth; }
+    TempDropScope(const TempDropScope&) = delete;
+    TempDropScope& operator=(const TempDropScope&) = delete;
+
+   private:
+    SessionState& s_;
+  };
 
   // -- xtset / tsset panel/time-series context (session.py's panelvar/
   // timevar) — M3a: read by translate.cpp's TS-context injection
@@ -1096,7 +1362,7 @@ class SessionState {
   // L./F./D./S. operators step by this many index units instead of the
   // engine's implicit default of 1. Reset (not just left stale) on every
   // tsset/xtset call, matching real Stata's "each tsset call fully replaces
-  // the prior ts state" semantics — see handlers_m3.cpp::runTsset/runXtset.
+  // the prior ts state" semantics — see handlers_m3.cpp::runTsDeclare/runXtset.
   std::optional<double> delta;
 
   // -- frames (P6 wave) -----------------------------------------------------
@@ -1179,8 +1445,19 @@ class SessionState {
   // minted nothing pays nothing. PIET_NO_ORPHAN_SWEEP=1 is the A/B arm.
   // Returns the number of files removed; the census at exit (PIET_SCRATCH_CENSUS)
   // is the gate: ORPHAN must read 0 on every probe shape of the LEAK AUDIT §1.
+  //
+  // e(sample) T2: the files another LIVE SessionState of this process owns are
+  // not orphans either. The mint registry is process-wide, so two sessions
+  // sharing one workdir (the selftest harness's blocks: an outer session and
+  // short-lived siblings beside it) saw each other's on-disk head as unowned:
+  // the sibling's first dispatch exit unlinked it, and the outer session's
+  // next Datastore open died on "a scratch file that was never written".
+  // Latent until the estimation-sample install put a fresh pinned head on disk
+  // after every fit. The registry (registerLiveSession/~SessionState) is the
+  // spare; a session that has ended owns nothing and is swept as before.
   int sweepOrphanScratch(const char* site);
   int lastOrphanSweepRemoved() const { return lastOrphanSweepRemoved_; }
+  void registerLiveSession();
 
   // BUG-390 (2026-09-02): the `use` memos are bounded by BYTES. Cap =
   // PIET_USE_CACHE_MB, else CECON_MEMORY_BUDGET_MB / 2, else 1024 MB; least
@@ -1212,6 +1489,11 @@ class SessionState {
   // every caller's fallback ("append --level only when session.level != 95")
   // is a byte-identical no-op until the user actually runs `set level`.
   int level = 95;
+  // The macro-expanded text of the command the innermost dispatch tokenized
+  // (dispatcher.cpp), cleared at every dispatch entry. The fit hook's default
+  // e(cmdline) reads it: the line a prefix re-dispatches can still be the
+  // unexpanded `c' (handlers_aer_estim.cpp postDefaultCmdline).
+  std::string leafCmdExpanded;
   // BUG-471 T2: `set type float|double` — the storage type an UNTYPED
   // generate / egen / bysort-gen takes (Stata's c(type); factory default
   // float, w2e_float_default.log settype_ctype_default :1236). Session-scoped
@@ -1219,6 +1501,9 @@ class SessionState {
   // writes no settings file (a headless do-file must not reconfigure the
   // app). piet/storage_type.h is the one reader that turns it into a store.
   std::string defaultStorageType = "float";
+  // EM1: `set more on|off` -> c(more). Stata 19 starts with more off
+  // (w2af_macro_text_file.log:328 mt_cmore_init `<off>`).
+  bool moreOn = false;
   // BUG-471 T2: how many `replace`s in this session resolved their store type
   // through the unrecorded-creator fallback (no varMeta stataType and not on
   // implicitFloatVars -> double, no rounding). The count measures how many
@@ -1226,10 +1511,9 @@ class SessionState {
   int64_t unrecordedReplaceFallbacks = 0;
   // AER-SCOPE1 bundle D (ENV, 2026-09-03): `sysdir set NAME "path"` and
   // `adopath + path` are the first two lines of a great many AER do-files --
-  // twenty-seven of the ninety packages between them. PIET runs no ado-files,
-  // so neither can change what executes; what they CAN do is tell `findfile`
-  // where the package expected its own files to be, which is the one thing
-  // downstream lines actually read back. Recording them costs two fields and
+  // twenty-seven of the ninety packages between them. They tell `findfile`, and
+  // the ado autoload (BUG-442), where the package expected its own files to be,
+  // which is what downstream lines actually read back. Recording them costs two fields and
   // turns an accept-and-forget note into an accept-and-remember one.
   //
   // Seeded with Stata's own directory names so `sysdir` bare prints the six
@@ -1254,13 +1538,25 @@ class SessionState {
   // runiform() (EvalSession::rngSeed) needs it to tell `set seed 7` issued
   // AGAIN from no `set seed` at all -- the value alone cannot, and Stata
   // restarts the stream on every `set seed`.
+  //
+  // stream(): Stata's session RNG itself (core/rng_mt64.h, mt64 = MT19937-64,
+  // bit-exact against StataBE). Every `set seed` re-initializes it
+  // (init_genrand64), and every consumer that draws the way Stata's session RNG
+  // does -- generate/replace/egen/keep if with runiform()/runiformint()/
+  // uniform()/rnormal(), the macro layer's runiform(), bsample, boottest, the
+  // lasso CV folds -- takes its draws from here and advances it, so draws
+  // continue across commands exactly as Stata's stream does. Before any
+  // `set seed` it is Stata's start-up stream (seed 123456789).
   class SeedSlot {
    public:
     SeedSlot& operator=(long long v) {
       value_ = v;
       ++epoch_;
+      stream_.seed(static_cast<uint64_t>(v));
       return *this;
     }
+    cecon::Mt64& stream() { return stream_; }
+    const cecon::Mt64& stream() const { return stream_; }
     bool has_value() const { return value_.has_value(); }
     explicit operator bool() const { return value_.has_value(); }
     long long operator*() const { return *value_; }
@@ -1271,6 +1567,7 @@ class SessionState {
    private:
     std::optional<long long> value_;
     unsigned long long epoch_ = 0;
+    cecon::Mt64 stream_;
   };
   SeedSlot seed;
   // B3(c): a per-call counter that rides beside the seed so two successive
@@ -1289,16 +1586,271 @@ class SessionState {
 
   // -- last model / last estimation block -----------------------------------
   const std::optional<LastModel>& lastModel() const { return lastModel_; }
+
+  // e(sample) T2 (internal note esample/SPEC.md §4.2, §5): the ONE
+  // reading of the token `e(sample)` that every layer consults -- the row
+  // rewrite (dispatcher.cpp rewriteEsampleToken) and the macro/arith layer's
+  // obs-1 hook (EvalSession::esampleObs1, installed in the constructor below).
+  //   kZero    -- no estimation results (no LastModel: a fresh session or
+  //               lastModel_reset(), the only producer of "no model"; a
+  //               posted e() has no LastModel either), or a model whose mask
+  //               column has left the data (`use`, `clear`, `collapse`,
+  //               `reshape`, save + use): Stata answers 0 (w2_esample.log
+  //               A1-A5, E9-E11, E14, E15, G5, G11).
+  //   kColumn  -- the column `__piet_esample__` on the working frame is this
+  //               model's mask.
+  //   kRefused -- the model has no mask PIET can vouch for
+  //               (LastModel::EsampleState kUnavailable/kStale): `refusal` is
+  //               the r(198) text, naming the command.
+  struct EsampleReading {
+    enum class Kind { kZero, kColumn, kRefused };
+    Kind kind = Kind::kZero;
+    std::string refusal;
+    unsigned long long serial = 0;  // kColumn: the value an admitted row holds
+  };
+  EsampleReading esampleReading();
+  // Observation 1 of e(sample) -- Stata's value for a variable in a scalar
+  // expression (`display e(sample)`, `local s = e(sample)`, `if e(sample) {`;
+  // w2_esample.log B16-B19, B29-B29c). nullopt = refused, `why` gets the text.
+  std::optional<int> esampleObs1(std::string* why);
+  // BUG-718: `VAR[idx]` for the macro layer (EvalSession::varObs) -- the value
+  // `display VAR[idx]` prints, read by display_hardening's one reader. Defined in
+  // session_state.cpp so this header does not pull in display_hardening.h.
+  std::optional<eval::EvalSession::VarObsReading> macroVarObs(const std::string& name,
+                                                               long long idx);
+  // BUG-1006: `` `c(name)' `` for the macro layer (EvalSession::cValue) -- the
+  // raw text of piet::resolveCValue. Defined in session_state.cpp so this header
+  // does not pull in cclass.h (which includes this one).
+  std::optional<std::string> macroCValue(const std::string& name);
+  // e(sample) T3/T4: re-point the LIVE model's e(sample) without reinstalling
+  // it. setLastModel() is a new model (it drops the e() keys written on top of
+  // the fit, e(_estimates_name), a posted e()); `estimates restore`, `estimates
+  // esample:`, `estimates use` and the ML mask install that follows a logit/
+  // probit fit (dispatcher.cpp) change only which rows e(sample) is. `dataPath`
+  // moves only when the install names the on-disk base of an unmoved frame
+  // (handlers.cpp esampleInstallOnHead); pass the model's own otherwise.
+  void setLastModelEsample(LastModel::EsampleState state, unsigned long long serial,
+                           std::string installPath, std::string dataPath) {
+    if (!lastModel_.has_value()) return;
+    lastModel_->esample = state;
+    lastModel_->esampleSerial = serial;
+    lastModel_->esampleInstallPath = std::move(installPath);
+    lastModel_->dataPath = std::move(dataPath);
+  }
+  // How many times a fit installed the mask column in this session
+  // (handlers.cpp esampleInstallColumn). Zero means no frame of this session
+  // can carry it, so a writer that must leave it out (save) skips the check.
+  unsigned long long esampleColumnInstalls = 0;
+  // Every load() of a new head, counted (the install's equivalence test below).
+  unsigned long long headLoadCount = 0;
+  // The last plain mask install (handlers.cpp esampleInstallOnHead): the frame it
+  // produced, the ON-DISK frame it was built from, and headLoadCount right after
+  // its load. While the head is still that frame (same path, no load since), it
+  // IS the base frame plus the hidden column -- same rows, same values -- so:
+  //  * the next fit names the base as its frame (LastModel::dataPath) instead of
+  //    writing the install frame to disk first; and
+  //  * a read-only engine call replaying the base (test/lincom/margins after the
+  //    fit) is served from the resident head (esampleBaseAlias), not by flushing
+  //    the head and re-reading the base.
+  // Before this, every wired fit wrote the whole working frame (review 2026-10-13:
+  // 20 x `regress` on 1M rows, 56 -> 240 ms per fit, a 32 MB flush each).
+  // The weight expression of the command being dispatched (ParsedCommand::
+  // weightExp), set by the dispatcher after tokenize: a fit's LastModel takes it
+  // as fitWexp in setLastModel(), which no fit handler has to pass along.
+  std::string commandWexp;
+  std::string esampleLastInstallFrame;
+  std::string esampleLastInstallBase;
+  unsigned long long esampleLastInstallLoads = 0;
+  // ... and its serial and the engine's 0/1 file (2 bytes a row): a next fit on
+  // that unmoved frame whose file is byte-identical installs nothing.
+  unsigned long long esampleLastInstallSerial = 0;
+  std::string esampleLastInstallBody;
+  long long esampleLastInstallRows = 0;  // the install frame's rows (lines of that file)
+  // The install adds only the HIDDEN column, which no card lists (cobra_session.cpp
+  // skips it at seeding), so a card current for the frame it was built on
+  // describes the new frame too: same rows, same user columns. Retagged, so a
+  // later verb reads the card instead of opening the install frame as a
+  // Datastore (which writes it to disk: `replace x2 = ...` after every fit,
+  // review p9). The setcol's delta folds into no card.
+  void carryCardAcrossHiddenInstall(const std::string& from, const std::string& to) {
+    if (shadowValid_ && shadowCardHbin_ == from) shadowCardHbin_ = to;
+    pendingDeltaValid_ = false;
+  }
+  bool esampleHeadIsInstallOf(const std::string& base) const {
+    return !esampleLastInstallFrame.empty() && !base.empty() &&
+           base == esampleLastInstallBase && currentHbin_.has_value() &&
+           *currentHbin_ == esampleLastInstallFrame && headLoadCount == esampleLastInstallLoads;
+  }
+  // The install moves the working frame to a new path (the old frame plus the
+  // mask column). Before it, no estimation command ever moved the head, and a
+  // driver that captured the head path around an inner fit relies on that:
+  // bootstrap/jackknife/permute record `startHbin`, dispatch the command once
+  // for the observed statistic, then resample from and return to that path
+  // (handlers_resample.cpp). The supersede inside the install's load() would
+  // reclaim it there ("run failed: cannot open .../esample_install_*.hbin",
+  // measured in selftest W2C(postest) `bootstrap ...: regress`). So the
+  // pre-install head is PINNED: spared by reclaimSupersededScratch and the
+  // orphan sweep until the head next moves for any other reason (load()) or the
+  // outermost dispatch exits (dispatcher.cpp), when it is offered to the
+  // ordinary reclaim -- which still spares it if anything else owns it.
+  void pinPreInstallHead() {
+    if (currentHbin_.has_value() && !currentHbin_->empty()) {
+      preInstallPins_.push_back(*currentHbin_);
+      preInstallLoadPending_ = true;
+    }
+  }
+  // True when `canonicalPath` (weakly canonical, u8string) is the on-disk base of the live install
+  // frame (esampleHeadIsInstallOf): the file the next fit and the read-only
+  // replays alias, so scratch reclaim and the orphan sweep must not take it.
+  bool isLiveEsampleBase(const std::string& canonicalPath) const;
+  void releasePreInstallPins() {
+    if (preInstallPins_.empty()) return;
+    std::vector<std::string> pins;
+    pins.swap(preInstallPins_);
+    for (const auto& p : pins) {
+      if (currentHbin_.has_value() && *currentHbin_ == p) continue;  // the head again
+      reclaimSupersededScratch(p);
+    }
+  }
+
+  // BUG-733 (W2D-T01 round 2): the lifetime of a POSTED e(). `ereturn post`
+  // (handlers_ereturn.cpp) and an estpost pseudo-estimate (handlers_aer_tables.cpp
+  // postPseudoEstimate; dispatcher.cpp sets the flag after a successful
+  // estpost) install a whole new e() into eval.eScalars / eStrings / eMatrices
+  // with no fitted model behind it, and every e() reader prefers those stores
+  // over the model result (e(N), e(df_r), `matrix c = e(b)`, colsof(e(b))).
+  // Stata replaces ALL of e() on the next estimation, so the next model
+  // install must drop the posting: before this, `ereturn post p, obs(999)`
+  // then `regress` on 60 obs answered e(N) 999 and the posted 1 x 2 e(b) in
+  // both reader layers, and an `estpost` on 60 rows answered e(N) 60 for a
+  // later fit on 40 (w2d_uncovered.log:2501 records 40).
+  //
+  // ePostedLive is true from a posting until the next setLastModel (or
+  // `ereturn clear`). The clear sits at the top of setLastModel because no
+  // ordinary fit writes the e() stores before it calls setLastModel; the three
+  // that do (runPca, runOaxaca, runTeffects) are wrapped in dispatcher.cpp
+  // (runFitWritingEFirst), which ends the posting and the recorded names below
+  // BEFORE the fit writes anything, puts both back when no model was installed
+  // (lastModelInstalls unchanged), and on a successful install records every
+  // e() name the fit left (FU-375) so the NEXT install drops them too. The
+  // dispatcher's runPostestKeepingE keeps a posting and the recorded names
+  // across test/testparm/lincom/nlcom/estat/erepost, which may re-enter
+  // setLastModel on the SAME model. Still OPEN (owned elsewhere): estadd's
+  // live writes on top of a fit (the BUG-467 estadd half) and the eclass
+  // program's `ereturn scalar` flush (program.cpp) are not recorded, so they
+  // outlive the next fit.
+  bool ePostedLive = false;
+  // Stata's ordered e() name lists (`: e(scalars)`, `: e(macros)`,
+  // `: e(matrices)`) for ONE fit, published by the fit handler for the paths
+  // whose whole Stata namespace it posts (estimation_m4.cpp
+  // installENameContractM4). Stata lists names in its e() store's own order
+  // (StataBE 19.5: macros newest-first, matrices `b V` then newest-first,
+  // scalars the store's order), which PIET's lazily resolved e() cannot
+  // reproduce from its stores, so the fit names the order. A kind left nullopt
+  // is not claimed and keeps the honest refusal. `missingScalars` are listed
+  // names Stata posts with a missing value (ivregress's e(df_r)), which
+  // resolve to `.` without a store entry. Read only through eNameOrderFor.
+  struct ENameContract {
+    std::uint64_t fitSerial = 0;
+    std::string cmd;
+    std::optional<std::vector<std::string>> scalars, macros, matrices;
+    std::vector<std::string> missingScalars;
+  };
+  std::optional<ENameContract> eNameContract;
+  // The contract's list for `kind`, only while the live e() is still exactly
+  // that fit's posting: the same fit serial, no `ereturn post`/estpost on top,
+  // the same e(cmd), every listed name resolving, and no store holding a name
+  // the list lacks (an estadd'ed scalar, say). Otherwise nullopt, and the
+  // caller falls back to the completeness rule above. session_state.cpp.
+  std::optional<std::vector<std::string>> eNameOrderFor(const std::string& kind) const;
+  // `set rng NAME` (dispatcher.cpp), read back by c(rng).
+  std::string rngSetting = "default";
+  // `ereturn post ..., esample(VAR)` (handlers_ereturn.cpp runPost): the posted
+  // e() has no LastModel, so its e(sample) is the mask column installed under
+  // THIS serial (the same `__piet_esample__` column and serial scheme a fit
+  // uses, SessionState::esampleColumnInstalls). 0 = the posting has no mask
+  // (e(sample) is 0, as Stata answers after a post without esample()). Read
+  // only while ePostedLive; reset with every e() replacement (lastModel_reset,
+  // supersedePostedE) and carried by estimates store/restore (StoredModel).
+  unsigned long long ePostedEsampleSerial = 0;
+  unsigned long long lastModelInstalls = 0;
+  // W2D-T01 round 3: the e() names an eclass program wrote with `ereturn local`
+  // while no posting was live -- on top of the installed fit, or of an empty e().
+  // Stata keeps them until the next model is fit (help return: estimation results
+  // persist until the next model is fit) and leaves them alone on
+  // test/lincom/nlcom/estat/erepost of the same model (dispatcher.cpp
+  // runPostestKeepingE). Dropped at every install (setLastModel, and before the
+  // pre-install writers in runFitWritingEFirst); emptied with the stores
+  // (lastModel_reset); carried by `estimates store`/`restore` (StoredModel).
+  // runFitWritingEFirst also records here every e() name a pca/oaxaca/teffects
+  // fit wrote before its install (FU-375). A name is erased from all three
+  // stores: the e() namespace is one namespace (eval/session.h setEString /
+  // setEScalar), and at a new install every old entry under it is stale.
+  std::vector<std::string> eOnFitNames;
+  void noteEOnFit(const std::string& name) {
+    if (std::find(eOnFitNames.begin(), eOnFitNames.end(), name) == eOnFitNames.end())
+      eOnFitNames.push_back(name);
+  }
+  void dropEOnFit() {
+    for (const auto& n : eOnFitNames) {
+      eval.eStrings.erase(n);
+      eval.eScalars.erase(n);
+      eval.eMatrices.erase(std::remove_if(eval.eMatrices.begin(), eval.eMatrices.end(),
+                                          [&](const auto& p) { return p.first == n; }),
+                           eval.eMatrices.end());
+    }
+    eOnFitNames.clear();
+  }
+  void supersedePostedE() {
+    if (!ePostedLive) return;
+    eval.eScalars = eval::OrderedFloatDict();
+    eval.eStrings.clear();
+    eval.eMatrices.clear();
+    ePostedLive = false;
+    ePostedEsampleSerial = 0;
+  }
+
   // Mirrors the result JSON into eval.lastModelResult: the macro layer's
   // _b[]/_se[]/e() resolver (macros.cpp resolveEstScalarRefs) reads the
   // embedded EvalSession, not lastModel_, so scalar/local/if expressions
   // must see the same estimation the display path sees.
   void setLastModel(LastModel m) {
-    lastModel_ = std::move(m);
+    if (m.fitWexp.empty() && !m.fitWeight.empty()) m.fitWexp = commandWexp;
+    supersedePostedE();  // BUG-733: a posted e() ends here (see above)
+    dropEOnFit();        // round 3: so do keys written on top of the previous fit
+    ++lastModelInstalls;
+    // eb-order T-P3 part 0: a NEW e() (another fit serial, or none live) owns
+    // no estimation block and no e(b)/e(V) until it writes its own. Every fit
+    // that has an e(b) writes its block AFTER this call (csdid, oaxaca and
+    // teffects included) and posts its e(b)/e(V) after it, so a fit that has
+    // none (pca, rdrobust, rddensity) leaves no block and the previous fit's
+    // can never answer for it. A copy of the live model keeps both.
+    const bool sameFit = lastModel_.has_value() && lastModel_->fitSerial == m.fitSerial;
+    if (!sameFit) {
+      // A new fit replaces e() whole, so what `estadd` attached to the previous
+      // e() goes with it -- also when the new fit repeats the same specification,
+      // which the bag's fingerprint (depvar|estimator|N|k) cannot tell apart
+      // (w2ak_estout_family: `estadd r(mean)` at do:191, then `regress y x1 x2`
+      // at :221 left e(mean) live). estadd mirrored the additions into the e()
+      // stores (mirrorIntoEStores), so they leave those too. A re-install of the
+      // SAME fit (test, lincom) keeps them.
+      dropEstAddedMirrors();
+      estAddedClear();
+      lastEstBlock.reset();
+      eval.eMatrices.erase(std::remove_if(eval.eMatrices.begin(), eval.eMatrices.end(),
+                                          [](const auto& p) { return p.first == "b" || p.first == "V"; }),
+                           eval.eMatrices.end());
+    }
     // W2 esttabnames: a new e() is not a stored one. `estimates restore` sets
     // the name again AFTER calling here (estimates.ado Store/Restore keep the
     // hidden e(_estimates_name) on the results, so a fresh fit has none).
-    activeEstimatesName.clear();
+    // W2AK: a re-install of the SAME fit (a post-estimation command such as
+    // `test` copying the live model back) keeps it -- Stata's e() is untouched
+    // there, so a later `estadd` still reaches the stored copy (w2ak ek_d01).
+    if (!lastModel_.has_value() || lastModel_->fitSerial != m.fitSerial) {
+      activeEstimatesName.clear();
+    }
+    lastModel_ = std::move(m);
     // BUG-518 (W2 predictframe, 2026-09-19): the frame a model was FIT on must
     // exist ON DISK for as long as the model is live. Every fit handler records
     // `lm.dataPath = *session.currentHbin()`, and after a resident `generate`
@@ -1328,7 +1880,7 @@ class SessionState {
     // the delimited form `e(cmd)', the bare form e(cmd) (BUG-456) and `ereturn
     // list` (which now reads the store) cannot disagree. Before this, only
     // pca/oaxaca/estadd wrote the store and `e(cmd)' was EMPTY after regress
-    // while `ereturn list` printed "feols" (plans/bug456-20260908 E0/E1).
+    // while `ereturn list` printed "feols" (internal notes bug456-20260908 E0/E1).
     // An empty depvar (pca) ERASES the macro rather than publishing "".
     eval.setEString("cmd", lastModel_->stataCmd.empty() ? lastModel_->cobraCmd
                                                         : lastModel_->stataCmd);
@@ -1361,9 +1913,15 @@ class SessionState {
       const bool robustLike = (v == "hc1");
       const bool clusterLike = (v == "cluster" || v == "twoway" || v == "multiway");
       const bool engineSpelling = v.empty() || v == "iid" || robustLike || clusterLike;
-      eval.setEString("vce", robustLike ? std::string("robust")
-                                        : clusterLike ? std::string("cluster") : v);
-      if (engineSpelling) {
+      eval.setEString("vce", lastModel_->eVce.has_value()
+                                 ? *lastModel_->eVce
+                                 : robustLike ? std::string("robust")
+                                              : clusterLike ? std::string("cluster") : v);
+      if (lastModel_->eVce.has_value() && *lastModel_->eVce == "linearized") {
+        // a `svy:` fit (cacheLastModelM4): StataBE 19.5 `svy: regress` e(vce)
+        // linearized, e(vcetype) Linearized (BUG-1513)
+        eval.setEString("vcetype", "Linearized");
+      } else if (engineSpelling) {
         eval.setEString("vcetype", (robustLike || clusterLike) ? "Robust" : "");
       } else if (lastModel_->stataCmd != "teffects") {
         eval.setEString("vcetype", "");
@@ -1388,10 +1946,25 @@ class SessionState {
                                 : wt == "pw" ? "pweight"
                                              : std::string();
       eval.setEString("wtype", wtype);
-      eval.setEString("wexp", wtype.empty() ? std::string() : "= " + lastModel_->fitWeight);
+      // The ivreg2-family ados store "=" + the expression with no blank after
+      // the equals sign (StataBE 19.5, BUG-1530: ivreg2/xtivreg2/ivreghdfe
+      // `[aw=wf]` and `[aw = wf]` -> "=wf", `[aw=wf ]` -> "=wf "), where regress,
+      // reghdfe, ivregress and areg store "= wf". A first stage stored by
+      // savefirst (cobraCmd feols) is left as it was.
+      const std::string& sc = lastModel_->stataCmd;
+      const bool ivreg2Family =
+          (sc == "ivreg2" || sc == "xtivreg2" || sc == "ivreghdfe") && lastModel_->cobraCmd != "feols";
+      eval.setEString("wexp", wtype.empty() ? std::string()
+                                             : (ivreg2Family ? "=" : "= ") +
+                                                   (lastModel_->fitWexp.empty()
+                                                        ? lastModel_->fitWeight
+                                                        : lastModel_->fitWexp));
       // reghdfe's e(resid) names the residual column of ONE fit (BUG-539);
-      // runRegress re-posts it after this call when the option was given.
-      eval.setEString("resid", "");
+      // runRegress re-posts it after this call when the option was given. A
+      // re-install of the SAME fit (setEstHandleM4, reached by lincom/test)
+      // keeps it (w2n_followups.log:673/:682/:741 D02/D03/D06: e(resid) is
+      // still `_reghdfe_resid` / `myres` after `quietly lincom x1`).
+      if (!sameFit) eval.setEString("resid", "");
     }
   }
 
@@ -1491,6 +2064,7 @@ class SessionState {
     for (const auto& kv : namedGraphs) {
       total += static_cast<int64_t>(kv.first.size() + kv.second.dump().size());
     }
+    total += sersets.bytes();  // serset-twoway SS: the graphs' sersets
 
     // 4. open postfiles — Σ open post-buffer bytes accumulating until postclose
     //    (§2.2): the parallel name/type arrays + every staged (kind,text) cell.
@@ -1608,12 +2182,25 @@ class SessionState {
   // grid panel.
   std::optional<nlohmann::ordered_json> lastGraph;
   std::map<std::string, nlohmann::ordered_json> namedGraphs;
+  // graph-family AI-4: per graph in memory, what `graph describe` reports
+  // ({family, command, scheme, ysize, xsize, date, time}; serset::makeGraphMeta),
+  // and the name of the current graph (the last drawn, displayed or used one).
+  std::map<std::string, nlohmann::ordered_json> graphMeta;
+  std::string currentGraph;
+  // serset-twoway SS: the sersets of the graphs in memory (piet/serset.h). Every
+  // graph registration (serset::registerGraph) replaces its graph's sersets;
+  // `graph drop`, `serset clear` and `clear all` drop them.
+  serset::Store sersets;
 
   // -- last margins result (M4a, marginsplot) — session._last_margins /
   // _last_margins_dydx: cached after each successful `margins` run so
   // `marginsplot` can plot it without re-running cobra.
   std::optional<nlohmann::ordered_json> lastMargins;
   std::vector<std::string> lastMarginsDydx;
+
+  // -- the last successful `correlate`'s r(C): a correlate that finds no or one
+  // usable row posts it again beside r(N) = 0 (StataBE 19.5, 2026-11-03).
+  std::optional<eval::EvalMatrix> lastCorrelateC;
 
   // -- history ---------------------------------------------------------------
   void addHistory(const std::string& cmd, bool success);
@@ -1632,12 +2219,46 @@ class SessionState {
                                                                // behavior-relevant here
   // BS-005 (B-data): vars carrying a USER-issued `format` command — a subset of
   // varMeta (which ALSO holds .dta-loaded default formats via applyDtaMeta).
-  // browse/list expose ONLY these, so a freshly-loaded .dta (no user format) is
-  // browse-byte-identical to before this phase.
+  // Since format-display-default-lifecycle no reader gates on it (browse/list
+  // take every column's format from displayFormat); kept as the record of
+  // which formats a `format` command set.
   std::set<std::string> userFormattedVars;
   std::map<std::string, std::string> varLblname;              // varname -> label-set name
   std::map<std::string, std::map<std::string, std::string>> labelDefs;  // lblname -> {code:text}
   std::map<std::string, std::map<int, std::string>> valueLabels;        // varname -> {code:text}
+  // Stata lists value-label sets most-recently defined/added/modified FIRST
+  // (`label dir`, bare `label list`; w2ao_label_family.log:1301 lb_dir `zz_lbl
+  // keep_lbl negative_lbl grade_drop`, created in the reverse order). The
+  // `label define` stamp of each set; a set without one (read from a file) is
+  // older than every stamped set. Only the order readers consult it.
+  std::map<std::string, unsigned long long> labelSeq;
+  unsigned long long labelSeqNext = 0;
+  // LBL-LANGUAGE ([D] label language): each language holds its own variable
+  // labels and value-label ATTACHMENTS (the label sets themselves are shared).
+  // The current language's live in varMeta/varLblname; the others are stashed
+  // here. `labelLangs` is the creation order (r(languages)).
+  struct LabelLangStore {
+    std::string dataLabel;
+    std::map<std::string, std::string> varLabels;
+    std::map<std::string, std::string> varLblname;
+  };
+  std::string labelLang = "default";
+  std::vector<std::string> labelLangs{"default"};
+  std::map<std::string, LabelLangStore> labelLangStash;
+  void stampLabelSet(const std::string& name) { labelSeq[name] = ++labelSeqNext; }
+  // The defined set names in Stata's listing order (newest first; unstamped
+  // sets after the stamped ones, alphabetically).
+  std::vector<std::string> labelSetOrder() const {
+    std::vector<std::string> names;
+    for (const auto& kv : labelDefs) names.push_back(kv.first);
+    std::stable_sort(names.begin(), names.end(), [this](const std::string& a, const std::string& b) {
+      const auto ia = labelSeq.find(a), ib = labelSeq.find(b);
+      const unsigned long long sa = ia == labelSeq.end() ? 0 : ia->second;
+      const unsigned long long sb = ib == labelSeq.end() ? 0 : ib->second;
+      return sa > sb;
+    });
+    return names;
+  }
 
   // FIX:PIET-SAVE-DTA-CHARS-CARRIAGE: the two blocks a .dta's own metadata
   // carries that applyDtaMeta() used to leave unread (handlers.cpp) — see that
@@ -1671,25 +2292,47 @@ class SessionState {
     return out;
   }
 
-  // BS-005 (BETA B-data, D6): `format VAR %fmt` is a display-layer session
-  // attribute (varMeta[name].format — the SAME field applyDtaMeta() already
-  // populates from a .dta's own native formats; handlers_m3.cpp's runFormat
-  // is the new writer). Mirrors valueLabelMapForBrowse() immediately above:
-  // reshape into the {varname -> fmt} vector-of-pairs shape
-  // Datastore::browse() consumes, SPARSE (only variables with an explicitly
-  // set format appear) so a .do file that never calls `format` gets a
-  // byte-identical browse()/list JSON to before this phase (freeze safety —
-  // the format key is only ever added to a column's JSON when this map has
-  // an entry for it; see Datastore::browse()'s own lookup).
-  std::vector<std::pair<std::string, std::string>> formatMapForBrowse() const {
-    std::vector<std::pair<std::string, std::string>> out;
-    for (const auto& [varname, meta] : varMeta) {
-      if (userFormattedVars.count(varname) && meta.format.has_value() && !meta.format->empty()) {
-        out.emplace_back(varname, *meta.format);
-      }
-    }
-    return out;
-  }
+  // ── format-display-default-lifecycle: the ONE display-format resolver ─────
+  //
+  // "The display format of variable v", for every reader: `: format` (the
+  // eval projection, syncEvalVarLabels), describe, codebook, list/browse, the
+  // varlist cards (varlistWithMetaFrom), tsset's current format and the
+  // var_detail route. In order:
+  //   1. the format this session holds for v (varMeta[v].format: a `format`
+  //      command, a .dta's or an .hbin header's own format adopted at load,
+  //      or a creation default a verb pinned before it changed v's type);
+  //   2. the format the card's file states (VarInfo::formatStated);
+  //   3. Stata's default for v's DECLARED storage type (defaultDisplayFormat):
+  //      byte/int %8.0g, long %12.0g, float %9.0g, double %10.0g, str# %#s
+  //      with a minimum width of 9, strL %9s ([D] format; w2p_estim_ev.log
+  //      :1725-1827). No claim: %9.0g numeric, %9s string.
+  // Step 3 is DERIVED at read time and never stored: hbinMetaPatch writes only
+  // step 1, so a saved header states no format the session did not hold (the
+  // BUG-198 absent-vs-empty law) and the reload derives the same default from
+  // the type the checkpoint carries (adoptCheckpointTsDecl).
+  static std::string defaultDisplayFormat(const std::optional<std::string>& stataType,
+                                          bool isString);
+  std::string displayFormat(const VarInfo& v) const;
+  // {name -> resolved format} for the given card entries (all of them), the
+  // shape Datastore::browse() takes: every listed column carries the format
+  // its cells are displayed in, not only the ones a `format` command set.
+  std::vector<std::pair<std::string, std::string>> displayFormatMap(
+      const std::vector<VarInfo>& card) const;
+  // Before a verb changes v's storage type: hold the format v displays now as
+  // the session's own (step 1 above), because Stata keeps the format a variable
+  // was created with (`recast double` of a float stays %9.0g, a widening
+  // replace of a byte keeps %8.0g: internal capture
+  // exprfns_contract_oracle.log:735/:736). No-op when v already has one.
+  void pinDisplayFormat(const VarInfo& v);
+  // Before a verb changes v's storage type (recast, compress): a numeric keeps
+  // the format it displays now (pinDisplayFormat); a string's DEFAULT format
+  // follows its new width instead (`recast str20` of a str4 displays %20s,
+  // `compress` of a str20 holding "ab" leaves str2 %9s, and a replace that
+  // widens str12 to str14 displays %14s: w2af_format_lifecycle.log
+  // af_recast_str4_str20, af_compress, af_replace_str12_str14), so a held
+  // format equal to the old width's default is dropped and an explicit one
+  // (%-12s) stays.
+  void prepareStorageChange(const VarInfo& v);
 
   void setVarLabel(const std::string& varname, const std::string& label) {
     varMeta[varname].label = label;
@@ -1822,6 +2465,18 @@ class SessionState {
     virtualSaveMeta_[path] = std::move(meta);
   }
   void seedVarMetaFromVirtualSave(const std::string& path);
+  // format-display-default-lifecycle: merge and append bring in a using
+  // variable with the format the using file states for it (Stata's tempfile is
+  // a .dta: w2af_format_lifecycle.log af_merge `double|%7.3f`). A virtual save
+  // states it only here, beside the path, so the variables in `names` that hold
+  // no format of their own adopt the one recorded for `path`.
+  void adoptVirtualSaveFormats(const std::string& path, const std::vector<std::string>& names);
+  // The whole format/label layer recorded beside a virtual save (nullptr when
+  // `path` has none): merge/append/joinby read a using variable's label too.
+  const std::vector<cecon::ColMetaPatch>* virtualSaveMetaOf(const std::string& path) const {
+    auto it = virtualSaveMeta_.find(path);
+    return it == virtualSaveMeta_.end() ? nullptr : &it->second;
+  }
   // BUG-291: every varname-keyed metadata plane must forget a column the moment
   // that column leaves the frame. Before this existed, the only eraser in the
   // tree was rename's (handlers_data_verbs.cpp), so `gen double x` -> `drop x`
@@ -1842,6 +2497,9 @@ class SessionState {
     implicitFloatVars.clear();
     userFormattedVars.clear();
     labelDefs.clear();
+    labelLang = "default";
+    labelLangs = {"default"};
+    labelLangStash.clear();
     varLblname.clear();
     valueLabels.clear();
     dataLabel.clear();
@@ -1977,25 +2635,83 @@ class SessionState {
   // Stata's tempfile IS a .dta whose _dta chars carry it: a checkpoint saved
   // declared comes back declared, one saved un-declared comes back un-declared
   // (w2_eststo_prefix.log:478-500 B2 applied to the tempfile container).
+  //
+  // BUG-922 (FU-752/FU-792): the same record carries the rest of what a .dta
+  // states and an hbin header cannot: each variable's declared storage type,
+  // the value-label attachments and definitions, and the dataset label. Stata's
+  // tempfile IS a .dta, so `save `t'` / `use `t', clear` must hand back
+  // double/long/byte/int/str#, `: value label b` and the label set exactly
+  // (oracle w2_prog_controlflow pc_tf_use_types, pc_tf_use_labels, pc_tf_rehop).
+  // The hbin header keeps carrying format and variable label (hbinMetaPatch /
+  // seedVarMetaFromVirtualSave); this record is the other half, recorded by
+  // the save plane's two arms through the one call below (noteCheckpointTsDecl,
+  // virtual and disk alike) and restated by `use` through the one call both of
+  // its planes make (adoptCheckpointTsDecl, after clearMetadata). Before, the
+  // types fell back to float and the labels were lost.
   struct CheckpointTsDecl {
     std::optional<std::string> panelvar;
     std::optional<std::string> timevar;
     std::optional<double> delta;
+    std::map<std::string, std::string> stataTypes;  // variable -> declared storage type
+    std::set<std::string> implicitFloat;            // gen's implicit float (implicitFloatVars)
+    std::map<std::string, std::string> varLblname;  // variable -> value-label set name
+    std::map<std::string, std::map<std::string, std::string>> labelDefs;
+    std::map<std::string, std::map<int, std::string>> valueLabels;
+    std::string dataLabel;
+    // The char table (notes `_dta[note1]`, `x[note0]`, user chars): a native
+    // checkpoint has no table of its own, so it rides beside the path like the
+    // label layer (w2aw_data_combine_family.log dc_ml_notes: notes saved to a
+    // tempfile are there after `use`).
+    std::vector<DtaCharacteristic> characteristics;
+    std::string labelLang;
+    std::vector<std::string> labelLangs;
+    std::map<std::string, LabelLangStore> labelLangStash;
   };
   void noteCheckpointTsDecl(const std::string& path) {
-    checkpointTsDecl_[path] = CheckpointTsDecl{panelvar, timevar, delta};
+    CheckpointTsDecl ck{panelvar, timevar, delta};
+    for (const auto& [name, vm] : varMeta)
+      if (vm.stataType.has_value() && !vm.stataType->empty()) ck.stataTypes[name] = *vm.stataType;
+    ck.implicitFloat = implicitFloatVars;
+    ck.varLblname = varLblname;
+    ck.labelDefs = labelDefs;
+    ck.valueLabels = valueLabels;
+    ck.dataLabel = dataLabel;
+    ck.characteristics = characteristics;
+    ck.labelLang = labelLang;
+    ck.labelLangs = labelLangs;
+    ck.labelLangStash = labelLangStash;
+    checkpointTsDecl_[path] = std::move(ck);
   }
   // `use` of a native checkpoint: false when this session never saved `path`
   // (the caller then keeps its own rule); true after restating the declaration
-  // recorded at save time, including "none".
+  // recorded at save time, including "none", and (BUG-922) the type and
+  // value-label layer recorded with it.
   bool adoptCheckpointTsDecl(const std::string& path) {
     auto it = checkpointTsDecl_.find(path);
     if (it == checkpointTsDecl_.end()) return false;
     panelvar = it->second.panelvar;
     timevar = it->second.timevar;
     delta = it->second.delta;
+    characteristics = it->second.characteristics;
     writeTsChars();
+    for (const auto& [name, t] : it->second.stataTypes) varMeta[name].stataType = t;
+    implicitFloatVars = it->second.implicitFloat;
+    varLblname = it->second.varLblname;
+    labelDefs = it->second.labelDefs;
+    valueLabels = it->second.valueLabels;
+    dataLabel = it->second.dataLabel;
+    labelLang = it->second.labelLang;
+    labelLangs = it->second.labelLangs;
+    labelLangStash = it->second.labelLangStash;
     return true;
+  }
+  // BUG-922: the storage types a native checkpoint recorded at its save (empty
+  // when this session never saved `path`) -- the tempfile counterpart of the
+  // .dta sidecar's stata_type, for a verb that reads `using` a checkpoint.
+  std::map<std::string, std::string> checkpointStataTypes(const std::string& path) const {
+    auto it = checkpointTsDecl_.find(path);
+    return it == checkpointTsDecl_.end() ? std::map<std::string, std::string>{}
+                                         : it->second.stataTypes;
   }
   // A native checkpoint's recorded declaration, or nullptr (merge's using side).
   const CheckpointTsDecl* checkpointTsDecl(const std::string& path) const {
@@ -2488,6 +3204,22 @@ class SessionState {
   // tell the two cases apart. See doexec.cpp's DoExecDepthGuard.
   int doExecDepth = 0;
 
+  // BUG-922: nested do-files that own a preserve level -- `do`/`run` FILE
+  // dispatched from a running script (dispatcher.cpp's do arm), not `include`
+  // (it runs as if typed in its caller) and not the top-level run. Stata keeps
+  // one preserved copy per program OR do-file level and restores it when that
+  // program or do-file concludes ([P] preserve: "When the program or do-file
+  // concludes, the user's data are automatically restored").
+  int doFileDepth = 0;
+
+  // BUG-1015/BUG-1459: the version the caller runs under (`version #`), 0 when
+  // none was set. A bare `version #` statement sets it until the do-file or
+  // program that set it concludes ([P] version: "the version set in a program
+  // or do-file is local to it"; StataBE: `version 12` inside a program reads
+  // 12 there and the caller's 16 after it); the `version #:` prefix sets it
+  // for its one command. table's pre-17 contents() reads it, and c(version).
+  double callerVersion = 0.0;
+
   // BUG-111: monotonic per-session counter so each `tempfile NAME` / `tempname NAME`
   // CALL mints a UNIQUE path/basename (Stata's `__000001`, `__000002`, … scheme).
   // The old scheme keyed the file purely on NAME (`<dir>/NAME.tmp`) / on epoch
@@ -2530,7 +3262,7 @@ class SessionState {
   // the ledger that owns it, or to ORPHAN. Env-gated (PIET_SCRATCH_CENSUS) —
   // it is a full recursive walk with a stat and a canonicalization per file.
   //
-  // Why it exists: ADDENDUM 6 of plans/GA-SWEEP-CENSUS-20260822.md measured a
+  // Why it exists: ADDENDUM 6 of internal note GA-SWEEP-CENSUS-20260822.md measured a
   // scratch floor that grows LINEARLY in wall time (3.37 GiB/hour, R^2 0.9981)
   // and that PIET_SCRATCH_BUDGET_MB cannot touch — so by construction it is not
   // superseded scratch. The two classes THIS header names above (projection
@@ -2578,8 +3310,26 @@ class SessionState {
   // superseded, and a tempfile is superseded by nothing.
   std::vector<std::pair<int, std::string>> mintedTempfiles;
 
+  // BUG-922: the names `tempvar` and `tempname` mint, tagged with the
+  // preserveLevel() that minted them, the same way as mintedTempfiles. Stata
+  // drops a program's or nested do/run file's temporary variables, scalars and
+  // matrices when it concludes (oracle w2_prog_controlflow pc_tv_gone and
+  // w2ad_prog_preserve_nest pn_tv_do_gone: `confirm variable/scalar` on the
+  // names afterwards are r(111)); program::concludeLevel drops the entries
+  // deeper than the caller's level.
+  std::vector<std::pair<int, std::string>> mintedTempvars;
+  std::vector<std::pair<int, std::string>> mintedTempnames;
+
   // -- preserve/restore LIFO snapshot stack (preserve_restore.py, M3a) -----
   std::vector<PreserveFrame> preserveStack;
+  // BUG-922: `restore, not` -- forget the top preserved copy without putting
+  // it back (its worker stash is released). The caller checks that the copy
+  // is its own (ownPreserveFrame).
+  void discardTopPreserve();
+  // BUG-922: the one reach predicate. The top frame iff the level now running
+  // preserved it, else nullptr. `preserve` (r(621)), `restore`, `restore, not`
+  // and `restore, preserve` (r(622)) all ask this, and nothing else.
+  const PreserveFrame* ownPreserveFrame() const;
 
   // -- user-defined programs (program.py, M3a S6/S7) -----------------------
   // session._programs: canonical-case name -> ProgramDef. std::map (not
@@ -2589,6 +3339,11 @@ class SessionState {
   // so map vs unordered_map is not itself behavior-relevant, but map keeps
   // debugging/iteration order stable.
   std::map<std::string, ProgramDef> programs;
+  // The ado file whose program is running (ProgramDef::ado), empty outside
+  // one. An ado file's other programs are private to it ([U] 17.11): they are
+  // stored under `<ado>.<name>` and only a program of that same file finds
+  // them by their short name.
+  std::string adoContext;
 
   // BUG-342: capture-time copies of every `program define` block seen in the
   // do-file currently being preprocessed, keyed the same way. `programs` is the
@@ -2630,6 +3385,19 @@ class SessionState {
   // session._prog_call_depth: recursion guard counter for run_program.
   int progCallDepth = 0;
 
+  // BUG-922: the preserve level of the code now running: one step per program
+  // call and per nested do/run file. A PreserveFrame records it; a second
+  // `preserve` at the same level is r(621); the program or do-file that ends
+  // restores every frame deeper than its caller's level.
+  int preserveLevel() const { return progCallDepth + doFileDepth; }
+
+  // BUG-920: loops::loopBodyDepth() when the program or nested do/run file now
+  // running started. A `continue` is in context only inside a loop body of its
+  // own level: a program or do-file run from a loop body starts outside any
+  // loop (oracle w2ad_prog_preserve_nest pn_lm_cb_prog, pn_lm_cb_do: r(119)
+  // at every iteration). program::LoopFloorGuard sets and restores it.
+  int loopBodyFloor = 0;
+
   // session._postfiles: handle name -> open PostHandle (S8/M3b, postfile.py).
   std::map<std::string, PostHandle> postfiles;
 
@@ -2644,6 +3412,11 @@ class SessionState {
     bool append = false;
     std::FILE* fp = nullptr;
     bool eof = false;      // last `file read` hit end-of-file -> r(eof)
+    // BUG-1526: `binary` mode, `read write` (both verbs on one handle) and the
+    // byte order of its multibyte elements (hilo = most significant first).
+    bool binary = false;
+    bool readWrite = false;
+    bool hilo = false;
   };
   std::map<std::string, FileHandle> fileHandles;
 
@@ -2821,6 +3594,23 @@ class SessionState {
     return dep + "|" + est + "|" + n + "|" + std::to_string(k);
   }
 
+  void dropEstAddedMirrors() {
+    for (const char* kind : {"scalars", "locals"}) {
+      if (!estAdded.contains(kind) || !estAdded[kind].is_object()) continue;
+      for (const auto& kv : estAdded[kind].items()) {
+        eval.eScalars.erase(kv.key());
+        eval.eStrings.erase(kv.key());
+      }
+    }
+    if (estAdded.contains("matrices") && estAdded["matrices"].is_object()) {
+      for (const auto& kv : estAdded["matrices"].items()) {
+        const std::string n = kv.key();
+        eval.eMatrices.erase(std::remove_if(eval.eMatrices.begin(), eval.eMatrices.end(),
+                                            [&](const auto& p) { return p.first == n; }),
+                             eval.eMatrices.end());
+      }
+    }
+  }
   void estAddedClear() {
     estAdded = nlohmann::ordered_json{{"scalars", nlohmann::ordered_json::object()},
                                       {"locals", nlohmann::ordered_json::object()},
@@ -2870,6 +3660,33 @@ class SessionState {
     eval::OrderedFloatDict eScalars;
     eval::OrderedDict eStrings;
     std::vector<std::pair<std::string, eval::EvalMatrix>> eMatrices;
+    // W2D-T01 round 3: SessionState::eOnFitNames as it stood at the store, so
+    // the next fit after `estimates restore` drops them again.
+    std::vector<std::string> eOnFitNames;
+    // e(sample) T3: the store wrote the variable `_est_<name>` (byte, 1 = in
+    // e(sample)) on the data, as estimates.ado Store does (`_est hold ...,
+    // varname(_est_<name>)`; w2_esample.log:1361 G0b `0|28|`). `estimates
+    // restore` reads e(sample) back from that variable, and `estimates drop`/
+    // `clear` drop it. False when the store could not write it (no data, or a
+    // model whose e(sample) PIET does not have): the restore then stays a named
+    // r(198) and a same-named variable the user made is never read as a mask.
+    bool esampleVar = false;
+    // A stored POSTED e() (no lastModel): its `ereturn post ..., esample()`
+    // mask serial (SessionState::ePostedEsampleSerial), restored with it. The
+    // reading still checks the cells, so a column another install has since
+    // replaced is refused, never read as this posting's rows.
+    unsigned long long postedEsampleSerial = 0;
+    // FU-1176: an `ereturn post` e() with an e(cmd) (an eclass program's own
+    // results): no fitted model and no estimation block, only the e() stores
+    // and the coeftable mirror in lastModelResult. `estimates restore`
+    // reinstalls it as the posted e() it was.
+    bool postedE = false;
+    // BUG-1414: the fit's published e() name lists (eNameContract) as they
+    // stood at the store. The restored LastModel keeps its fit serial, so after
+    // `estimates restore` the lists answer again, as they do right after the
+    // fit (StataBE 19.5: regress, store, `ereturn clear`, restore, then
+    // `matrix S = e(nosuch)` is the 1x1 missing, rc 0).
+    std::optional<ENameContract> eNameContract;
   };
   std::map<std::string, std::shared_ptr<const StoredModel>> estimatesModels;
 
@@ -2899,6 +3716,13 @@ class SessionState {
   // The ONE writer of estimatesModels: a re-store under the same name releases
   // the previous model's pins before the new model takes its own.
   void estimatesModelSet(const std::string& name, std::shared_ptr<const StoredModel> sm) {
+    // W2D-T01 round 3: the snapshot of the ACTIVE e() (eststo_esttab.cpp, the
+    // only caller) also carries the names that sit on top of the fit.
+    if (sm && sm->lastModel.has_value() && !eOnFitNames.empty()) {
+      auto withNames = std::make_shared<StoredModel>(*sm);
+      withNames->eOnFitNames = eOnFitNames;
+      sm = std::move(withNames);
+    }
     estimatesModelErase(name);
     if (sm) pinStoredModel(*sm, +1);
     estimatesModels[name] = std::move(sm);
@@ -2940,20 +3764,41 @@ class SessionState {
   // results with no replayable model, e.g. estpost) and is not already the
   // active results; the caller refuses by name. The §31 engine handle is
   // dropped: the next lincom/test re-specifies the model rather than trusting
-  // a handle minted in an earlier state of the worker. Not restored: e(sample).
+  // a handle minted in an earlier state of the worker. e(sample) is left a named
+  // r(198) here (kUnavailable); the one caller, handlers' runEstimatesRestore
+  // (eststo_esttab.cpp), then installs the mask from `_est_NAME` (T3).
   bool estimatesRestore(const std::string& name) {
     const auto it = estimatesModels.find(name);
     if (it == estimatesModels.end() || !it->second) return false;
     const std::shared_ptr<const StoredModel> sm = it->second;
-    if (!sm->lastModel.has_value()) return activeStoredName() == name;
-    LastModel lm = *sm->lastModel;
-    lm.estHandle.clear();
-    setLastModel(std::move(lm));
+    if (!sm->lastModel.has_value()) {
+      if (activeStoredName() == name) return true;
+      // eb-order T-P3 (SPEC C, `estimates restore` of an estpost store): a
+      // store with an estimation block but no fitted model behind it (an
+      // estpost posting; runEststo stashes its e() stores) is installed as the
+      // posted e() it was -- no LastModel, its block, its stores -- exactly as
+      // postPseudoEstimate installed it, so the next fit supersedes it.
+      if (!sm->estBlock.has_value() && !sm->postedE) return false;
+      lastModel_reset();
+      ePostedLive = true;
+      ePostedEsampleSerial = sm->postedEsampleSerial;
+    } else {
+      LastModel lm = *sm->lastModel;
+      lm.estHandle.clear();
+      // e(sample) T2: the stored LastModel may say kColumn, but the column on the
+      // data now holds whichever fit ran LAST, not this one's sample. The default
+      // is the named refusal, never another model's rows; runEstimatesRestore
+      // replaces it with the mask it installs from `_est_NAME` (T3).
+      lm.esample = LastModel::EsampleState::kUnavailable;
+      setLastModel(std::move(lm));
+    }
     lastEstBlock = sm->estBlock;
     eval.lastModelResult = sm->lastModelResult;
     eval.eScalars = sm->eScalars;
     eval.eStrings = sm->eStrings;
     eval.eMatrices = sm->eMatrices;
+    eOnFitNames = sm->eOnFitNames;  // round 3: setLastModel above emptied the live record
+    eNameContract = sm->eNameContract;
     estAddedClear();
     const nlohmann::ordered_json* snap = estimatesGet(name);
     if (snap != nullptr && snap->contains("added") && (*snap)["added"].is_object()) {
@@ -3016,56 +3861,58 @@ class SessionState {
     }
   }
 
-  // W2 esttabnames (BUG-552): ONE expansion of a stored-estimates NAMELIST, the
-  // port of Stata's est_expand.ado (the routine esttab/estout/`estimates
-  // table|dir|drop|restore` all call). Per token, in the order written:
-  //   `_all`  every stored name (an empty store adds nothing, no error)
-  //   `.`     the active results: their store name when they carry one, else
-  //           the literal "." (callers build the live snapshot); no active
-  //           results = r(301) "last estimates (.) not found"
-  //   other   Stata match() (`*` `?`, case-sensitive) against the stored
-  //           names IN STORE ORDER; no match = r(111)
-  //           "estimation result NAME not found"
-  // Oracle: tests/eval/golden/aer_w2/w2_smalls.log section G (`A_*`, `*`,
-  // `A_? B_1`, `.`, `Z_*` -> r(111)) and w2_cmdtriage.log section C
-  // (`estimates restore nosuch` -> r(111), same message).
-  // Duplicates are kept (est_expand does not de-duplicate). rc==0 on success.
+  // Stored-estimates namelist expansion (BUG-552), shared by every consumer of
+  // a namelist. rc==0 on success; otherwise rc/message carry the Stata error.
   struct EstNamelist {
     std::vector<std::string> names;
     int rc = 0;
     std::string message;
   };
+  //
+  // Namelist grammar per [R] estimates store/table: each token is `_all`
+  // (every stored name), `.` (the active results), or a Stata match()
+  // pattern over the stored names. Groups are concatenated in written order;
+  // within a group the store order is kept; duplicates are kept (consumers
+  // that want a set de-duplicate themselves). The first failing token decides
+  // the error and the name list is then empty. Never throws.
   EstNamelist expandEstimatesNamelist(const std::vector<std::string>& tokens) const {
     EstNamelist out;
-    for (const auto& tok : tokens) {
-      if (tok == "_all") {
-        for (const auto& kv : estimates) out.names.push_back(kv.first);
-        continue;
-      }
-      if (tok == ".") {
-        if (!lastModel_.has_value() && !lastEstBlock.has_value()) {
-          out.rc = 301;
-          out.message = "last estimates (.) not found";
-          out.names.clear();
+    auto fail = [&out](int rc, std::string msg) {
+      out.names.clear();
+      out.rc = rc;
+      out.message = std::move(msg);
+    };
+    try {
+      for (const std::string& tok : tokens) {
+        if (tok == "_all") {
+          // Empty store: nothing appended, not an error.
+          for (const auto& kv : estimates) out.names.push_back(kv.first);
+          continue;
+        }
+        if (tok == ".") {
+          const bool haveActive = lastModel_.has_value() || lastEstBlock.has_value();
+          if (!haveActive) {
+            fail(301, "last estimates (.) not found");
+            return out;
+          }
+          std::string stored = activeStoredName();
+          out.names.push_back(stored.empty() ? std::string(".") : std::move(stored));
+          continue;
+        }
+        bool hit = false;
+        for (const auto& kv : estimates) {
+          if (piet::strutil::globMatch(tok, kv.first)) {
+            out.names.push_back(kv.first);
+            hit = true;
+          }
+        }
+        if (!hit) {
+          fail(111, "estimation result " + tok + " not found");
           return out;
         }
-        const std::string active = activeStoredName();
-        out.names.push_back(active.empty() ? std::string(".") : active);
-        continue;
       }
-      bool any = false;
-      for (const auto& kv : estimates) {
-        if (strutil::globMatch(tok, kv.first)) {
-          out.names.push_back(kv.first);
-          any = true;
-        }
-      }
-      if (!any) {
-        out.rc = 111;
-        out.message = "estimation result " + tok + " not found";
-        out.names.clear();
-        return out;
-      }
+    } catch (...) {
+      fail(198, "invalid namelist");
     }
     return out;
   }
@@ -3203,6 +4050,8 @@ class SessionState {
   bool c4TraceSuppress_ = false;
   std::string residentToken_;         // path the worker's resident frame corresponds to ("" = out of sync)
   bool residentDirty_ = false;        // resident frame not yet on disk at residentToken_ (VIRTUAL head)
+  std::vector<std::string> preInstallPins_;  // e(sample) T2: see pinPreInstallHead
+  bool preInstallLoadPending_ = false;        // the next load() is the install's own
   long long tokenOrphanWarns_ = 0;    // BUG-384 audit hits (see auditHeadBacked)
   std::string lastHeadAudited_;       // BUG-384: one stat per distinct head
   bool lastRunResident_ = false;      // last runViaCobraSession() took the resident leg (see lastRunWasResident)
@@ -3326,6 +4175,9 @@ class SessionState {
   // plus any `name()`d ones). Empty for the overwhelming majority of sessions,
   // which therefore still pay nothing and stay byte-identical.
   std::vector<std::unique_ptr<LogState>> logs_;
+  // SMCL logs that `log close` has already removed from logs_ but whose last
+  // frame and closed-on footer logTee() has not written yet (LogOp::Close).
+  std::vector<std::unique_ptr<LogState>> endingLogs_;
   int dispatchDepth_ = 0;
 };
 

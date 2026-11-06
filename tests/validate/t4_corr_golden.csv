@@ -1,0 +1,40 @@
+key,value
+A.correlate.N, 7.40000000000000e+01
+A.correlate.rho_lastpair,-4.68596688195187e-01
+A.C[price,price], 1.00000000000000e+00
+A.C[mpg,price],-4.68596688195187e-01
+A.C[mpg,mpg], 1.00000000000000e+00
+A.C[weight,price], 5.38611462600479e-01
+A.C[weight,mpg],-8.07174858942442e-01
+A.C[weight,weight], 1.00000000000000e+00
+A.C[length,price], 4.31831244971588e-01
+A.C[length,mpg],-7.95779438983193e-01
+A.C[length,weight], 9.46008643417811e-01
+A.C[length,length], 1.00000000000000e+00
+B.pwcorr.N_lastpair, 7.40000000000000e+01
+B.pwcorr.rho_lastpair,-4.68596688195187e-01
+B.C[price,price], 1.00000000000000e+00
+B.Nobs[price,price], 7.40000000000000e+01
+B.sig[price,price],                    .
+B.C[mpg,price],-4.68596688195187e-01
+B.Nobs[mpg,price], 7.40000000000000e+01
+B.sig[mpg,price], 2.54613120514000e-05
+B.C[mpg,mpg], 1.00000000000000e+00
+B.Nobs[mpg,mpg], 7.40000000000000e+01
+B.sig[mpg,mpg],                    .
+B.C[weight,price], 5.38611462600479e-01
+B.Nobs[weight,price], 7.40000000000000e+01
+B.sig[weight,price], 7.41617082846000e-07
+B.C[weight,mpg],-8.07174858942442e-01
+B.Nobs[weight,mpg], 7.40000000000000e+01
+B.sig[weight,mpg], 3.79848593657000e-18
+B.C[weight,weight], 1.00000000000000e+00
+B.Nobs[weight,weight], 7.40000000000000e+01
+B.sig[weight,weight],                    .
+C.correlate.N_price_rep78, 6.90000000000000e+01
+C.correlate.rho_price_rep78, 6.55327254307080e-03
+C.pwcorr.N_price_rep78, 6.90000000000000e+01
+C.pwcorr.rho_price_rep78, 6.55327254307080e-03
+C.pwcorr.sig_price_rep78, 9.57380020699579e-01
+C.pwcorr.N_rep78_rep78, 6.90000000000000e+01
+C.pwcorr.sig_diag,                    .

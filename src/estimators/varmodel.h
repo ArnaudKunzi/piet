@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — varmodel: vector autoregression matching Stata `var`, `vargranger`
 // and `irf create` (the plain-VAR branch).
 //
@@ -13,7 +15,7 @@
 // the SUR/GLS refinement is algebraically the OLS answer and the system
 // covariance is the exact Kronecker Sigma_ml (x) (X'X)^-1.
 //
-// Oracle: Stata 19.5, tests/kitchensink/pangram/waves/_oracle/p7_stata.log plus
+// Oracle: Stata 19.5, internal capture p7_stata.log plus
 // the .irf artifact it writes. Assertions in tests/unit/test_varmodel.cpp,
 // which also names the quantities this fixture CANNOT pin and why.
 #pragma once

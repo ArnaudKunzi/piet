@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "io/columnar.h"
 #include <set>
 #include <map>
@@ -33,6 +35,62 @@ static constexpr char kMagic[8] = {'C', 'E', 'C', 'O', 'N', 'H', 'B', '1'};
 static constexpr int64_t kAlign = 64;
 
 static int64_t align_up(int64_t x, int64_t a = kAlign) { return (x + a - 1) / a * a; }
+
+// Well-formed UTF-8 as nlohmann's serializer and parser both demand it (Unicode
+// Table 3-7: no overlong form, no surrogate, nothing past U+10FFFF), plus the
+// marker byte at the front.
+bool hbin_level_needs_escape(const std::string& level) {
+    if (!level.empty() && level[0] == '\0') return true;
+    const auto* p = reinterpret_cast<const unsigned char*>(level.data());
+    const size_t n = level.size();
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char c = p[i];
+        if (c < 0x80) { ++i; continue; }
+        size_t len;
+        unsigned char lo = 0x80, hi = 0xBF;
+        if (c >= 0xC2 && c <= 0xDF) len = 2;
+        else if (c == 0xE0) { len = 3; lo = 0xA0; }
+        else if (c == 0xED) { len = 3; hi = 0x9F; }
+        else if (c >= 0xE1 && c <= 0xEF) len = 3;
+        else if (c == 0xF0) { len = 4; lo = 0x90; }
+        else if (c == 0xF4) { len = 4; hi = 0x8F; }
+        else if (c >= 0xF1 && c <= 0xF3) len = 4;
+        else return true;
+        if (i + len > n || p[i + 1] < lo || p[i + 1] > hi) return true;
+        for (size_t k = 2; k < len; ++k)
+            if (p[i + k] < 0x80 || p[i + k] > 0xBF) return true;
+        i += len;
+    }
+    return false;
+}
+
+std::string hbin_level_escape(const std::string& level) {
+    static const char* kHex = "0123456789abcdef";
+    std::string out(1, '\0');
+    out.reserve(1 + 2 * level.size());
+    for (const unsigned char c : level) {
+        out += kHex[c >> 4];
+        out += kHex[c & 0xF];
+    }
+    return out;
+}
+
+std::string hbin_level_json_text(const std::string& text) {
+    return hbin_level_needs_escape(text) ? hbin_level_escape(text) : text;
+}
+
+void hbin_level_unescape(std::string& level) {
+    if (level.empty() || level[0] != '\0') return;
+    const auto nibble = [](char h) {
+        return h <= '9' ? h - '0' : h - 'a' + 10;
+    };
+    std::string out;
+    out.reserve((level.size() - 1) / 2);
+    for (size_t i = 1; i + 1 < level.size(); i += 2)
+        out += static_cast<char>((nibble(level[i]) << 4) | nibble(level[i + 1]));
+    level = std::move(out);
+}
 
 namespace {
 
@@ -211,6 +269,7 @@ struct HbinHeaderSax {
             // the vector that holds them plus the frees when it dies.
             if (skipping_levels) return true;
             cols.back().levels.push_back(std::move(v));
+            hbin_level_unescape(cols.back().levels.back());
             return true;
         }
         if (st == S::ColsArr) { error = "non-object entry in the columns array"; return false; }
@@ -218,7 +277,10 @@ struct HbinHeaderSax {
             if (col_key == "name") { cols.back().name = std::move(v); cols.back().has_name = true; }
             else if (col_key == "dtype") { cols.back().dtype = std::move(v); cols.back().has_dtype = true; }
             else if (col_key == "format") { cols.back().format = std::move(v); }
-            else if (col_key == "label") { cols.back().label = std::move(v); }  // BUG-198
+            else if (col_key == "label") {  // BUG-198; escaped as a level is (BUG-1372)
+                cols.back().label = std::move(v);
+                hbin_level_unescape(cols.back().label);
+            }
         } else if (st == S::Root) {
             if (root_key == "sorted_by") sorted_by = std::move(v);  // BUG-272
         }
@@ -726,7 +788,7 @@ Dataset Dataset::open(const std::string& path) {
     // level_materialize} split of this function's cost — instrumentation only,
     // zero behavior change, zero cost when COBRA_OPEN_PHASE_DIAG is unset (the
     // getenv is cached once per process; the disabled branch skips every
-    // steady_clock call). See plans/FLOOR-20260721-campaign/instruments/
+    // steady_clock call). See internal capture
     // rowloop_rlload_subsplit.md §5 for why: rl_load's dominant open() call
     // scales with the written frame's level-dictionary size, not row count, and
     // this settles whether that is the JSON header parse or the per-column
@@ -1321,7 +1383,12 @@ MetaPatchResult patch_hbin_meta(const std::string& path, const std::vector<ColMe
         auto it = want.find(jc["name"].get<std::string>());
         if (it == want.end()) continue;
         bool moved = key_set(jc, "format", it->second->format);
-        moved = key_set(jc, "label", it->second->label) || moved;
+        // BUG-1372: a label that is not UTF-8 is stored escaped, as a level is.
+        const std::optional<std::string>& label = it->second->label;
+        moved = key_set(jc, "label",
+                        label.has_value() ? std::optional<std::string>(hbin_level_json_text(*label))
+                                          : std::nullopt) ||
+                moved;
         if (moved) ++res.columns_changed;
     }
     // NO-OP IS BYTE-EXACT (contract item 1). This early return is the freeze

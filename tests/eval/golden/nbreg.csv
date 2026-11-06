@@ -1,0 +1,13 @@
+key,value
+coeftable[treated].b,1.591364284763040e-01
+coeftable[treated].se,1.105059108024770e-02
+coeftable[female].b,2.191174301912096e-01
+coeftable[female].se,7.815749707263900e-03
+coeftable[age_z].b,-3.423112164112300e-03
+coeftable[age_z].se,3.925114889298200e-03
+coeftable[edu_hi].b,-2.032914176876369e-01
+coeftable[edu_hi].se,7.829436717072700e-03
+coeftable[_cons].b,3.212727452690496e+00
+coeftable[_cons].se,7.030290865329500e-03
+lnalpha,-1.303036950178043e-01
+loglik,-3.132346134533490e+05

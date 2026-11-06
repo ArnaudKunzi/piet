@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 
@@ -12,7 +14,7 @@
 // which does its own lagging/differencing by time value.
 //
 // Oracle for every number: StataBE 19.5,
-// tests/kitchensink/pangram/waves/_oracle/p7_stata.log — `xtset id t` then
+// internal capture p7_stata.log — `xtset id t` then
 // `xtabond y L.y x1 x2, lags(1) vce(robust)`. Assertions in
 // tests/unit/test_xtabond.cpp.
 

@@ -1,4 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "data/datasignature.h"
+#include "data/missing.h"
 
 #include <cmath>
 #include <cstdint>
@@ -55,7 +58,8 @@ struct Fnv {
     //   · every NaN collapses to ONE missing token — NaN is the engine's missing
     //     representation and no payload bit may be allowed to perturb a signature
     //     (a reader that starts distinguishing extended missing would have to
-    //     revisit this line deliberately, which is the point of naming it);
+    //     revisit this line deliberately, which is the point of naming it; the
+    //     order-free plane, BUG-1461, adds the kind after this token);
     //   · -0.0 is canonicalized to +0.0 — the two compare equal, so a sign bit
     //     must not fork the fingerprint of equal data.
     void real(double v) {
@@ -73,9 +77,117 @@ struct Fnv {
     }
 };
 
+// The value plane of one column (stored values in row order) into both value
+// accumulators; shared by data_signature and data_signature_vars.
+void sign_values(const FrameColumn& c, int64_t nrows, Fnv& va, Fnv& vb) {
+    // ── value plane: the STORED values, in column-then-row order. A factor
+    // hashes its LEVEL STRING, not its code, so a dictionary that was rebuilt
+    // in a different order over identical data still signs its values the same
+    // (that reordering shows up in `meta`, where identity changes belong).
+    va.byte(c.is_factor ? 'S' : 'F');
+    vb.byte(c.is_factor ? 'S' : 'F');
+    if (c.is_factor) {
+        const LevelCol& lv = c.levels;
+        const CodeCol& cd = c.codes;
+        const std::size_t nl = lv.size();
+        for (int64_t i = 0; i < nrows; ++i) {
+            const int32_t code =
+                (static_cast<std::size_t>(i) < cd.size()) ? cd[static_cast<std::size_t>(i)] : -1;
+            if (code < 0 || static_cast<std::size_t>(code) >= nl) {
+                va.byte(kMissing);
+                vb.byte(kMissing);
+            } else {
+                const std::string& s = lv[static_cast<std::size_t>(code)];
+                va.str(s);
+                vb.str(s);
+            }
+        }
+    } else {
+        // LADDER: read through the narrow-aware reader — the values are identical
+        // by the narrowing predicate (float-exact), so the hash is identical, and
+        // the signature must not widen the frame it is fingerprinting.
+        const F64Reader f = c.f64.reader();
+        const int64_t fn = static_cast<int64_t>(c.f64.size());
+        for (int64_t i = 0; i < nrows; ++i) {
+            const double v = (i < fn)
+                                 ? f[static_cast<std::size_t>(i)]
+                                 : std::numeric_limits<double>::quiet_NaN();
+            va.real(v);
+            vb.real(v);
+        }
+    }
+}
+
+// BUG-1461: the order-free value plane. Each row's value is hashed on its own
+// (both seeds, then mixed so the sum is not linear in the value bytes) and the
+// column keeps the 64-bit SUM of those hashes, which no permutation of rows can
+// move; an edited value still moves it.
+uint64_t mix64(uint64_t z) {
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+void sign_values_unordered(const FrameColumn& c, int64_t nrows, Fnv& va, Fnv& vb) {
+    va.byte(c.is_factor ? 'S' : 'F');
+    vb.byte(c.is_factor ? 'S' : 'F');
+    uint64_t sumA = 0, sumB = 0;
+    auto add = [&](const auto& feed) {
+        Fnv ra(kBasis), rb(kBasisB);
+        feed(ra);
+        feed(rb);
+        sumA += mix64(ra.h);
+        sumB += mix64(rb.h);
+    };
+    if (c.is_factor) {
+        const LevelCol& lv = c.levels;
+        const CodeCol& cd = c.codes;
+        const std::size_t nl = lv.size();
+        for (int64_t i = 0; i < nrows; ++i) {
+            const int32_t code =
+                (static_cast<std::size_t>(i) < cd.size()) ? cd[static_cast<std::size_t>(i)] : -1;
+            if (code < 0 || static_cast<std::size_t>(code) >= nl)
+                add([](Fnv& f) { f.byte(kMissing); });
+            else
+                add([&](Fnv& f) { f.str(lv[static_cast<std::size_t>(code)]); });
+        }
+    } else {
+        const F64Reader f = c.f64.reader();
+        const int64_t fn = static_cast<int64_t>(c.f64.size());
+        for (int64_t i = 0; i < nrows; ++i) {
+            const double v = (i < fn)
+                                 ? f[static_cast<std::size_t>(i)]
+                                 : std::numeric_limits<double>::quiet_NaN();
+            // Stata's confirm sees a `.` <-> `.a` edit, so here (unlike the
+            // ordered plane above) an extended missing's kind is signed too.
+            const int kind = missing_kind(v);
+            add([v, kind](Fnv& h) {
+                h.real(v);
+                if (kind > 0) h.byte(static_cast<unsigned char>(kind));
+            });
+        }
+    }
+    va.u64(sumA);
+    vb.u64(sumB);
+}
+
+// One column's value plane under `opts`: its storage type first, when known.
+void sign_column(const FrameColumn& c, int64_t nrows, const SignatureOptions& opts, Fnv& va,
+                 Fnv& vb) {
+    const auto t = opts.types.find(c.name);
+    if (t != opts.types.end()) {
+        va.str(t->second);
+        vb.str(t->second);
+    }
+    if (opts.unordered)
+        sign_values_unordered(c, nrows, va, vb);
+    else
+        sign_values(c, nrows, va, vb);
+}
+
 }  // namespace
 
-std::string data_signature(const Frame& fr) {
+std::string data_signature(const Frame& fr, const SignatureOptions& opts) {
     Fnv meta(kBasis), va(kBasis), vb(kBasisB);
 
     const int64_t nrows = fr.n_rows();
@@ -101,42 +213,7 @@ std::string data_signature(const Frame& fr) {
         }
         meta.byte(kColSep);
 
-        // ── value plane: the STORED values, in column-then-row order. A factor
-        // hashes its LEVEL STRING, not its code, so a dictionary that was rebuilt
-        // in a different order over identical data still signs its values the same
-        // (that reordering shows up in `meta`, where identity changes belong).
-        va.byte(c.is_factor ? 'S' : 'F');
-        vb.byte(c.is_factor ? 'S' : 'F');
-        if (c.is_factor) {
-            const LevelCol& lv = c.levels;
-            const CodeCol& cd = c.codes;
-            const std::size_t nl = lv.size();
-            for (int64_t i = 0; i < nrows; ++i) {
-                const int32_t code =
-                    (static_cast<std::size_t>(i) < cd.size()) ? cd[static_cast<std::size_t>(i)] : -1;
-                if (code < 0 || static_cast<std::size_t>(code) >= nl) {
-                    va.byte(kMissing);
-                    vb.byte(kMissing);
-                } else {
-                    const std::string& s = lv[static_cast<std::size_t>(code)];
-                    va.str(s);
-                    vb.str(s);
-                }
-            }
-        } else {
-            // LADDER: read through the narrow-aware reader — the values are identical
-            // by the narrowing predicate (float-exact), so the hash is identical, and
-            // the signature must not widen the frame it is fingerprinting.
-            const F64Reader f = c.f64.reader();
-            const int64_t fn = static_cast<int64_t>(c.f64.size());
-            for (int64_t i = 0; i < nrows; ++i) {
-                const double v = (i < fn)
-                                     ? f[static_cast<std::size_t>(i)]
-                                     : std::numeric_limits<double>::quiet_NaN();
-                va.real(v);
-                vb.real(v);
-            }
-        }
+        sign_column(c, nrows, opts, va, vb);
         va.byte(kColSep);
         vb.byte(kColSep);
     }
@@ -144,6 +221,28 @@ std::string data_signature(const Frame& fr) {
     char buf[96];
     std::snprintf(buf, sizeof buf, "%lld:%d(%u):%u:%u", static_cast<long long>(nrows), ncols,
                   meta.fold(), va.fold(), vb.fold());
+    return buf;
+}
+
+// Stata `_datasignature varlist, esample nodefault nonames`'s SHAPE over a chosen
+// variable list (repeats allowed, as signestimationsample passes `y x1 x2 id id
+// id2` after areg) and the frame's rows as given (the caller restricts them to
+// the estimation sample): `<rows>:<k>:<vals-a>:<vals-b>`, no identity term
+// (nonames). Same Q9 ruling as data_signature: deterministic, NOT Stata-exact.
+std::string data_signature_vars(const Frame& fr, const std::vector<std::string>& vars,
+                                const SignatureOptions& opts) {
+    Fnv va(kBasis), vb(kBasisB);
+    const int64_t nrows = fr.n_rows();
+    va.u64(static_cast<uint64_t>(nrows));
+    vb.u64(static_cast<uint64_t>(nrows));
+    for (const auto& v : vars) {
+        sign_column(fr.col(v), nrows, opts, va, vb);
+        va.byte(kColSep);
+        vb.byte(kColSep);
+    }
+    char buf[96];
+    std::snprintf(buf, sizeof buf, "%lld:%d:%u:%u", static_cast<long long>(nrows),
+                  static_cast<int>(vars.size()), va.fold(), vb.fold());
     return buf;
 }
 

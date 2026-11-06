@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "estimators/xtpois.h"
 
 #include <algorithm>
@@ -64,6 +66,17 @@ XtpoisFeResult xtpoisson_fe(const double* X_in, int64_t n_obs, int k,
     R.n_dropped_zero = n_dropped_zero;
     R.n_dropped_size = n_dropped_size;
     R.n_groups = static_cast<int64_t>(keep_grp.size());
+    if (!keep_grp.empty()) {
+        int64_t tot = 0;
+        R.g_min = -1;
+        for (int gi : keep_grp) {
+            const int64_t T = static_cast<int64_t>(rows_per_grp[static_cast<size_t>(gi)].size());
+            R.g_min = R.g_min < 0 ? T : std::min(R.g_min, T);
+            R.g_max = std::max(R.g_max, T);
+            tot += T;
+        }
+        R.g_avg = static_cast<double>(tot) / static_cast<double>(keep_grp.size());
+    }
 
     // Pack working arrays in group-contiguous order.
     std::vector<Group> groups;
@@ -276,6 +289,7 @@ XtpoisFeResult xtpoisson_fe(const double* X_in, int64_t n_obs, int k,
         return R;
     }
     // IID SE = sqrt(diag((-H)^{-1}))
+    R.V_iid = negH_inv;
     R.se_iid.assign(static_cast<size_t>(k), 0.0);
     for (int c = 0; c < k; ++c)
         R.se_iid[static_cast<size_t>(c)] =
@@ -314,6 +328,7 @@ XtpoisFeResult xtpoisson_fe(const double* X_in, int64_t n_obs, int k,
                 s += tmp[static_cast<size_t>(j) * k + r] * negH_inv[static_cast<size_t>(c) * k + j];
             Vr[static_cast<size_t>(c) * k + r] = q * s;
         }
+    R.V_robust = Vr;
     R.se_robust.assign(static_cast<size_t>(k), 0.0);
     for (int c = 0; c < k; ++c)
         R.se_robust[static_cast<size_t>(c)] =

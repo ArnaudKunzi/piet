@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // P9 automode · L1 (candidate discovery) + the region predicate + L4 (honest
 // reporting). Default OFF — this whole layer is inert unless PIET_PARALLEL_AUTO
 // is set, which is the User's ruling for the first release.

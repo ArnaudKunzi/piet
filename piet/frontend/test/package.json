@@ -1,0 +1,14 @@
+{
+  "name": "piet-frontend-dom-tests",
+  "version": "1.9.0",
+  "private": true,
+  "type": "module",
+  "description": "MI-099 — headless DOM test runner for PIET frontend ES modules (console.js/graph.js/app.js). Asserts BUG-017 (z/P>|z|), BUG-010 (multi-line paste→N submits), BUG-007/009 (marginsplot point-count). RED/GREEN exit code for CI.",
+  "scripts": {
+    "test": "node dom_runner.mjs",
+    "test:dom": "node dom_runner.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^24.1.0"
+  }
+}

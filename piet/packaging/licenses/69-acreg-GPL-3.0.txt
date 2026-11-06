@@ -1,0 +1,21 @@
+acreg 1.1.0 (Colella, Lalive, Sakalli, Thoenig) — GPL-3.0
+Adopted at: piet/native/src/handlers_e3_acreg.cpp (derived from acreg.ado; line cites there refer to the ado)
+
+Project:  acreg — Stata module to perform Arbitrary Correlation Regression
+Authors:  F. Colella, R. Lalive, S.O. Sakalli, M. Thoenig
+Version:  "Version December 2020 (1.1.0)"
+Source:   Statistical Software Components (SSC / RePEc), https://ideas.repec.org/c/boc/bocode/s458889.html
+Evidence: The licence is the GNU General Public License version 3, as stated on the SSC/RePEc listing https://ideas.repec.org/c/boc/bocode/s458889.html: "The module is made available under terms of the GPL v3 (https://www.gnu.org/licenses/gpl-3.0.txt)."
+Licence:  GNU General Public License version 3.
+
+No upstream LICENSE text ships with the package; the licence is stated in its
+SSC listing. The ado carries no licence header. Its title block reads, verbatim:
+
+    "Beta Version, please do not circulate - This Version: December 2020"
+
+This is recorded here so a reviewer sees it: the SSC listing nevertheless distributes the module under GPL v3, and that listing statement is the basis of this adoption.
+
+The full text of the GNU General Public License version 3 or later, under which this project is distributed, ships beside this application as LICENSE.txt.
+
+Copyright remains with the package authors for the portions derived from their
+code.

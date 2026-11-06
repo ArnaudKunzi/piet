@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // frames — Stata's `frame` family (P6 wave): additional named datasets living
 // beside the current one, plus the `frlink`/`frget` link-and-copy pair.
 //

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // AER-SCOPE1 bundle I (UTIL, 2026-09-04) -- the twelve data-tidying verbs the
 // ninety-paper corpus reaches for between `use` and the first regression:
 //
@@ -91,6 +93,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>  // std::memcpy -- the ±0-safe key bit-normalization
 #include <ctime>
 #include <exception>
@@ -112,7 +115,6 @@
 
 #include "io/win_compat.h"  // cecon::to_native_path / native_unlink
 #include "piet/bcal.h"  // AER scope-2 B2-3: business calendars
-#include "piet/calendar_paths.h"
 #include "piet/stata_format.h"  // piet::fmt::renderTd -- the describe table date column
 #include "piet/cobra_runner.h"
 #include "piet/column_fetch.h"
@@ -129,8 +131,6 @@
 #include "piet/scratch_seq.h"
 #include "piet/session_state.h"
 #include "piet/strutil.h"
-#include "piet/strmutate.h"
-#include "piet/translate.h"
 
 // ---------------------------------------------------------------------------
 // OPTION VOCABULARIES -- namespace scope, before any dispatch (defect class 3).
@@ -557,9 +557,22 @@ std::optional<ojson> writeAndConvert(SessionState& session, const CsvTable& t,
     }
     f << "\n";
     for (const auto& row : t.rows) {
+      // BUG-1078: a row whose every cell is missing would be a BLANK line, and
+      // cobra's CSV reader skips blank lines (BUG-697's pad rows, same reader),
+      // so a one-variable `input` with a `""` or `.` row lost it and stopped on
+      // the row-count assert. A quoted empty first field keeps the row; convert
+      // reads it as missing for a factor and for an f64 column alike.
+      bool allEmpty = true;
+      for (size_t c = 0; c < t.names.size() && allEmpty; ++c) {
+        if (c < row.size() && !row[c].empty()) allEmpty = false;
+      }
       for (size_t c = 0; c < t.names.size(); ++c) {
         if (c) f << ',';
-        if (c < row.size()) f << csvField(row[c], ',');
+        if (c == 0 && allEmpty) {
+          f << "\"\"";
+        } else if (c < row.size()) {
+          f << csvField(row[c], ',');
+        }
       }
       f << "\n";
     }
@@ -750,6 +763,11 @@ ojson newVarGuard(SessionState& session, const std::string& verb, const std::str
   if (!strutil::isValidStataIdentifier(newvar))
     return utilSyntax(verb + ": invalid variable name `" + newvar + "' -- " +
                       strutil::stataIdentifierRuleText());
+  // BUG-1120: nor is a reserved name one: `carryforward x, gen(_cons)', `tsspell
+  // x, spell(_cons)', `rangestat (mean) _cons=x, ...', `missings tag, gen(_cons)'
+  // and `bcal create ..., generate(_cons)' are each "_cons invalid varname" r(198)
+  // (StataBE 19.5).
+  if (strutil::isReservedVarName(newvar)) return utilErrorRc(newvar + " invalid varname", 198);
   Datastore* ds = nullptr;
   try {
     ds = session.datastore();
@@ -1226,74 +1244,76 @@ ojson runMissings(const eval::ParsedCommand& parsed, SessionState& session) {
     return displayBlock(oss.str());
   }
 
+  // missings: dropvars/dropobs on a dataset changed since it was
+  // last saved need `force` -- `force option required with changed dataset`,
+  // exit 4 (w2d_uncovered.log missings_dropvars_ctl / missings_dropobs_ctl
+  // `4|4|6|`). That is the ado's only use of the option.
+  if ((sub == "dropvars" || sub == "dropobs") && !force && session.datasetChanged)
+    return utilErrorRc("force option required with changed dataset", 4);
+
   if (sub == "dropvars") {
+    // missings: a variable qualifies when it is missing in every
+    // observation used (`r(N) == `N''); :440-447 drop them and return
+    // r(varlist) = the dropped names (missings_dropvars_force `0|2|6|b s|`).
+    if (n == 0) return utilErrorRc("no observations", 2000);
     std::vector<std::string> doomed;
     for (const auto& nm : vars) {
-      if (missingCountOf(session, ds, nm) == n && n > 0) doomed.push_back(nm);
+      if (missingCountOf(session, ds, nm) == n) doomed.push_back(nm);
     }
-    if (doomed.empty()) return silent();
-    if (doomed.size() == static_cast<size_t>(ds.nCols()) && !force) {
-      // missings.ado's own safety catch, which is what `force` is FOR -- the
-      // option is read here rather than accepted and ignored.
-      return utilError(
-          "missings dropvars: every variable in the dataset is missing in every observation; "
-          "dropping them would leave nothing. Add `force` if that is what you want.",
-          "bad_input");
+    ojson out = silent();
+    if (!doomed.empty()) {
+      out = runDrop(doomed, session);
+      if (firstError(out) != nullptr) return out;
     }
-    return runDrop(doomed, session);
+    session.eval.rValues.set("N", static_cast<double>(n));
+    session.eval.rStrings.set("varlist", joinWith(doomed, " "));
+    return out;
   }
 
   if (sub == "dropobs") {
-    // The predicate goes to the ENGINE's expression evaluator via runDropIf,
-    // and that evaluator has no missing() for a string column
-    // (`require_f64`). Naming the offending variable is honest; building the
-    // condition out of the numeric subset only would drop rows on a narrower
-    // test than the user asked for.
-    for (const auto& nm : vars) {
-      if (ds.dtype(nm) == "factor")
-        return utilError(
-            "missings dropobs: `" + nm +
-                "' is a string variable, and this build's expression evaluator has no missing() "
-                "for string columns. Name the numeric variables explicitly.",
-            "unimplemented");
+    // missings: drop the observations missing on EVERY variable in
+    // scope (`nmissing' == `nvars'`), strings included (missing() of "" is 1),
+    // within the qualifier; r(n_dropped) is their count (:453). The row test is
+    // the report's own per-cell predicate, written as a hidden column so the
+    // drop itself goes through the ordinary `drop if` path with the user's
+    // if/in ANDed in.
+    std::vector<ColView> views;
+    views.reserve(vars.size());
+    for (const auto& nm : vars) views.push_back(viewOf(ds, nm));
+    std::vector<std::string> cells;
+    cells.reserve(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+      bool all = !views.empty();
+      for (const auto& v : views) {
+        if (!cellMissing(v, i)) {
+          all = false;
+          break;
+        }
+      }
+      cells.push_back(numCell(all ? 1.0 : 0.0));
     }
-    std::string cond;
-    for (const auto& nm : vars) {
-      if (!cond.empty()) cond += " & ";
-      cond += "missing(" + nm + ")";
-    }
-    // The user's own `if` is ANDed in, never dropped: `missings dropobs x if
-    // year > 2000` must delete rows in 2001 and later only. runDropIf takes
-    // `in` as its own argument and composes it the same way.
-    const bool qualified = (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) ||
-                           (parsed.inRange.has_value() && !parsed.inRange->empty());
+    const std::string tag = "__missings_dropobs_tag";
+    std::string tagOut;
+    if (auto err = writeColumn(session, *session.currentHbin(), tag, cells, "f64", true, &tagOut))
+      return *err;
+    session.load(tagOut);
+    std::string cond = tag + " == 1";
     if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty())
       cond = "(" + *parsed.ifExpr + ") & (" + cond + ")";
-    // Would this drop every observation? Same catch as dropvars, same option.
-    // Skipped when a qualifier is present: the count below is taken over the
-    // whole frame, so it would answer a question the user did not ask.
-    if (!force && !qualified) {
-      std::vector<ColView> views;
-      views.reserve(vars.size());
-      for (const auto& nm : vars) views.push_back(viewOf(ds, nm));
-      int64_t doomedRows = 0;
-      for (int64_t i = 0; i < n; ++i) {
-        bool all = true;
-        for (const auto& v : views) {
-          if (!cellMissing(v, i)) {
-            all = false;
-            break;
-          }
-        }
-        if (all) ++doomedRows;
-      }
-      if (n > 0 && doomedRows == n)
-        return utilError(
-            "missings dropobs: every observation is missing on all of " + joinWith(vars, " ") +
-                "; dropping them would leave no data. Add `force` if that is what you want.",
-            "bad_input");
+    Datastore* before = session.datastore();
+    const int64_t n0 = before != nullptr ? before->nRows() : n;
+    ojson out = runDropIf(cond, session, parsed.inRange);
+    if (firstError(out) != nullptr) {
+      runDrop({tag}, session);
+      return out;
     }
-    return runDropIf(cond, session, parsed.inRange);
+    Datastore* after = session.datastore();
+    const int64_t n1 = after != nullptr ? after->nRows() : n0;
+    ojson dropTag = runDrop({tag}, session);
+    if (firstError(dropTag) != nullptr) return dropTag;
+    session.eval.rValues.set("N", static_cast<double>(n));
+    session.eval.rValues.set("n_dropped", static_cast<double>(n0 - n1));
+    return out;
   }
 
   // tag
@@ -1419,7 +1439,11 @@ ojson runLabmask(const eval::ParsedCommand& parsed, SessionState& session) {
   if (!session.hasData()) return ojson(eval::noDataLoaded());
   if (parsed.varlist.size() != 1)
     return utilSyntax("labmask: syntax is `labmask numvar, values(varname) [lblname(name)]`");
-  const std::string numvar = parsed.varlist[0];
+  // `labmask(yaxis), value(v)`: Stata's varname parser takes one pair of
+  // parentheses around the name (w2ao_label_family.log:2570 lb_labmask_paren).
+  std::string numvar = parsed.varlist[0];
+  if (numvar.size() >= 2 && numvar.front() == '(' && numvar.back() == ')')
+    numvar = strutil::trim(numvar.substr(1, numvar.size() - 2));
   const std::optional<std::string> valuesVar = optStr(parsed.opts, "values");
   if (!valuesVar.has_value() || valuesVar->empty())
     return utilSyntax("labmask: values(varname) is required -- it names the variable whose text "
@@ -1429,7 +1453,9 @@ ojson runLabmask(const eval::ParsedCommand& parsed, SessionState& session) {
     return utilSyntax("labmask: `" + lblname + "' is not a usable label name -- " +
                       strutil::stataIdentifierRuleText());
 
-  ReadScope scope(session, parsed, {numvar, *valuesVar}, "labmask", false);
+  // labmask.ado: `marksample touse` (if/in, numvar non-missing), r(2000) when
+  // it selects nothing (lb_labmask_empty `labmask state if state > 9`).
+  ReadScope scope(session, parsed, {numvar, *valuesVar}, "labmask", true);
   if (scope.failed())
     return scope.error().is_null() ? utilError("labmask: could not read the data", "data_io")
                                    : scope.error();
@@ -1450,6 +1476,34 @@ ojson runLabmask(const eval::ParsedCommand& parsed, SessionState& session) {
   // Both are checked over the WHOLE column first -- a half-written label set
   // would be worse than no label at all.
   std::map<long long, std::string> mapping;
+  int64_t used = 0;
+  for (int64_t i = 0; i < n; ++i)
+    if (!cellMissing(num, i)) ++used;
+  if (used == 0)
+    return ojson(eval::errorBlock("engine_error", "no observations", std::nullopt, std::nullopt,
+                                  std::nullopt, "r(2000)"));
+  // labmask.ado's two refusals, r(198) with its own texts (lb_labmask_nonint,
+  // lb_labmask_notconst): checked over every used row before anything is defined.
+  for (int64_t i = 0; i < n; ++i) {
+    if (cellMissing(num, i)) continue;
+    if (num.d[i] != std::floor(num.d[i]))
+      return ojson(eval::errorBlock("engine_error", "may not label non-integers", std::nullopt,
+                                    std::nullopt, std::nullopt, "r(198)"));
+  }
+  {
+    std::map<long long, std::string> seen;
+    for (int64_t i = 0; i < n; ++i) {
+      if (cellMissing(num, i)) continue;
+      const long long code = static_cast<long long>(num.d[i]);
+      const std::string& t = text[static_cast<size_t>(i)];
+      auto it = seen.find(code);
+      if (it == seen.end()) seen.emplace(code, t);
+      else if (it->second != t)
+        return ojson(eval::errorBlock("engine_error",
+                                      *valuesVar + " not constant within groups of " + numvar,
+                                      std::nullopt, std::nullopt, std::nullopt, "r(198)"));
+    }
+  }
   for (int64_t i = 0; i < n; ++i) {
     if (cellMissing(num, i)) continue;
     const double v = num.d[i];
@@ -1930,12 +1984,30 @@ ojson runMarksample(const eval::ParsedCommand& parsed, SessionState& session) {
       }
     }
   }
-  // DOCUMENTED DEVIATION: real marksample also folds the `if`/`in` the
-  // enclosing program was called with into the marker. That binding comes from
-  // `syntax`, which this build does not implement, so there is nothing to fold;
-  // the marker reflects the varlist only.
-  ojson blocks = dispatch("quietly generate byte " + *minted + " = (" + cond + ")", session);
+  // The `if`/`in` and weight the enclosing program's `syntax` bound (program.cpp
+  // bindSyntax: the locals `if` = "if EXP", `in` = "in RANGE", `weight`/`exp`)
+  // fold into the marker as Stata's marksample does: a row outside them is 0,
+  // and so is a row with a missing or zero weight.
+  const std::string* ifL = session.eval.locals.find("if");
+  const std::string* inL = session.eval.locals.find("in");
+  const std::string* wL = session.eval.locals.find("weight");
+  const std::string* eL = session.eval.locals.find("exp");
+  if (wL != nullptr && !wL->empty() && eL != nullptr && !eL->empty()) {
+    std::string w = *eL;
+    const size_t eq = w.find('=');
+    if (eq != std::string::npos) w = w.substr(eq + 1);
+    cond = "(" + cond + ") & !missing(" + w + ") & (" + w + ") != 0";
+  }
+  std::string qual;
+  if (ifL != nullptr && !ifL->empty()) qual += " " + *ifL;
+  if (inL != nullptr && !inL->empty()) qual += " " + *inL;
+  ojson blocks =
+      dispatch("quietly generate byte " + *minted + " = (" + cond + ")" + qual, session);
   if (const ojson* e = firstError(blocks)) return *e;
+  if (!qual.empty()) {
+    blocks = dispatch("quietly replace " + *minted + " = 0 if missing(" + *minted + ")", session);
+    if (const ojson* e = firstError(blocks)) return *e;
+  }
   return silent();
 }
 
@@ -2691,10 +2763,16 @@ ojson runTsspell(const eval::ParsedCommand& parsed, SessionState& session) {
 // bcal -- Stata business calendars ([D] bcal)
 // ===========================================================================
 //
-// Independent induction and file parsing live in piet/bcal.{h,cpp}; this
-// handler connects options, sample selection, file writing, cache refresh and
-// returned metadata. Reads search the working directory and configured PERSONAL
-// directory; other adopath entries are outside this loader's current scope.
+// AER scope-2 B2-3, the blocker of paper 066. The calendar reader, the
+// create induction and the index arithmetic live in piet/bcal.{h,cpp}; this
+// handler is the command surface ([D] bcal; measured StataBE 19.5 behaviour).
+//
+// NAMED DIVERGENCE (D2/D3/D4): Stata searches BASE;SITE;.;PERSONAL;PLUS for a
+// .stbcal and `bcal dir` walks the same path. PIET models no sysdir, so the
+// search directory is the session's cwd alone: `bofd("simple", ...)` -- the one
+// calendar StataBE ships, in BASE -- is missing here unless the file is in the
+// working directory, `bcal dir` lists the cwd, and `personal` is refused by
+// name rather than writing somewhere PIET cannot then find.
 
 namespace {
 
@@ -2702,704 +2780,691 @@ const eval::OptVocab& kVocabBcal = eval::registerOptVocab(
     {"bcal"}, {{"from", "generate", "personal", "excludemissing", "replace", "purpose",
                 "dateformat", "range", "centerdate", "maxgap", "rc0"},
                {},
-               // bcal.ado's own `syntax` line: Generate() and CENTERdate().
-               // The 2-character prefix floor cannot produce `g(...)`.
+               // Minimal abbreviations: g/gen for generate().
                {{"g", "generate"}, {"gen", "generate"}}});
 
-// %9.0fc -- the describe table's own width-9 comma-grouped integer field.
-std::string fmt9c(long long v) {
-  std::string digits = std::to_string(v < 0 ? -v : v);
-  std::string grouped;
-  int c = 0;
-  for (auto it = digits.rbegin(); it != digits.rend(); ++it) {
-    if (c != 0 && c % 3 == 0) grouped += ',';
-    grouped += *it;
-    ++c;
-  }
-  std::reverse(grouped.begin(), grouped.end());
-  if (v < 0) grouped = "-" + grouped;
-  if (grouped.size() < 9) grouped = std::string(9 - grouped.size(), ' ') + grouped;
-  return grouped;
+}  // namespace
+
+// The fit-sample filter that keeps each surviving row's position in the working
+// frame (inrange_filter.cpp; e(sample)'s channel).
+InRangeFilterResult applyIfAndInFilterKeepingIndex(SessionState&, const std::string&,
+                                                   const std::optional<std::string>&,
+                                                   const std::optional<std::string>&,
+                                                   std::string*);
+
+namespace {
+
+using BcalOpts = std::vector<std::pair<std::string, eval::OptValue>>;
+
+// PIET models no adopath: a calendar lives in the session's working directory or
+// nowhere, and a calendar's "./name.stbcal" is relative to it.
+std::string calendarFileIn(const std::string& home, const std::string& name) {
+  return (std::filesystem::path(home) / (name + ".stbcal")).u8string();
 }
 
-std::string fmtW(const std::string& body, size_t w) {
-  if (body.size() >= w) return body;
-  return std::string(w - body.size(), ' ') + body;
+// An option typed with no argument where one is required.
+bool typedBare(const BcalOpts& opts, const std::string& key) {
+  return hasFlag(opts, key) && !optStr(opts, key).has_value();
 }
 
-std::string fmtF(double v, int width, int dec) {
-  char buf[64];
-  std::snprintf(buf, sizeof(buf), "%*.*f", width, dec, v);
-  return std::string(buf);
+// A numeric column read as %9.0fc: right-aligned, with thousands commas.
+std::string paddedThousands(std::int64_t count) {
+  std::string digits = std::to_string(count < 0 ? -count : count);
+  for (int at = static_cast<int>(digits.size()) - 3; at > 0; at -= 3)
+    digits.insert(static_cast<size_t>(at), ",");
+  if (count < 0) digits.insert(digits.begin(), '-');
+  return digits.size() >= 9 ? digits : std::string(9 - digits.size(), ' ') + digits;
 }
 
-// `di ... _col(37) "text"`: pad the line out to column 37 (1-based) first.
-std::string atCol37(const std::string& line, const std::string& tail) {
-  std::string out = line;
-  while (out.size() < 36) out += ' ';
-  return out + tail;
+std::string padded9(std::int64_t value) {
+  char text[32];
+  std::snprintf(text, sizeof text, "%9lld", static_cast<long long>(value));
+  return text;
 }
 
-// Stata's %td rendering, for the describe table's date column.
-std::string td9(std::int64_t d) {
-  auto r = piet::fmt::renderTd(static_cast<double>(d));
-  return r ? *r : std::to_string(d);
+std::string padded11OneDecimal(double value) {
+  char text[64];
+  std::snprintf(text, sizeof text, "%11.1f", value);
+  return text;
 }
 
-// The one place `bcal describe`'s numbers are derived, shared by describe and
-// by create's own trailing describe (bcal.ado:290-310 and :666-690 compute
-// them identically).
-struct DescribeNumbers {
-  long long ddays = 0, bdays = 0, omitted = 0, included = 0;
-  double omitYear = 0.0, inclYear = 0.0;
+// The two per-year figures, as the table prints them and r() posts them: r() takes
+// the decimal the printed text shows, so a binary tie (182.625) goes to even.
+double postedOneDecimal(double value) {
+  char text[64];
+  std::snprintf(text, sizeof text, "%.1f", value);
+  return std::strtod(text, nullptr);
+}
+
+struct CalendarTally {
+  std::int64_t included = 0, omitted = 0;
+  double includedPerYear = 0, omittedPerYear = 0;
 };
 
-DescribeNumbers describeNumbers(const bcal::BusinessCalendar& c) {
-  DescribeNumbers d;
-  d.ddays = static_cast<long long>(c.hi - c.lo + 1);
-  d.bdays = static_cast<long long>(c.maxTb - c.minTb + 1);
-  d.omitted = d.ddays - d.bdays;
-  d.included = d.bdays;
-  d.omitYear = (static_cast<double>(d.omitted) / static_cast<double>(d.ddays)) * 365.25;
-  d.inclYear = (static_cast<double>(d.included) / static_cast<double>(d.ddays)) * 365.25;
-  return d;
+CalendarTally tallyCalendar(const bcal::BusinessCalendar& cal) {
+  const double span = static_cast<double>(cal.hi - cal.lo + 1);
+  CalendarTally tally;
+  tally.included = cal.maxTb - cal.minTb + 1;
+  tally.omitted = cal.hi - cal.lo + 1 - tally.included;
+  tally.includedPerYear = static_cast<double>(tally.included) / span * 365.25;
+  tally.omittedPerYear = static_cast<double>(tally.omitted) / span * 365.25;
+  return tally;
 }
 
-// `%11.1f` through a local, which is how bcal.ado rounds r(omitted_year).
-double round1(double v) {
-  char buf[64];
-  std::snprintf(buf, sizeof(buf), "%.1f", v);
-  return std::atof(buf);
+// The block `bcal describe` prints and `bcal create` opens with. Numbers end at a
+// fixed column; the unit word starts at column 37.
+std::string calendarTable(const bcal::BusinessCalendar& cal) {
+  const CalendarTally tally = tallyCalendar(cal);
+  const auto tdText = [](std::int64_t day) {
+    return piet::fmt::renderTd(static_cast<double>(day)).value_or(std::string("."));
+  };
+  const auto unitRow = [](const std::string& caption, const std::string& numbers,
+                          const std::string& unit) {
+    std::string row = caption + numbers;
+    if (row.size() < 36) row.append(36 - row.size(), ' ');
+    return row + unit + "\n";
+  };
+  const std::string gutter(13, ' ');
+  const std::string tbUnits = "in %tb" + cal.name + " units";
+  std::string table = "\n  Business calendar " + cal.name + " (format %tb" + cal.name + "):\n\n";
+  table += "    Purpose: " + cal.purpose + "\n\n";
+  table += "      Range: " + tdText(cal.lo) + "  " + tdText(cal.hi) + "\n";
+  table += unitRow(gutter, padded9(cal.lo) + "  " + padded9(cal.hi), "in %td units");
+  table += unitRow(gutter, padded9(cal.minTb) + "  " + padded9(cal.maxTb), tbUnits);
+  table += "\n     Center: " + tdText(cal.center) + "\n";
+  table += unitRow(gutter, padded9(cal.center), "in %td units");
+  table += unitRow(gutter, padded9(0), tbUnits);
+  table += "\n";
+  table += unitRow("    Omitted: ", paddedThousands(tally.omitted), "days");
+  table += unitRow(gutter, padded11OneDecimal(tally.omittedPerYear), "approx. days/year");
+  table += "\n";
+  table += unitRow("   Included: ", paddedThousands(tally.included), "days");
+  table += unitRow(gutter, padded11OneDecimal(tally.includedPerYear), "approx. days/year");
+  return table;
 }
 
-std::string describeTable(const bcal::BusinessCalendar& c) {
-  const DescribeNumbers d = describeNumbers(c);
-  const std::string bfmt = "%tb" + c.name;
-  std::ostringstream o;
-  o << "\n";
-  o << "  Business calendar " << c.name << " (format " << bfmt << "):\n";
-  o << "\n";
-  o << "    Purpose: " << c.purpose << "\n";
-  o << "\n";
-  o << "      Range: " << td9(c.lo) << "  " << td9(c.hi) << "\n";
-  o << atCol37("             " + fmtW(std::to_string(c.lo), 9) + "  " +
-                   fmtW(std::to_string(c.hi), 9),
-               "in %td units") << "\n";
-  o << atCol37("             " + fmtW(std::to_string(c.minTb), 9) + "  " +
-                   fmtW(std::to_string(c.maxTb), 9),
-               "in " + bfmt + " units") << "\n";
-  o << "\n";
-  o << "     Center: " << td9(c.center) << "\n";
-  o << atCol37("             " + fmtW(std::to_string(c.center), 9), "in %td units") << "\n";
-  o << atCol37("             " + fmtW("0", 9), "in " + bfmt + " units") << "\n";
-  o << "\n";
-  o << atCol37("    Omitted: " + fmt9c(d.omitted), "days") << "\n";
-  o << atCol37("             " + fmtF(d.omitYear, 11, 1), "approx. days/year") << "\n";
-  o << "\n";
-  o << atCol37("   Included: " + fmt9c(d.included), "days") << "\n";
-  o << atCol37("             " + fmtF(d.inclYear, 11, 1), "approx. days/year") << "\n";
-  return o.str();
+// r() belongs to the command as a whole: what an earlier one left does not survive
+// a bcal verb, whether it succeeds or refuses (measured: r(omitted) reads missing
+// after a load, r(undefined) empty after check's r(459)).
+void forgetEarlierR(SessionState& session) {
+  session.eval.rValues.clear();
+  session.eval.rStrings.clear();
 }
 
-void setDescribeR(SessionState& session, const bcal::BusinessCalendar& c, bool withCounts) {
-  // Cwd files use relative presentation; personal calendars report the path
-  // that was actually loaded, so the return value names an accessible file.
-  const auto file = std::filesystem::u8path(c.fn);
-  const auto cwd = std::filesystem::u8path(bcal::searchDir()).lexically_normal();
-  session.eval.rStrings.set("fn", file.parent_path().lexically_normal() == cwd
-                                      ? "./" + c.name + ".stbcal" : c.fn);
-  session.eval.rStrings.set("purpose", c.purpose);
-  session.eval.rStrings.set("name", c.name);
-  session.eval.rValues.set("max_date_tb", static_cast<double>(c.maxTb));
-  session.eval.rValues.set("min_date_tb", static_cast<double>(c.minTb));
-  session.eval.rValues.set("ctr_date_td", static_cast<double>(c.center));
-  session.eval.rValues.set("max_date_td", static_cast<double>(c.hi));
-  session.eval.rValues.set("min_date_td", static_cast<double>(c.lo));
-  if (!withCounts) return;
-  const DescribeNumbers d = describeNumbers(c);
-  session.eval.rValues.set("omitted", static_cast<double>(d.omitted));
-  session.eval.rValues.set("included", static_cast<double>(d.included));
-  session.eval.rValues.set("omitted_year", round1(d.omitYear));
-  session.eval.rValues.set("included_year", round1(d.inclYear));
-}
-
-// The session's cwd, the first directory PIET looks in. The
-// derivation is bcal::searchDirFor and NOT a second copy of it: dispatcher.cpp
-// sets the same search directory at depth 0, and if the two disagreed about
-// what an unset session.cwd means, one of them would RESOLVE `NAME.stbcal`
-// against the absolute cwd while the other resolved it against "" -- a real
-// file found by one caller and missed by the other.
-// (Until the 2026-09-09 review this string was also part of the CACHE key,
-// which is what made the disagreement a stale-answer bug as well; the key is
-// the name alone now, so this is a resolution question only.)
-std::string bcalCwd(SessionState& session) {
-  return bcal::searchDirFor(session.cwd.value_or(std::string()));
-}
-
-// Resolve `NAME.stbcal` in the cwd or PERSONAL directory, for describe/load.
-std::shared_ptr<const bcal::BusinessCalendar> bcalFind(SessionState& session,
-                                                       const std::string& nameIn, bool forceReload,
-                                                       bcal::StbcalError* err) {
-  bcal::setSearchDir(bcalCwd(session));
-  std::string name = bcal::calNameFromFormat(nameIn);
-  if (name.empty()) name = nameIn;
-  // The calendar-NAME rule (bcal.h). It has to be HERE and not only in
-  // bcal::lookup, because this function falls through to loadFile() -- which
-  // would happily read `elevenchars.stbcal` off the disk and answer where
-  // Stata refuses (r(198), measured).
-  if (!bcal::isValidCalName(name)) {
-    if (err != nullptr) {
-      err->rc = 198;
-      // The name AS TYPED, which is what Stata echoes: `bcal describe
-      // %tbelevenchars` says "%tbelevenchars is an invalid calendar name or
-      // %fmt", not the stripped "elevenchars" (measured, s1.log R11).
-      err->message = nameIn + " is an invalid calendar name or %fmt";
-    }
-    return nullptr;
+void postCalendarFacts(SessionState& session, const bcal::BusinessCalendar& cal,
+                       const std::string& fileAsShown, bool withTally) {
+  forgetEarlierR(session);
+  auto& numbers = session.eval.rValues;
+  auto& texts = session.eval.rStrings;
+  texts.set("fn", fileAsShown);
+  texts.set("name", cal.name);
+  texts.set("purpose", cal.purpose);
+  numbers.set("min_date_td", static_cast<double>(cal.lo));
+  numbers.set("max_date_td", static_cast<double>(cal.hi));
+  numbers.set("ctr_date_td", static_cast<double>(cal.center));
+  numbers.set("min_date_tb", static_cast<double>(cal.minTb));
+  numbers.set("max_date_tb", static_cast<double>(cal.maxTb));
+  std::vector<std::string> posted = {"fn",          "name",        "purpose",
+                                     "min_date_td", "max_date_td", "ctr_date_td",
+                                     "min_date_tb", "max_date_tb"};
+  if (!withTally) {
+    eval::declareRPosted(session.eval, "bcal", std::move(posted));
+    return;
   }
-  return bcal::lookup(name, forceReload, err);
+  const CalendarTally tally = tallyCalendar(cal);
+  numbers.set("omitted", static_cast<double>(tally.omitted));
+  numbers.set("included", static_cast<double>(tally.included));
+  numbers.set("omitted_year", postedOneDecimal(tally.omittedPerYear));
+  numbers.set("included_year", postedOneDecimal(tally.includedPerYear));
+  posted.insert(posted.end(), {"omitted", "included", "omitted_year", "included_year"});
+  eval::declareRPosted(session.eval, "bcal", std::move(posted));
+}
+
+// --- bcal describe / bcal load ---------------------------------------------
+// Both go to the file every time, unlike the expression surfaces, which answer
+// from the cache: a cached calendar whose file is gone is r(601) here (measured).
+ojson bcalReadVerb(const eval::ParsedCommand& parsed, SessionState& session, const std::string& home,
+                   bool isLoad) {
+  if (!parsed.opts.empty()) return utilErrorRc("options not allowed", 101);
+  if (parsed.varlist.size() > 2) return utilErrorRc("varlist not allowed", 101);
+  if (parsed.varlist.size() < 2) {
+    return utilErrorRc(std::string("syntax error\n    Syntax is bcal ") +
+                           (isLoad ? "load" : "describe") +
+                           " calname|%tbfmt.\n    Nothing was found where a calendar name or "
+                           "%tbfmt was expected.",
+                       198);
+  }
+  const std::string typed = dequote(parsed.varlist[1]);
+  const std::string name = bcal::calNameFromFormat(typed);
+  if (!bcal::isValidCalName(name))
+    return utilErrorRc(typed + " is an invalid calendar name or %fmt", 198);
+
+  const std::string fileName = name + ".stbcal";
+  const std::string shownFile = "./" + fileName;
+  const std::string diskFile = calendarFileIn(home, name);
+  std::ifstream source(cecon::to_native_path(diskFile), std::ios::binary);
+  if (!source) return utilErrorRc("file " + fileName + " not found", 601);
+
+  std::string listing = "loading " + shownFile + " ...\n\n";
+  if (isLoad) {
+    std::string line;
+    for (int number = 1; std::getline(source, line); ++number) {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      char prefix[32];
+      std::snprintf(prefix, sizeof prefix, "%6d. ", number);
+      listing += prefix + line + "\n";
+    }
+  }
+  source.close();
+
+  bcal::StbcalError readerError;
+  std::shared_ptr<const bcal::BusinessCalendar> cal = bcal::loadFile(name, diskFile, &readerError);
+  if (cal == nullptr) {
+    ojson refusal = utilErrorRc(readerError.message, readerError.rc);
+    if (!isLoad) return refusal;
+    ojson blocks = ojson::array();
+    blocks.push_back(displayBlock(listing));
+    blocks.push_back(std::move(refusal));
+    return blocks;
+  }
+  postCalendarFacts(session, *cal, shownFile, /*withTally=*/!isLoad);
+  return displayBlock(isLoad ? listing + "\n(calendar loaded successfully)\n" : calendarTable(*cal));
+}
+
+// --- bcal dir --------------------------------------------------------------
+ojson bcalDirVerb(const eval::ParsedCommand& parsed, SessionState& session, const std::string& home) {
+  if (findOpt(parsed.opts, "testmode") != nullptr)
+    return ojson(eval::unsupportedOption("testmode", "bcal dir has no test hook here"));
+  if (auto refusal = eval::rejectUnknownOptions(parsed.opts, {})) return ojson(*refusal);
+  if (parsed.varlist.size() > 2) return utilErrorRc("varlist not allowed", 101);
+  const std::string pattern = parsed.varlist.size() == 2 ? parsed.varlist[1] : std::string("*");
+  if (!pattern.empty() && pattern.front() == '%')
+    return utilErrorRc(pattern + " is not a calendar name pattern", 198);
+
+  // No name rule here: an eleven-character stem is still listed (measured).
+  std::vector<std::string> found;
+  std::error_code ec;
+  for (std::filesystem::directory_iterator it(std::filesystem::path(cecon::to_native_path(home)), ec), end;
+       !ec && it != end; it.increment(ec)) {
+    std::error_code typeError;
+    if (!it->is_regular_file(typeError) || it->path().extension() != ".stbcal") continue;
+    const std::string stem = it->path().stem().u8string();
+    if (strutil::globMatch(pattern, stem)) found.push_back(stem);
+  }
+  std::sort(found.begin(), found.end());
+
+  if (found.empty()) {
+    forgetEarlierR(session);
+    session.eval.rStrings.set("calendars", "");
+    eval::declareRPosted(session.eval, "bcal", {"calendars"});
+    return displayBlock("no calendar files matching " + pattern + " found\n    No business calendars matching " +
+                        pattern + " were found, which is to say, no files matching " + pattern +
+                        ".stbcal were found in any of the directories along the adopath.\n");
+  }
+  std::string text = "  " + std::to_string(found.size()) + " calendar file" +
+                     (found.size() == 1 ? " found:\n" : "s found:\n");
+  forgetEarlierR(session);
+  std::string reverseNames;  // r(calendars) runs opposite to the listing (measured)
+  std::vector<std::string> posted = {"calendars"};
+  for (const std::string& stem : found) {
+    const std::string shown = "./" + stem + ".stbcal";
+    text += std::string(stem.size() < 20 ? 20 - stem.size() : 0, ' ') + stem + ":  " + shown + "\n";
+    reverseNames = reverseNames.empty() ? stem : stem + " " + reverseNames;
+    session.eval.rStrings.set("fn_" + stem, shown);
+    posted.push_back("fn_" + stem);
+  }
+  session.eval.rStrings.set("calendars", reverseNames);
+  eval::declareRPosted(session.eval, "bcal", std::move(posted));
+  return displayBlock(text);
+}
+
+// --- bcal check ------------------------------------------------------------
+ojson bcalCheckVerb(const eval::ParsedCommand& parsed, SessionState& session, const std::string& home) {
+  if (auto refusal = eval::rejectUnknownOptions(parsed.opts, {"rc0"})) return ojson(*refusal);
+  Datastore* ds = session.hasData() ? session.datastore() : nullptr;
+
+  std::set<std::string> asked;
+  const bool narrowed = parsed.varlist.size() > 1;
+  if (narrowed) {
+    const std::vector<std::string> typed(parsed.varlist.begin() + 1, parsed.varlist.end());
+    if (ds == nullptr) return utilErrorRc("variable " + typed.front() + " not found", 111);
+    loops::VarlistExpandResult expanded = loops::expandVarlist(joinWith(typed, " "), session);
+    if (expanded.isError) return expanded.error;
+    if (auto refusal = loops::checkKnownVarlist(expanded.tokens, session)) return *refusal;
+    asked.insert(expanded.tokens.begin(), expanded.tokens.end());
+  }
+
+  // Calendar name -> the variables using it, names ascending, variables in dataset
+  // order. A varlist names the real variables; StataBE 19.5 itself reports the
+  // k-th variable of the dataset there, which is not copied.
+  std::map<std::string, std::vector<std::string>> users;
+  if (ds != nullptr) {
+    for (const VarInfo& info : ds->formatCard(ds->names())) {
+      if (narrowed && asked.count(info.name) == 0) continue;
+      const std::string fmt = session.displayFormat(info);
+      if (fmt.empty() || fmt.front() != '%') continue;
+      const std::string name = bcal::calNameFromFormat(fmt);
+      if (!name.empty()) users[name].push_back(info.name);
+    }
+  }
+  if (users.empty()) {
+    forgetEarlierR(session);
+    eval::declareRPosted(session.eval, "bcal", {});
+    return displayBlock("(no variables use %tb formats)\n");
+  }
+
+  std::vector<std::string> defined, undefined, withErrors;
+  std::string report;
+  std::error_code missing;
+  for (const auto& [name, vars] : users) {
+    const std::string tag = "%tb" + name;
+    const char* status = "defined, ";
+    if (bcal::isValidCalName(name) && bcal::lookup(name) != nullptr) {
+      defined.push_back(name);
+    } else if (bcal::isValidCalName(name) &&
+               std::filesystem::exists(cecon::to_native_path(calendarFileIn(home, name)), missing)) {
+      status = "defined, has errors, ";
+      withErrors.push_back(name);
+    } else {
+      status = "undefined, ";
+      undefined.push_back(name);
+    }
+    report += "\n" + std::string(tag.size() < 26 ? 26 - tag.size() : 0, ' ') + tag + ":  " + status +
+              (vars.size() == 1 ? "used by variable\n" : "used by variables\n");
+    report += std::string(29, ' ') + joinWith(vars, " ") + "\n";
+  }
+
+  const bool anyTrouble = !undefined.empty() || !withErrors.empty();
+  const std::string troubleLine = "undefined or defined-with-errors %tb formats";
+  if (anyTrouble && !hasFlag(parsed.opts, "rc0")) {
+    // The help's rule: r() is not stored on this path; runBcal empties it.
+    ojson blocks = ojson::array();
+    blocks.push_back(displayBlock(report));
+    blocks.push_back(utilErrorRc(troubleLine, 459));
+    return blocks;
+  }
+  if (anyTrouble) report += "\n" + troubleLine + "\n";
+
+  forgetEarlierR(session);
+  std::vector<std::string> posted;
+  const auto postText = [&](const std::string& rName, const std::string& value) {
+    session.eval.rStrings.set(rName, value);
+    posted.push_back(rName);
+  };
+  if (!defined.empty()) postText("defined", joinWith(defined, " "));
+  if (!undefined.empty()) postText("undefined", joinWith(undefined, " "));
+  if (!withErrors.empty()) postText("error", joinWith(withErrors, " "));
+  for (const auto& [name, vars] : users) postText("varlist_" + name, joinWith(vars, " "));
+  eval::declareRPosted(session.eval, "bcal", std::move(posted));
+  return displayBlock(report);
+}
+
+// --- bcal create -----------------------------------------------------------
+std::string creationStampLine() {
+  static const char* const kMonths[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  const std::time_t now = std::time(nullptr);
+  const std::tm* local = std::localtime(&now);
+  char line[64];
+  std::snprintf(line, sizeof line, "* Created/replaced on %2d %s %d", local->tm_mday,
+                kMonths[local->tm_mon], local->tm_year + 1900);
+  return line;
+}
+
+// The file token, split as typed: `sub/`, `./` or "" for the path, then NAME.
+struct CalendarTarget {
+  std::string typedPath, name, suffix;
+  std::string shownFile() const { return typedPath + name + ".stbcal"; }
+};
+
+std::optional<ojson> splitCalendarTarget(const std::string& token, const SessionState& session,
+                                         CalendarTarget* target) {
+  const size_t slash = token.find_last_of("/\\");
+  const std::string fileWord = slash == std::string::npos ? token : token.substr(slash + 1);
+  if (slash != std::string::npos) {
+    target->typedPath = token.substr(0, slash + 1);
+    const std::string folder = slash == 0 ? token.substr(0, 1) : token.substr(0, slash);
+    std::error_code ec;
+    if (!std::filesystem::is_directory(cecon::to_native_path(resolveUserPath(session, folder)), ec))
+      return utilErrorRc("path " + folder + " does not exist", 601);
+  }
+  const size_t dot = fileWord.find_last_of('.');
+  target->name = dot == std::string::npos ? fileWord : fileWord.substr(0, dot);
+  target->suffix = dot == std::string::npos ? std::string() : fileWord.substr(dot);
+  if (!strutil::isValidStataIdentifier(target->name))
+    return utilErrorRc(target->name + " is not a valid calendar name", 198);
+  if (target->name.size() > 10) {
+    return utilErrorRc(target->name + " too long; calendar names are limited to 10 characters",
+                       198);
+  }
+  if (!target->suffix.empty() && target->suffix != ".stbcal" && target->suffix != ".")
+    return utilErrorRc("extension " + target->suffix + " in calendar file not allowed", 198);
+  return std::nullopt;
+}
+
+std::optional<ojson> readMaxgapOption(const BcalOpts& opts, bcal::InduceOpts* into) {
+  const std::optional<std::string> typed = optStr(opts, "maxgap");
+  if (!typed.has_value() && !typedBare(opts, "maxgap")) return std::nullopt;
+  const std::string text = typed.value_or(std::string());
+  char* stop = nullptr;
+  const long long value = std::strtoll(text.c_str(), &stop, 10);
+  if (text.empty() || *stop != '\0') return utilErrorRc("option maxgap() incorrectly specified", 198);
+  if (value < 1) return utilErrorRc("maxgap() should be at least 1", 198);
+  into->maxgap = value;
+  return std::nullopt;
+}
+
+std::optional<ojson> readDateformatOption(const BcalOpts& opts, bcal::InduceOpts* into) {
+  into->dateformat = "ymd";
+  const std::optional<std::string> typed = optStr(opts, "dateformat");
+  if (!typed.has_value()) return std::nullopt;
+  const std::string order = lowerOf(*typed);
+  static const std::set<std::string> kOrders = {"ymd", "ydm", "myd", "mdy", "dym", "dmy"};
+  if (kOrders.count(order) == 0) {
+    return utilErrorRc(*typed + " found where dateformat expected\n"
+                                "    dateformat options: ymd | ydm | myd | mdy | dym | dmy",
+                       198);
+  }
+  into->dateformat = order;
+  return std::nullopt;
+}
+
+std::optional<ojson> readPurposeOption(const BcalOpts& opts, bcal::InduceOpts* into) {
+  const std::optional<std::string> typed = optStr(opts, "purpose");
+  if (!typed.has_value()) return std::nullopt;
+  std::string words = *typed;
+  words.erase(std::remove(words.begin(), words.end(), '"'), words.end());
+  if (words.size() > 63) return utilErrorRc("purpose() is limited to 63 characters", 198);
+  into->purpose = words;
+  return std::nullopt;
+}
+
+// range() and centerdate() read under the dateformat chosen just before them.
+std::optional<ojson> readDateOptions(const BcalOpts& opts, bcal::InduceOpts* into) {
+  const std::string& order = into->dateformat;
+  if (const std::optional<std::string> typed = optStr(opts, "range")) {
+    const std::vector<std::string> ends = splitWs(*typed);
+    if (ends.size() != 2) return utilErrorRc("two date arguments expected in range()", 198);
+    const auto readEnd = [&](const std::string& word, bool* have, std::int64_t* day) {
+      if (word == ".") return true;
+      const std::optional<std::int64_t> parsed = bcal::readWholeDate(word, order);
+      if (!parsed.has_value()) return false;
+      *have = true;
+      *day = *parsed;
+      return true;
+    };
+    if (!readEnd(ends[0], &into->haveRangeLo, &into->rangeLo))
+      return utilErrorRc(ends[0] + " not in " + order + " format", 198);
+    if (!readEnd(ends[1], &into->haveRangeHi, &into->rangeHi))
+      return utilErrorRc(ends[1] + " not in " + order + " format", 198);
+    if (into->haveRangeLo && into->haveRangeHi && into->rangeHi <= into->rangeLo)
+      return utilErrorRc("second date should be after first date in range()", 198);
+  }
+  if (const std::optional<std::string> typed = optStr(opts, "centerdate")) {
+    const std::optional<std::int64_t> parsed = bcal::readWholeDate(*typed, order);
+    if (!parsed.has_value()) return utilErrorRc(*typed + " not in " + order + " format", 198);
+    into->haveCenter = true;
+    into->center = *parsed;
+  }
+  return std::nullopt;
+}
+
+// excludemissing(varlist [, any]): the rows it takes out of the sample.
+struct ExclusionRule {
+  std::vector<std::string> vars;
+  bool whenAny = false;
+};
+
+std::optional<ojson> readExclusionOption(const BcalOpts& opts, SessionState& session,
+                                         ExclusionRule* rule) {
+  const std::optional<std::string> typed = optStr(opts, "excludemissing");
+  if (!typed.has_value()) return std::nullopt;
+  const size_t comma = typed->find(',');
+  if (comma != std::string::npos) {
+    for (const std::string& word : splitWs(typed->substr(comma + 1))) {
+      if (word != "any") return utilErrorRc("option " + word + " not allowed", 198);
+      rule->whenAny = true;
+    }
+  }
+  loops::VarlistExpandResult expanded =
+      loops::expandVarlist(trimOf(typed->substr(0, comma)), session);
+  if (expanded.isError) return ojson(expanded.error);
+  if (auto refusal = loops::checkKnownVarlist(expanded.tokens, session)) return refusal;
+  if (expanded.tokens.empty()) return utilErrorRc("varlist required", 100);
+  rule->vars = std::move(expanded.tokens);
+  return std::nullopt;
+}
+
+// The from() values in the sample, each with its row in the working frame. Stata's
+// missing counts for strings too: a blank cell is missing here.
+struct CreationSample {
+  std::vector<double> dates;
+  std::vector<std::int64_t> frameRows;
+};
+
+CreationSample drawSample(const Datastore& source, const std::string& fromVar,
+                          const ExclusionRule& rule, const double* framePositions) {
+  std::vector<ColView> guards;
+  for (const std::string& var : rule.vars) guards.push_back(viewOf(source, var));
+  const auto isBlank = [](const ColView& view, std::int64_t row) {
+    return cellMissing(view, row) ||
+           (view.isFactor && (*view.levels)[static_cast<size_t>(view.codes[row])].empty());
+  };
+  const double* from = source.col(fromVar).f64();
+  CreationSample sample;
+  for (std::int64_t row = 0; row < source.nRows(); ++row) {
+    if (!guards.empty()) {
+      const auto test = [&](const ColView& view) { return isBlank(view, row); };
+      const bool out = rule.whenAny ? std::any_of(guards.begin(), guards.end(), test)
+                                    : std::all_of(guards.begin(), guards.end(), test);
+      if (out) continue;
+    }
+    sample.dates.push_back(from[row]);
+    sample.frameRows.push_back(framePositions == nullptr
+                                   ? row
+                                   : static_cast<std::int64_t>(framePositions[row]) - 1);
+  }
+  return sample;
+}
+
+ojson bcalCreateVerb(const eval::ParsedCommand& parsed, SessionState& session) {
+  if (auto refusal = eval::rejectUnknownOptions(
+          parsed.opts, {"from", "generate", "personal", "excludemissing", "replace", "purpose",
+                        "dateformat", "range", "centerdate", "maxgap"}))
+    return ojson(*refusal);
+  if (parsed.varlist.size() < 2) return utilErrorRc("name of business calendar file expected", 198);
+  if (parsed.varlist.size() > 2) return utilSyntax("invalid syntax");
+
+  CalendarTarget target;
+  if (auto refusal = splitCalendarTarget(dequote(parsed.varlist[1]), session, &target)) return *refusal;
+  if (hasFlag(parsed.opts, "personal")) {
+    return ojson(eval::unsupportedOption(
+        "personal", "this build has no PERSONAL directory; give the calendar a path instead"));
+  }
+  const std::optional<std::string> fromText = optStr(parsed.opts, "from");
+  if (!fromText.has_value() || fromText->empty()) return utilErrorRc("option from() required", 198);
+  if (!session.hasData()) return utilErrorRc("no dataset in use", 3);
+  Datastore* head = session.datastore();
+  if (head == nullptr) return ojson(eval::noDataLoaded());
+
+  loops::VarlistExpandResult fromVars = loops::expandVarlist(*fromText, session);
+  if (fromVars.isError) return ojson(fromVars.error);
+  if (fromVars.tokens.size() > 1) return utilErrorRc("too many variables specified", 103);
+  if (auto refusal = loops::checkKnownVarlist(fromVars.tokens, session)) return *refusal;
+  if (fromVars.tokens.empty()) return utilErrorRc("option from() required", 198);
+  const std::string fromVar = fromVars.tokens.front();
+  if (head->dtype(fromVar) != "f64") return utilErrorRc(fromVar + " has non-numeric values", 198);
+
+  // generate() is judged here, before anything can be written. A storage-type word
+  // as the name is still taken as a name (open BUG-1874).
+  std::optional<std::string> newVar;
+  if (typedBare(parsed.opts, "generate")) return utilSyntax("option generate() incorrectly specified");
+  if (const std::optional<std::string> typed = optStr(parsed.opts, "generate")) {
+    const std::vector<std::string> names = splitWs(*typed);
+    if (names.size() > 1) return utilErrorRc("too many variables specified", 103);
+    if (names.empty()) return utilSyntax("option generate() incorrectly specified");
+    const std::string& name = names.front();
+    if (head->has(name)) return utilErrorRc("variable " + name + " already defined", 110);
+    if (strutil::isReservedVarName(name)) return utilErrorRc(name + " invalid varname", 198);
+    if (!strutil::isValidStataIdentifier(name)) return utilErrorRc(name + " invalid name", 198);
+    newVar = name;
+  }
+
+  bcal::InduceOpts induce;
+  induce.calName = target.name;
+  induce.todayLine = creationStampLine();
+  if (auto refusal = readMaxgapOption(parsed.opts, &induce)) return *refusal;
+  if (auto refusal = readDateformatOption(parsed.opts, &induce)) return *refusal;
+  if (auto refusal = readPurposeOption(parsed.opts, &induce)) return *refusal;
+  if (auto refusal = readDateOptions(parsed.opts, &induce)) return *refusal;
+  ExclusionRule exclusion;
+  if (auto refusal = readExclusionOption(parsed.opts, session, &exclusion)) return *refusal;
+
+  // The option readers above may have touched the session; take the head afresh.
+  head = session.datastore();
+  if (head == nullptr) return ojson(eval::noDataLoaded());
+  const std::int64_t rowsInFrame = head->nRows();
+  CreationSample sample;
+  const bool qualified = (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) ||
+                         (parsed.inRange.has_value() && !parsed.inRange->empty());
+  try {
+    if (qualified) {
+      std::string positionVar;
+      const InRangeFilterResult kept = applyIfAndInFilterKeepingIndex(
+          session, *session.currentHbin(), parsed.ifExpr, parsed.inRange, &positionVar);
+      if (!kept.ok) return inRangeRejectError(kept, parsed.inRange.value_or(std::string()), "bcal create");
+      session.noteProjectionScratch(kept.dataPath);
+      const Datastore filtered(kept.dataPath);
+      sample = drawSample(filtered, fromVar, exclusion, filtered.col(positionVar).f64());
+    } else {
+      sample = drawSample(*head, fromVar, exclusion, nullptr);
+    }
+  } catch (const std::exception& e) {
+    return utilError("bcal create: could not read the data -- " + std::string(e.what()), "data_io");
+  }
+  if (sample.dates.empty()) return utilErrorRc("no observations found for calendar", 2000);
+
+  // An existing file loses to everything checked so far and beats a gap failure,
+  // so the gap's answer waits until that test has been made (measured).
+  const bcal::InduceResult made = bcal::induceFromDates(sample.dates, induce);
+  const bool gapFailure = !made.ok && made.message.rfind("gap in business calendar", 0) == 0;
+  if (!made.ok && !gapFailure) return utilErrorRc(made.message, made.rc);
+
+  const std::string shownFile = target.shownFile();
+  const std::string diskFile = resolveUserPath(session, shownFile);
+  std::error_code existsError;
+  const bool alreadyThere = std::filesystem::exists(cecon::to_native_path(diskFile), existsError);
+  if (alreadyThere && !hasFlag(parsed.opts, "replace"))
+    return utilErrorRc("file " + shownFile + " already exists; use replace to overwrite", 602);
+  if (gapFailure) {
+    return utilErrorRc(made.message + (alreadyThere ? "\n    " + shownFile + " left unchanged" : ""),
+                       made.rc);
+  }
+
+  // What was just induced has to read back before it may touch the disk: a center
+  // or range start on an omitted weekday and a single distinct date all end here.
+  bcal::ParseResult reread = bcal::parseStbcal(made.text, target.name);
+  if (!reread.ok) {
+    return utilErrorRc("bcal describe " + target.name + " failed" +
+                           (alreadyThere ? "; " + shownFile + " left unchanged" : ""),
+                       197);
+  }
+  {
+    std::ofstream out(cecon::to_native_path(diskFile), std::ios::binary | std::ios::trunc);
+    out << made.text;
+    out.flush();
+    if (!out) return utilError("could not write " + shownFile + " (disk full or I/O error)", "data_io");
+  }
+  reread.cal.fn = diskFile;
+  auto calendar = std::make_shared<const bcal::BusinessCalendar>(std::move(reread.cal));
+  bcal::install(target.name, calendar);
+
+  std::string text = calendarTable(*calendar);
+  text += "\n  Notes:\n\n    Business calendar file " + shownFile + " saved.\n";
+  if (!target.typedPath.empty()) {
+    std::error_code sameError;
+    const std::string folder = resolveUserPath(session, target.typedPath);
+    if (!std::filesystem::equivalent(cecon::to_native_path(folder),
+                                     cecon::to_native_path(bcal::searchDir()), sameError) &&
+        !sameError) {
+      text += "\n    " + target.name + ".stbcal not in a Stata system directory.\n";
+    }
+  }
+  if (newVar.has_value()) {
+    text += "\n    Variable " + *newVar + " created; it contains business dates in %tb" +
+            target.name + " format.\n";
+  }
+  if (made.leadNote) text += "\n    First date in range() occurs before first business date in dataset.\n";
+  if (made.trailNote) text += "\n    Second date in range() occurs after last business date in dataset.\n";
+
+  ojson blocks = ojson::array();
+  blocks.push_back(displayBlock(text));
+  if (newVar.has_value()) {
+    // One value per observation; rows outside the sample stay missing.
+    std::vector<std::string> cells(static_cast<size_t>(rowsInFrame));
+    for (size_t i = 0; i < sample.dates.size(); ++i) {
+      cells[static_cast<size_t>(sample.frameRows[i])] = numCell(bcal::bofd(*calendar, sample.dates[i]));
+    }
+    std::string written;
+    if (auto refusal = writeColumn(session, *session.currentHbin(), *newVar, cells, "f64", true, &written))
+      return *refusal;
+    session.load(written);
+    session.varMeta[*newVar].format = "%tb" + target.name;
+    session.userFormattedVars.insert(*newVar);
+    ojson mutation = mutationResult(session, "gen", {*newVar});
+    if (mutation.is_array()) {
+      for (const auto& block : mutation) blocks.push_back(block);
+    } else if (!mutation.is_null()) {
+      blocks.push_back(std::move(mutation));
+    }
+  }
+  postCalendarFacts(session, *calendar, shownFile, /*withTally=*/true);
+  return blocks;
+}
+
+// A verb token against Stata's minimum abbreviations: `ch[eck]`, `d[escribe]`, and
+// dir, load and create only in full.
+std::string resolveBcalVerb(const std::string& typed) {
+  const std::string word = lowerOf(typed);
+  const auto abbreviates = [&](const std::string& full, size_t atLeast) {
+    return word.size() >= atLeast && word.size() <= full.size() &&
+           full.compare(0, word.size(), word) == 0;
+  };
+  if (word == "dir" || word == "load" || word == "create") return word;
+  if (abbreviates("check", 2)) return "check";
+  if (abbreviates("describe", 1)) return "describe";
+  return std::string();
 }
 
 }  // namespace
 
 ojson runBcal(const eval::ParsedCommand& parsed, SessionState& session) {
-  // NOTE: no reject net runs here. kVocabBcal is the UNION of five
-  // sub-commands' option lists (it has to be -- it is what the dispatcher's
-  // canonicalizeForCommand abbreviates against), and rejecting against the
-  // union BEFORE the sub-command is known is how every sub-command came to
-  // swallow every other sub-command's options as a silent no-op. The net now
-  // runs per sub-command, below, against the ado's own `syntax` line.
-  if (parsed.varlist.empty())
-    return utilSyntax("bcal: syntax is `bcal create|describe|load|dir|check ...'");
-  const std::string sub = lowerOf(parsed.varlist[0]);
-  // bcal.ado's own dispatcher: check/describe accept any prefix, dir/load/
-  // create are spelled in full.
-  auto isPrefixOf = [&](const char* full) {
-    const std::string f = full;
-    return !sub.empty() && sub.size() <= f.size() && f.compare(0, sub.size(), sub) == 0;
-  };
-  const bool isCheck = isPrefixOf("check");
-  const bool isDescribe = !isCheck && isPrefixOf("describe");
-  const bool isDir = sub == "dir";
-  const bool isLoad = sub == "load";
-  const bool isCreate = sub == "create";
-  if (!isCheck && !isDescribe && !isDir && !isLoad && !isCreate)
-    return utilErrorRc(sub + " invalid bcal subcommand", 198);
-  if (!isCreate && (parsed.ifExpr.has_value() || parsed.inRange.has_value()))
-    return utilErrorRc("bcal " + sub + ": if/in qualifiers are not allowed", 101);
+  (void)kVocabBcal;  // the dispatcher's abbreviation net reads it by registration
+  if (parsed.varlist.empty()) return utilSyntax("invalid syntax");
+  const std::string verb = resolveBcalVerb(parsed.varlist[0]);
+  if (verb.empty()) return utilErrorRc(parsed.varlist[0] + " invalid bcal subcommand", 198);
 
-  // --- the option net, NARROWED to the resolved sub-command ----------------
-  // Each set below is that sub-command's own `syntax` line in bcal.ado, and
-  // each refusal code is measured (StataBE 19.5, this machine):
-  //   bcal_describe :91 and bcal_load :69 are a BARE `syntax` -- ANY option is
-  //     "options not allowed", r(101), and it beats the calendar-name error
-  //     (`bcal describe elevenchars, maxgap(5)` is 101, not 198);
-  //   bcal_dir :50    `syntax [, TESTMODE]`      -- `bcal dir, rc0`      r(198);
-  //   bcal_check :38  `syntax [varlist] [, RC0]` -- `bcal check bd, maxgap(4)`
-  //     r(198), while `bcal check bd, rc0` and even `, rc` are r(0);
-  //   bcal_create :237-248 has no rc0 -- `bcal create c1, from(bd) replace
-  //     rc0` r(198).
-  // Before this narrowing all seven of those lines answered rc 0 here.
-  if (isDescribe || isLoad) {
-    if (!parsed.opts.empty()) return utilErrorRc("options not allowed", 101);
+  // Point lookup() at the same directory these verbs read.
+  const std::string home = bcal::searchDirFor(session.cwd.value_or(std::string()));
+  bcal::setSearchDir(home);
+
+  ojson answer;
+  if (verb == "create") {
+    answer = bcalCreateVerb(parsed, session);
+  } else if (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) {
+    answer = utilErrorRc("if not allowed", 101);
+  } else if (verb == "describe" || verb == "load") {
+    answer = bcalReadVerb(parsed, session, home, /*isLoad=*/verb == "load");
+  } else if (verb == "dir") {
+    answer = bcalDirVerb(parsed, session, home);
   } else {
-    static const std::unordered_set<std::string> kNoneKnown;
-    // `testmode` is bcal_dir's undocumented test hook (it re-points the paths
-    // bcal_dir prints). Stata accepts it (r(0), measured); PIET has no such
-    // mode, so it is refused BY NAME as known-but-absent rather than accepted
-    // as a silent no-op.
-    static const std::unordered_set<std::string> kDirUnimpl = {"testmode"};
-    static const std::unordered_set<std::string> kCheckKnown = {"rc0"};
-    static const std::unordered_set<std::string> kCreateKnown = {
-        "from",    "generate",   "personal", "excludemissing", "replace",
-        "purpose", "dateformat", "range",    "centerdate",     "maxgap"};
-    const std::unordered_set<std::string>& known =
-        isCheck ? kCheckKnown : (isCreate ? kCreateKnown : kNoneKnown);
-    const std::unordered_set<std::string>& unimpl =
-        isDir ? kDirUnimpl : kVocabBcal.unimplemented;
-    if (auto e = eval::rejectUnknownOptions(parsed.opts, known, unimpl)) return ojson(*e);
-    if (isCreate) {
-      std::set<std::string> seen;
-      for (const auto& [key, value] : parsed.opts) {
-        if (!seen.insert(key).second)
-          return utilErrorRc("bcal create: duplicate option " + key, 198);
-        const bool flag = key == "replace" || key == "personal";
-        if (value.isBool != flag)
-          return utilErrorRc("bcal create: invalid syntax for option " + key, 198);
-        if (!flag && key != "purpose" && trimOf(value.strValue).empty())
-          return utilErrorRc("bcal create: option " + key + " requires an argument", 198);
-      }
-    }
+    answer = bcalCheckVerb(parsed, session, home);
   }
-
-  configureCalendarSearch(session);
-
-  // --- describe / load -----------------------------------------------------
-  if (isDescribe || isLoad) {
-    if (parsed.varlist.size() < 2)
-      return utilErrorRc("bcal " + std::string(isLoad ? "load" : "describe") +
-                             ": nothing was found where a calendar name or %tbfmt was expected",
-                         198);
-    const std::string asked = parsed.varlist[1];
-    bcal::StbcalError err;
-    auto cal = bcalFind(session, asked, /*forceReload=*/isLoad, &err);
-    if (!cal) {
-      // The calendar-NAME rule (bcal.h), in Stata's own words. It is a
-      // DIFFERENT refusal from "no such file": `bcal load nosuchcal` is
-      // r(601), `bcal load elevenchars` is r(198), both measured.
-      if (err.rc == 198) return utilErrorRc(err.message, 198);
-      if (err.rc == 601)
-        return utilErrorRc("bcal " + std::string(isLoad ? "load" : "describe") + ": calendar " +
-                               asked + " not found (" + bcal::calNameFromFormat(asked) +
-                               ".stbcal is not in the working or PERSONAL directory)",
-                           601);
-      return utilErrorRc("bcal: " + asked + ".stbcal is not a valid calendar file -- " +
-                             err.message,
-                         err.rc);
-    }
-    if (isLoad) {
-      setDescribeR(session, *cal, /*withCounts=*/false);
-      return displayBlock("\n(calendar loaded successfully)\n");
-    }
-    setDescribeR(session, *cal, /*withCounts=*/true);
-    return displayBlock(describeTable(*cal));
+  if (firstError(answer) != nullptr) {
+    forgetEarlierR(session);
+    eval::declareRPosted(session.eval, "bcal", {});
   }
-
-  // --- dir -----------------------------------------------------------------
-  if (isDir) {
-    std::string pattern = parsed.varlist.size() > 1 ? parsed.varlist[1] : std::string("*");
-    if (!pattern.empty() && pattern[0] == '%')
-      return utilErrorRc("bcal dir: % is not allowed -- name the calendar (nyse), not its format "
-                         "(%tbnyse)",
-                         198);
-    auto globMatch = [](const std::string& pat, const std::string& s) {
-      // The two wildcards bcal dir's own pattern grammar uses.
-      std::function<bool(size_t, size_t)> m = [&](size_t pi, size_t si) -> bool {
-        if (pi == pat.size()) return si == s.size();
-        if (pat[pi] == '*') {
-          for (size_t k = si; k <= s.size(); ++k)
-            if (m(pi + 1, k)) return true;
-          return false;
-        }
-        if (si == s.size()) return false;
-        if (pat[pi] == '?' || pat[pi] == s[si]) return m(pi + 1, si + 1);
-        return false;
-      };
-      return m(0, 0);
-    };
-    std::vector<std::pair<std::string, std::string>> found;  // name, path
-    std::error_code ec;
-    std::vector<std::string> directories = {bcalCwd(session)};
-    const bool sameDirectory = !bcal::personalDir().empty() &&
-        std::filesystem::equivalent(std::filesystem::u8path(bcal::personalDir()),
-                                    std::filesystem::u8path(directories.front()), ec);
-    if (!bcal::personalDir().empty() && !sameDirectory)
-      directories.push_back(bcal::personalDir());
-    for (size_t index = 0; index < directories.size(); ++index) {
-      ec.clear();
-      for (std::filesystem::directory_iterator it(std::filesystem::u8path(directories[index]), ec), end;
-           !ec && it != end; it.increment(ec)) {
-        if (!it->is_regular_file()) continue;
-        const std::string fn = it->path().filename().u8string();
-        if (fn.size() <= 7 || fn.compare(fn.size() - 7, 7, ".stbcal") != 0) continue;
-        const std::string nm = fn.substr(0, fn.size() - 7);
-        if (!globMatch(pattern, nm)) continue;
-        found.emplace_back(nm, index == 0 ? "./" + fn : it->path().u8string());
-      }
-    }
-    std::sort(found.begin(), found.end());
-    std::ostringstream o;
-    if (found.empty()) {
-      o << "no calendar files matching " << pattern << " found\n";
-    } else {
-      o << "  " << found.size() << " calendar file" << (found.size() == 1 ? "" : "s")
-        << " found:\n";
-      for (const auto& [nm, path] : found) o << fmtW(nm, 20) << ":  " << path << "\n";
-    }
-    std::string names;
-    for (const auto& [nm, path] : found) {
-      session.eval.rStrings.set("fn_" + nm, path);
-      if (!names.empty()) names += " ";
-      names += nm;
-    }
-    session.eval.rStrings.set("calendars", names);
-    return displayBlock(o.str());
-  }
-
-  // --- check ---------------------------------------------------------------
-  if (isCheck) {
-    const bool rc0 = hasFlag(parsed.opts, "rc0");
-    std::vector<std::string> asked(parsed.varlist.begin() + 1, parsed.varlist.end());
-    Datastore* ds = nullptr;
-    try {
-      ds = session.datastore();
-    } catch (const std::exception&) {
-      ds = nullptr;
-    }
-    std::vector<std::string> vars;
-    if (!asked.empty()) {
-      vars = asked;
-    } else if (ds != nullptr) {
-      vars = ds->names();
-    }
-    std::map<std::string, std::vector<std::string>> byCal;  // calname -> vars
-    for (const auto& v : vars) {
-      auto it = session.varMeta.find(v);
-      if (it == session.varMeta.end() || !it->second.format.has_value()) continue;
-      const std::string nm = bcal::calNameFromFormat(*it->second.format);
-      if (nm.empty()) continue;
-      byCal[nm].push_back(v);
-    }
-    if (byCal.empty()) return displayBlock("(no variables use %tb formats)\n");
-    std::ostringstream o;
-    std::string defined, undefined, errored;
-    for (const auto& [nm, vlist] : byCal) {
-      bcal::StbcalError err;
-      auto cal = bcalFind(session, nm, /*forceReload=*/false, &err);
-      o << "\n" << fmtW("%tb" + nm, 21) << ":  ";
-      if (cal) {
-        o << "defined, ";
-        defined += (defined.empty() ? "" : " ") + nm;
-      } else if (err.rc == 601 || err.rc == 198) {
-        // 198 is the calendar-NAME rule. Stata cannot reach this line at all:
-        // it refuses `format x %tbelevenchars` up front with r(120) "invalid
-        // %format" (measured), so there is no Stata bucket to copy. "undefined"
-        // is the honest one of the two Stata has -- there is no such calendar,
-        // and "defined, has errors" would claim a file was read that was never
-        // opened.
-        o << "undefined, ";
-        undefined += (undefined.empty() ? "" : " ") + nm;
-      } else {
-        o << "defined, has errors, ";
-        errored += (errored.empty() ? "" : " ") + nm;
-      }
-      o << "used by " << (vlist.size() == 1 ? "variable" : "variables") << "\n";
-      o << joinWith(vlist, " ") << "\n";
-      session.eval.rStrings.set("varlist_" + nm, joinWith(vlist, " "));
-    }
-    session.eval.rStrings.set("defined", defined);
-    session.eval.rStrings.set("undefined", undefined);
-    session.eval.rStrings.set("error", errored);
-    if (undefined.empty() && errored.empty()) return displayBlock(o.str());
-    o << "\nundefined or defined-with-errors %tb formats\n";
-    if (rc0) return displayBlock(o.str());
-    return utilErrorRc(o.str(), 459);
-  }
-
-  // --- create --------------------------------------------------------------
-  if (parsed.varlist.size() < 2)
-    return utilErrorRc("bcal create: name of business calendar file expected", 198);
-  if (parsed.varlist.size() > 2)
-    return utilErrorRc("bcal create: only one calendar filename is allowed", 198);
-  const std::string spec = parsed.varlist[1];
-
-  // parse_pathname (bcal.ado:1183-1231): split path / calname / suffix.
-  std::string path, calname = spec;
-  const size_t slash = spec.find_last_of("/\\");
-  if (slash != std::string::npos) {
-    path = spec.substr(0, slash + 1);
-    calname = spec.substr(slash + 1);
-  }
-  std::string suffix;
-  const size_t dot = calname.find_last_of('.');
-  if (dot != std::string::npos) {
-    suffix = calname.substr(dot);
-    calname = calname.substr(0, dot);
-  }
-  if (hasFlag(parsed.opts, "personal") && !path.empty())
-    return utilErrorRc("personal cannot be combined with a filename path", 198);
-  if (!path.empty()) {
-    std::error_code ec;
-    if (!std::filesystem::is_directory(resolveUserPath(session, path), ec))
-      return utilErrorRc("path " + path + " does not exist", 601);
-  }
-  if (!strutil::isValidStataIdentifier(calname))
-    return utilErrorRc(calname + " is not a valid calendar name", 198);
-  if (calname.size() > 10)
-    return utilErrorRc(calname + " too long; calendar names are limited to 10 characters", 198);
-  if (!suffix.empty() && suffix != ".stbcal" && suffix != ".")
-    return utilErrorRc("extension " + suffix + " in calendar file not allowed", 198);
-
-  if (hasFlag(parsed.opts, "personal")) {
-    std::error_code ec;
-    if (!std::filesystem::is_directory(std::filesystem::u8path(bcal::personalDir()), ec))
-      return utilErrorRc("PERSONAL directory does not exist", 198);
-    path = bcal::personalDir();
-    if (!path.empty() && path.back() != '/' && path.back() != '\\') path += '/';
-  }
-
-  const std::optional<std::string> fromOpt = optStr(parsed.opts, "from");
-  if (!fromOpt.has_value() || trimOf(*fromOpt).empty())
-    return utilErrorRc("bcal create: option from() required", 198);
-  const std::string fromVar = trimOf(*fromOpt);
-
-  if (!session.hasData()) return utilErrorRc("no dataset in use", 3);
-
-  bcal::InduceOpts iopts;
-  iopts.calName = calname;
-  if (auto df = optStr(parsed.opts, "dateformat")) {
-    const std::string d = lowerOf(trimOf(*df));
-    static const std::set<std::string> kOrders = {"ymd", "ydm", "myd", "mdy", "dym", "dmy"};
-    if (kOrders.count(d) == 0)
-      return utilErrorRc(d + " found where dateformat expected (ymd|ydm|myd|mdy|dym|dmy)", 198);
-    iopts.dateformat = d;
-  }
-  if (auto pu = optStr(parsed.opts, "purpose")) {
-    std::string p = *pu;
-    if (p.size() >= 2 && p.front() == '"' && p.back() == '"') p = p.substr(1, p.size() - 2);
-    if (p.size() > 63) return utilErrorRc("purpose() is limited to 63 characters", 198);
-    iopts.purpose = p;
-  }
-  if (auto mg = optStr(parsed.opts, "maxgap")) {
-    const std::string m = trimOf(*mg);
-    char* endp = nullptr;
-    const long v = std::strtol(m.c_str(), &endp, 10);
-    if (endp == m.c_str() || *endp != '\0')
-      return utilErrorRc("maxgap(): " + m + " found where integer expected", 198);
-    if (v < 1) return utilErrorRc("maxgap() should be at least 1", 198);
-    iopts.maxgap = v;
-  }
-  // Options and calendar files share one date grammar. Parse just the token;
-  // building a calendar through year 9999 here would allocate millions of days.
-  auto readDate = [&](const std::string& tok, std::int64_t* out) -> bool {
-    return bcal::parseDailyDate(tok, iopts.dateformat, out);
-  };
-  if (auto rg = optStr(parsed.opts, "range")) {
-    const std::vector<std::string> parts = splitWs(trimOf(*rg));
-    if (parts.size() != 2) return utilErrorRc("two date arguments expected in range()", 198);
-    if (parts[0] != ".") {
-      if (!readDate(parts[0], &iopts.rangeLo))
-        return utilErrorRc(parts[0] + " not in " + iopts.dateformat + " format", 198);
-      iopts.haveRangeLo = true;
-    }
-    if (parts[1] != ".") {
-      if (!readDate(parts[1], &iopts.rangeHi))
-        return utilErrorRc(parts[1] + " not in " + iopts.dateformat + " format", 198);
-      iopts.haveRangeHi = true;
-    }
-    if (iopts.haveRangeLo && iopts.haveRangeHi && iopts.rangeHi <= iopts.rangeLo)
-      return utilErrorRc("second date should be after first date in range()", 198);
-  }
-  if (auto cd = optStr(parsed.opts, "centerdate")) {
-    if (!readDate(trimOf(*cd), &iopts.center))
-      return utilErrorRc(trimOf(*cd) + " not in " + iopts.dateformat + " format", 198);
-    iopts.haveCenter = true;
-  }
-
-  // excludemissing(varlist [, any]): the variables are joined with `|` by
-  // default and with `&` when `any` is given (bcal.ado:354-381 -- the option's
-  // OWN sub-option, read out of the parenthesised text).
-  std::vector<std::string> exclVars;
-  bool exclAny = false;
-  if (auto em = optStr(parsed.opts, "excludemissing")) {
-    std::string body = trimOf(*em);
-    const size_t comma = body.find(',');
-    if (comma != std::string::npos) {
-      const std::string tail = lowerOf(trimOf(body.substr(comma + 1)));
-      if (!tail.empty() && std::string("any").compare(0, tail.size(), tail) == 0) exclAny = true;
-      else if (!tail.empty())
-        return utilErrorRc("excludemissing(): option " + tail + " not allowed", 198);
-      body = trimOf(body.substr(0, comma));
-    }
-    exclVars = splitWs(body);
-  }
-
-  const std::optional<std::string> genVar = optStrAny(parsed.opts, {"generate", "gen"});
-  const bool haveQualifier = (parsed.ifExpr.has_value() && !parsed.ifExpr->empty()) ||
-                             (parsed.inRange.has_value() && !parsed.inRange->empty());
-  std::vector<std::string> readCols = {fromVar};
-  for (const auto& v : exclVars) readCols.push_back(v);
-  ReadScope scope(session, parsed, readCols, "bcal create", /*honourQualifiers=*/false);
-  if (scope.failed())
-    return scope.error().is_null() ? utilError("bcal create: could not read the data", "data_io")
-                                   : scope.error();
-  Datastore& ds = *scope.get();
-  for (const auto& nm : readCols) {
-    if (!ds.has(nm)) return utilError("variable " + nm + " not found");
-  }
-  if (ds.col(fromVar).dtype == cecon::DType::Factor)
-    return utilErrorRc(fromVar + " has non-numeric values", 198);
-
-  const int64_t n = ds.nRows();
-  std::vector<bool> selected;
-  if (haveQualifier && strmutate::needsStringCount(session, parsed.ifExpr)) {
-    auto selection = strmutate::countRowsIf(session, parsed.ifExpr.value_or("1"), parsed.inRange);
-    if (!selection.ok) {
-      if (selection.inRangeError) {
-        InRangeFilterResult failure;
-        failure.ok = false;
-        failure.refusal = selection.errMsg;
-        return inRangeRejectError(failure, parsed.inRange.value_or(""), "bcal create");
-      }
-      return utilErrorRc("bcal create: " + selection.errMsg, 198);
-    }
-    selected = std::move(selection.selected);
-    if (selected.size() != static_cast<size_t>(n))
-      return utilError("bcal create: sample mask does not match the dataset", "internal");
-  } else if (haveQualifier) {
-    // Numeric conditions use the engine, retaining its extended-missing and
-    // time-series semantics. The scratch result preserves every original row.
-    std::string predicate = "((" + parsed.ifExpr.value_or("1") + ")!=0)";
-    if (parsed.inRange.has_value()) {
-      const auto bounds = parseInRangeBounds(*parsed.inRange, n);
-      if (!bounds.ok) {
-        InRangeFilterResult failure;
-        failure.ok = false;
-        failure.refusal = bounds.refusal;
-        return inRangeRejectError(failure, *parsed.inRange, "bcal create");
-      }
-      predicate += " & (_n>=" + std::to_string(bounds.a) + " & _n<=" +
-                   std::to_string(bounds.b) + ")";
-    }
-    std::string marker = "__piet_bcal_sample";
-    const std::string samplePath = nextPath(session.workdir(), "bcal_sample");
-    session.noteProjectionScratch(samplePath);
-    try {
-      SessionState::ResidentSuspend statelessSample(session);
-      session.ensureMaterializedHead();
-      while (session.datastore()->has(marker)) marker += '_';
-      runCobraJson(translate::injectTsContextForExpr(
-          {"eval", "--data", *session.currentHbin(), "--bygen", marker + "=" + predicate,
-           "--out", samplePath}, predicate, session));
-      Datastore sample(samplePath);
-      if (sample.nRows() != n)
-        return utilError("bcal create: sample mask does not match the dataset", "internal");
-      const double* mask = sample.col(marker).f64();
-      selected.resize(static_cast<size_t>(n));
-      for (int64_t row = 0; row < n; ++row)
-        selected[static_cast<size_t>(row)] = mask[row] != 0;
-    } catch (const CobraError& error) {
-      return utilError(cobraErrorMessage(error), error.code);
-    } catch (const std::exception& error) {
-      return utilError("bcal create: could not read the sample -- " + std::string(error.what()),
-                       "data_io");
-    }
-  }
-  const double* fromCol = ds.col(fromVar).f64();
-  std::vector<ColView> exclViews;
-  for (const auto& v : exclVars) exclViews.push_back(viewOf(ds, v));
-  std::vector<double> values;
-  std::vector<char> included(static_cast<size_t>(n), 0);
-  values.reserve(static_cast<size_t>(n));
-  for (int64_t i = 0; i < n; ++i) {
-    if (!selected.empty() && !selected[static_cast<size_t>(i)]) continue;
-    if (!exclViews.empty()) {
-      bool keep = exclAny;
-      for (const auto& v : exclViews) {
-        const bool present = !cellMissing(v, i);
-        keep = exclAny ? (keep && present) : (keep || present);
-      }
-      if (!keep) continue;
-    }
-    included[static_cast<size_t>(i)] = 1;
-    values.push_back(fromCol[i]);
-  }
-  if (values.empty()) return utilErrorRc("no observations found for calendar", 2000);
-
-  {
-    std::time_t t = std::time(nullptr);
-    std::tm tmv{};
-#ifdef _WIN32
-    localtime_s(&tmv, &t);
-#else
-    localtime_r(&t, &tmv);
-#endif
-    static const char* kMonth[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "* Created/replaced on %2d %s %d", tmv.tm_mday,
-                  kMonth[tmv.tm_mon], tmv.tm_year + 1900);
-    iopts.todayLine = buf;
-  }
-
-  bcal::InduceResult ind = induceFromDates(values, iopts);
-  if (!ind.ok) return utilErrorRc(ind.message, ind.rc);
-
-  const std::string filename = path + calname + ".stbcal";
-  const std::string abs = resolveUserPath(session, filename);
-  const bool existed = std::filesystem::exists(abs);
-  if (existed && !hasFlag(parsed.opts, "replace"))
-    return utilErrorRc("file " + filename + " already exists; use replace to overwrite", 602);
-
-  // A self-parse BEFORE the write: bcal create runs `bcal describe` on the
-  // file it just wrote and, when that fails, restores the previous file and
-  // exits 197. Checking the bytes first reaches the same answer without ever
-  // damaging the old file.
-  bcal::ParseResult back = bcal::parseStbcal(ind.text, calname);
-  if (!back.ok)
-    return utilErrorRc("bcal describe " + calname + " failed -- " + back.err.message +
-                           (existed ? "; " + filename + " left unchanged" : ""),
-                       197);
-
-  {
-    std::ofstream f(cecon::to_native_path(abs), std::ios::binary);
-    if (!f) return utilError("bcal create: cannot write " + abs, "data_io");
-    f << ind.text;
-    f.flush();
-    if (!f) return utilError("bcal create: failed writing " + abs + " (disk full or I/O error)",
-                             "data_io");
-  }
-  back.cal.fn = abs;
-  auto cal = std::make_shared<const bcal::BusinessCalendar>(back.cal);
-  // `bcal create ..., replace` REFRESHES the cache (measured: the paper's
-  // second create on a narrower date set turns the outer rows missing at the
-  // very next bofd, 38/80).
-  bcal::install(calname, cal);
-
-  std::ostringstream out;
-  out << describeTable(*cal);
-  out << "\n  Notes:\n\n";
-  out << "    Business calendar file " << filename << " saved.\n";
-  if (ind.leadNote)
-    out << "\n    First date in range() occurs before first business date in dataset.\n";
-  if (ind.trailNote)
-    out << "\n    Second date in range() occurs after last business date in dataset.\n";
-  if (ind.fractionalNote)
-    out << "\n    " << fromVar << " contains noninteger dates; daily dates use their floor.\n";
-
-  ojson blocks = ojson::array();
-  if (genVar.has_value()) {
-    const std::string newvar = trimOf(*genVar);
-    ojson guard = newVarGuard(session, "bcal create", newvar);
-    if (!guard.is_null()) {
-      // The file is already written and cached, which is what Stata does too
-      // (it generates AFTER the successful describe); the 110 is still a hard
-      // stop and is reported as such.
-      return utilErrorRc("bcal create: variable " + newvar + " already defined", 110);
-    }
-    std::vector<std::string> cells;
-    cells.reserve(static_cast<size_t>(n));
-    for (int64_t i = 0; i < n; ++i) {
-      if (!included[static_cast<size_t>(i)]) {
-        cells.emplace_back();
-        continue;
-      }
-      cells.push_back(numCell(bcal::bofd(*cal, fromCol[i])));
-    }
-    std::string outPath;
-    if (auto err = writeColumn(session, *session.currentHbin(), newvar, cells, "f64", true,
-                               &outPath))
-      return *err;
-    session.load(outPath);
-    session.varMeta[newvar].format = "%tb" + calname;
-    session.varMeta[newvar].stataType = "long";
-    session.implicitFloatVars.erase(newvar);
-    session.userFormattedVars.insert(newvar);
-    out << "\n    Variable " << newvar << " created; it contains business dates in %tb" << calname
-        << " format.\n";
-    blocks.push_back(displayBlock(out.str()));
-    ojson mr = handlers::mutationResult(session, "gen", {newvar});
-    if (mr.is_array())
-      for (const auto& b : mr) blocks.push_back(b);
-    else if (!mr.is_null())
-      blocks.push_back(mr);
-  } else {
-    blocks.push_back(displayBlock(out.str()));
-  }
-
-  setDescribeR(session, *cal, /*withCounts=*/true);
-  session.eval.rStrings.set("fn", filename);
-  return blocks;
+  return answer;
 }
 
 }  // namespace piet::handlers

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Datastore — semantic layer over an .hbin file, C++ port of
 // piet/backend/piet/datastore.py. Wraps cecon::Dataset (LINKED from the
 // monorepo's src/io/columnar.{h,cpp} — read-only compile reuse, per the
@@ -148,6 +150,13 @@ struct VarInfo {
   // overwrites it whenever c.format is non-empty). Removing it would need a
   // nullable representation nothing downstream reads.
   std::string format = "%9.0g";
+  // format-display-default-lifecycle: true only when `format` above came from
+  // a file's own header (buildVarInfo, c.format non-empty) or an engine frame
+  // that stated one (SessionState::seedShadowFromFrameVars). False = `format`
+  // is still the member default above, which says nothing about the variable:
+  // SessionState::displayFormat then derives Stata's default from the declared
+  // storage type instead of answering %9.0g for a byte or a str12.
+  bool formatStated = false;
   std::string label;
   std::optional<int64_t> nLevels;
   LevelsRef levels;  // non-owning view into the column's levels (A12; see LevelsRef)
@@ -177,6 +186,76 @@ struct BrowseCell {
   }
   nlohmann::json toJson() const;
 };
+
+// e(sample) T2 (internal note esample/SPEC.md §4.3): PIET's own
+// column on the working frame, the estimation-sample mask `__piet_esample__`
+// (kEsampleColumn), is HIDDEN: absent from every user-facing listing
+// (Datastore::names()/varlist()/nCols(), the resident card, describe/ds/`*`/
+// `_all`) and from every user-facing file writer (save/export), while explicit
+// lookups (has()/col()) still answer, so a row expression that names it -- the
+// e(sample) rewrite -- reads it like any column.
+// DESIGN DECISION (narrower than SPEC §4.3's `__piet_` prefix): the hide is by
+// exact name. The other `__piet_*` names are SCRATCH columns that live only on
+// frames PIET's own code builds and then reads back by name through names()/
+// varlist() -- strmutate's `__piet_tsif<k>` (BUG-370), storage_type's
+// `__piet_rp_val__`/`__piet_rp_frac__` probes -- and hiding the prefix broke
+// both (selftest BUG-370(a)-(d), BUG-291). None of them is ever adopted as the
+// working frame, so none needs hiding; a future PERSISTENT PIET column joins
+// this test. The engine's writers (apps/cmds/cmds_data.cpp) do drop the whole
+// prefix, because a user file must never carry any of them. Stata names may
+// begin with `_`, so a user could type `__piet_esample__`; it is then unknown to
+// them (r(111)), which SPEC §7 item 6 lists.
+inline constexpr const char* kEsampleColumn = "__piet_esample__";
+// The qualifier columns: the row mask of an `if` the engine's f64 evaluator
+// cannot read (a string function, a compare against ""), `__piet_qualif<k>__`, and
+// the values of a weight EXPRESSION (`[pw=1/wf]`), `__piet_qualw<k>__` (k unique
+// per install). strmutate::installConditionMask / installWeightExpression put
+// one on the working frame for ONE command, which reads `(__piet_qualif<k>__!=0)`
+// as its condition or the column as its weight, and the dispatcher removes it
+// when that command returns. It stays on the frame a fit read (LastModel::
+// dataPath), so a replay of the fit's --keepif/--weight reads the same rows.
+// Hidden for the same reason as the e(sample) mask.
+inline constexpr const char* kQualifierColumnPrefix = "__piet_qual";
+inline bool isQualifierColumn(const std::string& name) {
+  return name.rfind(kQualifierColumnPrefix, 0) == 0;
+}
+inline bool isHiddenColumn(const std::string& name) {
+  return name == kEsampleColumn || isQualifierColumn(name);
+}
+// True when a condition text names a hidden column (the e(sample) mask or a
+// qualifier column): such a condition reads the frame that carries the column,
+// never an alias of it without the column.
+inline bool namesHiddenColumn(const std::string& text) {
+  return text.find(kEsampleColumn) != std::string::npos ||
+         text.find(kQualifierColumnPrefix) != std::string::npos;
+}
+// A NEGATIVE mask cell: a data verb rebuilt the rows in a way whose Stata marker
+// PIET cannot reproduce (StataBE capture w2_esample_copies, 2026-10-13): bsample
+// keeps the marker on the copies its own random draw picks (X2 `m0=20|m0_diff=10`,
+// an RNG PIET does not share); collapse/contract of data not
+// in by-group order mark a group's first row after Stata's own (randomized-tie)
+// sort (K3 first_diff=2). Every row of the rebuilt frame carries the verb's
+// code, so the marker follows the data through preserve/restore and save like
+// any column, and SessionState::esampleReading names the verb in its r(198).
+// gcollapse/fcollapse run collapse's engine verb here, but their marker rule is
+// their plugin's, which no capture has measured. joinby and `merge 1:m` keep
+// the marker on the first copy of each master row (handlers.cpp
+// esampleKeepFirstCopy; w2_esample_copies.log:470 X4, :596 M1); their codes
+// remain for a result whose key columns that rule cannot read.
+enum class EsampleLostBy : int {
+  kJoinby = 1, kBsample = 2, kCollapse = 3, kContract = 4, kCollapseShim = 5, kMerge1m = 6
+};
+inline const char* esampleLostByVerb(double cell) {
+  switch (static_cast<int>(-cell)) {
+    case 1: return "joinby";
+    case 2: return "bsample";
+    case 3: return "collapse";
+    case 4: return "contract";
+    case 5: return "gcollapse/fcollapse";
+    case 6: return "merge 1:m";
+    default: return "a data command";
+  }
+}
 
 class Datastore {
  public:
@@ -215,9 +294,13 @@ class Datastore {
 
   const std::string& path() const { return path_; }
   int64_t nRows() const { return ds_.n_rows(); }
-  int nCols() const { return ds_.n_cols(); }
+  // The USER's columns: names_ skips hidden ones (isHiddenColumn), and so does
+  // the count (`missings dropvars`' all-columns guard, the cockpit's n_cols).
+  int nCols() const { return static_cast<int>(names_.size()); }
   const std::vector<std::string>& names() const { return names_; }
 
+  // Answers for hidden columns too (isHiddenColumn): the e(sample) rewrite's
+  // `__piet_esample__` reference resolves through here and through col().
   bool has(const std::string& name) const { return ds_.has(name); }
   std::string dtype(const std::string& name) const;
   int64_t nMissing(const std::string& name) const;
@@ -240,6 +323,12 @@ class Datastore {
   const std::vector<VarInfo>& varlist();
 
   VarInfo varinfo(const std::string& name);
+
+  // format-display-default-lifecycle: name, dtype, format and formatStated of
+  // each named column that exists (every column when `vars` is nullopt), the
+  // same format fields buildVarInfo fills but without varlist()'s n_missing
+  // scan -- the input SessionState::displayFormatMap needs for browse().
+  std::vector<VarInfo> formatCard(const std::optional<std::vector<std::string>>& vars) const;
 
   // C2-F13a incremental nMissing: carry an unchanged column's missing-count
   // from the prior state so nMissing() skips its O(nrows) scan — which, on a
@@ -283,12 +372,11 @@ class Datastore {
   // BrowseResult-shaped window. `valueLabelMap` maps varname -> {code -> text}
   // for display-only value-labeled numeric columns (factor dtype uses its own
   // baked-in levels instead and ignores this map, mirroring datastore.py).
-  // `formatMap` (BS-005/D6: `format VAR %fmt` display-layer attribute) maps
-  // varname -> a Stata %fmt string; SPARSE by design (a variable absent from
-  // the map gets NO "format" key in its column-meta at all, not a fabricated
-  // default) — every caller that never touches `format` keeps a byte-
-  // identical browse() JSON (freeze safety), matching the value_labels key's
-  // own already-conditional emission just below.
+  // `formatMap` maps varname -> the Stata %fmt its cells display in. list and
+  // the browse route pass SessionState::displayFormatMap (every listed column,
+  // format-display-default-lifecycle); a variable absent from the map falls
+  // back to the file's own format, else gets no "format" key (never a
+  // fabricated default).
   nlohmann::ordered_json browse(
       int64_t offset, int64_t limit,
       const std::optional<std::vector<std::string>>& vars,

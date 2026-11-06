@@ -1,5 +1,7 @@
-// Sun & Abraham interaction-weighted (IW) event-study estimator — clean-room
-// implementation from the published methodology paper:
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
+// Sun & Abraham interaction-weighted (IW) event-study estimator —
+// implemented from the published methodology paper:
 //
 //   [SA21] Sun, L. and S. Abraham (2021), "Estimating dynamic treatment
 //          effects in event studies with heterogeneous treatment effects",
@@ -25,17 +27,17 @@
 //
 //   * VARIANCE ASSEMBLY. Var(tau_l) = c_reg * Vb + Vw, block-diagonal in the
 //     two influence functions (no delta/weight covariance term), where Vb is
-//     the saturated stage's cluster-summed IF and Vw the cohort-share IF. Only
-//     Vb carries the regression cluster small-sample factor.
+//     the saturated stage's cluster-summed IF and Vw the cohort-share IF summed
+//     over rows (BUG-1524, by StataBE measurement: clustered, it misses e(V_iw)
+//     when a cluster holds several units). Only Vb carries the regression cluster
+//     small-sample factor.
 //
 //   * K IN THE SMALL-SAMPLE FACTOR. c_reg = G/(G-1) * (N-1)/(N-K) counts the
 //     interactions, the NON-nested absorbed dof, and one intercept — an FE
 //     nested inside the cluster variable is exempt (its parameters are already
 //     accounted for by clustering). The same K drives the model F.
 //
-// Provenance: no eventstudyinteract.ado, Mata source, or fixest sunab() code
-// was read; the clean-room wall is the one recorded for csdid
-// (docs/legal/CSDID_CLEANROOM_WALL.md).
+// Method source: the paper above and this project's own goldens.
 
 #include "estimators/sunab.h"
 
@@ -109,7 +111,7 @@ SunabResult sunab_run(const double* y, const double* rel_ind, int n_rel,
                       const double* cohort, const double* control,
                       const double* fe_unit, const double* fe_time,
                       const double* cluster, int64_t n_obs,
-                      const SunabConfig& cfg) {
+                      const SunabConfig& cfg, const double* weight) {
     SunabResult R;
     R.level = cfg.level;
     if (n_obs <= 0 || n_rel <= 0 || y == nullptr || rel_ind == nullptr ||
@@ -124,11 +126,18 @@ SunabResult sunab_run(const double* y, const double* rel_ind, int n_rel,
         return R;
     }
     auto is_control = [&](int64_t i) { return control != nullptr && control[i] != 0.0; };
+    // BUG-1283 weights (see sunab.h): wt(i) is the raw weight, 1 unweighted.
+    auto wt = [&](int64_t i) { return weight != nullptr ? weight[i] : 1.0; };
 
     // --- cohort levels actually interacted (control cohort excluded) ---------
+    // BUG-1525 (StataBE 19.5 measurement): a row whose cohort is missing stays in
+    // the sample. On a control row it is an ordinary control row (`gen first = g
+    // if g > 0`: e(N) 180, the cohort(g) table). On a treated row it belongs to no
+    // cohort: no interaction, yet it counts in its relative period's share
+    // denominator ("(obs=120)" unchanged), so that period's shares sum below one.
     std::map<double, int> cohort_index;
     for (int64_t i = 0; i < n_obs; ++i)
-        if (!is_control(i)) cohort_index.emplace(cohort[i], 0);
+        if (!is_control(i) && !std::isnan(cohort[i])) cohort_index.emplace(cohort[i], 0);
     int C = 0;
     for (auto& kv : cohort_index) kv.second = C++;
     R.cohorts.resize(static_cast<size_t>(C));
@@ -138,6 +147,10 @@ SunabResult sunab_run(const double* y, const double* rel_ind, int n_rel,
         R.error = "eventstudyinteract: control_cohort() leaves no treated cohort to interact";
         return R;
     }
+    // Index of a treated row's cohort, -1 when the cohort is missing.
+    auto cohort_of = [&](int64_t i) {
+        return std::isnan(cohort[i]) ? -1 : cohort_index.find(cohort[i])->second;
+    };
 
     // --- cohort shares within each relative period (SA21 eq. 6 weights) ------
     // Counted over the ESTIMATION sample, excluding the control cohort.
@@ -147,11 +160,12 @@ SunabResult sunab_run(const double* y, const double* rel_ind, int n_rel,
     for (int64_t i = 0; i < n_obs; ++i) {
         if (is_control(i)) continue;
         ++n_weight_rows;
-        const int gi = cohort_index.find(cohort[i])->second;
+        R.sum_w_weights += wt(i);
+        const int gi = cohort_of(i);
         for (int l = 0; l < n_rel; ++l) {
             if (rel_ind[static_cast<size_t>(l) * n_obs + i] == 0.0) continue;
-            cnt[static_cast<size_t>(l) * C + gi] += 1.0;
-            n_l[static_cast<size_t>(l)] += 1.0;
+            if (gi >= 0) cnt[static_cast<size_t>(l) * C + gi] += wt(i);
+            n_l[static_cast<size_t>(l)] += wt(i);
         }
     }
     R.n_obs_weights = n_weight_rows;
@@ -183,7 +197,8 @@ SunabResult sunab_run(const double* y, const double* rel_ind, int n_rel,
     std::vector<double> Z(static_cast<size_t>(n_obs) * K, 0.0);
     for (int64_t i = 0; i < n_obs; ++i) {
         if (is_control(i)) continue;
-        const int gi = cohort_index.find(cohort[i])->second;
+        const int gi = cohort_of(i);
+        if (gi < 0) continue;  // a missing cohort: no interaction (see above)
         for (int l = 0; l < n_rel; ++l) {
             if (rel_ind[static_cast<size_t>(l) * n_obs + i] == 0.0) continue;
             const int j = col_of[static_cast<size_t>(l) * C + gi];
@@ -198,14 +213,38 @@ SunabResult sunab_run(const double* y, const double* rel_ind, int n_rel,
     const int ncomp = fe_components(fu, ft, n_obs);
     const int64_t df_a = static_cast<int64_t>(fu.n_levels) + ft.n_levels - ncomp;
 
-    // COBRA-DD-ACCUM (T1): compensated mean + centred sum of squares.
-    const double ybar = la::sum(y, n_obs) / static_cast<double>(n_obs);
-    const double tss = la::sumsq_dev(y, n_obs, ybar);
+    // Weighted: w~ = w * n/sum(w) (sum n), the weighted within transform, then the
+    // sqrt(w~) row scale, so the OLS, rss, F and the cluster scores below are the
+    // weighted ones (feols_fit's weighted-absorption order).
+    std::vector<double> wn;
+    if (weight != nullptr) {
+        R.sum_w = la::sum(weight, n_obs);
+        wn.resize(static_cast<size_t>(n_obs));
+        for (int64_t i = 0; i < n_obs; ++i)
+            wn[static_cast<size_t>(i)] = weight[i] * static_cast<double>(n_obs) / R.sum_w;
+    }
+    double tss = 0;
+    if (weight == nullptr) {
+        // COBRA-DD-ACCUM (T1): compensated mean + centred sum of squares.
+        const double ybar = la::sum(y, n_obs) / static_cast<double>(n_obs);
+        tss = la::sumsq_dev(y, n_obs, ybar);
+    } else {
+        const double ybar = la::dot(wn.data(), y, n_obs) / static_cast<double>(n_obs);
+        for (int64_t i = 0; i < n_obs; ++i)
+            tss += wn[static_cast<size_t>(i)] * (y[i] - ybar) * (y[i] - ybar);
+    }
 
     std::vector<double> yd(y, y + n_obs);
     std::vector<Factor> fes{fu, ft};
-    demean(yd.data(), n_obs, 1, fes);
-    demean(Z.data(), n_obs, K, fes);
+    const double* wdm = weight != nullptr ? wn.data() : nullptr;
+    demean(yd.data(), n_obs, 1, fes, wdm);
+    demean(Z.data(), n_obs, K, fes, wdm);
+    if (weight != nullptr)
+        for (int64_t i = 0; i < n_obs; ++i) {
+            const double sq = std::sqrt(wn[static_cast<size_t>(i)]);
+            yd[static_cast<size_t>(i)] *= sq;
+            for (int j = 0; j < K; ++j) Z[static_cast<size_t>(j) * n_obs + i] *= sq;
+        }
 
     // --- OLS on the within-transformed design -------------------------------
     std::vector<double> A(static_cast<size_t>(K) * K);
@@ -279,9 +318,17 @@ SunabResult sunab_run(const double* y, const double* rel_ind, int n_rel,
     // --- IW aggregation with influence-function inference --------------------
     const double alpha = cfg.level == 95 ? 0.05 : 1.0 - cfg.level / 100.0;
     const double tcrit = t_critical(alpha, static_cast<double>(R.df2));
-    std::vector<double> Sb(static_cast<size_t>(fc.n_levels)), Sw(static_cast<size_t>(fc.n_levels));
+    // Each period's per-cluster regression sums and per-row share influences are
+    // kept for e(V_iw) below.
+    const size_t nG = static_cast<size_t>(fc.n_levels);
+    std::vector<double> SbAll(static_cast<size_t>(n_rel) * nG, 0.0);
+    std::vector<double> IFw(static_cast<size_t>(n_rel) * static_cast<size_t>(n_obs), 0.0);
+    std::vector<double> SwSq(nG);
+    R.V_iw.assign(static_cast<size_t>(n_rel) * n_rel, 0.0);
     std::vector<double> what(static_cast<size_t>(K)), u(static_cast<size_t>(K));
     for (int l = 0; l < n_rel; ++l) {
+        double* Sb = SbAll.data() + static_cast<size_t>(l) * nG;
+        double* IFl = IFw.data() + static_cast<size_t>(l) * static_cast<size_t>(n_obs);
         SunabCoef row;
         row.rel_index = l;
         row.cohort_weight.assign(static_cast<size_t>(C), 0.0);
@@ -306,8 +353,7 @@ SunabResult sunab_run(const double* y, const double* rel_ind, int n_rel,
             continue;
         }
         la::matvec(A.data(), K, what.data(), u.data());
-        std::fill(Sb.begin(), Sb.end(), 0.0);
-        std::fill(Sw.begin(), Sw.end(), 0.0);
+        std::fill(SwSq.begin(), SwSq.end(), 0.0);
         for (int64_t i = 0; i < n_obs; ++i) {
             const int c = fc.codes[static_cast<size_t>(i)];
             double zu = 0;
@@ -316,24 +362,59 @@ SunabResult sunab_run(const double* y, const double* rel_ind, int n_rel,
             Sb[static_cast<size_t>(c)] += zu * e[static_cast<size_t>(i)];
             if (is_control(i)) continue;
             if (rel_ind[static_cast<size_t>(l) * n_obs + i] == 0.0) continue;
-            const int gi = cohort_index.find(cohort[i])->second;
-            const int j = col_of[static_cast<size_t>(l) * C + gi];
-            if (j < 0) continue;
-            Sw[static_cast<size_t>(c)] +=
-                (b[static_cast<size_t>(j)] - tau) / n_l[static_cast<size_t>(l)];
+            const int gi = cohort_of(i);
+            double dg = 0;  // delta_{l,g_i}; a row with a missing cohort has none
+            if (gi >= 0) {
+                const int j = col_of[static_cast<size_t>(l) * C + gi];
+                if (j < 0) continue;
+                dg = b[static_cast<size_t>(j)];
+            }
+            // The share part is a sum over rows, not clusters: StataBE 19.5's
+            // e(Sigma_ff) is each period's multinomial share covariance, and e(V_iw)
+            // with clusters of several units needs it (see e(V_iw) below). It is
+            // gathered per cluster only so that one row per cluster and period (the
+            // usual vce(cluster unit)) adds in the order it always did.
+            const double f = wt(i) * (dg - tau) / n_l[static_cast<size_t>(l)];
+            IFl[i] = f;
+            SwSq[static_cast<size_t>(c)] += f * f;
         }
         double vb = 0, vw = 0;
         for (int c = 0; c < fc.n_levels; ++c) {
             vb += Sb[static_cast<size_t>(c)] * Sb[static_cast<size_t>(c)];
-            vw += Sw[static_cast<size_t>(c)] * Sw[static_cast<size_t>(c)];
+            vw += SwSq[static_cast<size_t>(c)];
         }
         const double var = c_reg * vb + vw;
+        R.V_iw[static_cast<size_t>(l) * n_rel + l] = var;
         row.se = var > 0 ? std::sqrt(var) : 0.0;
         row.t = row.se > 0 ? row.coef / row.se : std::nan("");
         row.p = row.se > 0 ? t_twosided_pvalue(row.t, static_cast<double>(R.df2)) : std::nan("");
         row.ci_lo = row.coef - tcrit * row.se;
         row.ci_hi = row.coef + tcrit * row.se;
         R.coefs.push_back(row);
+    }
+    // e(V_iw) (BUG-1524): the same two-part form across periods,
+    //   Cov(tau_l, tau_m) = c_reg * sum_c Sb_l[c] Sb_m[c] + sum_i IF_l(i) IF_m(i),
+    // the regression part summed by cluster, the share part by row -- zero across
+    // periods, as no row sits in two -- whose diagonal is each se's variance above
+    // (StataBE 19.5: e(V_iw)[1,2] 2.7496194110362566 on the probe's panel, and
+    // with vce(cluster) on groups of three units e(V_iw) to 3e-15, where a share
+    // part summed by cluster misses the diagonal by up to 3%). A period with no
+    // observation keeps a zero row and column, Stata's omitted period (StataBE:
+    // an all-zero indicator is 0 in e(b_iw) and in its e(V_iw) row and column).
+    for (int l = 0; l < n_rel; ++l) {
+        if (n_l[static_cast<size_t>(l)] <= 0) continue;
+        for (int m = l + 1; m < n_rel; ++m) {
+            if (n_l[static_cast<size_t>(m)] <= 0) continue;
+            const double* Sbl = SbAll.data() + static_cast<size_t>(l) * nG;
+            const double* Sbm = SbAll.data() + static_cast<size_t>(m) * nG;
+            const double* IFl = IFw.data() + static_cast<size_t>(l) * static_cast<size_t>(n_obs);
+            const double* IFm = IFw.data() + static_cast<size_t>(m) * static_cast<size_t>(n_obs);
+            double vb = 0, vw = 0;
+            for (size_t c = 0; c < nG; ++c) vb += Sbl[c] * Sbm[c];
+            for (int64_t i = 0; i < n_obs; ++i) vw += IFl[i] * IFm[i];
+            R.V_iw[static_cast<size_t>(l) * n_rel + m] = R.V_iw[static_cast<size_t>(m) * n_rel + l] =
+                c_reg * vb + vw;
+        }
     }
     return R;
 }

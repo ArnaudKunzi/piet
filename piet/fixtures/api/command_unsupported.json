@@ -1,0 +1,12 @@
+{
+  "blocks": [
+    { "type": "echo", "text": ".  foreach v in y_all y_sui {" },
+    {
+      "type": "error",
+      "code": "unsupported_loop",
+      "token": "foreach",
+      "message": "foreach is a next-milestone feature (loops and macros arrive with the Tier-A interpreter).",
+      "reason": "piet_gap"
+    }
+  ]
+}

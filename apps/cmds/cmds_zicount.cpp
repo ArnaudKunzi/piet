@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 
@@ -95,7 +97,7 @@ int run_zi(const std::vector<std::string>& a, bool nb) {
     std::vector<std::string> cluster_names;
     if (!cluster_var.empty()) cluster_names.push_back(cluster_var);
     GlmInputs g = load_glm(ds, cmd, y, split_csv(xcsv), cluster_names);
-    if (g.n == 0) { std::fprintf(stderr, "%s: no rows after dropping missing.\n", cmd); return 1; }
+    require_sample(g.n);  // BUG-1269: r(2000) "no observations" / r(2001) for one row
     for (double v : g.y)
         if (v < 0.0 || v != std::floor(v))
             throw EngineError("bad_input",
@@ -230,7 +232,7 @@ int cmd_fracreg(const std::vector<std::string>& a) {
     std::vector<std::string> cluster_names;
     if (!cluster_var.empty()) cluster_names.push_back(cluster_var);
     GlmInputs g = load_glm(ds, "fracreg", y, split_csv(xcsv), cluster_names);
-    if (g.n == 0) { std::fprintf(stderr, "fracreg: no rows after dropping missing.\n"); return 1; }
+    require_sample(g.n);  // BUG-1269: r(2000) "no observations" / r(2001) for one row
     for (double v : g.y)
         if (!(v >= 0.0 && v <= 1.0))
             throw EngineError("bad_input",

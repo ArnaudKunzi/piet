@@ -1,0 +1,94 @@
+{
+  "_meta": {
+    "leg": "G12 exotica goldens — factor-variable coefficient rows under value labels",
+    "owner": "Eval Harness (CONSTITUTION Art 10 — Eval owns tests/eval/**)",
+    "status": "ADDITIVE standalone leg — NOT wired into run_eval.py's default gating set.",
+    "oracle": "Real StataBE 19.5. Source do-file + full log are committed at tests/eval/golden/g12_factor_valuelabel.{do,log} (authored 2026-07-31, opus-routine-202607311304-97936). Fixture = piet/packaging/sample/fatalities.csv (336 obs), the same bundled sample piet_native's `sysuse fatalities` loads, so oracle and engine see byte-identical data.",
+    "why_no_manifest_cell": "This dimension is unreachable from the cobra-facing run_eval manifest: value labels do not survive into hbin (no label field in src/io/columnar.h), so a cobra cell keyed on a labeled factor would compare two identical label-free runs and read GREEN vacuously — precisely the silent-skip class tests/eval/AUTHORING.md exists to prevent. The dimension is PIET-side only, hence a standalone piet_* leg (piet_d1 precedent).",
+    "what_is_ASSERTED": [
+      "A. row-name layer — every coeftable row `name` equals Stata's e(b) column name (`<level>.<varname>`), and is INVARIANT under value labelling. Measured directly: arms A (fully labeled), B (unlabeled) and C (partially labeled) produce identical colname vectors modulo the variable's own name.",
+      "B. numeric layer — b/se match the Stata oracle within rtol."
+    ],
+    "what_is_REPORTED_ONLY": [
+      "C. label carriage — WHERE the display stub text (`Y83`) is carried in the row object. Stata's own display puts the label text alone in the stub column, under a single `varname` header row; PIET's coeftable JSON is a flat array with no header-row concept and currently has no field for a stub distinct from `name` (row keys are exactly b/ci_hi/ci_lo/name/p/se/t). Choosing the carriage (a new `label`/`stub` field vs a nested structure) is a lane:piet design decision this golden deliberately does NOT prescribe. The runner reports what it finds and never fails on it."
+    ],
+    "tolerance": {
+      "rtol": 1e-09,
+      "atol": 1e-09,
+      "rationale": "Same policy as piet_d1: the oracle values are Stata's own full-precision e(b)/e(V) readouts (%20.15e), not display-rounded, so a tight rtol is honest here. Base-level rows carry b=se=0 exactly, hence the atol companion."
+    },
+    "name_aliases": {
+      "_cons": ["(intercept)"],
+      "note": "piet_native emits `(intercept)` where Stata's e(b) says `_cons`; that alias predates this leg and is NOT part of the BUG-102 question."
+    },
+    "base_level_note": "Stata OMITS the base level from the printed table but keeps it in e(b) as `1982b.year` (b=0, se=0). piet_native omits it from coeftable entirely. This leg therefore asserts over the NON-base rows only; the base-level representation is out of scope and unchanged by BUG-102."
+  },
+  "cases": [
+    {
+      "id": "g12a_labeled_full",
+      "oracle_kind": "golden",
+      "description": "Fully labeled 7-level numeric factor. Stata stub column = label text alone (Y83..Y88); e(b) colnames unchanged by the labelling.",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "label define yrlbl 1982 \"Y82\" 1983 \"Y83\" 1984 \"Y84\" 1985 \"Y85\" 1986 \"Y86\" 1987 \"Y87\" 1988 \"Y88\"",
+        "label values year yrlbl",
+        "regress fatal i.year"
+      ],
+      "oracle_colnames": ["1982b.year", "1983.year", "1984.year", "1985.year", "1986.year", "1987.year", "1988.year", "_cons"],
+      "oracle_stub_column": ["Y83", "Y84", "Y85", "Y86", "Y87", "Y88", "_cons"],
+      "expected_rows": {
+        "1983.year": {"b": -2.9375000000000e+01, "se": 1.9227834460208e+02, "stub": "Y83"},
+        "1984.year": {"b":  5.8125000000001e+00, "se": 1.9227834460208e+02, "stub": "Y84"},
+        "1985.year": {"b": -2.7083333333332e+00, "se": 1.9227834460208e+02, "stub": "Y85"},
+        "1986.year": {"b":  4.5333333333333e+01, "se": 1.9227834460208e+02, "stub": "Y86"},
+        "1987.year": {"b":  5.1583333333333e+01, "se": 1.9227834460208e+02, "stub": "Y87"},
+        "1988.year": {"b":  6.5541666666667e+01, "se": 1.9227834460208e+02, "stub": "Y88"},
+        "_cons":     {"b":  9.0920833333333e+02, "se": 1.3596132134346e+02, "stub": "_cons"}
+      }
+    },
+    {
+      "id": "g12b_unlabeled_control",
+      "oracle_kind": "golden",
+      "description": "CONTROL arm — identical model, no value label attached. Stata stub column = bare level numbers. Pins that the labeled arm's colnames are not an artefact of the fixture: A and B colname vectors are identical modulo varname.",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "gen yearnl = year",
+        "regress fatal i.yearnl"
+      ],
+      "oracle_colnames": ["1982b.yearnl", "1983.yearnl", "1984.yearnl", "1985.yearnl", "1986.yearnl", "1987.yearnl", "1988.yearnl", "_cons"],
+      "oracle_stub_column": ["1983", "1984", "1985", "1986", "1987", "1988", "_cons"],
+      "expected_rows": {
+        "1983.yearnl": {"b": -2.9375000000000e+01, "se": 1.9227834460208e+02, "stub": "1983"},
+        "1984.yearnl": {"b":  5.8125000000001e+00, "se": 1.9227834460208e+02, "stub": "1984"},
+        "1985.yearnl": {"b": -2.7083333333332e+00, "se": 1.9227834460208e+02, "stub": "1985"},
+        "1986.yearnl": {"b":  4.5333333333333e+01, "se": 1.9227834460208e+02, "stub": "1986"},
+        "1987.yearnl": {"b":  5.1583333333333e+01, "se": 1.9227834460208e+02, "stub": "1987"},
+        "1988.yearnl": {"b":  6.5541666666667e+01, "se": 1.9227834460208e+02, "stub": "1988"},
+        "_cons":       {"b":  9.0920833333333e+02, "se": 1.3596132134346e+02, "stub": "_cons"}
+      }
+    },
+    {
+      "id": "g12c_labeled_partial",
+      "oracle_kind": "golden",
+      "description": "EXOTICA arm — value-label set covers only 1983/1985/1987; 1984/1986/1988 are levels of the factor with no label entry. Stata falls back PER LEVEL, producing a MIXED stub column (Odd83, 1984, Odd85, 1986, Odd87, 1988). An all-or-nothing implementation reads plausible on arms A and B and is only caught here.",
+      "do_body": [
+        "sysuse fatalities, clear",
+        "gen yearpl = year",
+        "label define yrpart 1983 \"Odd83\" 1985 \"Odd85\" 1987 \"Odd87\"",
+        "label values yearpl yrpart",
+        "regress fatal i.yearpl"
+      ],
+      "oracle_colnames": ["1982b.yearpl", "1983.yearpl", "1984.yearpl", "1985.yearpl", "1986.yearpl", "1987.yearpl", "1988.yearpl", "_cons"],
+      "oracle_stub_column": ["Odd83", "1984", "Odd85", "1986", "Odd87", "1988", "_cons"],
+      "expected_rows": {
+        "1983.yearpl": {"b": -2.9375000000000e+01, "se": 1.9227834460208e+02, "stub": "Odd83"},
+        "1984.yearpl": {"b":  5.8125000000001e+00, "se": 1.9227834460208e+02, "stub": "1984"},
+        "1985.yearpl": {"b": -2.7083333333332e+00, "se": 1.9227834460208e+02, "stub": "Odd85"},
+        "1986.yearpl": {"b":  4.5333333333333e+01, "se": 1.9227834460208e+02, "stub": "1986"},
+        "1987.yearpl": {"b":  5.1583333333333e+01, "se": 1.9227834460208e+02, "stub": "Odd87"},
+        "1988.yearpl": {"b":  6.5541666666667e+01, "se": 1.9227834460208e+02, "stub": "1988"},
+        "_cons":       {"b":  9.0920833333333e+02, "se": 1.3596132134346e+02, "stub": "_cons"}
+      }
+    }
+  ]
+}

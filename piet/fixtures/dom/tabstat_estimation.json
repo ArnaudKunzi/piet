@@ -1,0 +1,28 @@
+{
+  "by": null,
+  "depvar": "",
+  "estimator": "tabstat",
+  "n_obs": 336,
+  "stats": [
+    "mean",
+    "sd",
+    "n"
+  ],
+  "total": {
+    "beertax": {
+      "mean": 0.5132559839126077,
+      "n": 336.0,
+      "sd": 0.4778441714961857
+    },
+    "income": {
+      "mean": 13880.184532528832,
+      "n": 336.0,
+      "sd": 2253.046291027562
+    }
+  },
+  "type": "estimation",
+  "vars": [
+    "income",
+    "beertax"
+  ]
+}

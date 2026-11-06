@@ -1,0 +1,182 @@
+# Cross-compile piet_native for Windows x64 (MinGW-w64, Debian 12 base).
+#
+# WP-W6 (Porting Op) — Windows toolchain/packaging lane. This recipe attempts
+# the WIN32 build/link of piet_native against whatever piet/native/ sources
+# are checked out. It is written to run TODAY (against main's piet/native,
+# which is still macOS/Linux-only) and to keep working, unmodified, once the
+# Conductor's WP-W1..W5 land the Windows platform code — at that point this
+# Dockerfile should go from "documents the exact blocker" to "produces
+# piet_native.exe" with no edits needed here (only piet/native/ changes).
+#
+# Model: same shape as docker/Dockerfile.windows (cobra.exe) — MinGW-w64,
+# POSIX threading model (winpthreads), static link, x86-64-v2 baseline via
+# the project's own -march defaults (piet/native/CMakeLists.txt has no
+# separate -march override; it inherits g++'s default, which is fine here
+# since piet_native does no numerical hot-path work itself — cobra.exe does).
+#
+# UNLIKE cobra.exe, piet_native needs NO OpenBLAS (it never links BLAS/LAPACK
+# — all numerics go through the cobra.exe subprocess, see
+# piet/native/src/cobra_runner.cpp). It needs two things cobra.exe does not:
+#   (a) the mmap Win32 shim (docker/windows-compat/mman.c) — piet_native
+#       links src/io/columnar.cpp directly (CMakeLists.txt: "linked, not
+#       copied"), and that TU still does `#include <sys/mman.h>`. Same shim
+#       already proven by the cobra.exe recipe.
+#   (b) Microsoft's WebView2.h — the vendored piet/native/vendor/webview/
+#       webview.h's WEBVIEW_EDGE backend still does a bare
+#       `#include "WebView2.h"` for the ICoreWebView2* COM interface
+#       declarations even with WEBVIEW_MSWEBVIEW2_BUILTIN_IMPL=1 (that flag
+#       only avoids needing WebView2Loader's prebuilt .lib import library —
+#       it dynamically LoadLibrary/GetProcAddress's WebView2Loader.dll at
+#       runtime instead — it does NOT inline the COM interface *types*).
+#       WebView2.h is fetched here at BUILD time from the official NuGet
+#       package (build-time-only compiler input, never shipped/linked into
+#       the binary — consistent with the "vendored-only NEW deps, no network
+#       AT RUNTIME" porting law; this mirrors how Dockerfile.windows already
+#       `git clone`s OpenBLAS at build time).
+#
+# Usage (from repo root):
+#   docker buildx build \
+#     -f docker/Dockerfile.piet-windows \
+#     --target export \
+#     --output type=local,dest=dist/windows-amd64-piet \
+#     .
+#   (no --platform needed: the MinGW cross-compiler targets Windows x64
+#   regardless of the container's own arch; native-arch containers build
+#   much faster on an arm64 Mac than under amd64 QEMU emulation.)
+#
+# Output is BEST-EFFORT: /build.log always exports (compiler diagnostics),
+# /build/ (ninja's build tree) exports whatever it produced. piet_native.exe
+# only appears in /build/ if the link actually succeeded — check build.log.
+#
+# ── VERIFIED BLOCKER LIST (2026-07-08, sources = main@230f73b; re-run this
+#    build to re-derive — these are COMPILE-stage findings, link stage not
+#    reached yet) ────────────────────────────────────────────────────────
+# The toolchain side is CLEAR: WebView2.h (NuGet) + the vendored webview.h
+# WEBVIEW_EDGE backend compile clean under MinGW-w64 12.2 with the
+# EventToken.h case shim below (warnings only: MSVC '#pragma warning' +
+# -Wcast-function-type on GetProcAddress casts — both benign). MinGW ships
+# dirent.h/unistd.h(access)/eventtoken.h, so routes.cpp/handlers*/graph_m4
+# etc. compile as-is. What remains is exactly the WP-W1..W5 (Conductor)
+# platform code, four items:
+#   1. src/cobra_runner.cpp — <poll.h>, <sys/wait.h>, pipe()/fork()/execvp/
+#      waitpid subprocess machinery → needs the Win32 port (CreateProcessW +
+#      anonymous-pipe HANDLEs + WaitForSingleObject/GetExitCodeProcess).
+#      (Line ~70's own comment already flags this as Phase D.)
+#   2. src/selftest.cpp — <sys/wait.h> + WIFEXITED/WEXITSTATUS on
+#      std::system() status, plus POSIX shell strings ("command -v node",
+#      "rm -rf", "mkdir -p", single-quote quoting) → gate or port.
+#   3. src/main.cpp:421 — mkdtemp() (makeWorkdir) → Win32 equivalent
+#      (GetTempPathW + unique-suffix CreateDirectoryW loop).
+#   4. vendor/webview/webview.h — the PIET-local show_open_dialog() (2.0.1
+#      native file picker) exists ONLY in the WEBVIEW_COCOA backend; the
+#      WEBVIEW_EDGE class has no such member → shell.cpp:73 fails. Needs an
+#      IFileOpenDialog implementation in the EDGE backend (mirror of the
+#      NSOpenPanel one) or a WIN32 branch in shell.cpp.
+# Non-blocking functional gap (compiles today, returns nullopt): src/
+# bundle_paths.cpp has no Windows executablePath() (GetModuleFileNameW) —
+# needed for packaged-bundle cobra/frontend resolution, not for the link.
+
+# ── Stage 1: fetch WebView2.h (build-time compiler input only) ────────────
+ARG WEBVIEW2_NUGET_VERSION=1.0.2957.106
+FROM debian:12-slim AS fetch-webview2
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      --no-install-recommends curl ca-certificates unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG WEBVIEW2_NUGET_VERSION
+# The .nupkg is a plain zip; we only need the native C/C++ headers out of
+# build/native/include/. No .lib/.dll extracted — WEBVIEW_MSWEBVIEW2_BUILTIN_IMPL
+# loads WebView2Loader.dll dynamically at runtime, no import lib needed.
+RUN set -e; \
+    URL="https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/${WEBVIEW2_NUGET_VERSION}"; \
+    echo "fetching WebView2 SDK headers: ${URL}"; \
+    curl -fL "${URL}" -o /webview2.nupkg \
+      || { echo "WEBVIEW2_FETCH_FAILED: could not reach NuGet or version ${WEBVIEW2_NUGET_VERSION} does not exist — pin a known-good version or vendor WebView2.h manually into piet/native/vendor/webview2/ and adjust this stage" > /webview2-fetch-status.txt; }; \
+    mkdir -p /webview2-include; \
+    if [ -f /webview2.nupkg ]; then \
+      unzip -o -j /webview2.nupkg 'build/native/include/*.h' -d /webview2-include \
+        && echo "WEBVIEW2_FETCH_OK: $(ls /webview2-include)" > /webview2-fetch-status.txt; \
+    fi; \
+    cat /webview2-fetch-status.txt
+
+# Case-sensitivity shim: WebView2.h does `#include "EventToken.h"` (the MSVC
+# SDK spelling), but MinGW-w64 ships the header as lowercase `eventtoken.h`
+# — on the case-sensitive Linux build fs the quoted include fails (verified:
+# exact first shell.cpp error of the first build attempt). A one-line alias
+# header next to WebView2.h satisfies the quoted-include lookup (same-dir
+# search happens first) and forwards to MinGW's real header. Add further
+# aliases here if a WebView2 SDK bump introduces new case-mismatched
+# MSVC-spelling includes.
+RUN printf '#include <eventtoken.h>\n' > /webview2-include/EventToken.h
+
+# ── Stage 2: build piet_native.exe ─────────────────────────────────────────
+FROM debian:12-slim AS build-piet-native
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      --no-install-recommends \
+      g++-mingw-w64-x86-64 cmake ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+# posix variant: ships winpthreads (<pthread.h>, C++11 threads) — same
+# reasoning as Dockerfile.windows; piet_native links Threads::Threads too
+# (CMakeLists.txt: find_package(Threads REQUIRED) unconditionally).
+RUN update-alternatives --set x86_64-w64-mingw32-gcc \
+        /usr/bin/x86_64-w64-mingw32-gcc-posix \
+    && update-alternatives --set x86_64-w64-mingw32-g++ \
+        /usr/bin/x86_64-w64-mingw32-g++-posix
+
+COPY --from=fetch-webview2 /webview2-include /webview2-include
+COPY --from=fetch-webview2 /webview2-fetch-status.txt /webview2-fetch-status.txt
+
+WORKDIR /src
+COPY . /src
+
+# -- mmap shim (proven by docker/Dockerfile.windows) ------------------------
+RUN x86_64-w64-mingw32-gcc -O2 -D_FILE_OFFSET_BITS=64 \
+      -I/src/docker/windows-compat \
+      -c /src/docker/windows-compat/mman.c \
+      -o /mman_compat.o \
+    && x86_64-w64-mingw32-ar rcs /libmman_compat.a /mman_compat.o
+
+# -- piet_native.exe (best-effort; never fails the docker build) -----------
+# piet/native/CMakeLists.txt's elseif(WIN32) branch (as of this writing)
+# only emits a message(WARNING ...) — it does not yet add WebView2/Win32
+# system-lib linkage (that lands with the Conductor's WP-W1..W5). We supply
+# the include/link flags this Porting-Op recipe already knows Windows will
+# need, externally via CMAKE_CXX_FLAGS / CMAKE_EXE_LINKER_FLAGS, the same
+# LINK-ORDER NOTE (takeover fix, 2026-07-08): /libmman_compat.a must be passed
+# via CMAKE_CXX_STANDARD_LIBRARIES (appended AFTER all objects), not in
+# CMAKE_EXE_LINKER_FLAGS (lands BEFORE them) — GNU ld resolves static archives
+# only against already-seen objects; columnar.cpp's mmap refs otherwise fail.
+# pattern Dockerfile.windows uses for OpenBLAS — no edits to the src-governed
+# CMakeLists.txt required. System libs below are what webview.h's own
+# `#pragma comment(lib, ...)` hints list for the MSVC path (advapi32, ole32,
+# shell32, shlwapi, user32, version) plus oleaut32/uuid/dwmapi that the COM
+# activation + dark-mode-detection code paths need; #pragma comment is a
+# no-op under MinGW so we pass them explicitly on the link line instead.
+RUN mkdir -p /build; \
+    ( cmake -S /src/piet/native -B /build \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_TOOLCHAIN_FILE=/src/docker/windows-toolchain.cmake \
+        "-DCMAKE_CXX_FLAGS=-D_FILE_OFFSET_BITS=64 -I/src/docker/windows-compat -I/webview2-include" \
+        "-DCMAKE_EXE_LINKER_FLAGS=-static -lole32 -loleaut32 -lshlwapi -lshell32 -luser32 -lversion -ladvapi32 -luuid -ldwmapi" \
+        "-DCMAKE_CXX_STANDARD_LIBRARIES=/libmman_compat.a" \
+      && ninja -C /build piet_native ) > /build.log 2>&1; \
+    RC=$?; \
+    echo "=== ninja exit code: ${RC} ===" >> /build.log; \
+    if [ -f /build/piet_native.exe ]; then \
+      x86_64-w64-mingw32-strip /build/piet_native.exe; \
+      echo "piet_native.exe: $(du -sh /build/piet_native.exe | cut -f1)" >> /build.log; \
+    else \
+      echo "piet_native.exe NOT PRODUCED — see compiler/linker diagnostics above" >> /build.log; \
+    fi; \
+    cat /webview2-fetch-status.txt >> /build.log; \
+    tail -n 80 /build.log
+
+# ── Stage 3: export (best-effort — log always present, exe if it built) ───
+FROM scratch AS export
+COPY --from=build-piet-native /build.log /build.log
+COPY --from=build-piet-native /webview2-fetch-status.txt /webview2-fetch-status.txt
+COPY --from=build-piet-native /build/ /build/

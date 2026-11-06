@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>PIET — formatEstimation() golden test</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; background: #f9f7f4; color: #333; margin: 0; padding: 16px; }
+    h1 { font-size: 14px; font-weight: 600; margin: 0 0 16px; }
+    .suite { margin-bottom: 24px; }
+    .suite h2 { font-size: 12px; font-weight: 600; color: #555; margin: 0 0 4px; }
+    pre {
+      font-family: 'Menlo', 'Courier New', monospace;
+      font-size: 11px;
+      line-height: 1.5;
+      background: #fff;
+      border: 1px solid #d4d0cc;
+      border-left: 3px solid #0d47a1;
+      padding: 8px 12px;
+      margin: 0;
+      overflow-x: auto;
+      white-space: pre;
+    }
+    .pass { color: #2e7d32; font-size: 11px; margin-top: 4px; }
+    .fail { color: #d93b3b; font-size: 11px; margin-top: 4px; }
+    .err  { background: #faeaea; border-left-color: #d93b3b; }
+  </style>
+</head>
+<body>
+<h1>PIET — formatEstimation() golden verification</h1>
+<div id="output"></div>
+
+<script type="module">
+import { formatEstimation } from '../js/console.js';
+
+// ── Inline golden fixtures ───────────────────────────────────────────────────
+// Real cobra --tidy JSON; fields mapped to EstimationResult shape from CONTRACT.md.
+// We add type:"estimation" (absent from raw cobra output) and normalise vcov_type.
+
+// Public Stata `auto` dataset (price ~ mpg weight; clustered/factored on rep78).
+const GOLDENS = [
+  {
+    label: 'feols_plain (iid)',
+    file:  '../../fixtures/golden/feols_plain.json',
+    // Brief sanity checks on the formatted output
+    expects: [
+      s => s.includes('_cons') || s.includes('intercept'),
+      s => s.includes('mpg'),
+      s => s.includes('weight'),
+      s => s.includes('74'),
+      s => s.includes('┬') && s.includes('┼') && s.includes('┴'),
+    ],
+  },
+  {
+    label: 'feols_robust (HC1)',
+    file:  '../../fixtures/golden/feols_robust.json',
+    expects: [
+      s => s.includes('heteroskedasticity'),
+    ],
+  },
+  {
+    label: 'feols_cluster (cluster(rep78))',
+    file:  '../../fixtures/golden/feols_cluster.json',
+    expects: [
+      s => s.includes('clusters'),
+      s => s.includes('rep78'),
+    ],
+  },
+  {
+    label: 'feols_factor (rep78==N levels)',
+    file:  '../../fixtures/golden/feols_factor.json',
+    expects: [
+      s => s.includes('rep78==5'),
+      s => s.includes('rep78==2'),
+    ],
+  },
+  {
+    label: 'feols_fe (absorbed rep78, cluster)',
+    file:  '../../fixtures/golden/feols_fe.json',
+    expects: [
+      s => s.includes('absorbed') || s.includes('Absorbed'),
+      s => s.includes('rep78'),
+      s => s.includes('clusters'),
+    ],
+  },
+  {
+    label: 'feols_multi (outcomes: price, mpg)',
+    file:  '../../fixtures/golden/feols_multi.json',
+    expects: [
+      s => s.includes('price'),
+      s => s.includes('mpg'),
+      s => s.includes('weight'),
+    ],
+  },
+];
+
+async function loadGolden(path) {
+  const resp = await fetch(path);
+  const raw = await resp.json();
+  // Map raw cobra --tidy output → EstimationResult shape
+  const block = {
+    type:       'estimation',
+    estimator:  raw.estimator,
+    depvar:     raw.depvar,            // may be undefined for feols_multi
+    n_obs:      raw.n_obs,
+    coeftable:  raw.coeftable,         // may be undefined for feols_multi (use outcomes)
+    outcomes:   raw.outcomes,          // feols_multi
+    r2:         raw.r2,
+    r2_within:  raw.r2_within,
+    sigma2:     raw.sigma2,
+    vcov_type:  raw.vcov_type,         // "iid" | "HC1" | "cluster(var)"
+    n_clusters: raw.n_clusters > 0 ? raw.n_clusters : undefined,
+    absorbed:   raw.absorbed && Object.keys(raw.absorbed).length > 0 ? raw.absorbed : undefined,
+    dof_resid:  raw.dof_resid,
+  };
+  return block;
+}
+
+const out = document.getElementById('output');
+
+for (const g of GOLDENS) {
+  const section = document.createElement('div');
+  section.className = 'suite';
+  const h2 = document.createElement('h2');
+  h2.textContent = g.label;
+  section.appendChild(h2);
+
+  try {
+    const block = await loadGolden(g.file);
+    const result = formatEstimation(block);
+
+    const pre = document.createElement('pre');
+    pre.textContent = result;
+    section.appendChild(pre);
+
+    // Run sanity checks
+    const checks = g.expects || [];
+    const fails = checks.filter(fn => !fn(result));
+    const status = document.createElement('div');
+    if (fails.length === 0) {
+      status.className = 'pass';
+      status.textContent = `✓ ${checks.length} check(s) passed`;
+    } else {
+      status.className = 'fail';
+      pre.classList.add('err');
+      status.textContent = `✕ ${fails.length}/${checks.length} check(s) FAILED`;
+    }
+    section.appendChild(status);
+  } catch (err) {
+    const pre = document.createElement('pre');
+    pre.className = 'err';
+    pre.textContent = 'ERROR: ' + err.message + '\n' + err.stack;
+    section.appendChild(pre);
+  }
+
+  out.appendChild(section);
+}
+</script>
+</body>
+</html>

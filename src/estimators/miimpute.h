@@ -1,8 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — `mi impute regress`: multiple imputation of one continuous variable by
 // chained linear regression (Rubin's PROPER imputation, [MI] mi impute regress).
 //
 // WHAT IS PINNED AND WHAT IS OURS. The oracle is StataBE 19.5 on the P7 pangram
-// wave (tests/kitchensink/pangram/waves/_oracle/p7_stata.log,
+// wave (internal capture p7_stata.log,
 // `mi impute regress x2 = x1 y, add(2) rseed(20260802) noisily`). Everything
 // DETERMINISTIC there is pinned exactly — the inner regression of x2 on x1 y over
 // the complete cases (N = 4,649, F(2,4646) = 54.92, R2 = .0231, Root MSE = .73482,

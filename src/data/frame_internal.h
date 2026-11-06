@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // R2 (giant-file split, 2026-09-01): declarations shared by the two frame.cpp
 // TUs. Definitions stay in frame.cpp (cecon::frame_detail). This is the
 // ENGINE numerics heart — the split is a MOVE-ONLY 2-way cut at the

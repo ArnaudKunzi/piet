@@ -1,0 +1,7 @@
+key,value
+coeftable[PM25_mean].b,-7.999183407897241e-04
+coeftable[PM25_mean].se,1.418120811951479e-04
+coeftable[t2m_max_C].b,-4.094323572753306e-03
+coeftable[t2m_max_C].se,9.113903985133847e-05
+n_obs,6.202790000000000e+05
+irls_iters,5.000000000000000e+00

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // C++ port of piet/backend/piet/router/macros.py + postfile.eval_macro_expr
 // + matrix_op.substitute_matrix_refs + the display_hardening est-scalar
 // resolvers _eval_arith depends on. The Python sources are the spec — every
@@ -5,6 +7,7 @@
 // single-pass RHS expansion in definitions and first-occurrence string
 // replacement during substitution).
 #include "piet/eval/macros.h"
+#include "estimators/postest_names.h"  // coefFullName: the engine's coefficient-name rule
 
 #include "../dispatch_profile.h"  // WS-D1: per-line regex counter (opt-in, stderr)
 
@@ -19,16 +22,33 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <regex>
+#include <set>
+#include <unordered_set>
 #include <vector>
 
+#include "piet/eval/errors.h"
 #include "piet/eval/exprfns.h"
 #include "piet/eval/pyeval.h"
 #include "piet/eval/pyvalue.h"
 #include "piet/strutil.h"
+#include "core/ident.h"  // Unicode names: the shared identifier byte tests
+#include "core/expr_blanks.h"  // FU-875: the blanks Stata drops inside ( ) and [ ]
+#include "data/stata_dates.h"  // the literal pseudo-function scan (liftDateLiterals)
 #include "io/win_compat.h"  // cecon::to_native_path (BUG-050 wide open)
 
 namespace piet::eval {
+
+// BUG-1545: `_b[/name]`/`_se[/name]` (`kind` "b"/"se") for an ancillary column
+// only the live fit's posted e(b)/e(V) carry (tobit's `/var(e.yc)`, ologit/oprobit's
+// `/cut1`, nbreg's `/lnalpha`; estimation_m4.cpp postAncillaryEbM4): Stata answers
+// them from e(b) and e(V) (StataBE 19.5, p-ancillary/side.do: `_b[/cut1]`
+// -.091028014590738324 and `_se[/cut1]` .45734276246127026 after ologit), and a factor
+// level such as proportion's `0bn.d` (`_b[0.d]`). nullopt = no such column. Defined
+// beside ebStripeCoef; display_hardening.cpp's resolveBRef declares it alike.
+std::optional<double> ancillaryEbCoef(const EvalSession& session, const std::string& name,
+                                      const std::string& kind);
 
 namespace {
 
@@ -59,8 +79,10 @@ std::string strip(const std::string& s) {
 // cheapest statement the language has — paid both.
 //
 // EQUIVALENCE, not approximation. These two functions reproduce
-//     reLocalDef()  = ^local\s+([A-Za-z_][A-Za-z0-9_]*)\s*(.*)?$   (icase)
+//     reLocalDef()  = ^local\s+([A-Za-z_][A-Za-z0-9_]*|[0-9]+(?![A-Za-z0-9_]))\s*(.*)?$
+//                                                                  (icase; BUG-923)
 //     reGlobalDef() = ^global\s+([A-Za-z_][A-Za-z0-9_]*)\s*(.*)?$  (icase)
+// (each identifier class also admits the bytes \x80-\xff -- Unicode names)
 // exactly, including the greedy-then-no-backtracking parse (the trailing
 // `(.*)$` can always match, so the greedy first pass is the only pass the
 // regex engine ever needs). Three details are load-bearing:
@@ -80,13 +102,27 @@ std::string strip(const std::string& s) {
 bool isRegexSpace(char c) {
   return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
 }
-bool isIdentStart(char c) {
-  unsigned char u = static_cast<unsigned char>(c);
-  return (u >= 'A' && u <= 'Z') || (u >= 'a' && u <= 'z') || c == '_';
-}
-bool isIdentChar(char c) {
-  unsigned char u = static_cast<unsigned char>(c);
-  return isIdentStart(c) || (u >= '0' && u <= '9');
+// Unicode names (lane M): the identifier classes are the ONE shared rule's
+// permissive byte tests (src/core/ident.h) -- a byte >= 0x80 is an identifier
+// byte, so `local م 1`, `` `م' ``, `scalar سعر = 2` and the mixed-script
+// `دخل_2020` are each ONE name (before, the Arabic bytes were word breaks and
+// the ASCII tail `_2020` was bound on its own). Every regex twin of a scan
+// below carries the same `\x80-\xff` widening, so the selftest cross-checks
+// still hold the pairs together.
+bool isIdentStart(char c) { return cecon::ident::isIdentStartByte(c); }
+bool isIdentChar(char c) { return cecon::ident::isIdentByte(c); }
+// Unicode names (lane M): a GLOBAL reference must START with a letter. StataBE
+// 19.5 (scratch-r150/uni-m/m2.do): `$ق` expands, but `$€5`, `$٥٠` (Arabic-Indic
+// digits) and `$<NBSP>` print literally, and `global ٥ 3` is r(198); a LOCAL
+// reference is looser (`` `€' `` expands to "" and `local €x 3` is rc 0), so
+// only the `$` forms take this test. Every later character stays permissive --
+// `$ق€` reads the global `ق€`, as Stata does. The regexes admit any byte
+// >= 0x80 as the start; this is the filter on what they found.
+bool globalNameStartOk(const std::string& name) {
+  if (name.empty()) return false;
+  if (static_cast<unsigned char>(name[0]) < 0x80) return isIdentStart(name[0]);
+  char32_t cp = 0;
+  return cecon::ident::decodeUtf8(name, 0, &cp) != 0 && cecon::ident::isUnicodeLetter(cp);
 }
 bool ciStartsWith(const std::string& s, const char* kw, size_t kwLen) {
   if (s.size() < kwLen) return false;
@@ -133,9 +169,21 @@ bool matchMacroDef(const std::string& s, const char* kw, size_t kwLen, std::stri
   size_t i = kwLen;
   if (i >= s.size() || !isRegexSpace(s[i])) return false;  // \s+ needs at least one
   while (i < s.size() && isRegexSpace(s[i])) ++i;
-  if (i >= s.size() || !isIdentStart(s[i])) return false;
+  if (i >= s.size()) return false;
   size_t j = i;
-  while (j < s.size() && isIdentChar(s[j])) ++j;
+  if (isIdentStart(s[i])) {
+    while (j < s.size() && isIdentChar(s[j])) ++j;
+    // Unicode names: a global's name starts with a letter (`global ٥ 3` is
+    // r(198) in StataBE; `local €x 3` is rc 0) -- see globalNameStartOk.
+    if (kwLen == 6 && !globalNameStartOk(s.substr(i, j - i))) return false;
+  } else if (kwLen == 5 && std::isdigit(static_cast<unsigned char>(s[i]))) {
+    // BUG-923: a positional local (`local 1 "alpha"`, the do-file-level form
+    // `args` reads) is a digit run; `local 1x 3` stays a non-match.
+    while (j < s.size() && std::isdigit(static_cast<unsigned char>(s[j]))) ++j;
+    if (j < s.size() && isIdentChar(s[j])) return false;
+  } else {
+    return false;
+  }
   name.assign(s, i, j - i);
   size_t k = j;
   while (k < s.size() && isRegexSpace(s[k])) ++k;
@@ -214,6 +262,22 @@ std::vector<std::pair<std::string, std::string>> findAll(const std::regex& re,
   return out;
 }
 
+std::vector<std::pair<std::string, std::string>> findAllGlobalRefs(const std::regex& re,
+                                                                   const std::string& s) {
+  std::vector<std::pair<std::string, std::string>> out = findAll(re, s);
+  out.erase(std::remove_if(out.begin(), out.end(),
+                           [](const std::pair<std::string, std::string>& r) {
+                             return !globalNameStartOk(r.second);
+                           }),
+            out.end());
+  return out;
+}
+bool hasGlobalRef(const std::regex& re, const std::string& s) {
+  for (auto it = std::sregex_iterator(s.begin(), s.end(), re); it != std::sregex_iterator(); ++it)
+    if (globalNameStartOk(it->str(1))) return true;
+  return false;
+}
+
 // Python repr(str) — used in the non-convergence error message ({line!r}).
 std::string pyRepr(const std::string& s) {
   bool hasSingle = s.find('\'') != std::string::npos;
@@ -251,41 +315,43 @@ std::string pyRepr(const std::string& s) {
 // Patterns (macros.py) — names mirror the Python constants.
 
 const std::regex& reScalarDef() {
-  static const std::regex r(R"(^scalar\s+(?:define\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$)",
+  static const std::regex r(R"(^scalar\s+(?:define\s+)?([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)\s*=\s*(.+)$)",
                              std::regex::icase);
   return r;
 }
 const std::regex& reLocalDef() {
-  static const std::regex r(R"(^local\s+([A-Za-z_][A-Za-z0-9_]*)\s*(.*)?$)", std::regex::icase);
+  // BUG-923: or a positional digit run (`local 1 "alpha"`); see matchMacroDef.
+  static const std::regex r(R"(^local\s+([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*|[0-9]+(?![A-Za-z0-9_\x80-\xff]))\s*(.*)?$)",
+                             std::regex::icase);
   return r;
 }
 const std::regex& reGlobalDef() {
-  static const std::regex r(R"(^global\s+([A-Za-z_][A-Za-z0-9_]*)\s*(.*)?$)", std::regex::icase);
+  static const std::regex r(R"(^global\s+([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)\s*(.*)?$)", std::regex::icase);
   return r;
 }
 const std::regex& reLocalRef() {
-  static const std::regex r(R"(`([A-Za-z_][A-Za-z0-9_]*|[0-9]+)')");
+  static const std::regex r(R"(`([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*|[0-9]+)')");
   return r;
 }
 const std::regex& reGlobalRefBrace() {
-  static const std::regex r(R"(\$\{([A-Za-z_][A-Za-z0-9_]*)\})");
+  static const std::regex r(R"(\$\{([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)\})");
   return r;
 }
 const std::regex& reGlobalRefBare() {
-  static const std::regex r(R"(\$([A-Za-z_][A-Za-z0-9_]*))");
+  static const std::regex r(R"(\$([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*))");
   return r;
 }
 const std::regex& reRRef() {
-  static const std::regex r(R"(\br\(([A-Za-z_][A-Za-z0-9_]*)\))");
+  static const std::regex r(R"(\br\(([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)\))");
   return r;
 }
 const std::regex& reRRefDelim() {
-  static const std::regex r(R"(`r\(([A-Za-z_][A-Za-z0-9_]*)\)')");
+  static const std::regex r(R"(`r\(([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)\)')");
   return r;
 }
 const std::regex& reERef() {
   // RISK-A: negative-lookahead keeps e(b)/e(V) for the matrix layer.
-  static const std::regex r(R"(\be\((?!b\)|V\))([A-Za-z_][A-Za-z0-9_]*)\))");
+  static const std::regex r(R"(\be\((?!b\)|V\))([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)\))");
   return r;
 }
 // BUG-409: `e(name)' — the DELIMITED (macro-expansion) form, the twin of
@@ -296,7 +362,7 @@ const std::regex& reERef() {
 // example uses was a hard error. Unlike reERef this has no b/V exclusion: a
 // delimited reference is never the matrix layer's.
 const std::regex& reERefDelim() {
-  static const std::regex r(R"(`e\(([A-Za-z_][A-Za-z0-9_]*)\)')");
+  static const std::regex r(R"(`e\(([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)\)')");
   return r;
 }
 // P4: `s(name)' — sreturn-local read (sclass programs). Delimited form
@@ -305,7 +371,14 @@ const std::regex& reERefDelim() {
 // numeric variant (unlike r(), which has both — see reRRef/reRRefDelim
 // just below what this sits next to).
 const std::regex& reSRefDelim() {
-  static const std::regex r(R"(`s\(([A-Za-z_][A-Za-z0-9_]*)\)')");
+  static const std::regex r(R"(`s\(([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)\)')");
+  return r;
+}
+// BUG-1006: `c(name)' -- the delimited c-class reference. Like `e(name)' it is
+// macro expansion (Stata expands it inside double quotes); the value comes from
+// EvalSession::cValue.
+const std::regex& reCRefDelim() {
+  static const std::regex r(R"(`c\(([A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)\)')");
   return r;
 }
 // MUST stay byte-identical to program.cpp's kSClassKeyPrefix — see that
@@ -353,11 +426,15 @@ const std::regex& reSafeArithExt() {
   // whitelist rejects the expression before the parser ever sees it. Must
   // stay in lockstep with SafeArithTables::ext below (selftestSafeArithScan-
   // MatchesRegex cross-checks the two).
-  static const std::regex r(R"(^[0-9\s\+\-\*/\(\)\.\^eEa-zA-Z_,"'<>=!%&\|]+$)");
+  // FU-844: `~` too -- Stata's other spelling of `!` and `!=` (pyeval.cpp lexer).
+  // Unicode names (lane M): `\x80-\xff` -- see SafeArithTables::ext.
+  static const std::regex r(R"(^[0-9\s\+\-\*/\(\)\.\^eEa-zA-Z_,"'<>=!%&\|~\x80-\xff]+$)");
   return r;
 }
 const std::regex& rePostfileSafeArith() {
-  static const std::regex r(R"(^[0-9\s\+\-\*/\(\)\.\^eEa-zA-Z_,]+$)");
+  // Unicode names (lane M): `\x80-\xff`, so a UTF-8 scalar name (`=سعر*2')
+  // is admitted as the identifier it is.
+  static const std::regex r(R"(^[0-9\s\+\-\*/\(\)\.\^eEa-zA-Z_,\x80-\xff]+$)");
   return r;
 }
 const std::regex& reArithMacro() {
@@ -397,7 +474,13 @@ struct SafeArithTables {
     for (char c = 'a'; c <= 'z'; ++c) ext[static_cast<unsigned char>(c)] = true;
     for (char c = 'A'; c <= 'Z'; ++c) ext[static_cast<unsigned char>(c)] = true;
     // BUG-660 fix round: `&`/`|` — see reSafeArithExt()'s comment above.
-    for (char c : std::string("_,\"'<>=!%&|")) ext[static_cast<unsigned char>(c)] = true;
+    for (char c : std::string("_,\"'<>=!%&|~")) ext[static_cast<unsigned char>(c)] = true;  // ~: FU-844
+    // Unicode names (lane M): every byte >= 0x80 -- a UTF-8 name such as
+    // `ملاحظات[1]` or `سعر` reaches this gate as identifier bytes (a continuation
+    // byte never collides with an ASCII operator), so `` `=ملاحظات[1]' `` was
+    // refused here before anything evaluated it. `basic` stays ASCII: the fast
+    // path is the empty-namespace arithmetic one and has no names at all.
+    for (int i = 0x80; i < 256; ++i) ext[i] = true;
   }
 };
 const SafeArithTables& safeArithTables() {
@@ -428,6 +511,9 @@ const SafeArithTables& safeArithTables() {
 // ONE-SIDED, like the display scanner's BUG-293(c) fix: an UNTERMINATED quote is
 // left exactly where it is, so every degenerate expression this function ever
 // judged is judged the same way.
+// EM3b: a compound-quoted `"..."' literal (nesting, inner quotes) is ONE literal
+// too: `local v = stritrim(`"cmd  a  b"')` (w2af mt_fn_stritrim) reached the
+// pre-passes as raw text and failed as r(198).
 std::string protectStringLiterals(const std::string& s, std::vector<std::string>* out) {
   out->clear();
   if (s.find('"') == std::string::npos) return s;  // the common case, untouched
@@ -435,6 +521,15 @@ std::string protectStringLiterals(const std::string& s, std::vector<std::string>
   r.reserve(s.size());
   size_t i = 0;
   while (i < s.size()) {
+    if (startsCompound(s, i)) {
+      const size_t end = compoundSpanEnd(s, i);
+      if (end != std::string::npos) {
+        out->push_back(s.substr(i, end - i));
+        r += "\"0L" + std::to_string(out->size() - 1) + "L0\"";
+        i = end;
+        continue;
+      }
+    }
     if (s[i] == '"') {
       const size_t close = s.find('"', i + 1);
       if (close != std::string::npos) {
@@ -447,6 +542,39 @@ std::string protectStringLiterals(const std::string& s, std::vector<std::string>
     r += s[i++];
   }
   return r;
+}
+
+// BUG-446. The literal pseudo-functions take unquoted date TEXT, and a clock
+// literal has a ':' in it -- which the extended whitelist below refuses, so
+// `display tc(11:00)` echoed its own text at rc 0, `local w = tc(12:00)` was
+// r(198), and hh(tc(10:30)) never reached hh() (w2y_fn_datetime fd_tc_edges,
+// fd_tc_full, fd_hhmm_edges, fd_minutes_edges). Each call is replaced by its
+// value, parenthesised, before any pre-pass sees it -- the value the evaluator's
+// own lexer would have lifted (pyeval.cpp's date-literal case), from the same
+// cecon:: parser. An impossible literal is Stata's r(198) (fd_tq_bad, fd_tm_bad,
+// fd_td_bad): `*bad` names it and the caller raises. Runs after
+// protectStringLiterals, so text inside a string literal is never read.
+std::string liftDateLiterals(const std::string& s, std::string* bad) {
+  if (s.find('(') == std::string::npos) return s;
+  std::string out;
+  size_t copied = 0;
+  cecon::for_each_datetime_literal(
+      s, [&](const std::string& name, const std::string& raw, size_t begin, size_t end) {
+        cecon::LiteralScale ls;
+        cecon::literal_scale_for(name, ls);
+        const double v = cecon::stata_datetime_literal(raw, ls);
+        if (std::isnan(v)) {
+          *bad = name + "(" + raw + ")";
+          return false;
+        }
+        out.append(s, copied, begin - copied);
+        out += "(" + pythonFloatRepr(v) + ")";
+        copied = end;
+        return true;
+      });
+  if (copied == 0) return s;
+  out.append(s, copied, std::string::npos);
+  return out;
 }
 
 // BUG-507, the convergence guard's half. `hasMacroRefs` reports an r()/e()/s()
@@ -469,7 +597,9 @@ std::string maskParensInQuotes(const std::string& s) {
       inQ = !inQ;
       continue;
     }
-    if (inQ && (out[i] == '(' || out[i] == ')')) out[i] = '_';
+    // LBL-DOLLAR: '#', not '_' -- a blanked `$(r)` must not read as the global
+    // `$_r_` (w2ao lb_var_dollar: `"... $(r)$"` died "did not converge").
+    if (inQ && (out[i] == '(' || out[i] == ')')) out[i] = '#';
   }
   return out;
 }
@@ -592,6 +722,11 @@ bool hasLocalMacroRef(const std::string& s) {
 
 // `\bscalar\(\s*([A-Za-z_]\w*)\s*\)` -> the stored scalar's value, or the
 // matched text unchanged when the name is not a defined scalar.
+// BUG-1419: a STRING scalar's value goes in as a string literal, as an e()
+// string does (resolveERef): `scalar t = scalar(s1) + "y"` with s1 = "-3" is
+// -3y in StataBE 19.5 and `gen str5 g = scalar(s1) + "x"` -3x; both read the
+// text as the number -3 and failed r(109). A value holding `"` is carried
+// compound-quoted; one that cannot be (`"'` inside) is left as the call.
 std::string substituteScalarCalls(const std::string& in, const EvalSession& session) {
   std::string out;
   size_t i = 0, last = 0;
@@ -624,10 +759,19 @@ std::string substituteScalarCalls(const std::string& in, const EvalSession& sess
       continue;
     }
     const size_t end = r + 1;
-    const std::string* v = session.scalars.find(in.substr(nameStart, q - nameStart));
+    const std::string name = in.substr(nameStart, q - nameStart);
+    const std::string* v = session.scalars.find(name);
     out.append(in, last, p - last);
-    if (v != nullptr) {
-      out.append(*v);
+    if (v != nullptr && session.isStringScalar(name)) {
+      if (v->find('"') == std::string::npos) {
+        out.append("\"" + *v + "\"");
+      } else if (v->find("\"'") == std::string::npos && v->find("`\"") == std::string::npos) {
+        out.append("`\"" + *v + "\"'");
+      } else {
+        out.append(in, p, end - p);
+      }
+    } else if (v != nullptr) {
+      out.append(valueRefText(*v));  // FU-842: one operand
     } else {
       out.append(in, p, end - p);  // undefined: leave the token verbatim
     }
@@ -727,6 +871,12 @@ std::optional<double> jsonToFloat(const nlohmann::ordered_json& v) {
   return std::nullopt;  // null / object / array -> TypeError
 }
 
+// A posted e() scalar as expression text: Stata's `.` for a missing one, never
+// pythonFloatRepr's "nan" (which the evaluator reads as a variable name).
+static std::string postedEText(double v) {
+  return std::isnan(v) ? std::string(".") : pythonFloatRepr(v);
+}
+
 std::string resolveEScalar(const std::string& name, const EvalSession& session) {
   // BUG-421 (2026-09-06): a handler-POSTED e-scalar lives in `eScalars`, not in
   // the estimation JSON. `pca` posts e(rho)/e(f)/e(trace) there and `estadd
@@ -736,12 +886,12 @@ std::string resolveEScalar(const std::string& name, const EvalSession& session) 
   // cannot be shadowed by a posted one.
   if (const double* posted = session.eScalars.find(name);
       posted != nullptr && !session.lastModelResult) {
-    return pythonFloatRepr(*posted);
+    return postedEText(*posted);
   }
   if (!session.lastModelResult) return ".";
   const auto& result = *session.lastModelResult;
   if (result.is_null() || (result.is_object() && result.empty())) {
-    if (const double* p2 = session.eScalars.find(name)) return pythonFloatRepr(*p2);
+    if (const double* p2 = session.eScalars.find(name)) return postedEText(*p2);
     return ".";
   }
   std::string key = name;
@@ -752,7 +902,7 @@ std::string resolveEScalar(const std::string& name, const EvalSession& session) 
     }
   }
   if (!result.contains(key) || result.at(key).is_null()) {
-    if (const double* p3 = session.eScalars.find(name)) return pythonFloatRepr(*p3);
+    if (const double* p3 = session.eScalars.find(name)) return postedEText(*p3);
     return ".";
   }
   auto f = jsonToFloat(result.at(key));
@@ -760,7 +910,7 @@ std::string resolveEScalar(const std::string& name, const EvalSession& session) 
   // "unclustered", which Stata reports as e(N_clust) missing.
   if (f && name == "N_clust" && *f == 0.0) f.reset();
   if (!f) {
-    if (const double* p4 = session.eScalars.find(name)) return pythonFloatRepr(*p4);
+    if (const double* p4 = session.eScalars.find(name)) return postedEText(*p4);
     return ".";
   }
   // BUG-382 (off-pin sweep, 2026-09-01): substitute at FULL precision, exactly
@@ -794,21 +944,59 @@ std::string resolveEScalar(const std::string& name, const EvalSession& session) 
 // local, scalar, gen, count, assert, if (refute3_capture.log V3-V8) -- and
 // returning `.` for it turned a typo into a missing that `assert _b[nosuch]==0`
 // then reported as r(9), a wrong-reason error. When `err` is null the historical
-// `.` is kept so no caller changes behaviour without opting in. The NO-MODEL
-// case stays `.` here on purpose: the row surfaces leave the `_b[` text alone
-// with no model (BUG-432's ruling, dispatcher.cpp substituteRowExprRefs) so the
-// engine refuses it honestly, and the macro surfaces keep their pre-existing
-// `.` (Stata: r(111) "_b not allowed when e(b) is not present" -- a named
-// divergence, not claimed by this change).
+// `.` is kept so no caller changes behaviour without opting in.
+// eb-order T-P3 (SPEC part 1): the coefficients come from coefSource() -- the
+// live e()'s estimation block, the store e(b) is built from and the one the
+// display twin reads -- never from lastModelResult while a session is attached
+// (after estpost, erepost and `estimates use` that mirror describes an earlier
+// e()). A null source -- a live e() without an e(b) (pca, rdrobust, rddensity,
+// estpost) or no e() at all -- is Stata's r(111) "_b not allowed when e(b) is
+// not present" on every surface, never `.` at rc 0 (w2g_ebmat.log:2155
+// e15c_local_bx1, :2169, :2187 after pca; w2v_estpost_ematrix.log
+// ep15f_local_bx1 and ep15f_disp_bx1_times2 after `ereturn clear`, ep13_local_bx1
+// after estpost). The no-e() `.` the SPEC first kept as a named divergence is
+// gone: the capture refuted it (FU-949).
 std::string resolveBRef(const std::string& varname, const std::string& kind,
                          const EvalSession& session, std::string* err = nullptr) {
-  if (!session.lastModelResult) return ".";  // no estimation in memory
-  const auto& result = *session.lastModelResult;
+  const nlohmann::ordered_json* source = session.coefSource();
+  if (source == nullptr) {
+    if (err != nullptr && err->empty())
+      *err = kind == "b" ? "_b not allowed when e(b) is not present"
+                         : "_se not allowed when e(V) is not present";
+    return ".";
+  }
+  const auto& result = *source;
   // Try the requested spelling first, then its intercept alias.
   std::vector<std::string> tryNames{varname};
+  if (!varname.empty() && varname.front() == '/') {
+    tryNames.push_back(varname.substr(1) + ":_cons");
+    tryNames.push_back("/:" + varname.substr(1));
+  }
   if (varname == "_cons") tryNames.push_back("(intercept)");
   else if (varname == "(intercept)") tryNames.push_back("_cons");
+  // `_b[yb:x1]` after a depvar-equation fit is the bare row (BUG-1328); the
+  // display twin does the same through the same helper.
+  if (const size_t colon = varname.find(':'); colon != std::string::npos && colon > 0) {
+    const std::string eq = depvarEquationOf(session);
+    if (!eq.empty() && varname.compare(0, colon, eq) == 0 && colon == eq.size()) {
+      const std::string bare = varname.substr(colon + 1);
+      tryNames.push_back(bare);
+      if (bare == "_cons") tryNames.push_back("(intercept)");
+    }
+  }
+  if (const std::string o = omittedColumnSpelling(varname); !o.empty()) tryNames.push_back(o);
   if (!result.is_null() && result.contains("coeftable")) {
+    // An equation-less name falls back to e(b)'s FIRST equation, tried last
+    // (`_b[1._at]` after `margins, dydx(x) at() post` is `_b[x:1._at]`,
+    // w2v_margins_corpus F1_dydx_at_post_bname1/2) -- the display twin's
+    // addFirstEquationName.
+    const auto& ct = result.at("coeftable");
+    if (varname.find(':') == std::string::npos && ct.is_array() && !ct.empty() &&
+        ct.front().is_object() && ct.front().contains("name") && ct.front().at("name").is_string()) {
+      const std::string head = ct.front().at("name").get<std::string>();
+      const size_t colon = head.find(':');
+      if (colon != std::string::npos && colon > 0) tryNames.push_back(head.substr(0, colon + 1) + varname);
+    }
     for (const auto& want : tryNames) {
       for (const auto& row : result.at("coeftable")) {
         if (row.contains("name") && row.at("name") == want) {
@@ -821,13 +1009,24 @@ std::string resolveBRef(const std::string& varname, const std::string& kind,
       }
     }
   }
-  // Name not in the model -- r(111), same text as the display twin (BUG-162).
-  if (err != nullptr && err->empty()) *err = varname + " not found";
+  // A column only the fit's recorded stripe names (a factor's base level, an
+  // `o.` spelling): eval::ebStripeCoef, shared with the display twin.
+  if (const std::optional<double> v = ebStripeCoef(*source, varname, kind))
+    return pythonFloatRepr(*v);
+  // An ancillary parameter only the posted e(b)/e(V) carry (BUG-1545).
+  if (const std::optional<double> v = ancillaryEbCoef(session, varname, kind))
+    return pythonFloatRepr(*v);
+  // An abbreviated / reordered spelling of a posted column (coefFullName).
+  if (const std::string full = coefFullName(*source, varname); !full.empty())
+    return resolveBRef(full, kind, session, err);
+  // Name not in the model -- r(111), same text as the display twin (BUG-162):
+  // Stata's `[name] not found`, bracketed.
+  if (err != nullptr && err->empty()) *err = "[" + varname + "] not found";
   return ".";
 }
 
 // BUG-456 (2026-09-08): the bare-form e(name) resolver's STRING arm. Measured
-// on StataNow 19.5 BE (plans/bug456-20260908/refute3_capture.log, 40/40 macro
+// on StataNow 19.5 BE (internal capture refute3_capture.log, 40/40 macro
 // shapes): a bare e-MACRO is a STRING in every expression context -- `ereturn
 // local m "5"` then `display e(m)+1` is r(109), `assert e(m)=="5"` rc 0,
 // `assert e(m)==5` r(109), `local t = e(m)` keeps the TEXT. [U] 18.9 rule 1.3
@@ -1022,7 +1221,7 @@ bool stringFnNumericArgImpl(const std::string& e, std::string* call) {
       continue;
     }
     if (c == '"') { inStr = true; continue; }
-    if (!(std::isalpha(static_cast<unsigned char>(c)) || c == '_')) continue;
+    if (!isIdentStart(c)) continue;  // a Unicode name is skipped whole, too
     if (i > 0 && isIdentChar(e[i - 1])) continue;  // mid-identifier
     size_t j = i;
     while (j < e.size() && isIdentChar(e[j])) ++j;
@@ -1077,6 +1276,880 @@ bool stringFnNumericArgImpl(const std::string& e, std::string* call) {
 
 bool hasBareRParen(const std::string& s) { return hasBareLetterParen(s, 'r'); }
 
+// eb-order T-P1 (SPEC B.4 "One builder", rules 1-3 and 5; declared in
+// eval/session.h). Stata's rule, from the oracle records only (SPEC A):
+// `_cons` is the last column of its equation and is never spelled
+// `(intercept)` (w2g_ebmat.log:230 `x1 x2 _cons` after `regress y x1 x2`, where
+// the engine's feols coeftable puts `(intercept)` first); the other columns
+// keep the order the engine emitted (IV: endogenous, exogenous, then `_cons`,
+// w2g_ebmat.log:536); e(V) is the fit's full covariance in that same order with
+// its real off-diagonals (:365 V[1,2] = -1.f7d0ccaeed4b1X-00a). Equation-
+// prefixed names (`eq:name`) are grouped by equation in the order the
+// equations first appear. Base/omitted factor columns are not in the engine's
+// coeftable yet (SPEC Q1, task T-E2) and are not invented here.
+std::optional<EvalMatrix> canonicalEMatrix(const nlohmann::ordered_json& block, char which,
+                                           std::string* why) {
+  const auto fail = [why](std::string w) -> std::optional<EvalMatrix> {
+    if (why != nullptr) *why = std::move(w);
+    return std::nullopt;
+  };
+  const std::string label = std::string("e(") + which + ")";
+  // A reg3/sureg system: no single table, one `outcomes` entry per equation
+  // ({depvar, coeftable}); each column is `depvar:coef` (Stata's reg3/sureg
+  // e(b) stripe, `y:x1 y:x2 y:_cons x3:x2 x3:_cons`).
+  nlohmann::ordered_json systemTable;
+  const bool system = block.is_object() && block.value("estimator", std::string()) == "reg3" &&
+                      !block.contains("coeftable") && block.contains("outcomes") &&
+                      block.at("outcomes").is_array();
+  if (system) {
+    systemTable = nlohmann::ordered_json::array();
+    for (const auto& o : block.at("outcomes")) {
+      if (!o.is_object() || !o.contains("coeftable") || !o.at("coeftable").is_array()) continue;
+      const std::string eq = o.value("depvar", std::string());
+      for (const auto& row : o.at("coeftable")) {
+        if (!row.is_object() || !row.contains("name") || !row.at("name").is_string()) continue;
+        nlohmann::ordered_json r = row;
+        r["name"] = eq + ":" + row.at("name").get<std::string>();
+        systemTable.push_back(std::move(r));
+      }
+    }
+  }
+  const nlohmann::ordered_json* table =
+      system ? &systemTable
+             : (block.is_object() && block.contains("coeftable") ? &block.at("coeftable") : nullptr);
+  if (table == nullptr || !table->is_array() || table->empty())
+    return fail("matrix " + label + " not found");
+  struct Col {
+    std::string engine;  // the coeftable's own spelling
+    std::string eq;      // "" for a single-equation name
+    std::string bare;    // the name after the equation, `(intercept)` spelled `_cons`
+    double b = std::numeric_limits<double>::quiet_NaN();
+  };
+  std::vector<Col> cols;
+  for (const auto& row : *table) {
+    if (!row.is_object() || !row.contains("name") || !row.at("name").is_string()) continue;
+    Col c;
+    c.engine = row.at("name").get<std::string>();
+    const size_t colon = c.engine.find(':');
+    c.eq = colon == std::string::npos ? std::string() : c.engine.substr(0, colon);
+    c.bare = colon == std::string::npos ? c.engine : c.engine.substr(colon + 1);
+    if (c.bare == "(intercept)") c.bare = "_cons";
+    if (row.contains("b") && !row.at("b").is_null()) {
+      if (auto f = jsonToFloat(row.at("b"))) c.b = *f;
+    }
+    cols.push_back(std::move(c));
+  }
+  if (cols.empty()) return fail("matrix " + label + " not found");
+  // Equation order of first appearance; within each, `_cons` after the rest.
+  std::vector<std::string> eqs;
+  for (const auto& c : cols)
+    if (std::find(eqs.begin(), eqs.end(), c.eq) == eqs.end()) eqs.push_back(c.eq);
+  std::vector<size_t> order;
+  for (const auto& eq : eqs)
+    for (int consPass = 0; consPass < 2; ++consPass)
+      for (size_t i = 0; i < cols.size(); ++i)
+        if (cols[i].eq == eq && (cols[i].bare == "_cons") == (consPass == 1)) order.push_back(i);
+  EvalMatrix m;
+  for (size_t i : order)
+    m.colnames.push_back(cols[i].eq.empty() ? cols[i].bare : cols[i].eq + ":" + cols[i].bare);
+  const size_t k = order.size();
+  if (which == 'b') {
+    m.rownames = {"y1"};
+    std::vector<double> row;
+    for (size_t i : order) row.push_back(cols[i].b);
+    m.data.push_back(std::move(row));
+    return m;
+  }
+  // e(V): the engine's full covariance (`e_V` = {names, matrix}, the shape of
+  // apps/cmds/common.cpp add_e_v), permuted by name. Without it there is no
+  // e(V) to give: the coeftable's standard errors are only its diagonal.
+  const auto eVit = block.find("e_V");
+  if (eVit == block.end() || !eVit->is_object() || !eVit->contains("names") ||
+      !eVit->contains("matrix") || !eVit->at("names").is_array() || !eVit->at("matrix").is_array())
+    return fail("no-e_V");
+  const auto& vnames = eVit->at("names");
+  const auto& vmat = eVit->at("matrix");
+  std::vector<size_t> at(k, std::string::npos);
+  for (size_t a = 0; a < k; ++a) {
+    const Col& c = cols[order[a]];
+    for (size_t j = 0; j < vnames.size(); ++j) {
+      if (!vnames[j].is_string()) continue;
+      const std::string vn = vnames[j].get<std::string>();
+      if (vn == c.engine || (c.bare == "_cons" && (vn == (c.eq.empty() ? "_cons" : c.eq + ":_cons") ||
+                                                   vn == (c.eq.empty() ? "(intercept)"
+                                                                       : c.eq + ":(intercept)")))) {
+        at[a] = j;
+        break;
+      }
+    }
+    if (at[a] == std::string::npos || at[a] >= vmat.size())
+      return fail("the fit's covariance matrix does not name the coefficient `" + c.engine + "`");
+  }
+  const auto cell = [&vmat](size_t r, size_t c) -> double {
+    if (r >= vmat.size() || !vmat[r].is_array() || c >= vmat[r].size()) return std::nan("");
+    const auto& v = vmat[r][c];
+    if (v.is_null()) return std::numeric_limits<double>::quiet_NaN();
+    auto f = jsonToFloat(v);
+    return f ? *f : std::numeric_limits<double>::quiet_NaN();
+  };
+  m.rownames = m.colnames;
+  m.data.assign(k, std::vector<double>(k, 0.0));
+  for (size_t a = 0; a < k; ++a)
+    for (size_t c = 0; c < k; ++c)
+      // Stata's e(V) is exactly symmetric; an engine sandwich can differ from
+      // its transpose in the last bit, and the mean of the two is the same
+      // value whenever the engine's matrix is symmetric already.
+      m.data[a][c] = 0.5 * (cell(at[a], at[c]) + cell(at[c], at[a]));
+  return m;
+}
+
+std::optional<std::vector<EbStripeEntry>> ebStripeOf(const nlohmann::ordered_json& block,
+                                                     const std::vector<std::string>& canonNames) {
+  if (!block.is_object()) return std::nullopt;
+  const auto it = block.find("eb_stripe");
+  if (it == block.end() || !it->is_array() || it->empty()) return std::nullopt;
+  std::vector<EbStripeEntry> out;
+  std::vector<int> used(canonNames.size(), 0);
+  for (const auto& e : *it) {
+    if (!e.is_object() || !e.contains("name") || !e.at("name").is_string()) return std::nullopt;
+    EbStripeEntry en;
+    en.name = e.at("name").get<std::string>();
+    if (e.contains("src") && e.at("src").is_string()) en.src = e.at("src").get<std::string>();
+    if (!en.src.empty()) {
+      const auto f = std::find(canonNames.begin(), canonNames.end(), en.src);
+      if (f == canonNames.end()) return std::nullopt;
+      if (++used[static_cast<size_t>(f - canonNames.begin())] > 1) return std::nullopt;
+    }
+    out.push_back(std::move(en));
+  }
+  for (int u : used)
+    if (u != 1) return std::nullopt;
+  return out;
+}
+
+bool applyEbStripe(const nlohmann::ordered_json& block, char which, EvalMatrix& m) {
+  const std::optional<std::vector<EbStripeEntry>> st = ebStripeOf(block, m.colnames);
+  if (!st.has_value()) return false;
+  const size_t k = st->size();
+  std::vector<long> at(k, -1);
+  for (size_t a = 0; a < k; ++a) {
+    if ((*st)[a].src.empty()) continue;
+    at[a] = static_cast<long>(std::find(m.colnames.begin(), m.colnames.end(), (*st)[a].src) -
+                              m.colnames.begin());
+  }
+  EvalMatrix out;
+  for (const auto& e : *st) out.colnames.push_back(e.name);
+  if (which == 'b') {
+    out.rownames = m.rownames;
+    out.data.assign(m.data.size(), std::vector<double>(k, 0.0));
+    for (size_t r = 0; r < m.data.size(); ++r)
+      for (size_t a = 0; a < k; ++a)
+        if (at[a] >= 0) out.data[r][a] = m.data[r][static_cast<size_t>(at[a])];
+  } else {
+    out.rownames = out.colnames;
+    out.data.assign(k, std::vector<double>(k, 0.0));
+    for (size_t a = 0; a < k; ++a)
+      for (size_t c = 0; c < k; ++c)
+        if (at[a] >= 0 && at[c] >= 0)
+          out.data[a][c] = m.data[static_cast<size_t>(at[a])][static_cast<size_t>(at[c])];
+  }
+  m = std::move(out);
+  return true;
+}
+
+std::vector<EbColumnRow> stataEbColumns(const nlohmann::ordered_json& block) {
+  std::vector<EbColumnRow> out;
+  if (!block.is_object() || !block.contains("coeftable") || !block.at("coeftable").is_array())
+    return out;
+  // canonicalEMatrix's order, by the same rule: equations in order of first
+  // appearance, `_cons` last within each.
+  struct C {
+    std::string full;
+    std::string eq;
+    bool cons = false;
+    const nlohmann::ordered_json* row = nullptr;
+  };
+  std::vector<C> cols;
+  for (const auto& r : block.at("coeftable")) {
+    if (!r.is_object() || !r.contains("name") || !r.at("name").is_string()) continue;
+    const std::string n = r.at("name").get<std::string>();
+    const size_t colon = n.find(':');
+    C c;
+    c.eq = colon == std::string::npos ? std::string() : n.substr(0, colon);
+    std::string bare = colon == std::string::npos ? n : n.substr(colon + 1);
+    if (bare == "(intercept)") bare = "_cons";
+    c.cons = bare == "_cons";
+    c.full = c.eq.empty() ? bare : c.eq + ":" + bare;
+    c.row = &r;
+    cols.push_back(std::move(c));
+  }
+  std::vector<std::string> eqs;
+  for (const auto& c : cols)
+    if (std::find(eqs.begin(), eqs.end(), c.eq) == eqs.end()) eqs.push_back(c.eq);
+  std::vector<std::string> names;
+  std::vector<const nlohmann::ordered_json*> rows;
+  for (const auto& eq : eqs)
+    for (int pass = 0; pass < 2; ++pass)
+      for (const auto& c : cols)
+        if (c.eq == eq && c.cons == (pass == 1)) {
+          names.push_back(c.full);
+          rows.push_back(c.row);
+        }
+  if (const auto st = ebStripeOf(block, names)) {
+    for (const auto& e : *st) {
+      EbColumnRow cr;
+      cr.name = e.name;
+      if (!e.src.empty())
+        cr.row = rows[static_cast<size_t>(std::find(names.begin(), names.end(), e.src) -
+                                          names.begin())];
+      out.push_back(std::move(cr));
+    }
+    return out;
+  }
+  for (size_t i = 0; i < names.size(); ++i) out.push_back({names[i], rows[i]});
+  return out;
+}
+
+std::string coefFullName(const nlohmann::ordered_json& block, const std::string& name) {
+  if (!block.is_object()) return std::string();
+  std::vector<std::string> names;
+  for (const char* key : {"coeftable", "eb_stripe"}) {
+    const auto it = block.find(key);
+    if (it == block.end() || !it->is_array()) continue;
+    for (const auto& r : *it)
+      if (r.is_object() && r.contains("name") && r.at("name").is_string()) names.push_back(r.at("name").get<std::string>());
+  }
+  const cecon::postest::CoefRef r = cecon::postest::resolve_coef(names, name, nullptr);
+  if (r.kind != cecon::postest::CoefKind::Column) return std::string();
+  const std::string& full = names[static_cast<size_t>(r.idx)];
+  return full == name ? std::string() : full;
+}
+
+std::optional<double> ebStripeCoef(const nlohmann::ordered_json& block, const std::string& name,
+                                   const std::string& kind) {
+  if (!block.is_object()) return std::nullopt;
+  const auto it = block.find("eb_stripe");
+  if (it == block.end() || !it->is_array()) return std::nullopt;
+  const size_t colon = name.find(':');
+  const std::string bare = colon == std::string::npos ? name : name.substr(colon + 1);
+  // `0b.g` is also read as `0.g`: the level number, then the variable.
+  const auto unmarked = [](const std::string& n) {
+    size_t i = 0;
+    while (i < n.size() && std::isdigit(static_cast<unsigned char>(n[i])) != 0) ++i;
+    if (i > 0 && i + 1 < n.size() && n[i] == 'b' && n[i + 1] == '.') return n.substr(0, i) + n.substr(i + 1);
+    return n;
+  };
+  // Every atom's base/omitted marker dropped: `1o.t#0b.e` is read as `1.t#0.e`,
+  // `0b.a#1o.b` as `0.a#1.b` (StataBE bc3.do: `_b[1.t#0.e]` is 0 after reghdfe
+  // omits that cell; the engine sends no row for it since BUG-1476).
+  const auto plain = [](const std::string& n) {
+    static const std::regex reLevel(R"(^(\d+)(?:bn|b|o|bo|ob)\.)");
+    std::string out;
+    size_t start = 0;
+    for (;;) {
+      const size_t hash = n.find('#', start);
+      std::string atom = n.substr(start, hash == std::string::npos ? std::string::npos : hash - start);
+      atom = std::regex_replace(atom, reLevel, "$1.");
+      if (atom.rfind("co.", 0) == 0) atom = "c." + atom.substr(3);
+      else if (atom.rfind("o.", 0) == 0) atom = atom.substr(2);
+      out += atom;
+      if (hash == std::string::npos) break;
+      out += '#';
+      start = hash + 1;
+    }
+    return out;
+  };
+  const std::string barePlain = plain(bare);
+  for (const auto& e : *it) {
+    if (!e.is_object() || !e.contains("name") || !e.at("name").is_string()) continue;
+    const std::string nm = e.at("name").get<std::string>();
+    const std::string src = e.contains("src") && e.at("src").is_string()
+                                ? e.at("src").get<std::string>()
+                                : std::string();
+    if (src.empty()) {
+      if (bare == nm || bare == unmarked(nm) || barePlain == plain(nm)) return 0.0;
+      continue;
+    }
+    if (bare != nm || nm == src) continue;
+    // An `o.` spelling: the engine's row under its bare name.
+    if (!block.contains("coeftable") || !block.at("coeftable").is_array()) return std::nullopt;
+    for (const auto& r : block.at("coeftable")) {
+      if (!r.is_object() || r.value("name", std::string()) != src) continue;
+      const char* field = kind == "b" ? "b" : "se";
+      if (!r.contains(field) || r.at(field).is_null()) return std::nullopt;
+      return jsonToFloat(r.at(field));
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<double> ancillaryEbCoef(const EvalSession& session, const std::string& name,
+                                      const std::string& kind) {
+  // Also a factor level, `#.var` or `#bn.var`, which proportion's posted columns name
+  // without its engine row (`0bn.d 1.d`): StataBE 19.5 answers `_b[0.d]`, `_b[0bn.d]`,
+  // `_b[1bn.d]` and `_se[1.d]` alike after `proportion d` (scratch-laneA2/agents/epost/
+  // s11.log), and `_b[d:0]` is r(111).
+  static const std::regex reLevel(R"(^(\d+)(?:bn)?\.([A-Za-z_][A-Za-z0-9_]*)$)");
+  const auto plainLevel = [](const std::string& n) {
+    std::smatch m;
+    return std::regex_match(n, m, reLevel) ? m.str(1) + "." + m.str(2) : std::string();
+  };
+  const std::string level = plainLevel(name);
+  if (name.size() < 2 || (name.front() != '/' && level.empty()) ||
+      session.coefOverride != nullptr)
+    return std::nullopt;
+  const EvalMatrix* m = session.findClassMatrix('e', kind == "b" ? "b" : "V");
+  if (m == nullptr) return std::nullopt;
+  for (size_t j = 0; j < m->colnames.size(); ++j) {
+    if (m->colnames[j] != name && (level.empty() || plainLevel(m->colnames[j]) != level)) continue;
+    if (kind == "b") {
+      if (m->data.size() != 1 || m->data[0].size() <= j) return std::nullopt;
+      return m->data[0][j];
+    }
+    if (m->data.size() <= j || m->data[j].size() <= j || !(m->data[j][j] >= 0.0))
+      return std::nullopt;
+    return std::sqrt(m->data[j][j]);
+  }
+  return std::nullopt;
+}
+
+namespace {
+
+// eb-order ROUND 3: the CLOSED stripe table (internal capture
+// DIAGNOSIS.md section 3). canonicalEMatrix keeps the
+// engine's names, so what Stata's e(b)/e(V) is called -- and whether the
+// engine's coefficient table holds all of its columns at all -- depends on the
+// command. A command is BUILT only when a row below names it with the record
+// that resolves its stripe; every other e(cmd) refuses every e(b)/e(V) reader
+// by name (the last line of eStripeRowFor). Rounds 1 and 2 of this goal were
+// one class: a deny list whose default answered as emitted (csdid's one `ATT`
+// column where Stata's e(b) has one column per ATT(g,t) cell).
+//   kAsEmitted          -- the coeftable's names (equation-less in Stata).
+//   kDepvarEq           -- every column in one equation named after the depvar.
+//   kDepvarEqUnderscore -- the same, the depvar's `.` spelled `_`.
+//   kAbsent             -- Stata's e() has no e(b)/e(V) (the 0x0 path:
+//                          EvalSession::eMatrixAbsentFromLiveE).
+//   kRefuse             -- a named r(198) with `reason`.
+// A matrix POSTED for the live e() (glm, oaxaca, teffects, `ereturn post`,
+// erepost, estadd matrix, `estat ..., post`) is answered before this table.
+enum class EStripe { kAsEmitted, kDepvarEq, kDepvarEqUnderscore, kAbsent, kRefuse };
+
+// What the coefficient table must say about `_cons` for the matrix to be whole:
+//   kNeedCons   -- Stata keeps `_cons` unless the fit was noconstant; a table
+//                  without one is built only when the fit's block records
+//                  `noconstant` (runRegress), since areg/xtreg fe/reghdfe drop
+//                  it from the table when a regressor is collinear with the
+//                  absorbed effects while Stata's e(b) keeps it
+//                  (w2d_uncovered.log:3195-3221; FU-986);
+//   kNoCons     -- Stata's e(b) has no `_cons` (the conditional fe fits);
+//   kAnyCons    -- the names are Stata's own (the margins/nlcom postings).
+enum class ConsRule { kNeedCons, kNoCons, kAnyCons };
+
+struct EStripeRow {
+  const char* key;
+  EStripe rule;
+  ConsRule cons;
+  const char* reason;  // kRefuse only
+};
+
+constexpr const char* kNoStripeRecord = "";  // reason filled from the key
+
+// Section 3 rows. Each answering row cites the record that resolves it.
+const EStripeRow kEStripeTable[] = {
+    // w2g_ebmat.log:402 `e(b)[1,3]` x1 x2 _cons; :230 e1_colnames_eb `x1 x2 _cons`
+    {"regress", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
+    // w2g_ebmat.log:798 `symmetric e(V)[3,3]` (x1 x2 _cons)
+    {"areg", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
+    // w2g_ebmat.log:860 `symmetric e(V)[3,3]`
+    {"reghdfe", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
+    // w2g_ebmat.log:594 `symmetric e(V)[3,3]` after `ivregress 2sls y x2 (x1 = id)`
+    {"ivregress", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
+    // aer_b4/ivreg2-partial.log:121 `e(b)[1,4]`
+    {"ivreg2", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
+    // ivreghdfe.ado (corpus 065) absorb() sets noconstant,
+    // `_cons` only `if `cons''; the absorb rule is in resolveEMatrixFor
+    {"ivreghdfe", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
+    // w2p_estim_ev.log:755 B_xtreg_fe `|3|3|`; xtreg,re est post, no coleq
+    {"xtreg", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
+    // qreg posts `b' and `V' without coleq; w2j_e3_qreg2.log:229-232
+    {"qreg", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
+    // newey: bare coefficient names (the
+    // census fit esc_newey failed r(198), so this stays the row's evidence)
+    {"newey", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
+    // prais: bare coefficient names
+    {"prais", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
+    // ppmlhdfe (PIET's e(cmd) spells it `fepois`, FU-967): ppmlhdfe.ado (corpus
+    // 090) :298-302 `matrix colnames `b' = `indepvars'` (no coleq). Element
+    // (1,1) is pinned by w2l_vce_shape_det.log ppmlhdfe_*_se, which bin/main
+    // (FU-118) answers; w2v_estripe_census.log:1112 esc_ppmlhdfe `x1 x2 _cons`.
+    {"fepois", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
+    {"ppmlhdfe", EStripe::kAsEmitted, ConsRule::kNeedCons, nullptr},
+    // w2g_ebmat.log:653-656 `yb:x1 yb:x2 yb:_cons`; logistic fits `logit`
+    {"logit", EStripe::kDepvarEq, ConsRule::kNeedCons, nullptr},
+    // e(cmd) `logistic` (BUG-1192): logit's fit, logit's stripe
+    {"logistic", EStripe::kDepvarEq, ConsRule::kNeedCons, nullptr},
+    // w2g_ebmat.log:723
+    {"probit", EStripe::kDepvarEq, ConsRule::kNeedCons, nullptr},
+    {"cloglog", EStripe::kDepvarEq, ConsRule::kNeedCons, nullptr},
+    // poisson: a depvar's `.` becomes `_` in the equation name
+    {"poisson", EStripe::kDepvarEqUnderscore, ConsRule::kNeedCons, nullptr},
+    // xtlogit ,fe fits clogit and reposts nothing; the equation is
+    // named `depvar:`.
+    // The fe fit only (block estimator xtlogit_fe): re has /lnsig2u.
+    {"xtlogit_fe", EStripe::kDepvarEq, ConsRule::kNoCons, nullptr},
+    // xtpoisson ,fe: a depvar's `.` becomes `_` in the equation name.
+    // The fe fit only.
+    {"xtpoisson_fe", EStripe::kDepvarEqUnderscore, ConsRule::kNoCons, nullptr},
+    // margins/nlcom `..., post`: the block's names are Stata's (w2v_margins_vce /
+    // w2v_margins_corpus readers, 37/37 on bin/main)
+    // reg3/sureg: one equation per depvar, each `depvar:coef` with `_cons`
+    // last (reg3.ado's `y:x1 y:x2 y:_cons x3:x2 x3:_cons`); canonicalEMatrix
+    // builds the columns from the block's per-equation tables and e(V) is the
+    // engine's stacked system covariance. Neither accepts noconstant or factor
+    // terms here (runReg3 refuses them), so the table's names are the stripe.
+    {"reg3", EStripe::kAsEmitted, ConsRule::kAnyCons, nullptr},
+    {"sureg", EStripe::kAsEmitted, ConsRule::kAnyCons, nullptr},
+    {"margins", EStripe::kAsEmitted, ConsRule::kAnyCons, nullptr},
+    {"nlcom", EStripe::kAsEmitted, ConsRule::kAnyCons, nullptr},
+    // No e(b): w2g_ebmat.log:2087 e15c_matrix_b `0|`, :2096 (pca);
+    // w2v_estpost_ematrix ep13_b_shape `0|0|0||`; w2g_ebmat.log:2486
+    // e15d_list_eb2 `111` (rddensity)
+    {"pca", EStripe::kAbsent, ConsRule::kAnyCons, nullptr},
+    {"estpost", EStripe::kAbsent, ConsRule::kAnyCons, nullptr},
+    {"rddensity", EStripe::kAbsent, ConsRule::kAnyCons, nullptr},
+    // REFUSE rows with a reason of their own (owners: DIAGNOSIS section 3).
+    {"csdid", EStripe::kRefuse, ConsRule::kAnyCons,
+     "Stata's e(b) after csdid has one column per ATT(g,t) cell (`g####:t_####_####`, "
+     "csdid_kitchensink_oracle.log:61-87, :107), which the engine does not send"},
+    {"drdid", EStripe::kRefuse, ConsRule::kAnyCons,
+     "Stata posts e(b) as `ATET:r1vs0.<treatment>` (drdid), which this version "
+     "does not build"},
+    {"rdrobust", EStripe::kRefuse, ConsRule::kAnyCons,
+     // runRdrobust posts e(b)/e(V) as e() matrices, which answer before this
+     // table; the row answers only an rdrobust e() that carries neither.
+     "Stata's e(b) after rdrobust is 1x3 (Conventional, Bias-corrected, Robust; "
+     "w2g_ebmat.log:2305), and these results carry none"},
+    {"mean", EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord},
+    {"proportion", EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord},
+    {"did_imputation", EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord},
+    {"eventstudyinteract", EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord},
+    {"sdid", EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord},
+    {"stcox", EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord},
+    {"fracreg", EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord},
+    {"xtabond", EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord},
+    {"mediate", EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord},
+    // nl's free parameters are the engine's own row names (`/b0 /b1`), which is
+    // e(b)'s stripe in StataBE 19.5 (BUG-1246: colfullnames `/b0 /b1`, el(e(b),1,2)
+    // = _b[/b1]); no `_cons` column.
+    {"nl", EStripe::kAsEmitted, ConsRule::kAnyCons, nullptr},
+};
+
+// Ancillary parameters or extra equations the engine's table does not carry
+// (tobit/ivtobit var(e.y), nbreg lnalpha, ologit/oprobit cuts, mixed variance
+// components, streg ancillaries, the selection/inflation equations of
+// heckman/zip/zinb/ivprobit, the outcome equations of mlogit/var, the
+// parameter equations of gmm; w2u_binary_ml_edges.log heckman `yh:... s:...
+// /mills`; owner FU-968).
+const char* const kAncillaryCmds[] = {"nbreg", "tobit", "ivtobit", "ologit", "oprobit", "mlogit",
+                                      "zip",   "zinb",  "heckman", "ivprobit", "var",
+                                      "gmm",   "mixed",   "streg"};
+
+// The block spellings of a key, for the scoped coefOverride (no e(cmd)) and for
+// the fe fits whose e(cmd) does not say fe.
+std::string eStripeKeyOfEstimator(const std::string& est) {
+  if (est == "feols") return "regress";
+  if (est == "logistic") return "logit";
+  const std::string head = est.substr(0, est.find(' '));  // "ivregress 2sls|gmm|liml"
+  return head;
+}
+
+EStripeRow eStripeRowFor(const std::string& eCmd, const std::string& blockEstimator) {
+  std::string key = eCmd.empty() ? eStripeKeyOfEstimator(blockEstimator) : eCmd;
+  // e(cmd) `xtlogit`/`xtpoisson` covers re and fe; only the fe fit has a row.
+  if (key == "xtlogit" || key == "xtpoisson")
+    key = blockEstimator == key + "_fe" ? blockEstimator : key + " (not fe)";
+  // xtlogit, fe with an empty cluster() posts the underlying clogit e(cmd).
+  // The fitted block still identifies the conditional FE estimator and now
+  // carries its full covariance, so it uses that same no-constant stripe.
+  if (key == "clogit" && blockEstimator == "xtlogit_fe") key = "xtlogit_fe";
+  for (const EStripeRow& r : kEStripeTable)
+    if (key == r.key) return r;
+  for (const char* c : kAncillaryCmds)
+    if (key == c)
+      return {c, EStripe::kRefuse, ConsRule::kAnyCons,
+              "Stata's e(b) has equations or ancillary parameters the engine does not send"};
+  return {nullptr, EStripe::kRefuse, ConsRule::kAnyCons, kNoStripeRecord};
+}
+
+// A factor-variable column (`2.g`, `1b.g`, `x1#2.g`, `2.g#c.x`): any `#`, or a
+// part that starts with a level number followed by `.` (FU-118's rule).
+bool isFactorColumn(const std::string& name) {
+  if (name.find('#') != std::string::npos) return true;
+  static const std::regex reLevel(R"((^|[:#])\d+[A-Za-z]*\.)");
+  return std::regex_search(name, reLevel);
+}
+
+// Whether a column name already carries Stata's base (`1b.`, `1bn.`) or
+// omitted (`o.`, `2o.`, `co.`) marker in any `:`/`#`-separated part.
+bool hasBaseOrOmittedMarker(const std::string& name) {
+  static const std::regex reMark(R"((^|[:#])(\d*(b|bn|o)|co)\.)");
+  return std::regex_search(name, reMark);
+}
+
+}  // namespace
+
+std::string depvarEquationOf(const EvalSession& session) {
+  const nlohmann::ordered_json* source = session.coefSource();
+  if (source == nullptr || !source->is_object()) return std::string();
+  const std::string* eCmd = session.eStrings.find("cmd");
+  const EStripeRow row = eStripeRowFor(eCmd != nullptr ? *eCmd : std::string(),
+                                       source->value("estimator", std::string()));
+  if (row.rule != EStripe::kDepvarEq && row.rule != EStripe::kDepvarEqUnderscore)
+    return std::string();
+  std::string eq = source->value("depvar", std::string());
+  if (eq.empty())
+    if (const std::string* dv = session.eStrings.find("depvar")) eq = *dv;
+  if (row.rule == EStripe::kDepvarEqUnderscore) std::replace(eq.begin(), eq.end(), '.', '_');
+  return eq;
+}
+
+std::string omittedColumnSpelling(const std::string& name) {
+  const size_t colon = name.find(':');
+  const std::string eq = colon == std::string::npos ? std::string() : name.substr(0, colon + 1);
+  const std::string bare = colon == std::string::npos ? name : name.substr(colon + 1);
+  if (bare.empty() || std::isdigit(static_cast<unsigned char>(bare[0])) != 0) return std::string();
+  for (char c : bare)
+    if (!(std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_')) return std::string();
+  if (bare == "_cons") return std::string();
+  return eq + "o." + bare;
+}
+
+bool ebHasUnsentColumns(const EvalSession& session) {
+  const nlohmann::ordered_json* source = session.coefSource();
+  const std::string* eCmd = session.eStrings.find("cmd");
+  const std::string key =
+      eCmd != nullptr && !eCmd->empty()
+          ? *eCmd
+          : (source != nullptr && source->is_object()
+                 ? eStripeKeyOfEstimator(source->value("estimator", std::string()))
+                 : std::string());
+  for (const char* c : kAncillaryCmds)
+    if (key == c) return true;
+  return false;
+}
+
+EvalSession::EMatrixAnswer EvalSession::resolveEMatrixFor(const std::string& name,
+                                                          EReader reader) const {
+  EMatrixAnswer a;
+  const auto fail = [&a](int code, std::string w, bool absent) {
+    a.rc = code;
+    a.why = std::move(w);
+    a.absent = absent;
+    return a;
+  };
+  if (const EvalMatrix* posted = findClassMatrix('e', name)) {
+    a.matrix = *posted;
+    return a;
+  }
+  // e(beta) and e(V_modelbased) of a fit whose block records them (regress's
+  // `beta_std`, a built-in multiway fit's `e_Vmb`; estimation_m4.cpp
+  // postENameListsRegressM4): read at the moment of need from a local copy of
+  // the live block with its coefficients (covariance) replaced, through the very
+  // e(b) (e(V)) reader below, so they carry e(b)'s (e(V)'s) stripe -- the base
+  // and `o.` columns annotateEbStripe records after the fit included (StataBE
+  // 19.5 `regress y x1 i.g`: e(beta) `x1 1b.g 2.g 3.g` with a 0 base column;
+  // the multiway-cluster e(V_modelbased) on e(V)'s stripe). e(beta)
+  // drops `_cons` ([R] regress, Stored results) and its row is `r1` (StataBE
+  // `matrix list e(beta)`).
+  if ((name == "beta" || name == "V_modelbased") && eLive()) {
+    const nlohmann::ordered_json* live = coefSource();
+    const char* key = name == "beta" ? "beta_std" : "e_Vmb";
+    if (live != nullptr && live->is_object() && live->contains(key) && live->at(key).is_object()) {
+      nlohmann::ordered_json copy = *live;
+      if (name == "V_modelbased") {
+        copy["e_V"] = live->at(key);
+        return resolveFitEMatrixFrom("V", reader, &copy);
+      }
+      const auto& beta = live->at(key);
+      if (!copy.contains("coeftable") || !copy["coeftable"].is_array())
+        return fail(111, "matrix e(beta) not found", true);
+      for (auto& r : copy["coeftable"]) {
+        if (!r.is_object() || !r.contains("name") || !r["name"].is_string())
+          return fail(111, "matrix e(beta) not found", true);
+        const std::string nm = r["name"].get<std::string>();
+        if (nm == "(intercept)" || nm == "_cons") continue;
+        const auto it = beta.find(nm);
+        if (it != beta.end() && it->is_number()) {
+          r["b"] = *it;
+          continue;
+        }
+        // A column the fit omitted (b 0): Stata's e(beta) is 0 there too.
+        const auto b = r.find("b");
+        if (b == r.end() || !b->is_number() || b->get<double>() != 0.0)
+          return fail(111, "matrix e(beta) not found", true);
+      }
+      EMatrixAnswer bm = resolveFitEMatrixFrom("b", reader, &copy);
+      if (!bm.matrix.has_value()) {
+        if (!bm.why.empty()) {
+          const size_t at = bm.why.find("e(b)");
+          if (at != std::string::npos) bm.why.replace(at, 4, "e(beta)");
+        }
+        return bm;
+      }
+      if (bm.matrix->data.size() != 1) return fail(111, "matrix e(beta) not found", true);
+      EvalMatrix out;
+      out.rownames = {"r1"};
+      out.data.emplace_back();
+      for (size_t j = 0; j < bm.matrix->colnames.size(); ++j) {
+        const std::string& c = bm.matrix->colnames[j];
+        const size_t colon = c.find(':');
+        const std::string bare = colon == std::string::npos ? c : c.substr(colon + 1);
+        if (bare == "_cons") continue;
+        out.colnames.push_back(c);
+        out.data[0].push_back(bm.matrix->data[0][j]);
+      }
+      if (out.colnames.empty()) return fail(111, "matrix e(beta) not found", true);
+      a.matrix = std::move(out);
+      return a;
+    }
+  }
+  if (name != "b" && name != "V") return fail(111, "matrix e(" + name + ") not found", true);
+  return resolveFitEMatrixFrom(name, reader, coefSource());
+}
+
+EvalSession::EMatrixAnswer EvalSession::resolveFitEMatrixFrom(
+    const std::string& name, EReader reader, const nlohmann::ordered_json* source) const {
+  EMatrixAnswer a;
+  const auto fail = [&a](int code, std::string w, bool absent) {
+    a.rc = code;
+    a.why = std::move(w);
+    a.absent = absent;
+    return a;
+  };
+  if (name != "b" && name != "V") return fail(111, "matrix e(" + name + ") not found", true);
+  // No e() at all: Stata's r(301) "last estimates not found" (w2g_ebmat.log:2229
+  // e15c_fresh_matrix_b, :2238 e15c_fresh_matlist_eb).
+  if (!eLive()) return fail(301, "last estimates not found", true);
+  const std::string* eCmdP = coefOverride == nullptr ? eStrings.find("cmd") : nullptr;
+  const std::string eCmd = eCmdP != nullptr ? *eCmdP : std::string();
+  const std::string blockEst = source != nullptr && source->is_object()
+                                   ? source->value("estimator", std::string())
+                                   : std::string();
+  const EStripeRow row = eStripeRowFor(eCmd, blockEst);
+  const std::string cmdName = !eCmd.empty() ? eCmd : blockEst;
+  const auto refuse = [&](const std::string& reason) {
+    return fail(198,
+                "e(" + name + ") is not available in this version of PIET after `" +
+                    (cmdName.empty() ? std::string("this estimation") : cmdName) + "`: " + reason,
+                false);
+  };
+  const auto rowReason = [&row, &cmdName]() -> std::string {
+    if (row.reason != nullptr && *row.reason != '\0') return row.reason;
+    return "Stata's stripe for " + (cmdName.empty() ? std::string("this estimation") : cmdName) +
+           " is not recorded here";
+  };
+  if (source == nullptr) {
+    // A live e() without this matrix (pca, estpost, rddensity, an `ereturn post`
+    // without b: w2g_ebmat.log:2486 e15d_list_eb2 `matrix e(b) not found`,
+    // r(111)). A named row Stata DOES post an e(b) for (rdrobust) refuses.
+    if (row.key != nullptr && row.rule == EStripe::kRefuse) return refuse(rowReason());
+    return fail(111, "matrix e(" + name + ") not found", true);
+  }
+  // `erepost b = M` (handlers_aer_tables.cpp runErepost marks the block): on a
+  // posting with no e(b) (estpost) the rows ARE M -- its names, its order, no
+  // e(V) (erepost.ado `eret post `b''; w2v_estpost_ematrix.log
+  // ep14e_colnames_eb `c1 c2`, ep14e2_colnames_eb `x1 x2`). On a fit the rows
+  // keep the fit's names and only the values change, so the stripe row and
+  // both guards still apply (G1 reads the row's `omitted` mark there).
+  const auto repIt = source->find("reposted_b");
+  const bool reposted = repIt != source->end() && repIt->is_boolean() && repIt->get<bool>();
+  if (row.rule == EStripe::kAbsent && reposted) {
+    if (name != "b") return fail(111, "matrix e(" + name + ") not found", true);
+    EvalMatrix pm;
+    pm.rownames = {"y1"};
+    pm.data.emplace_back();
+    if (source->contains("coeftable") && source->at("coeftable").is_array()) {
+      for (const auto& r : source->at("coeftable")) {
+        if (!r.is_object() || !r.contains("name") || !r.at("name").is_string()) continue;
+        pm.colnames.push_back(r.at("name").get<std::string>());
+        double v = std::numeric_limits<double>::quiet_NaN();
+        if (r.contains("b") && !r.at("b").is_null())
+          if (auto f = jsonToFloat(r.at("b"))) v = *f;
+        pm.data[0].push_back(v);
+      }
+    }
+    a.matrix = std::move(pm);
+    return a;
+  }
+  if (row.rule == EStripe::kRefuse || row.rule == EStripe::kAbsent) return refuse(rowReason());
+  // The coefficient table's terms, in the engine's spelling.
+  struct Term {
+    std::string name;
+    bool zero = false;  // b == 0 exactly and se 0 or missing, or marked omitted
+  };
+  std::vector<Term> terms;
+  if (source->is_object() && source->contains("coeftable") && source->at("coeftable").is_array()) {
+    for (const auto& r : source->at("coeftable")) {
+      if (!r.is_object() || !r.contains("name") || !r.at("name").is_string()) continue;
+      Term t;
+      t.name = r.at("name").get<std::string>();
+      std::optional<double> b, se;
+      if (r.contains("b") && !r.at("b").is_null()) b = jsonToFloat(r.at("b"));
+      if (r.contains("se") && !r.at("se").is_null()) se = jsonToFloat(r.at("se"));
+      // A reposted row's se is null and its b is M's value, so the fit's
+      // omission survives only as the row's `omitted` mark (runErepost sets it
+      // before it nulls se); a reposted 0 alone is not an omission.
+      const auto omIt = r.find("omitted");
+      const bool marked = omIt != r.end() && omIt->is_boolean() && omIt->get<bool>();
+      t.zero = marked ||
+               (!reposted && b.has_value() && *b == 0.0 && (!se.has_value() || *se == 0.0));
+      terms.push_back(std::move(t));
+    }
+  }
+  // (G1) an omitted (collinear) column: the engine keeps it at b 0 / se 0 under
+  // its bare name, where Stata marks the omitted column `o.` (w2u_binary_ml_edges.log:215
+  // bm_l_dz0_names `x1 o.dz0 _cons`). Stata may omit a different member of the
+  // collinear set than the engine (w2v_estripe_census.log:274 esc_regress_omit
+  // `o.x1 x2 x3c _cons` where the engine dropped x3c), so the refusal names
+  // only the engine's column. Owner: T-E2.
+  // eb-order T-E2: a stripe the fit recorded (ebStripeOf) names the base
+  // columns and the `o.` spelling of a screen-omitted column itself.
+  std::vector<std::string> stripeNames;  // the stripe's Stata names, when it has one
+  std::vector<std::string> stripeSrcOmitted;  // canonical columns it spells `o.`
+  if (const auto stIt = source->find("eb_stripe"); stIt != source->end() && stIt->is_array()) {
+    for (const auto& e : *stIt) {
+      if (!e.is_object() || !e.contains("name") || !e.at("name").is_string()) continue;
+      const std::string nm = e.at("name").get<std::string>();
+      stripeNames.push_back(nm);
+      if (e.contains("src") && e.at("src").is_string() && hasBaseOrOmittedMarker(nm))
+        stripeSrcOmitted.push_back(e.at("src").get<std::string>());
+    }
+  }
+  for (const Term& t : terms)
+    if (t.zero && !hasBaseOrOmittedMarker(t.name) &&
+        std::find(stripeSrcOmitted.begin(), stripeSrcOmitted.end(), t.name) ==
+            stripeSrcOmitted.end())
+      return refuse("the fit omitted the collinear column `" + t.name +
+                    "` (Stata marks an omitted column `o.`; the engine and Stata may omit "
+                    "different columns of a collinear set)");
+  // Factor-variable terms whose base levels the engine does not send (`2.g 3.g`
+  // where Stata has `1b.g 2.g 3.g`, w2g_ebmat.log:452 e2_colnames_eb). Owner
+  // T-E2; `matrix b = e(b)` and `matrix list e(b)` keep bin/main's rc-0 answer
+  // (e2_list_eb, w2g_ebmat.log:495), the name and operand readers refuse.
+  if (row.cons != ConsRule::kAnyCons && reader != EReader::kCopy) {
+    const bool anyFactor = std::any_of(terms.begin(), terms.end(),
+                                       [](const Term& t) { return isFactorColumn(t.name); });
+    const bool anyBase = std::any_of(terms.begin(), terms.end(), [](const Term& t) {
+      return hasBaseOrOmittedMarker(t.name);
+    }) || std::any_of(stripeNames.begin(), stripeNames.end(), [](const std::string& n) {
+      return hasBaseOrOmittedMarker(n);
+    });
+    // A recorded stripe placed every column under Stata's name (a `c.x#c.z`
+    // cell has no base level to mark).
+    if (anyFactor && !anyBase && stripeNames.empty())
+      return refuse("the fit has factor-variable terms, and the engine does not send their "
+                    "base-level columns (`1b.` ...) that Stata's e(" + name + ") carries");
+  }
+  const auto isCons = [](const std::string& n) {
+    const size_t colon = n.find(':');
+    const std::string bare = colon == std::string::npos ? n : n.substr(colon + 1);
+    return bare == "_cons" || bare == "(intercept)";
+  };
+  const bool hasCons =
+      std::any_of(terms.begin(), terms.end(), [&isCons](const Term& t) { return isCons(t.name); });
+  if (row.cons == ConsRule::kNoCons && hasCons)
+    return refuse("the fit's coefficient table has a `_cons` that Stata's e(" + name +
+                  ") does not");
+  if (row.cons == ConsRule::kNeedCons) {
+    // ivreghdfe under absorb() partials the constant out (w2b_estim.log:1168
+    // `Partialled-out: _cons`); the block names the absorbed effects.
+    const auto absorbedIt = source->find("absorbed");
+    const bool consPartialled = std::string(row.key) == "ivreghdfe" &&
+                                absorbedIt != source->end() && absorbedIt->is_object() &&
+                                !absorbedIt->empty();
+    const auto ncIt = source->find("noconstant");
+    const bool noConstant = ncIt != source->end() && ncIt->is_boolean() && ncIt->get<bool>();
+    if (consPartialled) {
+      if (hasCons)
+        return refuse("the fit's coefficient table has a `_cons` that ivreghdfe partials out");
+    } else if (!hasCons && !noConstant) {
+      return refuse("the fit's coefficient table has no `_cons`, and this build cannot tell a "
+                    "noconstant fit from a constant the engine dropped, so the columns of "
+                    "Stata's e(" + name + ") are unknown");
+    }
+  }
+  std::string w;
+  std::optional<EvalMatrix> m = canonicalEMatrix(*source, name[0], &w);
+  if (!m.has_value() && w == "no-e_V") {
+    if (reader == EReader::kOperand) {
+      // Only the coefficient table's standard errors exist: V's DIAGONAL. The
+      // operand caller answers el(e(V),i,i) = se_i^2 and the dimensions, and
+      // refuses an off-diagonal cell by name (FU-118), never the silent 0 of a
+      // diagonal synthesis (FU-98).
+      std::optional<EvalMatrix> bm = canonicalEMatrix(*source, 'b', &w);
+      // (a reg3/sureg system has no top-level table to read the se's from)
+      if (bm.has_value() && source->contains("coeftable") && source->at("coeftable").is_array()) {
+        EvalMatrix d;
+        d.colnames = bm->colnames;
+        d.rownames = bm->colnames;
+        const size_t k = d.colnames.size();
+        d.data.assign(k, std::vector<double>(k, 0.0));
+        // canonicalEMatrix's column order, read back by name from the table.
+        for (size_t i = 0; i < k; ++i) {
+          d.data[i][i] = std::numeric_limits<double>::quiet_NaN();
+          for (const auto& r : source->at("coeftable")) {
+            if (!r.is_object() || !r.contains("name") || !r.at("name").is_string()) continue;
+            std::string n = r.at("name").get<std::string>();
+            const size_t colon = n.find(':');
+            std::string bare = colon == std::string::npos ? n : n.substr(colon + 1);
+            if (bare == "(intercept)") bare = "_cons";
+            const std::string full =
+                colon == std::string::npos ? bare : n.substr(0, colon + 1) + bare;
+            if (full != d.colnames[i]) continue;
+            if (r.contains("se") && !r.at("se").is_null())
+              if (auto se = jsonToFloat(r.at("se"))) d.data[i][i] = *se * *se;
+            break;
+          }
+        }
+        m = std::move(d);
+        a.diagonalOnly = true;
+      }
+    } else {
+      // SPEC Q2 interim, an open completion gap: the engine sent no covariance
+      // for this fit, and a diagonal of se^2 would answer every off-diagonal
+      // with a silent 0. A named refusal, never a diagonal.
+      return refuse("the engine did not send the fit's covariance matrix");
+    }
+  }
+  if (!m.has_value()) return fail(111, w, false);  // defensive: G1 runs first
+  // The fit's own stripe (base columns, `o.` names): e(b) and e(V) alike. A
+  // diagonal-only e(V) keeps zeros off the diagonal there too.
+  if (!applyEbStripe(*source, name[0], *m) && !stripeNames.empty() &&
+      row.cons != ConsRule::kAnyCons && reader != EReader::kCopy &&
+      std::any_of(terms.begin(), terms.end(), [](const Term& t) { return isFactorColumn(t.name); }))
+    return refuse("the fit's recorded e(" + name + ") stripe no longer matches its coefficient "
+                  "table, so the base-level columns Stata's e(" + name + ") carries are unknown");
+  if (row.rule == EStripe::kDepvarEq || row.rule == EStripe::kDepvarEqUnderscore) {
+    std::string eq = source->value("depvar", std::string());
+    if (eq.empty() && coefOverride == nullptr) {
+      if (const std::string* dv = eStrings.find("depvar")) eq = *dv;
+    }
+    if (eq.empty()) {
+      a.diagonalOnly = false;
+      return refuse("the fit did not record its dependent variable");
+    }
+    if (row.rule == EStripe::kDepvarEqUnderscore) std::replace(eq.begin(), eq.end(), '.', '_');
+    const auto stripeOf = [&eq](std::vector<std::string>& names) {
+      for (auto& n : names)
+        if (n.find(':') == std::string::npos) n = eq + ":" + n;
+    };
+    stripeOf(m->colnames);
+    if (name == "V") stripeOf(m->rownames);
+  }
+  a.matrix = std::move(m);
+  return a;
+}
+
 // B4-W3b: is this line one of the MATRIX verbs — the only surface that can
 // consume an r-class matrix reference (handlers_m3.cpp:1978 / :1955)? Stata's
 // own abbreviations of `matrix` are mat/matr/matri/matrix; `matlist` is the
@@ -1091,7 +2164,244 @@ bool isMatrixVerbLine(const std::string& line) {
   return verb == "mat" || verb == "matr" || verb == "matri" || verb == "matrix" ||
          verb == "matlist";
 }
+// W2AK: an `estadd` line (after any capture/noisily/quietly prefixes). estadd
+// reads `r(name)` ITSELF -- `estadd r(mean)` posts e(mean) (estadd)
+// and `estadd scalar r(sd)` posts e(sd) (:249-255) -- so the bare r() pass
+// leaves those references for the handler instead of splicing a number into
+// the subcommand position (w2ak ek_ad_r_bare, ek_ad_scalar_rname).
+// AER tier-1: `matselrc` too -- its row()/col() options abbreviate to r()/c(),
+// so `matselrc A B, r(r3)` names a row and must not become `r(.)` (StataBE
+// 2026-10-28: rc 0, one row r3; internal capture
+// t1_matselrc_onename.log).
+bool isEstaddLine(const std::string& line) {
+  static const std::set<std::string> kPrefix = {
+      "cap",  "capt", "captu", "captur", "capture", "n",      "no",     "noi",    "nois",
+      "noisi", "noisil", "noisily", "qui",  "quie",  "quiet", "quietl", "quietly"};
+  size_t i = 0;
+  for (;;) {
+    i = line.find_first_not_of(" \t", i);
+    if (i == std::string::npos) return false;
+    size_t j = i;
+    while (j < line.size() && std::isalpha(static_cast<unsigned char>(line[j])) != 0) ++j;
+    std::string w = line.substr(i, j - i);
+    for (auto& c : w) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (w == "estadd" || w == "matselrc") {
+      return j >= line.size() || line[j] == ' ' || line[j] == '\t';
+    }
+    if (kPrefix.count(w) == 0) return false;
+    i = j;
+    if (i < line.size() && line[i] == ':') ++i;
+  }
+}
 bool hasBareEParen(const std::string& s) { return hasBareLetterParen(s, 'e'); }
+
+namespace {
+// e(sample) T2: the one spelling of the token, applied to text whose string
+// literals protectStringLiterals has already swapped out.
+const std::regex& reEsampleToken() {
+  static const std::regex re(R"(\be\(\s*sample\s*\))");
+  return re;
+}
+}  // namespace
+
+bool hasEsampleToken(const std::string& s) {
+  if (s.find("sample") == std::string::npos || !hasBareEParen(s)) return false;
+  std::vector<std::string> spans;
+  const std::string bare = protectStringLiterals(s, &spans);
+  return std::regex_search(bare, reEsampleToken());
+}
+
+std::string replaceEsampleToken(const std::string& s, const std::string& with) {
+  if (!hasEsampleToken(s)) return s;
+  std::vector<std::string> spans;
+  const std::string bare = protectStringLiterals(s, &spans);
+  // `with` is spliced verbatim: regex_replace would read a `$` in it as a group.
+  std::string out;
+  auto it = std::sregex_iterator(bare.begin(), bare.end(), reEsampleToken());
+  size_t last = 0;
+  for (; it != std::sregex_iterator(); ++it) {
+    out.append(bare, last, static_cast<size_t>(it->position(0)) - last);
+    out += with;
+    last = static_cast<size_t>(it->position(0) + it->length(0));
+  }
+  out.append(bare, last, std::string::npos);
+  return restoreStringLiterals(out, spans);
+}
+
+namespace {
+
+// BUG-629 (eval half): the spellings in which a bare r(NAME) is a MATRIX operand
+// that substituteMatrixRefs answers on every verb -- r(NAME)[i,j],
+// rowsof(r(NAME)), colsof(r(NAME)) and el(r(NAME),i,j). w2c_postest.log family
+// (1) reads a posted r(table) as `display rowsof(r(table))`, `display %18.0g
+// r(table)[1,1]` and `local x : display ...`; family (5) reads nlcom's r(b) as
+// `r(b)[1,1]`. Returns `s` with each operand occurrence of r(NAME) cut out, so an
+// r(NAME) still present afterwards is one used as a SCALAR. NAME is an
+// identifier (reRRef's grammar), so it is safe inside a pattern.
+std::string cutRMatrixOperands(const std::string& s, const std::string& name) {
+  if (s.find("r(" + name + ")") == std::string::npos) return s;
+  const std::string ref = R"(r\()" + name + R"(\))";
+  std::string out = std::regex_replace(s, std::regex(R"(\b)" + ref + R"((?=\s*\[))"), "");
+  out = std::regex_replace(
+      out, std::regex(R"(\b(colsof|rowsof)(\s*\(\s*))" + ref + R"((?=\s*\)))", std::regex::icase),
+      "$1$2");
+  out = std::regex_replace(
+      out, std::regex(R"(\b(el)(\s*\(\s*))" + ref + R"((?=\s*,))", std::regex::icase), "$1$2");
+  return out;
+}
+
+// The inline extended macro functions, `` `: fn args' `` anywhere in a line, all
+// answered by tryExtendedMacroFn -- the arm that answers `local x : fn args`.
+// BUG-1384/1379/1380: this was six per-function patterns (the matrix stripes of
+// BUG-629, `: word`, the variable readers of BUG-719 with `: label (V) #` only,
+// `: sortedby`, `: e(kind)`, `: char`), and every other inline function tripped
+// the tokenizer's "does not expand macros" refusal (r(198)) although its two-line
+// form answered: `` `: label ul 1' `` (StataBE 19.5 `Yes`), `` `: var lab u' ``,
+// `` `: list A - B' ``, `` `: pwd' ``, and `` `: word count `"a b"' c' `` (2), whose
+// compound quotes the `: word` pattern could not hold.
+//
+// A span is READY once it holds no macro reference of its own: `` `: word `i' of
+// `plist'' `` waits for `i' and `plist' to expand on the pass before (w2x
+// fx_nullmat_macro), and a $global in it likewise. A compound-quoted string
+// inside it is an argument, not a reference. `display` is not this layer's: the
+// dispatcher splices `` `: display ...' `` before the line is expanded
+// (substituteInlineDisplay), so it is left alone here. Nor is a span escaped as
+// `` \`: fn' ``: Stata keeps it literal (`display "\`: list sizeof A'"` prints
+// `` `: list sizeof A' ``), which this layer cannot express, so it stays for the
+// tokenizer's refusal rather than turning into `\3`. Returns the start of the
+// rightmost ready span beginning before `before` (its closing quote in *end when
+// `end` is given), or npos.
+size_t findReadyInlineMacroFn(const std::string& line, size_t before, size_t* end) {
+  static const std::regex reDisplayHead(R"(^\s*(?:display|displa|displ|disp|dis|di)(?:\s|$))",
+                                        std::regex::icase);
+  for (size_t p = before == 0 ? std::string::npos : line.rfind("`:", before - 1);
+       p != std::string::npos; p = p == 0 ? std::string::npos : line.rfind("`:", p - 1)) {
+    if (p > 0 && line[p - 1] == '\\') continue;
+    size_t i = p + 2, quote = std::string::npos;
+    int depth = 0;
+    while (i < line.size()) {
+      if (startsCompound(line, i)) {
+        ++depth;
+        i += 2;
+      } else if (line[i] == '`') {
+        break;  // a macro reference still to expand
+      } else if (depth > 0 && line[i] == '\'') {
+        // BUG-1340: a nested pair closes at its first quote, `"' or not:
+        // `"[`: word count `"a b c'"'|"` prints [1| in StataBE 19.5 (the list
+        // is `"a b c'"`).
+        --depth;
+        ++i;
+      } else if (line[i] == '\'' && depth == 0) {
+        quote = i;
+        break;
+      } else {
+        ++i;
+      }
+    }
+    if (quote == std::string::npos) continue;
+    const std::string body = line.substr(p + 2, quote - p - 2);
+    if (body.find('$') != std::string::npos &&
+        (hasGlobalRef(reGlobalRefBrace(), body) || hasGlobalRef(reGlobalRefBare(), body)))
+      continue;
+    if (std::regex_search(body, reDisplayHead)) continue;
+    if (end != nullptr) *end = quote;
+    return p;
+  }
+  return std::string::npos;
+}
+
+bool usesRRefAsScalar(const std::string& s, const std::string& name) {
+  const std::string cut = cutRMatrixOperands(s, name);
+  if (cut.find("r(" + name + ")") == std::string::npos) return false;
+  return std::regex_search(cut, std::regex(R"(\br\()" + name + R"(\))"));
+}
+
+// Stata's code for reading an r() matrix that is not there. r(NAME) is then the
+// missing scalar, so `r(NAME)[i,j]` is `.[i,j]` -- r(198) "invalid syntax"
+// (w2c_postest.log:363-370, rtable_survives_summarize) -- and colsof/rowsof of it
+// is a scalar where a matrix is required -- r(109) "type mismatch"
+// (w2c_postest.log:377-384, rtable_replaced_by_test). Decided by the FIRST bare
+// reference, the one Stata's parser stops at. "" = neither spelling.
+std::string absentClassMatrixRc(const std::string& s, char cls, const std::string& name) {
+  std::smatch m;
+  if (!std::regex_search(s, m, std::regex(R"(\b)" + std::string(1, cls) + R"(\()" + name + R"(\))")))
+    return std::string();
+  const size_t at = static_cast<size_t>(m.position(0));
+  size_t k = at + static_cast<size_t>(m.length(0));
+  while (k < s.size() && std::isspace(static_cast<unsigned char>(s[k]))) ++k;
+  if (k < s.size() && s[k] == '[') return "198";
+  size_t j = at;
+  while (j > 0 && std::isspace(static_cast<unsigned char>(s[j - 1]))) --j;
+  if (j == 0 || s[j - 1] != '(') return std::string();
+  --j;
+  while (j > 0 && std::isspace(static_cast<unsigned char>(s[j - 1]))) --j;
+  size_t w = j;
+  while (w > 0 && (std::isalnum(static_cast<unsigned char>(s[w - 1])) || s[w - 1] == '_')) --w;
+  std::string fn = s.substr(w, j - w);
+  for (auto& c : fn) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return (fn == "colsof" || fn == "rowsof" || fn == "el") ? "109" : std::string();
+}
+
+std::string absentRMatrixRc(const std::string& s, const std::string& name) {
+  return absentClassMatrixRc(s, 'r', name);
+}
+
+ExpandResult rcErrorResult(const std::string& message, const std::string& rc) {
+  ExpandResult r;
+  r.isError = true;
+  r.error = nlohmann::ordered_json(
+      errorBlock("engine_error", message, std::nullopt, std::nullopt, std::nullopt,
+                 "r(" + rc + ")"));
+  return r;
+}
+
+// The absent r(NAME) rule (internal capture
+// RULING.md C.1). Both are asked only for a name in neither rStrings
+// nor rValues; a posted r() matrix is never theirs (it has its own 109 below).
+//
+// Rule 1: Stata posts NAME for the live r-class command and PIET did not
+// (EvalSession::rUnposted, recorded by handlers::rTableAfterCommand). The read is
+// a named r(111) in every form and on every path -- `.` there would be a silent
+// wrong answer (lincom's r(level), pinned 95 at w2h_postest_refit.log:191).
+std::optional<std::string> unpostedRRefusal(const EvalSession& session, const std::string& name) {
+  if (session.findClassMatrix('r', name) != nullptr) return std::nullopt;
+  if (std::find(session.rUnposted.begin(), session.rUnposted.end(), name) ==
+      session.rUnposted.end())
+    return std::nullopt;
+  if (name == "table" && !session.rTableRefusal.empty()) return session.rTableRefusal;
+  return "r(" + name + ") after `" + session.rClassCmd +
+         "`: Stata posts this result and this version of PIET does not, so it is refused "
+         "rather than read as missing (.)";
+}
+
+// Rule 2: the live r-class command's Stata set is not recorded (class U), so an
+// absent bare or delimited read cannot be told apart from a result PIET omitted.
+// The if/while path keeps `.` (it never asks).
+std::optional<std::string> unknownSetRRefusal(const EvalSession& session,
+                                              const std::string& name) {
+  if (!session.rClassSetUnknown || session.findClassMatrix('r', name) != nullptr)
+    return std::nullopt;
+  return "r(" + name + ") is not set after `" + session.rClassCmd +
+         "`, and this version of PIET does not record which results Stata posts there; "
+         "refused rather than read as missing (.)";
+}
+
+// BUG-629: `local x = r(table)[1,1]` with no r(table) died in expansion, and the
+// `= expr` forms answer an expansion error by STORING THE TEXT at rc 0 -- here the
+// seven characters `r(table)[1,1]`, a silent wrong value where Stata stops at
+// r(198). An expansion error that carries Stata's own code (reason "r(NNN)", only
+// the coded refusals above) is surfaced instead; every other expansion error keeps
+// the legacy fallback. Gated on err like classifyFailedEqExpr.
+bool takeCodedExpandError(const ExpandResult& exp, MacroFnError* err) {
+  if (err == nullptr || !exp.isError) return false;
+  const std::string reason = exp.error.value("reason", std::string());
+  if (reason.size() < 4 || reason.compare(0, 2, "r(") != 0 || reason.back() != ')') return false;
+  err->rc = reason.substr(2, reason.size() - 3);
+  err->message = exp.error.value("message", std::string());
+  return true;
+}
+
+}  // namespace
 
 // MOVED OUT of the anonymous namespace 2026-09-06 (BUG-432): the dispatcher's
 // row-predicate substitution point needs this exact function, and a second copy
@@ -1153,6 +2463,20 @@ std::string substituteBareName(const std::string& in, const std::string& name,
   return substituteBareNameWith(in, name, [&value]() -> const std::string& { return value; });
 }
 
+// name-binding-display-literals: see macros.h.
+std::string protectLiterals(const std::string& s, std::vector<std::string>* spans) {
+  return protectStringLiterals(s, spans);
+}
+std::string restoreLiterals(const std::string& s, const std::vector<std::string>& spans) {
+  return restoreStringLiterals(s, spans);
+}
+
+// FU-842: see macros.h.
+std::string valueRefText(const std::string& text) {
+  if (text.empty() || text[0] != '-' || !pythonFloat(text).has_value()) return text;
+  return "(" + text + ")";
+}
+
 // BUG-512: `_N` / `_n` in a MACRO-context expression.
 //
 // Stata evaluates `local n = _N`, `scalar s = _N`, `global G = _N`,
@@ -1186,6 +2510,22 @@ std::string substituteObsSpecials(const std::string& in, const EvalSession& sess
   std::vector<std::string> spans;
   std::string s = protectStringLiterals(in, &spans);
   if (hasBigN) {
+    // BUG-1449: `_N` as a stored result's NAME -- margins' r(_N), e(_N) after
+    // `margins, post` -- is not the observation count (StataBE 19.5
+    // `colsof(r(_N))` after `margins` is 1): such an `_N` is masked from the
+    // count's substitution below and put back after it.
+    bool resultN = false;
+    for (size_t p = s.find("_N"); p != std::string::npos; p = s.find("_N", p + 1)) {
+      size_t q = p;
+      while (q > 0 && (s[q - 1] == ' ' || s[q - 1] == '\t')) --q;
+      size_t e = p + 2;
+      while (e < s.size() && (s[e] == ' ' || s[e] == '\t')) ++e;
+      if (q < 2 || s[q - 1] != '(' || (s[q - 2] != 'r' && s[q - 2] != 'e') ||
+          (q >= 3 && isIdentChar(s[q - 3])) || e >= s.size() || s[e] != ')')
+        continue;
+      s.replace(p, 2, "\x1f" "N");
+      resultN = true;
+    }
     std::string countText;
     bool asked = false;
     s = substituteBareNameWith(s, "_N", [&]() -> const std::string& {
@@ -1195,6 +2535,9 @@ std::string substituteObsSpecials(const std::string& in, const EvalSession& sess
       }
       return countText;
     });
+    if (resultN)
+      for (size_t p = s.find("\x1f" "N"); p != std::string::npos; p = s.find("\x1f" "N", p))
+        s.replace(p, 2, "_N");
   }
   if (hasSmallN) {
     static const std::string kOne = "1";
@@ -1263,9 +2606,23 @@ std::string resolveEstScalarRefs(std::string expr, const EvalSession& session,
   // came back "matrix _b not found" (r(111)) -- an honest error, and the wrong
   // one. Stata's teffects colname carries the treatment VARIABLE after the
   // r#vs#, so the dot is structural, not decorative.
-  static const std::regex reB(R"(_b\[([A-Za-z_][\w:.]*)\])");
-  static const std::regex reSe(R"(_se\[([A-Za-z_][\w:.]*)\])");
-  static const std::regex reECall(R"(\be\(\s*([A-Za-z_]\w*)\s*\))");
+  // BUG-629 (eval half) widened the HEAD class by the digits and the tail by `#`:
+  // a factor-level coefficient is named `2.c` (`0b.c` for the base, `1.c#c.x1`
+  // for an interaction cell), so `local q = _b[2.c]` and `generate g = _b[2.c]`
+  // fell through to "_b not found" / "unknown variable _b" while `test 2.c` and
+  // `lincom _b[2.c]` answered (w2c_postest.log families (2)-(4)). The display
+  // twin (display_hardening.cpp reBRef/reSeRef) carries the same classes.
+  static const std::regex reB(R"(_b\[([A-Za-z_0-9/\x80-\xff][\w:.#\x80-\xff]*)\])");
+  static const std::regex reSe(R"(_se\[([A-Za-z_0-9/\x80-\xff][\w:.#\x80-\xff]*)\])");
+  static const std::regex reECall(R"(\be\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\))");
+  // BUG-1518: a `_b[`/`_se[` that ends a longer name is that name's subscript,
+  // not a coefficient: `g_b[1]` is observation 1 of the variable g_b (StataBE
+  // 19.5: `assert g_b[1] == 1` and `generate z = g_b[1]*3` are rc 0). reB and
+  // reSe have no left word boundary, so a match preceded by a name byte is left
+  // as it is.
+  auto endsName = [](const std::smatch& m) {
+    return m.prefix().length() > 0 && isIdentChar(*(m.prefix().second - 1));
+  };
 
   // A3: each of these four ran a full regex scan over EVERY expression, whether
   // or not the text could possibly contain its construct. A profile of a pure
@@ -1278,14 +2635,39 @@ std::string resolveEstScalarRefs(std::string expr, const EvalSession& session,
   // (Deliberately NOT a single combined regex: the substitutions must stay
   // ordered and independent, and combining them would be a semantic change
   // dressed as an optimization.)
+  if (expr.find(']') != std::string::npos) {
+    // `[eq]_b[name]` / `[eq]_se[name]` are `_b[eq:name]` / `_se[eq:name]`
+    // (BUG-1328: `[yb]_b[x1]` after logit), read before the `[eq]name` form,
+    // which would take `_b` for the coefficient name.
+    static const std::regex eqBRef(R"(\[([A-Za-z_\x80-\xff][\w\x80-\xff]*)\]_(b|se)\[([^\]]+)\])");
+    expr = regexSubFn(eqBRef, expr, [&session, err](const std::smatch& m) {
+      return valueRefText(resolveBRef(m.str(1) + ":" + m.str(3), m.str(2), session, err));
+    });
+    static const std::regex equationCoef(R"(\[([A-Za-z_\x80-\xff][\w\x80-\xff]*)\]([A-Za-z_0-9\x80-\xff][\w.#\x80-\xff]*))");
+    expr = regexSubFn(equationCoef, expr, [&session, err](const std::smatch& m) {
+      return valueRefText(resolveBRef(m.str(1) + ":" + m.str(2), "b", session, err));
+    });
+  }
+  // BUG-1545: an ancillary parameter's name can carry parentheses (`_b[/var(e.yc)]`
+  // after tobit, StataBE 19.5 1.5244086035135405), which reB's tail class does not
+  // take; left as text, the row layer then bound `e` to the variable `eps`
+  // (expandRowVarAbbrevs) and the engine refused `_b`. Read before reB.
+  if (expr.find("[/") != std::string::npos) {
+    static const std::regex reAnc(R"(_(b|se)\[(/[A-Za-z_]\w*\([^()\[\]]*\))\])");
+    expr = regexSubFn(reAnc, expr, [&session, err](const std::smatch& m) {
+      return valueRefText(resolveBRef(m.str(2), m.str(1), session, err));
+    });
+  }
   if (expr.find("_b[") != std::string::npos) {
-    expr = regexSubFn(reB, expr, [&session, err](const std::smatch& m) {
-      return resolveBRef(m.str(1), "b", session, err);
+    expr = regexSubFn(reB, expr, [&session, err, &endsName](const std::smatch& m) {
+      if (endsName(m)) return m.str(0);
+      return valueRefText(resolveBRef(m.str(1), "b", session, err));  // FU-842
     });
   }
   if (expr.find("_se[") != std::string::npos) {
-    expr = regexSubFn(reSe, expr, [&session, err](const std::smatch& m) {
-      return resolveBRef(m.str(1), "se", session, err);
+    expr = regexSubFn(reSe, expr, [&session, err, &endsName](const std::smatch& m) {
+      if (endsName(m)) return m.str(0);
+      return valueRefText(resolveBRef(m.str(1), "se", session, err));  // FU-842
     });
   }
   // scalar(NAME) function form -> the stored scalar value (or the literal
@@ -1302,9 +2684,26 @@ std::string resolveEstScalarRefs(std::string expr, const EvalSession& session,
   // hardcoded pair keeps the same rule ("a matrix is not a scalar") true for
   // every matrix, including ones added later.
   if (hasBareEParen(expr)) {  // EXPRLAYER-3: reECall is \be\( — the \b is the guard
-    expr = regexSubFn(reECall, expr, [&session, err](const std::smatch& m) {
+    const std::string whole = expr;
+    expr = regexSubFn(reECall, expr, [&session, err, &whole](const std::smatch& m) {
       std::string inner = m.str(1);
-      if (inner == "b" || inner == "V") return m.str(0);
+      if (inner == "b" || inner == "V") {
+        // eb-order T-P1: substituteMatrixRefs ran first and answered el()/
+        // colsof()/rowsof() of an e(b)/e(V) that resolves, so one still here
+        // is absent. Stata then reads e(b) as an e() macro, and the function
+        // gets a string: r(109) "type mismatch", with or without a live e()
+        // (w2v_estpost_ematrix.log ep13_el_eb_11 / ep13_colsof_eb after estpost,
+        // ep15c_* after pca, ep15f_* with no e()). An e(V) the engine did not
+        // send keeps its own named refusal.
+        if (err != nullptr && err->empty() && absentClassMatrixRc(whole, 'e', inner) == "109") {
+          const EvalSession::EMatrixAnswer a =
+              session.resolveEMatrixFor(inner, EvalSession::EReader::kOperand);
+          if (!a.matrix.has_value())
+            *err = !a.absent ? "r(" + std::to_string(a.rc) + "): " + a.why
+                             : "r(109): type mismatch: e(" + inner + ") is not a matrix here";
+        }
+        return m.str(0);
+      }
       if (session.findClassMatrix('e', inner) != nullptr) return m.str(0);
       // W2 predictframe (2026-09-19): e(sample) is Stata's per-ROW estimation
       // sample mask, not a scalar, and this build keeps no such mask. It used to
@@ -1317,19 +2716,38 @@ std::string resolveEstScalarRefs(std::string expr, const EvalSession& session,
       // Refused BY NAME on the same channel as r(111)/r(109) below, so every
       // caller maps it the same way; with no channel the token is left as text
       // for the evaluator to refuse in its own words -- never a silent `.`.
+      //
+      // e(sample) T2: the mask now exists (SessionState::esampleReading), and
+      // every ROW caller rewrites the token before it gets here
+      // (dispatcher.cpp rewriteEsampleToken: `(__piet_esample__==SERIAL)` or `0`).
+      // What still arrives is a SCALAR context -- display, `local =`, `scalar
+      // =`, `if e(sample) {` -- where Stata reads a variable at observation 1
+      // (w2_esample.log B16-B19, B29-B29c; 0 with no estimation results,
+      // A2-A4). The hook (EvalSession::esampleObs1) answers that value, or the
+      // named r(198) for a model PIET has no mask for; with no hook (a
+      // session-less harness) it is the same refusal.
       if (inner == "sample") {
-        if (err != nullptr && err->empty()) {
-          *err = "r(198): e(sample) is not available in this version of PIET: the "
-                 "estimation sample is not kept as a row mask, so `if e(sample)` cannot be "
-                 "evaluated. Restate the sample with the estimation command's own if/in "
-                 "condition.";
+        // The session decides (SessionState::esampleReading: no model or a
+        // posted e() -> 0, a live mask -> observation 1, a model PIET has no
+        // mask for -> the named r(198)). Without a session (a bare evaluator)
+        // this layer's own absent-e() predicate, resolveEScalar's, says 0 for
+        // "no estimation results" and anything else is refused by name.
+        std::string why;
+        if (session.esampleObs1) {
+          if (std::optional<int> v = session.esampleObs1(&why)) return std::to_string(*v);
+        } else if (!session.lastModelResult) {
+          return std::string("0");
+        } else {
+          why = "e(sample) is not available in this version of PIET here: no data session is "
+                "attached to evaluate the estimation sample.";
         }
+        if (err != nullptr && err->empty()) *err = "r(198): " + why;
         return m.str(0);
       }
       // BUG-456: matrix (above) -> string -> scalar. The string arm is what
       // `local c = e(cmd)`, `if e(cmd)=="regress" {`, `assert e(cmd)=="regress"`
       // and `gen z = (e(cmd)=="regress")` all lacked; every one of them saw `.`.
-      return resolveERef(inner, session);
+      return valueRefText(resolveERef(inner, session));  // FU-842
     });
   }
   // BUG-456 follow-up: a NUMBER that has landed in a STRING-typed argument slot
@@ -1409,22 +2827,198 @@ double getMatrixElement(const EvalSession& session, const std::string& name, lon
   return readMatrixElement(session.findMatrix(name), i, j);
 }
 
+// FU-118: el(M,i,j) is MISSING for an index outside M ([FN] Matrix functions,
+// el(): "missing if i or j are out of range"), unlike the M[i,j] subscript,
+// which refuses. A 0x0 M (`matrix b = e(b)` after estpost) reads `.` at any
+// index (w2v_estpost_ematrix.log ep13_b_11 +1.0000000000000X+3ff). An
+// undefined M still throws, so the caller leaves the text and
+// unresolvedMatrixOperandError names it. (The same page says el() of a matrix
+// that does not exist is missing too, but StataBE refuses it: w2f_residuals.log
+// :1261-1267 b560_unknown, `NoSuchMatrix not found`, rc 111.)
+double readElFunction(const EvalMatrix* mat, long long i, long long j) {
+  if (mat == nullptr) throw PyExc("KeyError: matrix not defined");
+  const long long nrows = static_cast<long long>(mat->data.size());
+  const long long ncols = nrows > 0 ? static_cast<long long>(mat->data[0].size()) : 0;
+  if (!(1 <= i && i <= nrows) || !(1 <= j && j <= ncols))
+    return std::numeric_limits<double>::quiet_NaN();
+  return mat->data[static_cast<size_t>(i - 1)][static_cast<size_t>(j - 1)];
+}
+
+// FU-118 / FU-178 / FU-190: e(b) and e(V) as an OPERAND of el(), colsof() and
+// rowsof() in an expression (display, `local =`, `scalar =`). eb-order: the
+// operand is EvalSession::resolveEMatrixFor's (reader kOperand), the same one
+// source `matrix X = e(b)`, `matrix list` and `: colnames e(b)` read -- a posted
+// matrix, else the live fit's block in Stata's order under the closed stripe
+// table -- so the two can never disagree. Its two operand-only answers: e(V)
+// known only from the standard errors (`diagonalOnly`: el(e(V),i,i) is se_i^2,
+// an off-diagonal cell is refused by name, never the silent 0 of FU-98), and an
+// absent operand, which the caller reads as Stata's r(109).
+// mat() is the matrix, or nullptr with `why` set: rc "198" (a refusal) or ""
+// (absent -- the caller applies Stata's absent-operand rc).
+struct EOperand {
+  std::optional<EvalMatrix> hold;
+  bool diagonalOnly = false;
+  const EvalMatrix* mat() const { return hold.has_value() ? &*hold : nullptr; }
+  std::string rc;   // "198" refused; "" absent (when mat() is null)
+  std::string why;
+};
+
+EOperand resolveEOperand(const EvalSession& session, const std::string& name) {
+  EOperand out;
+  EvalSession::EMatrixAnswer a = session.resolveEMatrixFor(name, EvalSession::EReader::kOperand);
+  if (a.matrix.has_value()) {
+    out.hold = std::move(a.matrix);
+    out.diagonalOnly = a.diagonalOnly;
+    return out;
+  }
+  out.why = std::move(a.why);
+  if (!a.absent) out.rc = std::to_string(a.rc);
+  return out;
+}
+
 }  // namespace
 
+// FU-118: the named error for a matrix operand substituteMatrixRefs left in
+// `expr` (it answers every operand it can, so one still present cannot be
+// read). Before this, the text reached the evaluator as a bare call and came
+// back as "NameError: name 'el' is not defined" -- rc 1 on display, r(133)
+// "unknown function el()" on `local =`, and the expression TEXT stored at rc 0
+// by `scalar =` (FU-348). Returns "r(NNN): message" for the leftmost operand,
+// or "" when none is left. The codes:
+//   * an e()/r() operand that is absent -- r(109) "type mismatch" inside el(),
+//     colsof(), rowsof(): Stata then reads e(V) as an (empty) e() macro, a
+//     string where a matrix is required. Pinned: w2l_vce_shape.log:280-283
+//     (`se11=type mismatch`, display_rc=109, after a failed fit under
+//     `ereturn clear`), and the r() twin's w2c_postest.log:377-384;
+//   * a subscript `e(NAME)[i,j]` / `r(NAME)[i,j]`: e() keeps the r(111) of
+//     display's own whole-token arm (display_hardening.cpp resolveToken 3b,
+//     posted matrices only, W2D-T03), r() keeps absentRMatrixRc's r(198)
+//     (w2c_postest.log:363-370); an index outside a present matrix is r(503);
+//   * a refusal from resolveEOperand, and an off-diagonal cell of an e(V) that
+//     is known only on its diagonal: r(198), named;
+//   * el()/colsof()/rowsof() of a bare NAME that is not a matrix: r(111)
+//     "NAME not found", StataBE's text and code for el() (w2f_residuals.log
+//     :1261-1267 b560_unknown, `NoSuchMatrix not found` / rc 111); colsof()/
+//     rowsof() share it (their own rc is unpinned). A NAME that is a scalar is
+//     r(109) "type mismatch" for all three (StataBE 19.5, 2026-11-03): scalars
+//     and matrices share one namespace, so it is the wrong kind, not absent.
+// el() with an index that is not an integer literal (`el(M,1,`z'+1)`,
+// `el(vecdiag(M),1,3)`) is not claimed: it keeps the unknown-function r(133)
+// classifyFailedEqExpr gives it (w2c_functions.log:110 vecdiag_el_local 133).
+static std::string unresolvedMatrixOperandError(const std::string& expr,
+                                                const EvalSession& session) {
+  static const std::regex reClsEl(
+      R"(\bel\s*\(\s*([er])\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\)\s*,\s*(\d+)\s*,\s*(\d+)\s*\))",
+      std::regex::icase);
+  static const std::regex reClsDim(
+      R"(\b(colsof|rowsof)\s*\(\s*([er])\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\)\s*\))", std::regex::icase);
+  static const std::regex reClsElem(
+      R"(\b([er])\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\)\s*\[\s*(\d+)\s*,\s*(\d+)\s*\])");
+  static const std::regex reEl(
+      R"(\bel\s*\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*,\s*(\d+)\s*,\s*(\d+)\s*\))", std::regex::icase);
+  static const std::regex reDim(R"(\b(colsof|rowsof)\s*\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\))",
+                                std::regex::icase);
+  const std::string lower = toLower(expr);
+  if (lower.find("el") == std::string::npos && lower.find("sof") == std::string::npos &&
+      expr.find('[') == std::string::npos)
+    return std::string();
+  struct Hit {
+    size_t pos = std::string::npos;
+    std::string err;
+  };
+  Hit best;
+  const auto consider = [&best, &expr](const std::regex& re,
+                                       const std::function<std::string(const std::smatch&)>& fn) {
+    std::smatch m;
+    if (std::regex_search(expr, m, re)) {
+      const size_t pos = static_cast<size_t>(m.position(0));
+      if (pos < best.pos) {
+        std::string e = fn(m);
+        if (!e.empty()) best = Hit{pos, std::move(e)};
+      }
+    }
+  };
+  const auto classAbsent = [&session](char cls, const std::string& name, bool subscript) {
+    if (cls == 'r') {
+      if (auto why = unpostedRRefusal(session, name)) return "r(111): " + *why;
+      return subscript ? "r(198): invalid syntax: r(" + name + ") is not a matrix"
+                       : std::string("r(109): type mismatch");
+    }
+    if (subscript)
+      return session.lastModelResult.has_value()
+                 ? "r(111): matrix e(" + name + ") has not been posted by the last estimation "
+                   "in this version of PIET; read single coefficients with _b[name] / _se[name]"
+                 : "r(111): matrix e(" + name + ") not found";
+    return std::string("r(109): type mismatch");
+  };
+  consider(reClsEl, [&](const std::smatch& m) -> std::string {
+    const char cls = static_cast<char>(std::tolower(static_cast<unsigned char>(m.str(1)[0])));
+    const std::string name = m.str(2);
+    if (cls == 'r') {
+      if (session.findClassMatrix('r', name) != nullptr) return std::string();
+      return classAbsent('r', name, false);
+    }
+    const EOperand op = resolveEOperand(session, name);
+    if (op.mat() == nullptr)
+      return op.rc.empty() ? classAbsent('e', name, false) : "r(" + op.rc + "): " + op.why;
+    if (op.diagonalOnly && m.str(3) != m.str(4))
+      return "r(198): e(V)[" + m.str(3) + "," + m.str(4) +
+             "] is not available in this version of PIET after `" +
+             *session.eStrings.find("cmd") +
+             "`: the engine sent the fit's standard errors (the diagonal of e(V)), not its "
+             "covariances";
+    return std::string();
+  });
+  consider(reClsDim, [&](const std::smatch& m) -> std::string {
+    const char cls = static_cast<char>(std::tolower(static_cast<unsigned char>(m.str(2)[0])));
+    const std::string name = m.str(3);
+    if (cls == 'r')
+      return session.findClassMatrix('r', name) != nullptr ? std::string()
+                                                           : classAbsent('r', name, false);
+    const EOperand op = resolveEOperand(session, name);
+    if (op.mat() == nullptr)
+      return op.rc.empty() ? classAbsent('e', name, false) : "r(" + op.rc + "): " + op.why;
+    return std::string();
+  });
+  consider(reClsElem, [&](const std::smatch& m) -> std::string {
+    const char cls = m.str(1)[0];
+    const std::string name = m.str(2);
+    const EvalMatrix* mat = session.findClassMatrix(cls, name);
+    if (mat == nullptr) return classAbsent(cls, name, true);
+    return "r(503): conformability error";
+  });
+  consider(reEl, [&](const std::smatch& m) -> std::string {
+    if (session.findMatrix(m.str(1)) != nullptr) return std::string();
+    if (session.scalars.find(m.str(1)) != nullptr) return "r(109): type mismatch";
+    return "r(111): " + m.str(1) + " not found";
+  });
+  consider(reDim, [&](const std::smatch& m) -> std::string {
+    if (session.findMatrix(m.str(2)) != nullptr) return std::string();
+    if (session.scalars.find(m.str(2)) != nullptr) return "r(109): type mismatch";
+    return "r(111): " + m.str(2) + " not found";
+  });
+  return best.err;
+}
+
+static std::string stataMissingText(double d);
+
 // A matrix cell can hold Stata's missing, and pythonFloatRepr spells that "nan",
-// which is a NameError once it is substituted back into the expression. Emit `.`
-// instead -- replaceBareDotMissing runs after this pass and turns it into the
-// sentinel. Reachable from B3(c) onward because `J(3,2,.)` is the corpus's own
-// spelling (24 uses) and paper 049 reads those cells straight back.
+// which is a NameError once it is substituted back into the expression. Emit the
+// missing TOKEN instead (`.`, or `.a` for a `.a` cell, handlers_m3.cpp stores
+// stataMissingWithKind) -- replaceStataMissingLiterals runs after this pass and
+// turns it back into the exact double. A decimal spelling of a band value would
+// be read by the next layer as a number. Reachable from B3(c) onward because
+// `J(3,2,.)` is the corpus's own spelling (24 uses) and paper 049 reads those
+// cells straight back. r() values go out through here too.
 std::string matrixElementText(double v) {
-  if (std::isnan(v)) return ".";
+  if (std::isnan(v) || std::fabs(v) >= kStataMissingSentinel) return stataMissingText(v);
   return pythonFloatRepr(v);
 }
 
 std::string substituteMatrixRefs(const std::string& expr, const EvalSession& session) {
-  static const std::regex reElem(R"(\b([A-Za-z_]\w*)\s*\[\s*(\d+)\s*,\s*(\d+)\s*\])");
-  static const std::regex reColsof(R"(\bcolsof\s*\(\s*([A-Za-z_]\w*)\s*\))", std::regex::icase);
-  static const std::regex reRowsof(R"(\browsof\s*\(\s*([A-Za-z_]\w*)\s*\))", std::regex::icase);
+  static const std::regex reElem(R"((?:\b|(?=[\x80-\xff]))([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\[\s*(\d+)\s*,\s*(\d+)\s*\])");
+  static const std::regex reColsof(R"(\bcolsof\s*\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\))", std::regex::icase);
+  static const std::regex reRowsof(R"(\browsof\s*\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\))", std::regex::icase);
   // AER scope 2 / B3(c): colnumb(M,"name") -> the 1-based column index, or
   // missing when the name is not a column. Paper 020 drives an entire loop off
   // it (`local idx_row = colnumb(RHO_D`dd'_res, "rho_Dy`cc'_Dr`cc'")`). It
@@ -1437,18 +3031,18 @@ std::string substituteMatrixRefs(const std::string& expr, const EvalSession& ses
   static const std::regex reColnumb(
       // Custom raw-string delimiter: the pattern contains `)"`, which would close
       // a plain R"( ... )" early.
-      R"RX(\bcolnumb\s*\(\s*([A-Za-z_]\w*)\s*,\s*"([^"]*)"\s*\))RX", std::regex::icase);
+      R"RX(\bcolnumb\s*\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*,\s*"([^"]*)"\s*\))RX", std::regex::icase);
   // e(<name>)[i,j] / r(<name>)[i,j], and the same wrapper inside colsof/rowsof.
   // These run FIRST because the three bare-name patterns above cannot express
   // them: `\b([A-Za-z_]\w*)\s*\[` stops at the ')' in `e(Ev)[1,1]`, so before
   // AER bundle H there was no syntax at all for reading an element out of a
   // posted class matrix -- pca could publish e(Ev) and nothing could read it.
   static const std::regex reClsElem(
-      R"(\b([er])\(\s*([A-Za-z_]\w*)\s*\)\s*\[\s*(\d+)\s*,\s*(\d+)\s*\])");
+      R"(\b([er])\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\)\s*\[\s*(\d+)\s*,\s*(\d+)\s*\])");
   static const std::regex reClsColsof(
-      R"(\bcolsof\s*\(\s*([er])\(\s*([A-Za-z_]\w*)\s*\)\s*\))", std::regex::icase);
+      R"(\bcolsof\s*\(\s*([er])\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\)\s*\))", std::regex::icase);
   static const std::regex reClsRowsof(
-      R"(\browsof\s*\(\s*([er])\(\s*([A-Za-z_]\w*)\s*\)\s*\))", std::regex::icase);
+      R"(\browsof\s*\(\s*([er])\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\)\s*\))", std::regex::icase);
   // el(NAME,i,j) / el(e(NAME),i,j) / el(r(NAME),i,j) -- Stata's function form
   // of NAME[i,j] (papers 058 and 044). Joins the same family for the reason
   // colsof/rowsof/colnumb do: every matrix reference in an expression is a
@@ -1465,44 +3059,131 @@ std::string substituteMatrixRefs(const std::string& expr, const EvalSession& ses
   // to match, is left unsubstituted, and the parser refuses it the same way
   // an out-of-range NAME[i,j] does below.
   static const std::regex reClsEl(
-      R"(\bel\s*\(\s*([er])\(\s*([A-Za-z_]\w*)\s*\)\s*,\s*(\d+)\s*,\s*(\d+)\s*\))",
+      R"(\bel\s*\(\s*([er])\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\)\s*,\s*(\d+)\s*,\s*(\d+)\s*\))",
       std::regex::icase);
   static const std::regex reEl(
-      R"(\bel\s*\(\s*([A-Za-z_]\w*)\s*,\s*(\d+)\s*,\s*(\d+)\s*\))", std::regex::icase);
+      R"(\bel\s*\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*,\s*(\d+)\s*,\s*(\d+)\s*\))", std::regex::icase);
 
-  std::string pre = regexSubFn(reClsElem, expr, [&session](const std::smatch& m) -> std::string {
+  // csdid-ematrix-post: an el() index written as integer arithmetic once the
+  // macros are expanded (`el(e(V),`__w',`__w'+1)` -> `el(e(V),13,13+1)`,
+  // w2ag_csdid_drdid.do:75/:112, StataBE rc 0 at log ag_defx_vw / ag_cl_vw) is
+  // folded to its literal so the passes below read it. Only digits joined by
+  // + - * (Stata's precedence: * first); anything else -- `el(vecdiag(M),1,3)`,
+  // a name, a function -- is left as it was.
+  static const std::regex reElArith(
+      R"(\bel\s*\(\s*((?:[er]\(\s*[A-Za-z_\x80-\xff][\w\x80-\xff]*\s*\))|[A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*,\s*([0-9][0-9 +*-]*)\s*,\s*([0-9][0-9 +*-]*)\s*\))",
+      std::regex::icase);
+  const auto foldIntArith = [](const std::string& s, long long& out) -> bool {
+    // a sum of products of non-negative integer literals
+    std::string t;
+    for (char c : s)
+      if (c != ' ') t += c;
+    if (t.empty()) return false;
+    long long total = 0, prod = 1;
+    int sign = 1;
+    size_t i = 0;
+    bool needNum = true;
+    while (i < t.size()) {
+      if (needNum) {
+        if (!std::isdigit(static_cast<unsigned char>(t[i]))) return false;
+        long long v = 0;
+        while (i < t.size() && std::isdigit(static_cast<unsigned char>(t[i]))) {
+          v = v * 10 + (t[i] - '0');
+          if (v > 1000000000LL) return false;
+          ++i;
+        }
+        prod *= v;
+        needNum = false;
+      } else {
+        const char op = t[i++];
+        if (op == '*') {
+          needNum = true;
+        } else if (op == '+' || op == '-') {
+          total += sign * prod;
+          prod = 1;
+          sign = op == '+' ? 1 : -1;
+          needNum = true;
+        } else {
+          return false;
+        }
+      }
+    }
+    if (needNum) return false;
+    out = total + sign * prod;
+    return true;
+  };
+  const std::string folded =
+      regexSubFn(reElArith, expr, [&foldIntArith](const std::smatch& m) -> std::string {
+        long long i = 0, j = 0;
+        if (!foldIntArith(m.str(2), i) || !foldIntArith(m.str(3), j) || i < 0 || j < 0)
+          return m.str(0);
+        return "el(" + m.str(1) + "," + std::to_string(i) + "," + std::to_string(j) + ")";
+      });
+
+  // eb-order T-P1: an e() matrix is EvalSession::resolveEMatrix's -- a posted
+  // one, else e(b)/e(V) in Stata's canonical order from the live fit's own
+  // block (w2g_ebmat.log:260 el(e(b),1,1) = _b[x1], :305 colsof(e(b)) = 3) --
+  // and an r() matrix the posted store's. Unresolved stays text for the
+  // parser to refuse, as before.
+  std::string pre = regexSubFn(reClsElem, folded, [&session](const std::smatch& m) -> std::string {
     try {
-      const EvalMatrix* mat = session.findClassMatrix(m.str(1)[0], m.str(2));
-      double val = readMatrixElement(mat, std::stoll(m.str(3)), std::stoll(m.str(4)));
-      return matrixElementText(val);
+      const long long i = std::stoll(m.str(3)), j = std::stoll(m.str(4));
+      const EvalMatrix* mat = nullptr;
+      EOperand op;
+      if (m.str(1)[0] == 'e') {
+        op = resolveEOperand(session, m.str(2));
+        if (op.diagonalOnly && i != j) return m.str(0);  // a covariance the engine did not send
+        mat = op.mat();
+      } else {
+        mat = session.findClassMatrix(m.str(1)[0], m.str(2));
+      }
+      double val = readMatrixElement(mat, i, j);
+      return valueRefText(matrixElementText(val));  // FU-842
     } catch (const PyExc&) {
       return m.str(0);  // KeyError/ValueError — leave unchanged, as below
     } catch (const std::exception&) {
       return m.str(0);
     }
   });
+  // FU-118: an e() operand of el()/colsof()/rowsof() is resolveEOperand's (a
+  // posted matrix, else e(b)/e(V) built from the live fit under Stata's rules);
+  // an r() operand is the posted store's. An operand left unsubstituted is
+  // named by unresolvedMatrixOperandError, never left for the evaluator's
+  // NameError. The subscript form above stays posted-only (W2D-T03).
   pre = regexSubFn(reClsEl, pre, [&session](const std::smatch& m) -> std::string {
     try {
+      const long long i = std::stoll(m.str(3)), j = std::stoll(m.str(4));
+      if (std::tolower(static_cast<unsigned char>(m.str(1)[0])) == 'e') {
+        const EOperand op = resolveEOperand(session, m.str(2));
+        if (op.mat() == nullptr || (op.diagonalOnly && i != j)) return m.str(0);
+        return valueRefText(matrixElementText(readElFunction(op.mat(), i, j)));  // FU-842
+      }
       const EvalMatrix* mat = session.findClassMatrix(m.str(1)[0], m.str(2));
-      double val = readMatrixElement(mat, std::stoll(m.str(3)), std::stoll(m.str(4)));
-      return matrixElementText(val);
+      return valueRefText(matrixElementText(readElFunction(mat, i, j)));  // FU-842
     } catch (const PyExc&) {
-      return m.str(0);  // KeyError/ValueError — leave unchanged, as below
+      return m.str(0);  // undefined matrix — leave unchanged, as below
     } catch (const std::exception&) {
       return m.str(0);
     }
   });
-  pre = regexSubFn(reClsColsof, pre, [&session](const std::smatch& m) -> std::string {
-    const EvalMatrix* mat = session.findClassMatrix(m.str(1)[0], m.str(2));
+  const auto classDims = [&session](const std::smatch& m, bool cols) -> std::string {
+    EOperand op;
+    const EvalMatrix* mat = nullptr;
+    if (std::tolower(static_cast<unsigned char>(m.str(1)[0])) == 'e') {
+      op = resolveEOperand(session, m.str(2));
+      mat = op.mat();
+    } else {
+      mat = session.findClassMatrix(m.str(1)[0], m.str(2));
+    }
     if (mat == nullptr) return m.str(0);
+    if (!cols) return pythonFloatRepr(static_cast<double>(mat->data.size()));
     long long ncols = mat->data.empty() ? 0 : static_cast<long long>(mat->data[0].size());
     return pythonFloatRepr(static_cast<double>(ncols));
-  });
-  pre = regexSubFn(reClsRowsof, pre, [&session](const std::smatch& m) -> std::string {
-    const EvalMatrix* mat = session.findClassMatrix(m.str(1)[0], m.str(2));
-    if (mat == nullptr) return m.str(0);
-    return pythonFloatRepr(static_cast<double>(mat->data.size()));
-  });
+  };
+  pre = regexSubFn(reClsColsof, pre,
+                   [&classDims](const std::smatch& m) { return classDims(m, true); });
+  pre = regexSubFn(reClsRowsof, pre,
+                   [&classDims](const std::smatch& m) { return classDims(m, false); });
 
   pre = regexSubFn(reColnumb, pre, [&session](const std::smatch& m) -> std::string {
     const EvalMatrix* mat = nullptr;
@@ -1510,6 +3191,8 @@ std::string substituteMatrixRefs(const std::string& expr, const EvalSession& ses
       if (p.first == m.str(1)) { mat = &p.second; break; }
     if (mat == nullptr) return m.str(0);  // unknown matrix: leave for the parser to reject
     const std::string want = m.str(2);
+    // colnumb(M, "") is 1 in StataBE 19.5 (w2x_fn_string_math fx_colnumb_empty).
+    if (want.empty() && !mat->data.empty() && !mat->data[0].empty()) return pythonFloatRepr(1.0);
     for (size_t i = 0; i < mat->colnames.size(); ++i) {
       const std::string& c = mat->colnames[i];
       if (c == want) return pythonFloatRepr(static_cast<double>(i + 1));
@@ -1519,11 +3202,31 @@ std::string substituteMatrixRefs(const std::string& expr, const EvalSession& ses
     }
     return ".";  // a name that is not a column is MISSING, not an error
   });
+  // rownumb(M,"name"): colnumb's row twin, on the row names (w2j_e3_qreg2.do's
+  // `rownumb(_e3_T, "df")` on a copy of margins' r(table): StataBE 7, M01 log:2915).
+  static const std::regex reRownumb(
+      R"RX(\brownumb\s*\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*,\s*"([^"]*)"\s*\))RX", std::regex::icase);
+  pre = regexSubFn(reRownumb, pre, [&session](const std::smatch& m) -> std::string {
+    const EvalMatrix* mat = nullptr;
+    for (const auto& p : session.matrices)
+      if (p.first == m.str(1)) { mat = &p.second; break; }
+    if (mat == nullptr) return m.str(0);  // unknown matrix: leave for the parser to reject
+    const std::string want = m.str(2);
+    if (want.empty() && !mat->data.empty()) return pythonFloatRepr(1.0);
+    for (size_t i = 0; i < mat->rownames.size(); ++i) {
+      const std::string& c = mat->rownames[i];
+      if (c == want) return pythonFloatRepr(static_cast<double>(i + 1));
+      const size_t colon = c.find(':');
+      if (colon != std::string::npos && c.substr(colon + 1) == want)
+        return pythonFloatRepr(static_cast<double>(i + 1));
+    }
+    return ".";
+  });
 
   std::string out = regexSubFn(reElem, pre, [&session](const std::smatch& m) -> std::string {
     try {
       double val = getMatrixElement(session, m.str(1), std::stoll(m.str(2)), std::stoll(m.str(3)));
-      return matrixElementText(val);
+      return valueRefText(matrixElementText(val));  // FU-842
     } catch (const PyExc&) {
       return m.str(0);  // KeyError/ValueError — leave unchanged
     } catch (const std::exception&) {
@@ -1532,14 +3235,41 @@ std::string substituteMatrixRefs(const std::string& expr, const EvalSession& ses
   });
   out = regexSubFn(reEl, out, [&session](const std::smatch& m) -> std::string {
     try {
-      double val = getMatrixElement(session, m.str(1), std::stoll(m.str(2)), std::stoll(m.str(3)));
-      return matrixElementText(val);
+      double val = readElFunction(session.findMatrix(m.str(1)), std::stoll(m.str(2)),
+                                  std::stoll(m.str(3)));  // FU-118: out of range -> missing
+      return valueRefText(matrixElementText(val));  // FU-842
     } catch (const PyExc&) {
       return m.str(0);  // KeyError/ValueError — leave unchanged
     } catch (const std::exception&) {
       return m.str(0);  // stoll overflow etc. — leave unchanged
     }
   });
+  // mreldif(X,Y): max_ij |x_ij - y_ij| / (|y_ij| + 1) over two named matrices
+  // (w2j_e3_rlasso.do:406 D1_seed_invariant, mreldif of two tempname copies of
+  // e(b)/e(Psi): StataBE 0). Unknown names are left for the parser to refuse;
+  // matrices of different shape are Stata's r(503), left the same way.
+  static const std::regex reMreldif(
+      R"(\bmreldif\s*\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*,\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\))", std::regex::icase);
+  if (out.find("reldif") != std::string::npos) {
+    out = regexSubFn(reMreldif, out, [&session](const std::smatch& m) -> std::string {
+      const EvalMatrix* x = session.findMatrix(m.str(1));
+      const EvalMatrix* y = session.findMatrix(m.str(2));
+      if (x == nullptr || y == nullptr || x->data.size() != y->data.size()) return m.str(0);
+      double mx = 0.0;
+      for (size_t i = 0; i < x->data.size(); ++i) {
+        if (x->data[i].size() != y->data[i].size()) return m.str(0);
+        for (size_t j = 0; j < x->data[i].size(); ++j) {
+          const double a = x->data[i][j];
+          const double b = y->data[i][j];
+          if (std::isnan(a) && std::isnan(b)) continue;
+          const double d = std::fabs(a - b) / (std::fabs(b) + 1.0);
+          if (std::isnan(d)) return std::string(".");
+          if (d > mx) mx = d;
+        }
+      }
+      return valueRefText(matrixElementText(mx));
+    });
+  }
   out = regexSubFn(reColsof, out, [&session](const std::smatch& m) -> std::string {
     const EvalMatrix* mat = session.findMatrix(m.str(1));
     if (mat == nullptr) return m.str(0);
@@ -1566,6 +3296,10 @@ bool hasMacroRefs(const std::string& rawLine) {
   // three-character scan and it can only skip work the regexes would have
   // reported false for.
   if (rawLine.find_first_of("`$(") == std::string::npos) return false;
+  // LBL-DOLLAR: `\$` is Stata's escape for a literal dollar (the backslash goes):
+  // `label var m "Risk Aversion \$(r)\$"` stores `Risk Aversion $(r)$`
+  // (w2ao_label_family.log:176). A line carrying one is the expander's to rewrite.
+  if (rawLine.find("\\$") != std::string::npos) return true;
   // P2-PERF ARC-A/A3-b: the same pre-filter argument, applied PER PATTERN
   // rather than once for all seven. The blanket guard above lets a line
   // through on any one of three characters and then runs all seven regexes,
@@ -1578,8 +3312,19 @@ bool hasMacroRefs(const std::string& rawLine) {
   const bool dollar = rawLine.find('$') != std::string::npos;
   std::smatch m;
   if (tick && hasLocalMacroRef(rawLine)) return true;  // EXPRLAYER-7: was reLocalRef()
-  if (dollar && std::regex_search(rawLine, m, reGlobalRefBrace())) return true;
-  if (dollar && std::regex_search(rawLine, m, reGlobalRefBare())) return true;
+  // EM3a: `macval(NAME)' is a local reference too (expandPass splices it).
+  if (tick && rawLine.find("`macval(") != std::string::npos) {
+    for (size_t t = rawLine.find("`macval("); t != std::string::npos;
+         t = rawLine.find("`macval(", t + 1)) {
+      size_t j = t + 8;
+      const size_t st = j;
+      while (j < rawLine.size() && isIdentChar(rawLine[j])) ++j;
+      if (j > st && j + 1 < rawLine.size() && rawLine[j] == ')' && rawLine[j + 1] == '\'')
+        return true;
+    }
+  }
+  if (dollar && hasGlobalRef(reGlobalRefBrace(), rawLine)) return true;  // Unicode names
+  if (dollar && hasGlobalRef(reGlobalRefBare(), rawLine)) return true;
   // EXPRLAYER-3: the guards are the patterns' own `\b` requirement, not the
   // bare two-character literal — "r(" and "e(" both occur inside ordinary
   // identifiers (`scalar(`, `subinstr(`, `true(`, `size(`), and every one of
@@ -1589,48 +3334,117 @@ bool hasMacroRefs(const std::string& rawLine) {
   if (tick && rawLine.find("s(") != std::string::npos &&
       std::regex_search(rawLine, m, reSRefDelim()))
     return true;
+  if (tick && rawLine.find("`c(") != std::string::npos &&
+      std::regex_search(rawLine, m, reCRefDelim()))
+    return true;  // BUG-1006
   if (rawLine.find("`=") != std::string::npos && std::regex_search(rawLine, m, reArithMacro()))
     return true;
+  if (rawLine.find("`:") != std::string::npos &&
+      findReadyInlineMacroFn(rawLine, rawLine.size(), nullptr) != std::string::npos)
+    return true;  // BUG-629, BUG-719, EM13, BUG-1384
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// EM3a/EM3b: verbatim sentinels and compound-quoted spans (see macros.h).
+
+bool hasVerbatim(const std::string& s) {
+  return s.find_first_of(std::string{kVerbatimTick, kVerbatimDollar}) != std::string::npos;
+}
+
+std::string encodeVerbatim(const std::string& s) {
+  if (s.find_first_of("`$") == std::string::npos) return s;
+  std::string out = s;
+  for (char& c : out) {
+    if (c == '`') c = kVerbatimTick;
+    else if (c == '$') c = kVerbatimDollar;
+  }
+  return out;
+}
+
+std::string decodeVerbatim(std::string s) {
+  if (!hasVerbatim(s)) return s;
+  for (char& c : s) {
+    if (c == kVerbatimTick) c = '`';
+    else if (c == kVerbatimDollar) c = '$';
+  }
+  return s;
+}
+
+bool startsCompound(const std::string& s, size_t i) {
+  return i + 1 < s.size() && (s[i] == '`' || s[i] == kVerbatimTick) && s[i + 1] == '"';
+}
+
+size_t compoundSpanEnd(const std::string& s, size_t i) {
+  if (!startsCompound(s, i)) return std::string::npos;
+  int depth = 0;
+  size_t j = i;
+  while (j < s.size()) {
+    if (startsCompound(s, j)) {
+      ++depth;
+      j += 2;
+    } else if (j + 1 < s.size() && s[j] == '"' && s[j + 1] == '\'') {
+      j += 2;
+      if (--depth == 0) return j;
+    } else {
+      ++j;
+    }
+  }
+  return std::string::npos;
+}
+
+std::string normalizeCompoundQuotes(const std::string& s) {
+  if (s.find('"') == std::string::npos) return s;
+  if (s.find("`\"") == std::string::npos &&
+      s.find(std::string{kVerbatimTick, '"'}) == std::string::npos)
+    return s;
+  std::string out;
+  out.reserve(s.size());
+  size_t i = 0;
+  while (i < s.size()) {
+    if (startsCompound(s, i)) {
+      const size_t end = compoundSpanEnd(s, i);
+      if (end == std::string::npos) {  // unterminated: left exactly as written
+        out.append(s, i, std::string::npos);
+        break;
+      }
+      const std::string body = s.substr(i + 2, end - i - 4);
+      if (body.find('"') == std::string::npos) {
+        out += '"';
+        out += body;
+        out += '"';
+      } else {
+        out.append(s, i, end - i);
+      }
+      i = end;
+      continue;
+    }
+    if (s[i] == '"') {  // a plain literal: copied through to its closing quote
+      const size_t close = s.find('"', i + 1);
+      if (close == std::string::npos) {
+        out.append(s, i, std::string::npos);
+        break;
+      }
+      out.append(s, i, close + 1 - i);
+      i = close + 1;
+      continue;
+    }
+    out += s[i++];
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
 // _eval_arith (macros.py)
 
-// A bare `.` (Stata system-missing) that is not part of a number or an
-// ident.member — mirrors strmutate.cpp's replaceBareDot. Mapped to Stata's
-// max-double missing sentinel so e.g. `substr(s, 3, .)` (missing length ==
-// "to end of string") reaches fnSubstr as a huge length and slices to the end,
-// and arithmetic on missing propagates the sentinel rather than a Python
-// SyntaxError. Word-adjacency guards leave `.` inside 3.14 / a."b" untouched.
+// A bare `.` and an extended `.a`..`.z` become their exact doubles (exprfns.h
+// replaceStataMissingLiterals, shared with loops.cpp and strmutate.cpp) so e.g.
+// `substr(s, 3, .)` (missing length == "to end of string") reaches fnSubstr as a
+// huge length and arithmetic on missing reaches pyeval's collapse rather than a
+// Python SyntaxError. BUG-249: each kind keeps its own double, so string(.a)
+// answers `.a`.
 static std::string replaceBareDotMissing(const std::string& s) {
-  auto isWordOrDot = [](char c) {
-    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.';
-  };
-  std::string out;
-  out.reserve(s.size());
-  for (size_t i = 0; i < s.size(); ++i) {
-    if (s[i] == '.') {
-      bool prev = (i > 0 && isWordOrDot(s[i - 1]));
-      bool next = (i + 1 < s.size() && isWordOrDot(s[i + 1]));
-      if (!prev && !next) { out += "8.988465674311579e+307"; continue; }
-      // BUG-249: EXTENDED missing `.a`..`.z` — a single lowercase letter with
-      // non-word neighbours on both sides ( `.ab` and `x.a` and `1.e5` all
-      // pass through untouched). Each code maps to its own kind-carrying
-      // sentinel (exprfns.h) so string(.a) can answer `.a` instead of `.`,
-      // and every existing >= sentinel missing test still fires.
-      if (!prev && i + 1 < s.size() && s[i + 1] >= 'a' && s[i + 1] <= 'z' &&
-          !(i + 2 < s.size() && isWordOrDot(s[i + 2]))) {
-        char buf[40];
-        std::snprintf(buf, sizeof(buf), "%.17g", stataMissingWithKind(s[i + 1] - 'a' + 1));
-        out += buf;
-        ++i;  // consume the kind letter
-        continue;
-      }
-    }
-    out += s[i];
-  }
-  return out;
+  return replaceStataMissingLiterals(s);
 }
 
 // BUG-249: the way OUT of the evaluator for a kind-carrying missing — `.a`
@@ -1730,6 +3544,13 @@ static std::string stataLocalRealText(double d) {
   return sign + f;
 }
 
+// BUG-920: forvalues stores each loop value as macro text by this same rule
+// (oracle w2_prog_controlflow pc_fv_frac: 0(0.1)1 assigns `.3`, not
+// `0.30000000000000004`, and `.7999999999999999`). loops.cpp declares this
+// wrapper itself (macros.h is not the loop runner's to widen), so the loop
+// and the local/global store share one rule instead of a second copy of it.
+std::string stataMacroRealText(double d) { return stataLocalRealText(d); }
+
 // BUG-660 fix round: the local/global STORAGE sites apply Stata's macro
 // real-to-text rule (stataLocalRealText, %18.0g) on top of evalArith's own
 // round-trip-exact text, instead of evalArith doing it for every caller (see
@@ -1758,18 +3579,29 @@ static std::string capNumericTextToStataLocalDigits(const std::string& text) {
   return stataLocalRealText(d);
 }
 
-// BUG-196: inside the evaluator missing is the sentinel double; on the way out
-// it has to be a `.` again. MAGNITUDE, not signed value: Stata renders `-.` as
-// `.` (measured — tests/kitchensink/fmt_oracle/missing_range_oracle.log, row
-// `negated-dot`), and PIET's evaluator reaches that case as literally
-// -kStataMissingSentinel because it negates the sentinel like any other double.
-// `2*.` overflows to inf, which this also admits, and Stata agrees (row
-// `dot-times-two`). NaN compares false against both bounds and is handled by
-// its own paths.
+// BUG-1006: a numeric r()/e() spliced by MACRO expansion (`` `r(N)' ``,
+// `` `e(r2)' ``) is macro text, so it takes the same %18.0g rule as a stored
+// local: count's r(N) is `8`, not `8.0` (w2aq_histogram_family.log every
+// hk_*_g record's nonmissing field; w2af_macro_text_file.log mt_num_r_count
+// `<8>`, mt_num_r_summean `<6.791666666666667>`, mt_num_e_r2
+// `<.0004984216647284>`). A missing value stays its token. The BARE r(N) is an
+// expression operand and keeps matrixElementText.
+static std::string macroRealText(double v) {
+  if (std::isnan(v) || std::fabs(v) >= kStataMissingSentinel) return stataMissingText(v);
+  return stataLocalRealText(v);
+}
+
+// BUG-196: inside the evaluator missing is the band |d| >= 2^1023 (exprfns.h);
+// on the way out it has to be a token again. MAGNITUDE, not signed value: Stata
+// renders `-.` as `.` (internal capture missing_range_oracle.log,
+// row `negated-dot`), and an out-of-range result is `.` on either side
+// (`scalar h8 = -1e308`, w2e_float_followups.log:1770). `2*.` and inf are
+// admitted too (row `dot-times-two`). c(maxdouble) is one ulp under 2^1023 and
+// stays a real number (rows sentinel-exact / sentinel-negated). NaN compares
+// false and is handled by its own paths.
 //
-// Used ONLY to decide whether a bare-dot retry landed on a clean missing —
-// deliberately not applied to evalArith's ordinary numeric returns; see the
-// retry site for why.
+// Applied at all three of evalArith's exits (fast path, bare-dot retry,
+// extended path), so a band value never leaves as a decimal.
 static bool isStataMissingResult(double d) {
   return std::fabs(d) >= kStataMissingSentinel;
 }
@@ -1779,19 +3611,255 @@ static bool isStataMissingResult(double d) {
 // (piet/eval/exprfns.h is outside this task's write manifest).
 void addSessionRngFns(PyNamespace& ns, EvalSession& session);
 
+// BUG-718: defined with the extended macro functions below. BUG-710: with
+// `outerSpans`, evalArith's mode -- see the definition.
+namespace {
+std::string substituteVarSubscripts(const std::string& in, EvalSession& session,
+                                    std::optional<std::string>* whole,
+                                    bool* stringLeft = nullptr,
+                                    std::vector<std::string>* outerSpans = nullptr);
+
+// BUG-710: a STRING cell (or a string scalar's value) read into an expression
+// becomes a literal the evaluator lexes itself: pushed onto the caller's
+// protectStringLiterals spans and referenced by its `"0L<k>L0"` placeholder, so
+// no later pre-pass reads its content. nullopt for text holding a `"`, which
+// this layer's literals cannot carry; the read is then left in place and the
+// line is refused downstream, the rule display's bindBareVarsToObs1 keeps.
+std::optional<std::string> stringReadPlaceholder(const std::string& text,
+                                                 std::vector<std::string>& spans) {
+  if (text.find('"') != std::string::npos) {
+    // A value holding `"` is carried as Stata's compound-quoted literal `"..."',
+    // which the evaluator lexes verbatim (pyeval.cpp, EM3b). 007's Wave 3 reads
+    // `local value = G4_1[1]` from a cell holding the survey question, quotes and
+    // newlines included, and StataBE takes it. Only text that would itself close
+    // or open a compound level (`"'` or `` `" ``) cannot be wrapped and stays
+    // refused.
+    if (text.find("\"'") != std::string::npos || text.find("`\"") != std::string::npos)
+      return std::nullopt;
+    spans.push_back("`\"" + text + "\"'");
+    return "\"0L" + std::to_string(spans.size() - 1) + "L0\"";
+  }
+  spans.push_back("\"" + text + "\"");
+  return "\"0L" + std::to_string(spans.size() - 1) + "L0\"";
+}
+
+// BUG-710: one EvalSession::varObs reading as expression text -- a number
+// parenthesised (a negative value stays one operand), a missing value as its
+// `.`/`.a` token in parentheses (replaceBareDotMissing turns it into the
+// evaluator's double), a string as a literal. Outside 1.._N the value is
+// missing: `.` for a numeric column, "" for a string one (Stata [U] 13.7;
+// w2i_varsub a_05..a_07, d_03, d_04). nullopt = the text cannot be carried.
+std::optional<std::string> varReadText(const EvalSession::VarObsReading& r,
+                                       std::vector<std::string>& spans) {
+  if (!r.inRange) return r.isString ? stringReadPlaceholder("", spans) : std::string("(.)");
+  if (r.isString) return stringReadPlaceholder(r.text, spans);
+  if (r.text.empty()) return std::string("(.)");
+  return "(" + r.text + ")";
+}
+
+// BUG-710: a BARE dataset variable in a scalar expression (`local k = xd`,
+// `scalar k2 = xd`, `local ks = s`) is its first observation, as in StataBE
+// (w2i_varsub f_01..f_04; `if xd > 0` reads it the same way, loops.cpp
+// BUG-921). Every identifier that is not a call (`name(`), a subscript
+// (`name[`, substituteVarSubscripts' business), a member or missing-kind
+// letter (`.name`, `.a`), or part of a number or a literal placeholder, and that
+// EvalSession::varObs knows as a variable, is replaced by varReadText. A name
+// the reader does not know is left exactly where it was, so a scalar, an e()
+// alias already resolved or an unknown name reaches the evaluator as before.
+// Unset hook (session-less harnesses) = unchanged input.
+std::string bindBareVariables(const std::string& in, EvalSession& session,
+                              std::vector<std::string>& spans) {
+  if (!session.varObs) return in;
+  std::string out;
+  size_t i = 0, last = 0;
+  bool any = false;
+  while (i < in.size()) {
+    const char c = in[i];
+    if (c == '"') {  // a placeholder (or an unterminated quote): data
+      const size_t close = in.find('"', i + 1);
+      i = close == std::string::npos ? in.size() : close + 1;
+      continue;
+    }
+    if (!isIdentStart(c) || (i > 0 && (isIdentChar(in[i - 1]) || in[i - 1] == '.'))) {
+      ++i;
+      continue;
+    }
+    size_t j = i + 1;
+    while (j < in.size() && isIdentChar(in[j])) ++j;
+    size_t k = j;
+    while (k < in.size() && (in[k] == ' ' || in[k] == '\t')) ++k;
+    if (k < in.size() && (in[k] == '(' || in[k] == '[')) {
+      i = j;
+      continue;
+    }
+    const std::string name = in.substr(i, j - i);
+    std::optional<EvalSession::VarObsReading> r = session.varObs(name, 1);
+    std::optional<std::string> text;
+    if (r) text = varReadText(*r, spans);
+    if (!text) {
+      i = j;
+      continue;
+    }
+    out.append(in, last, i - last);
+    out += *text;
+    last = j;
+    i = j;
+    any = true;
+  }
+  if (!any) return in;
+  out.append(in, last, std::string::npos);
+  return out;
+}
+}  // namespace
+
+namespace {
+// name-binding-display-literals: two literal forms Stata reads and this
+// evaluator's Python lexer does not.
+//  * `_pi`, the built-in constant: `local l = _pi`, `scalar s = _pi` and
+//    `` `=_pi' `` were r(111) / unexpanded, where Stata reads 3.141592653589793
+//    (w2av_name_binding bd_loc_pi, bd_sca_pi, bd_inl_pi, bd_dy_ilpi).
+//  * A decimal literal with leading zeros, `05`: Python refuses it, so `local l
+//    = 05+1` and `display 05+1` were r(198) where Stata reads 6
+//    (bd_loc_lead0, bd_sca_lead0, bd_inl_lead0, bd_dy_lead0). The zeros before
+//    another digit are dropped; `0`, `0.5`, `.05` and `1e05` are untouched.
+// Quoted text (and a protected literal's placeholder) is data and is skipped.
+std::string normalizeStataLiterals(const std::string& in) {
+  std::string s = in;
+  if (s.find("_pi") != std::string::npos) {
+    static const std::string kPiText = pythonFloatRepr(3.14159265358979323846);
+    std::vector<std::string> spans;
+    s = restoreStringLiterals(substituteBareName(protectStringLiterals(s, &spans), "_pi", kPiText),
+                              spans);
+  }
+  if (s.find('0') == std::string::npos) return s;
+  std::string out;
+  out.reserve(s.size());
+  bool inQuote = false;
+  for (size_t i = 0; i < s.size(); ++i) {
+    const char c = s[i];
+    if (c == '"') inQuote = !inQuote;
+    if (!inQuote && c == '0' && i + 1 < s.size() && std::isdigit(static_cast<unsigned char>(s[i + 1]))) {
+      // The first digit of a number: no identifier character or `.` before it,
+      // and no digit either (a zero inside `105` is not leading).
+      size_t b = out.size();
+      const bool startsNumber = b == 0 || !(isIdentChar(out[b - 1]) || out[b - 1] == '.');
+      if (startsNumber) continue;  // drop this leading zero; the next digit decides again
+    }
+    out.push_back(c);
+  }
+  return out;
+}
+}  // namespace
+
+namespace {
+// name-binding-display-literals: a matrix subscript that names its row or
+// column, `M["d1",1]` / `M[1,"x"]`, is the index of that name in the matrix's
+// stripe ([P] matrix subscripting; Stata takes the bare name or `eq:name`).
+// The literal reaches here as a protected placeholder (`"0L<k>L0"`, its text in
+// `spans`); the subscript became `M[1,1]` for the element pass, and a name the
+// stripe lacks stays as typed for that pass's refusal. Before, the subscript
+// was no element at all and `local l = delta["d1",1]` was r(111) `delta not
+// found` where StataBE reads 1 (w2av_name_binding bd_loc_matrow; bd_*_matrowa,
+// where a scalar d1 beside the row name d1 must not reach the literal).
+std::string resolveMatrixStripeSubscripts(const std::string& in, const EvalSession& session,
+                                          const std::vector<std::string>& spans) {
+  if (in.find('[') == std::string::npos || in.find("\"0L") == std::string::npos) return in;
+  static const std::regex reSub(
+      R"RX((?:\b|(?=[\x80-\xff]))([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\[\s*("0L\d+L0"|\d+)\s*,\s*("0L\d+L0"|\d+)\s*\])RX");
+  const auto stripeIndex = [&spans](const std::string& tok,
+                                    const std::vector<std::string>& names) -> std::string {
+    if (tok.empty() || tok[0] != '"') return tok;
+    const std::string lit = restoreStringLiterals(tok, spans);
+    if (lit.size() < 2 || lit.front() != '"' || lit.back() != '"') return std::string();
+    const std::string want = lit.substr(1, lit.size() - 2);
+    for (size_t k = 0; k < names.size(); ++k) {
+      const std::string& n = names[k];
+      const size_t colon = n.rfind(':');
+      if (n == want || (colon != std::string::npos && n.compare(colon + 1, std::string::npos, want) == 0))
+        return std::to_string(k + 1);
+    }
+    return std::string();
+  };
+  return regexSubFn(reSub, in, [&](const std::smatch& m) -> std::string {
+    if (m.str(2)[0] != '"' && m.str(3)[0] != '"') return m.str(0);
+    const EvalMatrix* mat = session.findMatrix(m.str(1));
+    if (mat == nullptr) return m.str(0);
+    const std::string r = stripeIndex(m.str(2), mat->rownames);
+    const std::string c = stripeIndex(m.str(3), mat->colnames);
+    if (r.empty() || c.empty()) return m.str(0);
+    return m.str(1) + "[" + r + "," + c + "]";
+  });
+}
+}  // namespace
+
 std::optional<std::string> evalArith(const std::string& expr, EvalSession* session,
                                      std::string* raisedError, bool* resultIsString) {
   dprof::EScope _z(dprof::kEEvalArith);
+  // name-binding-display-literals: x/0 is missing here, as in Stata (display
+  // 1/0 `.`, `local r = 1/0` `.`; w2av_name_binding bd_dy_div0, bd_loc_div0,
+  // bd_sca_div0). It was a ZeroDivisionError and so r(198).
+  StataDivisionScope stataDivision;
   dprof::ezoneBegin(dprof::kEEvalArithPre);
   std::string cleaned = strip(expr);
   // BUG-501: literals out of harm's way before any pre-pass runs (see
   // protectStringLiterals). No-op for an expression with no quote in it.
   std::vector<std::string> litSpans;
   cleaned = protectStringLiterals(cleaned, &litSpans);
+  // FU-875: the blanks inside ( ) and [ ] go, as Stata reads the expression
+  // (core/expr_blanks.h): `display abs(1 2)` is 12 and `local m = max(1 2, 3)`
+  // 12, as cobra's generate answers them. The literals are placeholders here.
+  cleaned = cecon::squeeze_bracketed_blanks(cleaned);
+  // ... and brackets that do not pair are r(132) "too few ')' or ']'" before any
+  // name is read, as in generate (`display tq(2010q1`, `local m = max(1 2`).
+  if (const std::string unbalanced = cecon::bracket_imbalance(cleaned); !unbalanced.empty()) {
+    if (raisedError) *raisedError = "r(132): " + unbalanced;
+    dprof::ezoneEnd(dprof::kEEvalArithPre);
+    return std::nullopt;
+  }
+  // BUG-1463: a c(name) still here is read through the session's c-class hook
+  // (cclass.cpp). display/local/scalar substitute it before they call in, typed
+  // (piet::substituteCRefs); the inline `=exp' expansion did not, so `set
+  // processors `=min(4, c(processors_max))'' died as "c() is a Stata function
+  // this version of PIET does not implement". The hook gives text: a number (or
+  // a missing `.`) splices as one, anything else as a string literal.
+  if (session != nullptr && session->cValue && cleaned.find("c(") != std::string::npos) {
+    static const std::regex reCRef(R"((^|[^\w\x80-\xff.])c\(([A-Za-z_]\w*)\))");
+    static const std::regex reNumber(R"(^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$|^\.[a-z]?$)");
+    cleaned = regexSubFn(reCRef, cleaned, [&](const std::smatch& m) -> std::string {
+      const std::optional<std::string> v = session->cValue(m.str(2));
+      if (!v.has_value()) return m.str(0);
+      if (std::regex_match(*v, reNumber)) return m.str(1) + "(" + *v + ")";
+      const std::optional<std::string> lit = stringReadPlaceholder(*v, litSpans);
+      return lit.has_value() ? m.str(1) + *lit : m.str(0);
+    });
+  }
+  // BUG-446: td()/tc()/tq()... literals become their value (see liftDateLiterals).
+  {
+    std::string badLiteral;
+    cleaned = liftDateLiterals(cleaned, &badLiteral);
+    if (!badLiteral.empty()) {
+      if (raisedError) *raisedError = "r(198): " + badLiteral + " invalid";
+      dprof::ezoneEnd(dprof::kEEvalArithPre);
+      return std::nullopt;
+    }
+  }
   // BUG-512: `_N` / `_n` (see substituteObsSpecials). Ahead of the matrix
   // pre-pass on purpose: that pass only recognises LITERAL subscripts, and an
   // index is an expression like any other.
   if (session != nullptr) cleaned = substituteObsSpecials(cleaned, *session);
+  cleaned = normalizeStataLiterals(cleaned);  // `_pi`, `05`
+  if (session != nullptr) cleaned = resolveMatrixStripeSubscripts(cleaned, *session, litSpans);
+  // BUG-710: a dataset-variable subscript `VAR[i]` is read NOW, through the one
+  // cell reader (EvalSession::varObs), and its value travels on as text: `local a
+  // = xd[1]` was r(111) (the matrix pass below named xd a missing matrix) and
+  // `scalar b = xd[1]` stored the source text `xd[1]`, which every later read
+  // re-evaluated against the data of THAT moment -- a replace, a gsort or a
+  // restore moved a scalar defined before it (w2i_varsub A-E, i_02..i_20;
+  // FU-1324). After `_N`/`_n` so an index may use them, and ahead of the matrix
+  // pre-pass, which keeps every name that is a matrix and every two-index
+  // subscript (substituteVarSubscripts skips both).
+  if (session != nullptr && session->varObs && cleaned.find('[') != std::string::npos)
+    cleaned = substituteVarSubscripts(cleaned, *session, nullptr, nullptr, &litSpans);
   // ^ -> ** (Stata exponentiation)
   {
     std::string tmp;
@@ -1809,9 +3877,37 @@ std::optional<std::string> evalArith(const std::string& expr, EvalSession* sessi
   {
     // A3: `ln` is a two-character literal; the regex only fires when it is
     // present, so let a find() decide instead of scanning every expression.
-    static const std::regex reLn(R"(\bln\b)");
+    // Unicode names: identifier-class boundaries (`lnدخل` is a name, not ln).
+    static const std::regex reLn(R"((^|[^\w\x80-\xff])ln(?![\w\x80-\xff]))");
     if (cleaned.find("ln") != std::string::npos)
-      cleaned = std::regex_replace(cleaned, reLn, "log");
+      cleaned = std::regex_replace(cleaned, reLn, "$1log");
+  }
+
+  // colnumb(M, "name") reads its name out of a string literal, which
+  // protectStringLiterals has already swapped for a `0L<k>L0` placeholder, so
+  // substituteMatrixRefs never matched and every colnumb() answered `.`
+  // (w2x_fn_string_math fx_colnumb_macro/_fv/_disp/_if). The call's own literal
+  // is put back here, and only when the matrix exists -- the substitution then
+  // consumes it. colnumb() of a matrix that does not exist is r(111)
+  // (fx_colnumb_nomat), never a value.
+  if (session != nullptr && !litSpans.empty() &&
+      (toLower(cleaned).find("colnumb") != std::string::npos ||
+       toLower(cleaned).find("rownumb") != std::string::npos)) {
+    static const std::regex reColnumbLit(
+        R"RX(\b((?:col|row)numb\s*\(\s*)([A-Za-z_\x80-\xff][\w\x80-\xff]*)(\s*,\s*)("0L\d+L0")(\s*\)))RX", std::regex::icase);
+    std::string missingMat;
+    cleaned = regexSubFn(reColnumbLit, cleaned, [&](const std::smatch& m) -> std::string {
+      if (session->findMatrix(m.str(2)) == nullptr) {
+        if (missingMat.empty()) missingMat = m.str(2);
+        return m.str(0);
+      }
+      return m.str(1) + m.str(2) + m.str(3) + restoreStringLiterals(m.str(4), litSpans) + m.str(5);
+    });
+    if (!missingMat.empty()) {
+      if (raisedError) *raisedError = "r(111): matrix " + missingMat + " not found";
+      dprof::ezoneEnd(dprof::kEEvalArithPre);
+      return std::nullopt;
+    }
   }
 
   // WS-C matrix pre-substitution.
@@ -1819,11 +3915,36 @@ std::optional<std::string> evalArith(const std::string& expr, EvalSession* sessi
     std::string lower = toLower(cleaned);
     if (cleaned.find('[') != std::string::npos || lower.find("colsof") != std::string::npos ||
         lower.find("rowsof") != std::string::npos || lower.find("colnumb") != std::string::npos ||
-        lower.find("el(") != std::string::npos) {
+        lower.find("rownumb") != std::string::npos ||
+        lower.find("el(") != std::string::npos || lower.find("mreldif") != std::string::npos) {
       cleaned = substituteMatrixRefs(cleaned, *session);
+      // FU-118: a matrix operand the pass could not answer is a named error
+      // here, on the r(NNN) channel every caller already maps (display,
+      // `local =`, `scalar =` -- which then creates no scalar, FU-348).
+      const std::string matErr = unresolvedMatrixOperandError(cleaned, *session);
+      if (!matErr.empty()) {
+        if (raisedError) *raisedError = matErr;
+        dprof::ezoneEnd(dprof::kEEvalArithPre);
+        return std::nullopt;
+      }
     }
   }
 
+  // BUG-1419: scalar(NAME) of a STRING scalar is that string, as the bare name
+  // is below: `display scalar(s1) + "x"` with s1 = "-3" is -3x in StataBE 19.5
+  // (x1b/a1.do C2). Here it is a protected literal (stringReadPlaceholder), so
+  // no later pre-pass reads inside it, as resolveEstScalarRefs' raw one would be.
+  if (session != nullptr && !session->stringScalars.empty() &&
+      cleaned.find("scalar(") != std::string::npos) {
+    static const std::regex reStrScalarCall(
+        R"((^|[^\w\x80-\xff])scalar\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\))");
+    cleaned = regexSubFn(reStrScalarCall, cleaned, [&](const std::smatch& m) -> std::string {
+      const std::string* v = session->scalars.find(m.str(2));
+      if (v == nullptr || !session->isStringScalar(m.str(2))) return m.str(0);
+      if (auto lit = stringReadPlaceholder(*v, litSpans)) return m.str(1) + *lit;
+      return m.str(0);
+    });
+  }
   if (session != nullptr) {
     std::string bErr;
     cleaned = resolveEstScalarRefs(cleaned, *session, &bErr);
@@ -1843,23 +3964,44 @@ std::optional<std::string> evalArith(const std::string& expr, EvalSession* sessi
     }
     // _rc — the bare last-command return code local.
     // A3: same shape — `_rc` cannot match without the literal.
-    static const std::regex reRc(R"(\b_rc\b)");
+    // Unicode names (lane M): the boundary is the identifier class, not
+    // ECMAScript's ASCII `\b` -- `\b_rc\b` matched the tail of a variable
+    // named `دخل_rc` (an Arabic byte is a non-word character to `\b`).
+    static const std::regex reRc(R"((^|[^\w\x80-\xff])_rc(?![\w\x80-\xff]))");
     std::smatch m;
     if (cleaned.find("_rc") != std::string::npos && std::regex_search(cleaned, m, reRc)) {
       std::string rcv = session->locals.get("_rc", "0");
       if (!pythonFloat(rcv)) rcv = "0";
-      cleaned = std::regex_replace(cleaned, reRc, rcv);
+      // A callback, not a "$1..." format: rcv is digits, and "$10" reads as group 10.
+      cleaned = regexSubFn(reRc, cleaned, [&rcv](const std::smatch& mm) { return mm.str(1) + rcv; });
     }
     // Bare scalar-name substitution (insertion order; (?!\s*\() spares
     // same-named function CALLS; value inserted literally).
     dprof::EScope _zs(dprof::kEEvalArithScalars);
     for (const auto& [sn, sv] : session->scalars.items()) {
       if (cleaned.find(sn) != std::string::npos) {
+        // BUG-710: a dataset variable wins over a same-named scalar (Stata's
+        // rule, which loops.cpp's condition binder and the dispatcher's
+        // substituteStoredScalars already keep); bindBareVariables reads it.
+        if (session->varObs && session->varObs(sn, 1)) continue;
+        // BUG-710: a STRING scalar is a literal, not a bare name: `local x =
+        // d_st` substituted `ab2` and stored the source text `d_st`
+        // (w2i_varsub d_02).
+        if (session->isStringScalar(sn)) {
+          if (auto lit = stringReadPlaceholder(sv, litSpans)) {
+            const std::string litText = *lit;
+            cleaned = substituteBareNameWith(cleaned, sn,
+                                             [&litText]() -> const std::string& { return litText; });
+            continue;
+          }
+        }
         // EXPRLAYER-5: was a std::regex CONSTRUCTED (i.e. compiled) per scalar
         // per expression — `\bNAME\b(?!\s*\()` walked directly instead.
-        cleaned = substituteBareName(cleaned, sn, sv);
+        cleaned = substituteBareName(cleaned, sn, valueRefText(sv));  // FU-842
       }
     }
+    // BUG-710: a bare dataset variable reads observation 1 (bindBareVariables).
+    cleaned = bindBareVariables(cleaned, *session, litSpans);
     // BUG-456 follow-up (2026-09-09): the string-slot type test runs AGAIN here,
     // after the stored scalars have been substituted -- `scalar one = 1` then
     // `local sf = strpos(one,"1")` answered 1 at rc 0 where Stata is r(109)
@@ -1924,6 +4066,16 @@ std::optional<std::string> evalArith(const std::string& expr, EvalSession* sessi
       // this branch already returned before BUG-196, leaving those cases
       // exactly as they were. Real missing propagation belongs to a missing
       // type in the expression layer and is not claimed here.
+      // BUG-1388: the only names this alphabet admits are runs of e/E, and
+      // Stata defines none of them (`local d = e + 1` is `e not found`,
+      // r(111)). The NameError goes out on the channel the extended path
+      // below uses, so the caller's classifier answers r(111) rather than
+      // r(198) invalid syntax. A bare-dot retry cannot cure an unbound name.
+      if (raisedError && out.status == PyEvalOutcome::Status::Raised &&
+          out.error.rfind("NameError", 0) == 0) {
+        *raisedError = out.error;
+        return std::nullopt;
+      }
       const std::string withMissing = replaceBareDotMissing(cleaned);
       if (withMissing == cleaned) return std::nullopt;  // no bare dot to retry with
       const PyEvalOutcome retry = evalPyExprDetailed(withMissing, empty);
@@ -1942,6 +4094,9 @@ std::optional<std::string> evalArith(const std::string& expr, EvalSession* sessi
     if (r.isInt() || r.isBool()) return std::to_string(r.intVal());
     if (r.isFloat()) {
       double d = r.floatVal();
+      // The same exit test as the retry and the extended path: a missing result
+      // (`-1e308`, r(sd) after meanonly substituted as `.`) leaves as its token.
+      if (std::isnan(d) || isStataMissingResult(d)) return stataMissingText(d);
       if (pyIsInteger(d)) return stataIntText(d);
       // BUG-660 fix round: evalArith itself stays ROUND-TRIP-EXACT
       // (pythonFloatRepr) for every caller -- `scalar s = expr` stores this
@@ -2044,12 +4199,8 @@ std::optional<std::string> evalArith(const std::string& expr, EvalSession* sessi
     // rewriting it into a finite double (replaceBareDotMissing above) without
     // this gate would have PRINTED that double (`local x = .a` storing
     // 8.99e+307), a confident wrong number replacing a visible non-answer.
-    // Also catches what was already leaking here: `sqrt(4)+.` used to render
-    // the sentinel itself as 8.988465674311579e+307, where Stata says `.` —
-    // any value at or beyond the sentinel is missing BY CONSTRUCTION in this
-    // engine's own representation. Bounded change: doubles below 2^1023 are
-    // untouched, and no real computation lands there (Stata's own numeric
-    // ceiling is the same sentinel).
+    // Any value in the band |d| >= 2^1023 is missing in StataBE's own
+    // representation; c(maxdouble), one ulp below, is a real number.
     if (isStataMissingResult(d)) return stataMissingText(d);
     // BUG-374(2): NaN is Stata MISSING and prints as ".", not "nan". It reaches
     // here from any legitimately-missing result — `display mod(7,0)` is the
@@ -2105,6 +4256,7 @@ static const PyNamespace& postfileStataMathNamespace() {
 
 std::optional<std::string> evalMacroExpr(const std::string& expr, EvalSession& session) {
   dprof::EScope _z(dprof::kEEvalMacroExpr);
+  StataDivisionScope stataDivision;  // `=1/0' is `.' (w2av_name_binding bd_inl_div0)
   std::string cleaned = strip(expr);
   if (cleaned.empty()) return std::nullopt;
   // BUG-512: `` `=_N' `` / `` `=_N-1' `` (w2_smalls.log inline_N 12|11). The
@@ -2112,6 +4264,17 @@ std::optional<std::string> evalMacroExpr(const std::string& expr, EvalSession& s
   // the reference was left in the line and expandMacros reported a circular
   // definition after 16 passes -- `forvalues i = 1/`=_N'` died on it.
   cleaned = substituteObsSpecials(cleaned, session);
+  cleaned = normalizeStataLiterals(cleaned);  // `_pi`, `05` (name-binding-display-literals)
+  // BUG-718: `` `=__d_itrim[1]' `` -- a dataset variable read at an observation
+  // (w2c_functions.log itrim_data and twelve sibling `data` records). The name
+  // used to reach the whitelist and the evaluator as an unknown identifier, the
+  // reference stayed in the line, and expandMacros reported non-convergence
+  // after 16 passes (rc 1). After `_N`/`_n` above, so `x[_N]` reads row _N.
+  {
+    std::optional<std::string> whole;
+    cleaned = substituteVarSubscripts(cleaned, session, &whole);
+    if (whole) return whole;
+  }
 
   {
     std::string tmp;
@@ -2128,15 +4291,17 @@ std::optional<std::string> evalMacroExpr(const std::string& expr, EvalSession& s
   {
     // A3: `ln` is a two-character literal; the regex only fires when it is
     // present, so let a find() decide instead of scanning every expression.
-    static const std::regex reLn(R"(\bln\b)");
+    // Unicode names: identifier-class boundaries (`lnدخل` is a name, not ln).
+    static const std::regex reLn(R"((^|[^\w\x80-\xff])ln(?![\w\x80-\xff]))");
     if (cleaned.find("ln") != std::string::npos)
-      cleaned = std::regex_replace(cleaned, reLn, "log");
+      cleaned = std::regex_replace(cleaned, reLn, "$1log");
   }
 
   {
     std::string lower = toLower(cleaned);
     if (cleaned.find('[') != std::string::npos || lower.find("colsof") != std::string::npos ||
-        lower.find("rowsof") != std::string::npos || lower.find("el(") != std::string::npos) {
+        lower.find("rowsof") != std::string::npos || lower.find("el(") != std::string::npos ||
+        lower.find("mreldif") != std::string::npos) {
       cleaned = substituteMatrixRefs(cleaned, session);
     }
   }
@@ -2154,6 +4319,13 @@ std::optional<std::string> evalMacroExpr(const std::string& expr, EvalSession& s
   // evalArith's own install for the rationale).
   if (expr.find("runiform") != std::string::npos) addSessionRngFns(ns, session);
   for (const auto& [sname, sval] : session.scalars.items()) {
+    // name-binding-display-literals: a dataset variable (or a unique
+    // abbreviation of one) wins over a same-named scalar, as in evalArith; the
+    // name is left unbound here, so the expression falls to expandPass's
+    // evalArith fallback, which reads the variable (w2av_name_binding
+    // bd_inl_varsc `=v'` 10, not scalar v's 5; bd_inl_abbrsc `=lngd'`).
+    if (session.varObs && cleaned.find(sname) != std::string::npos && session.varObs(sname, 1))
+      continue;
     auto f = pythonFloat(sval);
     if (f) ns.consts[sname] = PyValue::floating(*f);
   }
@@ -2186,6 +4358,9 @@ std::optional<std::string> evalMacroExpr(const std::string& expr, EvalSession& s
   if (r.isInt() || r.isFloat()) {
     double fval = r.isFloat() ? r.floatVal() : static_cast<double>(r.intVal());
     if (std::isnan(fval)) return ".";
+    // A finite band value (pyeval's collapse and result rule return 2^1023)
+    // is missing; printed as a decimal it would be a number.
+    if (std::isfinite(fval) && std::fabs(fval) >= kStataMissingSentinel) return stataMissingText(fval);
     // Python: `if fval == int(fval) and not isinf(fval)` — int(inf) raises
     // OverflowError BEFORE the isinf guard, and the whole body sits in a
     // broad try/except -> ±inf yields None (the guard is dead code).
@@ -2212,19 +4387,448 @@ std::optional<std::string> evalMacroExpr(const std::string& expr, EvalSession& s
 // ---------------------------------------------------------------------------
 // _expand_pass
 
+// Defined below with the rest of the extended macro functions; the inline
+// matrix-stripe pass in expandPass answers through it (BUG-629).
+namespace {
+std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSession& session,
+                                              MacroFnError* err);
+bool classifyFailedEqExpr(const std::string& exprIn, const std::string& raised,
+                          MacroFnError* err, const EvalSession* session);
+
+// The extended macro functions tryExtendedMacroFn answers, by Stata's name and
+// shortest abbreviation ([P] macro): `tok` -> the full name, "" for any other
+// token. Case-sensitive, as Stata is: StataBE 19.5 answers `: t u`, `: fo u`,
+// `: lab ul 1`, `: sort`, `: rown M`, `: colf M`, `: rowe M` and refuses `: T u`,
+// `: TYPE u`, `: Word count a`, `: COLNAMES M`, `: colso M`, `: sor`, `: la ul 1`,
+// `: dat label`, `: pw`, `: subinst` with "<tok> not allowed", r(101).
+std::string extMacroFnName(const std::string& tok) {
+  struct Name {
+    const char* full;
+    size_t shortest;
+  };
+  static constexpr Name kNames[] = {
+      {"type", 1},     {"format", 1},   {"value", 3},        {"variable", 3},     {"data", 4},
+      {"sortedby", 4}, {"label", 3},    {"char", 4},         {"list", 4},         {"word", 4},
+      {"length", 6},   {"subinstr", 8}, {"pwd", 3},          {"dir", 3},          {"rownames", 4},
+      {"colnames", 4}, {"roweq", 4},    {"rowfullnames", 4}, {"colfullnames", 4}, {"coleq", 4},
+      {"rowsof", 6},   {"colsof", 6}};
+  for (const auto& n : kNames) {
+    const std::string full = n.full;
+    if (tok.size() >= n.shortest && full.compare(0, tok.size(), tok) == 0) return full;
+  }
+  return std::string();
+}
+
+// Stata's check of a macro NAME an extended function reads or writes (`: list`
+// operands, `: length`, `: subinstr` and its count()): a local is stored as `_`
+// plus its name, so it may start with a digit but holds at most 31 characters; a
+// global is a Stata name of up to 32. StataBE 19.5, r(198): "_abcdefghijabcdefgh
+// ijabcdefghijab invalid name" for a 32-character local, "1A invalid name" for
+// global(1A), "_) invalid name" for local(). "" when the name is good.
+std::string macroNameError(bool global, const std::string& name) {
+  const std::string stored = global ? name : "_" + name;
+  bool ok = !stored.empty() && utf8Len(stored) <= 32 && cecon::ident::isIdentStartByte(stored[0]);
+  for (size_t i = 0; ok && i < stored.size(); ++i) ok = isIdentChar(stored[i]);
+  return ok ? std::string() : stored + " invalid name";
+}
+
+// name-binding-display-literals: the messages of inline `=exp' references that
+// failed and expanded to nothing (expandPass), for the dispatcher to print
+// (takeInlineExpansionNotes). Bounded: a caller that never drains cannot grow it.
+thread_local std::vector<std::string> tl_inlineNotes;
+void noteInlineFailure(const std::string& message) {
+  if (tl_inlineNotes.size() < 64) tl_inlineNotes.push_back(message);
+}
+
+// name-binding-display-literals (review, round 5): the names of Stata 19.5's
+// expression functions. An inline `=exp' whose evaluation stops on an unknown
+// function expands to nothing at rc 0 only when Stata does not know the
+// function either (bd_inl_nofn, `=nosuchfn_q(1)'); a NameError here only says
+// that THIS evaluator lacks the name. Design decision: no list existed in
+// piet/native, so this one is read off StataNow 19.5 itself -- every
+// `{cmd:NAME(}` signature in ado/base/f/f_*.ihlp, the f_*.sthlp entries
+// (binomiallc; the d/h/m/q/w anachronisms; normprob, uniform), the out-of-date
+// table in f_normprob.sthlp (nchi ... tprob), the _by() family (byable), the
+// pre-14 string names (whatsnew10to11: lower ... upper; length, index, trim,
+// itrim) and invnorm/normd/normden/issym/uniform0, plus ty. Case matters, as
+// it does in Stata (Ftail, not ftail). Erring toward membership costs a loud
+// refusal; erring the other way is a silent empty expansion.
+// BUG-1420: the names StataBE 19.5 answers in c() -- the 196 keys `creturn list`
+// prints, plus the hidden ones measured beside them (seed, namelen,
+// rngstate_mt64s; lane expr-sem x1b/a24.do, a25.do), plus 27 more that
+// `creturn list` does not print and StataBE 19.5 still answers at rc 0
+// (c(matsize) 400, c(flavor) IC, c(timeout1) 30, c(sortseed), c(java) 1, ...;
+// over 500 names tried on 2026-11-03, every c(NAME) and `set NAME` in the
+// manuals and variants of them), plus 248 more found in the identifier strings
+// of Stata's own library. Any other c(NAME) is r(133) "c(NAME)
+// undefined" in display, local, scalar and generate alike (c(bogus_setting),
+// c(Linesize), c(n), c(seed0), c(dockable)), and `c(NAME)' is "". A hidden key
+// missing here would expand to "" where Stata has a value, so a name found
+// later belongs in this list. Case matters. The names resolveCValue serves are
+// answered before this list is asked, so PIET's own c(obs) and c(sysdir_sample)
+// keep their values.
+bool isStataCName(const std::string& name) {
+  static const std::unordered_set<std::string> kNames = {
+      "ALPHA", "MP", "Mons", "Months", "N", "SE", "Wdays", "Weekdays", "adopath", "adosize",
+      "alpha", "bit", "born_date", "byteorder", "cformat", "changed", "charlen", "clevel",
+      "cmdlen", "coeftabresults", "collect_double", "collect_label", "collect_style",
+      "collect_warn", "console", "copycolor", "current_date", "current_time", "dirsep",
+      "docx_hardbreak", "docx_maxtable", "docx_paramode", "doeditbackup", "dots", "dp",
+      "dtable_style", "dtascomplevel", "dyndoc_version", "edition", "edition_real", "emptycells",
+      "epsdouble", "epsfloat", "eqlen", "etable_style", "filedate", "filename", "frame", "fredkey",
+      "fvbase", "fvlabel", "fvtrack", "fvwrap", "fvwrapon", "graphics", "hostname", "httpproxy",
+      "httpproxyauth", "httpproxyhost", "httpproxyport", "httpproxypw", "httpproxyuser",
+      "include_bitmap", "iterlog", "java_heapmax", "java_home", "k", "lapack_openblas", "level",
+      "linegap", "linesize", "locale_functions", "locale_icudflt", "locale_ui", "logmsg",
+      "logtype", "lstretch", "machine_type", "macrolen", "matacache", "matafavor", "matalibs",
+      "matalnum", "matamofirst", "mataoptimize", "matasolvetol", "matastrict", "max_N_theory",
+      "max_cmdlen", "max_graphsize", "max_it_cvars", "max_it_fvars", "max_k_theory",
+      "max_macrolen", "max_matdim", "max_memory", "max_width_theory", "maxbezierpath", "maxbyte",
+      "maxdb", "maxdouble", "maxfloat", "maxint", "maxiter", "maxlong", "maxstrlvarlen",
+      "maxstrvarlen", "maxvar", "maxvlabellen", "memory", "min_graphsize", "min_memory", "minbyte",
+      "mindouble", "minfloat", "minint", "minlong", "mode", "more", "namelen", "namelenbyte",
+      "namelenchar", "niceness", "noisily", "notifyuser", "obs_t", "odbcdriver", "odbcmgr", "os",
+      "osdtl", "pagesize", "pdf_maxtable", "pformat", "pi", "playsnd", "printcolor", "processors",
+      "processors_lic", "processors_mach", "processors_max", "pwd", "python_exec",
+      "python_userpath", "rc", "reshape_favor", "reventries", "revkeyboard", "rmsg", "rmsg_time",
+      "rng", "rng_current", "rngseed_mt64s", "rngstate", "rngstate_mt64s", "rngstream", "scheme",
+      "scrollbufsize", "searchdefault", "seed", "segmentsize", "sformat", "showbaselevels",
+      "showemptycells", "showomitted", "smallestdouble", "smoothfonts", "sort_current",
+      "sortmethod", "sortrngstate", "stata_name", "stata_version", "svy_tab_comps", "sysdir_base",
+      "sysdir_oldplace", "sysdir_personal", "sysdir_plus", "sysdir_site", "sysdir_stata",
+      "table_style", "tabulate_comps", "tabulate_style", "tmpdir", "trace", "tracedepth",
+      "traceexpand", "tracehilite", "traceindent", "tracenumber", "tracesep", "type",
+      "update_interval", "update_prompt", "update_query", "username", "userversion", "varabbrev",
+      "varkeyboard", "version", "width",
+      // Hidden: answered by StataBE 19.5, not printed by `creturn list`.
+      "charset", "checksum", "debug", "flavor", "flavor_real", "java", "java_version",
+      "lapack_mkl", "matsize", "max_N_current", "max_k_current", "max_matsize",
+      "max_preservemem", "max_width_current", "min_matsize", "rngstate_kiss32",
+      "rngstate_mt64", "seed_kiss32", "seed_mt64", "seed_mt64s", "sortseed", "sysdir_updates",
+      "timeout1", "timeout2", "unicode", "varlabelpos", "virtual",
+      // Hidden as well, found by asking StataBE 19.5 for c(NAME) over the identifier
+      // strings of its own library (review of lane expr-sem, 2026-11-03): rc 0 for
+      // each, c(framesmax) 100, c(osclass) MACARM64, c(hasicu) 1, c(tol_1) 1e-09, the
+      // collect_dlg_* family "". Their neighbours c(collect_dlg_bogus), c(tol_3) and
+      // c(framesmaxx) are r(133), so no prefix stands in for the list.
+      "UseConsoleFontLength", "bayesmhtmpfn", "buildfvinfo", "c_compiler", "c_compiler_fullvers",
+      "c_compiler_vers", "cmdtitle", "coeftabfail", "collect_catch_backup", "collect_current",
+      "collect_dlg__cons_position", "collect_dlg_cell_abbreviate", "collect_dlg_cell_bground_color",
+      "collect_dlg_cell_border_color", "collect_dlg_cell_border_pattern",
+      "collect_dlg_cell_border_smcl", "collect_dlg_cell_border_width",
+      "collect_dlg_cell_cidelimiter", "collect_dlg_cell_cridelimiter",
+      "collect_dlg_cell_dborder_color", "collect_dlg_cell_dborder_pattern",
+      "collect_dlg_cell_empty", "collect_dlg_cell_fground_color", "collect_dlg_cell_fill_pattern",
+      "collect_dlg_cell_font_color", "collect_dlg_cell_font_family", "collect_dlg_cell_font_size",
+      "collect_dlg_cell_font_strikeout", "collect_dlg_cell_font_style",
+      "collect_dlg_cell_font_underline", "collect_dlg_cell_font_variant",
+      "collect_dlg_cell_font_weight", "collect_dlg_cell_halign", "collect_dlg_cell_latex",
+      "collect_dlg_cell_margin_width", "collect_dlg_cell_maxLabel", "collect_dlg_cell_maximum",
+      "collect_dlg_cell_minLabel", "collect_dlg_cell_minimum", "collect_dlg_cell_nformat",
+      "collect_dlg_cell_sformat", "collect_dlg_cell_smcl", "collect_dlg_cell_valign",
+      "collect_dlg_cid", "collect_dlg_col_atDelimiter", "collect_dlg_col_barDelimiter",
+      "collect_dlg_col_binder", "collect_dlg_col_delimiter", "collect_dlg_col_dups",
+      "collect_dlg_col_extraspace", "collect_dlg_col_nodelimiter", "collect_dlg_col_position",
+      "collect_dlg_col_width", "collect_dlg_dim", "collect_dlg_dim1", "collect_dlg_dim10",
+      "collect_dlg_dim2", "collect_dlg_dim3", "collect_dlg_dim4", "collect_dlg_dim5",
+      "collect_dlg_dim6", "collect_dlg_dim7", "collect_dlg_dim8", "collect_dlg_dim9",
+      "collect_dlg_dim_autolevels", "collect_dlg_dim_label", "collect_dlg_dim_level",
+      "collect_dlg_dim_level_label", "collect_dlg_dim_spanheader", "collect_dlg_export_style_key",
+      "collect_dlg_export_style_type", "collect_dlg_export_style_value",
+      "collect_dlg_header_fvlevels", "collect_dlg_header_level", "collect_dlg_header_nformat",
+      "collect_dlg_header_title", "collect_dlg_item_base", "collect_dlg_item_empty",
+      "collect_dlg_item_omit", "collect_dlg_note", "collect_dlg_notes_bground_color",
+      "collect_dlg_notes_count", "collect_dlg_notes_fground_color",
+      "collect_dlg_notes_fill_pattern", "collect_dlg_notes_font_color",
+      "collect_dlg_notes_font_family", "collect_dlg_notes_font_size",
+      "collect_dlg_notes_font_strikeout", "collect_dlg_notes_font_style",
+      "collect_dlg_notes_font_underline", "collect_dlg_notes_font_variant",
+      "collect_dlg_notes_font_weight", "collect_dlg_notes_latex", "collect_dlg_notes_smcl",
+      "collect_dlg_notes_tags", "collect_dlg_row_abbreviate", "collect_dlg_row_arrangement",
+      "collect_dlg_row_atDelimiter", "collect_dlg_row_barDelimiter", "collect_dlg_row_binder",
+      "collect_dlg_row_delimiter", "collect_dlg_row_dups", "collect_dlg_row_indent",
+      "collect_dlg_row_length", "collect_dlg_row_nobinder", "collect_dlg_row_nodelimiter",
+      "collect_dlg_row_position", "collect_dlg_row_spacer", "collect_dlg_row_span",
+      "collect_dlg_row_truncate", "collect_dlg_row_wrap", "collect_dlg_row_wrapon",
+      "collect_dlg_show_ci", "collect_dlg_side", "collect_dlg_stars_attach",
+      "collect_dlg_stars_delimiter", "collect_dlg_stars_fortags", "collect_dlg_stars_label1",
+      "collect_dlg_stars_label2", "collect_dlg_stars_label3", "collect_dlg_stars_label4",
+      "collect_dlg_stars_label5", "collect_dlg_stars_nformat", "collect_dlg_stars_order",
+      "collect_dlg_stars_prefix", "collect_dlg_stars_pvname", "collect_dlg_stars_results",
+      "collect_dlg_stars_shownote", "collect_dlg_stars_suffix", "collect_dlg_stars_type",
+      "collect_dlg_stars_value1", "collect_dlg_stars_value2", "collect_dlg_stars_value3",
+      "collect_dlg_stars_value4", "collect_dlg_stars_value5", "collect_dlg_tab_atDelimiter",
+      "collect_dlg_tab_barDelimiter", "collect_dlg_tab_binder", "collect_dlg_tab_delimiter",
+      "collect_dlg_tab_dimBinder", "collect_dlg_tab_dimDelimiter", "collect_dlg_tab_nodelimiter",
+      "collect_dlg_tag", "collect_dlg_title", "collect_dlg_title_bground_color",
+      "collect_dlg_title_fground_color", "collect_dlg_title_fill_pattern",
+      "collect_dlg_title_font_color", "collect_dlg_title_font_family",
+      "collect_dlg_title_font_size", "collect_dlg_title_font_strikeout",
+      "collect_dlg_title_font_style", "collect_dlg_title_font_underline",
+      "collect_dlg_title_font_variant", "collect_dlg_title_font_weight", "collect_dlg_title_latex",
+      "collect_dlg_title_smcl", "collect_export_version", "compactvarlist", "compile_number",
+      "curl_version", "curscm", "dark_mode", "di_g", "excelsupport", "expr_revar", "filenamelen",
+      "framesmax", "getsockopt", "graphexttext", "guixeqcmd", "hasharu", "hasicu", "helpcolor",
+      "httpsendport", "httpuseragent", "importcase", "irngalways64", "java_debugger",
+      "java_heap_committed", "java_heap_max", "java_heap_usage", "java_initialized",
+      "java_javacall_classpath", "java_jconsole", "java_library_path", "java_system_classpath",
+      "java_system_java", "java_vendor", "jitterseed", "jvm_override_options", "loghelp",
+      "mapsymbols", "marginsatvars", "marginscmd", "marginsdxvars", "marginsmvars", "marginsrevars",
+      "mata_hdfe", "matadebug", "matawarningaserror", "max_intpoints", "max_rngstreams",
+      "maxoptions", "min_k", "netdebug", "osclass", "pollrate", "polltime", "postunlinktimeout",
+      "prefix", "preserve_ttl", "procs_license", "procs_mach", "procs_use", "profiling",
+      "regex_current", "regexmethod", "scheme_cscript", "slowrun", "spsssas_support", "sslrelax",
+      "stata_serno", "stata_version_major", "staticlink", "suppress_statanow_update",
+      "sysdir_sjplus", "sysdir_stbplus", "textresultsmode", "textsize", "tokenlen", "tol_0",
+      "tol_1", "tol_2", "tol_r", "tracecode", "tracetime", "unlinktimeout", "update_oride",
+      "url_allow_redirects", "useoldlapack", "varlabellen", "varlabellenbyte", "version_rng",
+      "version_rng_kiss32", "version_rng_mt64", "version_rng_mt64s", "visible_graph_names"};
+  return kNames.count(name) != 0;
+}
+
+bool isStataFunctionName(const std::string& name) {
+  static const std::unordered_set<std::string> kNames = {
+      "Cdhms", "Chms", "Clock", "Clockdiff", "Clockdiff_frac", "Clockpart", "Cmdyhms", "Cofc",
+      "Cofd", "F", "Fden", "Ftail", "I", "J", "_by", "_byindex", "_bylastcall", "_byn1", "_byn2",
+      "_caller", "_frval", "abbrev", "abs", "acos", "acosh", "age", "age_frac", "asin", "asinh",
+      "atan", "atan2", "atanh", "autocode", "betaden", "binomial", "binomiallc", "binomialp",
+      "binomialtail", "binormal", "birthday", "bofd", "byteorder", "c", "cauchy", "cauchyden",
+      "cauchytail", "ceil", "char", "chi2", "chi2den", "chi2tail", "chiprob", "cholesky", "chop",
+      "clip", "clock", "clockdiff", "clockdiff_frac", "clockpart", "cloglog", "cofC", "cofd",
+      "coleqnumb", "collatorlocale", "collatorversion", "colnfreeparms", "colnumb", "colsof",
+      "comb", "cond", "corr", "cos", "cosh", "d", "daily", "date", "datediff", "datediff_frac",
+      "datepart", "day", "daysinmonth", "dayssincedow", "dayssinceweekday", "daysuntildow",
+      "daysuntilweekday", "det", "dgammapda", "dgammapdada", "dgammapdadx", "dgammapdx",
+      "dgammapdxdx", "dhms", "diag", "diag0cnt", "digamma", "dmy", "dofC", "dofb", "dofc", "dofh",
+      "dofm", "dofq", "dofw", "dofy", "dow", "doy", "dunnettprob", "e", "el", "epsdouble",
+      "epsfloat", "exp", "expm1", "exponential", "exponentialden", "exponentialtail", "fileexists",
+      "fileread", "filereaderror", "filewrite", "firstdayofmonth", "firstdowofmonth",
+      "firstweekdayofmonth", "float", "floor", "fmtwidth", "fprob", "frval", "gammaden", "gammap",
+      "gammaptail", "get", "h", "hadamard", "halfyear", "halfyearly", "has_eprop", "hh", "hhC",
+      "hms", "hofd", "hours", "hypergeometric", "hypergeometricp", "ibeta", "ibetatail",
+      "igaussian", "igaussianden", "igaussiantail", "index", "indexnot", "inlist", "inrange", "int",
+      "inv", "invF", "invFtail", "invbinomial", "invbinomialtail", "invcauchy", "invcauchytail",
+      "invchi", "invchi2", "invchi2tail", "invcloglog", "invdunnettprob", "invexponential",
+      "invexponentialtail", "invfprob", "invgammap", "invgammaptail", "invibeta", "invibetatail",
+      "invigaussian", "invigaussiantail", "invlaplace", "invlaplacetail", "invlogistic",
+      "invlogistictail", "invlogit", "invnF", "invnFtail", "invnbinomial", "invnbinomialtail",
+      "invnchi", "invnchi2", "invnchi2tail", "invnibeta", "invnorm", "invnormal", "invnt",
+      "invnttail", "invpoisson", "invpoissontail", "invsym", "invt", "invttail", "invtukeyprob",
+      "invvech", "invvecp", "invweibull", "invweibullph", "invweibullphtail", "invweibulltail",
+      "irecode", "isleapsecond", "isleapyear", "issym", "issymmetric", "itrim", "laplace",
+      "laplaceden", "laplacetail", "lastdayofmonth", "lastdowofmonth", "lastweekdayofmonth",
+      "length", "ln", "ln1m", "ln1p", "lncauchyden", "lndirichletden", "lnfactorial", "lngamma",
+      "lngeometricp", "lnigammaden", "lnigaussianden", "lniwishartden", "lnlaplaceden",
+      "lnmvnormalden", "lnnormal", "lnnormalden", "lnparetoden", "lnwishartden", "log", "log10",
+      "log1m", "log1p", "logistic", "logisticden", "logistictail", "logit", "lower", "ltrim", "m",
+      "matmissing", "matrix", "matuniform", "max", "maxbyte", "maxdouble", "maxfloat", "maxint",
+      "maxlong", "mdy", "mdyhms", "mi", "min", "minbyte", "mindouble", "minfloat", "minint",
+      "minlong", "minutes", "missing", "mm", "mmC", "mod", "mofd", "month", "monthly", "mreldif",
+      "msofhours", "msofminutes", "msofseconds", "nF", "nFden", "nFtail", "nbetaden", "nbinomial",
+      "nbinomialp", "nbinomialtail", "nchi", "nchi2", "nchi2den", "nchi2tail", "nextbirthday",
+      "nextdow", "nextleapyear", "nextweekday", "nibeta", "normal", "normalden", "normd", "normden",
+      "normprob", "now", "npnF", "npnchi", "npnchi2", "npnt", "nt", "ntden", "nttail", "nullmat",
+      "plural", "poisson", "poissonp", "poissontail", "previousbirthday", "previousdow",
+      "previousleapyear", "previousweekday", "proper", "q", "qofd", "quarter", "quarterly", "r",
+      "rbeta", "rbinomial", "rcauchy", "rchi2", "real", "recode", "regexcapture",
+      "regexcapturenamed", "regexm", "regexmatch", "regexr", "regexreplace", "regexreplaceall",
+      "regexs", "reldif", "replay", "return", "reverse", "rexponential", "rgamma", "rgeometric",
+      "rhypergeometric", "rigaussian", "rlaplace", "rlogistic", "rnbinomial", "rnormal", "round",
+      "roweqnumb", "rownfreeparms", "rownumb", "rowsof", "rpareto", "rpoisson", "rt", "rtrim",
+      "runiform", "runiformint", "rweibull", "rweibullph", "s", "scalar", "seconds", "sign", "sin",
+      "sinh", "smallestdouble", "soundex", "soundex_nara", "sqrt", "ss", "ssC", "strcat", "strdup",
+      "string", "stritrim", "strlen", "strlower", "strltrim", "strmatch", "strofreal", "strpos",
+      "strproper", "strreverse", "strrpos", "strrtrim", "strtoname", "strtrim", "strupper",
+      "subinstr", "subinword", "substr", "sum", "sweep", "t", "tC", "tan", "tanh", "tc", "td",
+      "tden", "th", "tin", "tm", "tobytes", "today", "tprob", "tq", "trace", "trigamma", "trim",
+      "trunc", "ttail", "tukeyprob", "tw", "twithin", "ty", "uchar", "udstrlen", "udsubstr",
+      "uisdigit", "uisletter", "uniform", "uniform0", "upper", "ustrcompare", "ustrcompareex",
+      "ustrfix", "ustrfrom", "ustrinvalidcnt", "ustrleft", "ustrlen", "ustrlower", "ustrltrim",
+      "ustrnormalize", "ustrpos", "ustrregexm", "ustrregexra", "ustrregexrf", "ustrregexs",
+      "ustrreverse", "ustrright", "ustrrpos", "ustrrtrim", "ustrsortkey", "ustrsortkeyex",
+      "ustrtitle", "ustrto", "ustrtohex", "ustrtoname", "ustrtrim", "ustrunescape", "ustrupper",
+      "ustrword", "ustrwordcount", "usubinstr", "usubstr", "vec", "vecdiag", "vech", "vecp", "w",
+      "week", "weekly", "weibull", "weibullden", "weibullph", "weibullphden", "weibullphtail",
+      "weibulltail", "wofd", "word", "wordbreaklocale", "wordcount", "year", "yearly", "yh", "ym",
+      "yofd", "yq", "yw"};
+  return kNames.count(name) != 0;
+}
+}  // namespace
+
+std::optional<std::string> undefinedCRef(const std::string& expr) {
+  if (expr.find("c(") == std::string::npos) return std::nullopt;
+  std::vector<std::string> spans;
+  const std::string bare = protectStringLiterals(expr, &spans);
+  static const std::regex reC(R"(\bc\(\s*([A-Za-z_]\w*)\s*\))");
+  for (std::sregex_iterator it(bare.begin(), bare.end(), reC), end; it != end; ++it) {
+    const std::string name = (*it)[1].str();
+    if (!isStataCName(name)) return "c(" + name + ") undefined";
+  }
+  return std::nullopt;
+}
+
+// BUG-1330: a name StataBE's c() answers. isStataCName holds the list (BUG-1420
+// measured it, hidden keys included); this is the name the c() refusal and the
+// delimited expansion ask by.
+bool isStataCClassName(const std::string& name) { return isStataCName(name); }
+
+namespace {
+// BUG-1330: the c() names whose value is a string (quoted in `creturn list`,
+// StataNow 19.5 BE), so a value that happens to read as a number (a digits-only
+// c(username)) is still spliced as a string.
+bool isStataCClassStringName(const std::string& name) {
+  static const std::unordered_set<std::string> kNames = {
+      "current_date", "current_time", "stata_name", "born_date", "edition", "edition_real",
+      "mode", "console", "os", "osdtl", "hostname", "machine_type", "byteorder", "username",
+      "sysdir_stata", "sysdir_base", "sysdir_site", "sysdir_plus", "sysdir_personal",
+      "sysdir_oldplace", "sysdir_sample", "tmpdir", "adopath", "pwd", "dirsep", "frame",
+      "filename", "filedate", "more", "rmsg", "dp", "logtype", "logmsg", "notifyuser", "playsnd",
+      "include_bitmap", "iterlog", "showbaselevels", "showemptycells", "showomitted", "fvlabel",
+      "fvwrapon", "lstretch", "cformat", "sformat", "pformat", "coeftabresults", "dots",
+      "collect_label", "collect_style", "table_style", "etable_style", "dtable_style",
+      "tabulate_style", "tabulate_comps", "svy_tab_comps", "collect_warn", "revkeyboard",
+      "varkeyboard", "smoothfonts", "graphics", "scheme", "printcolor", "copycolor", "httpproxy",
+      "httpproxyhost", "httpproxyauth", "httpproxyuser", "httpproxypw", "update_query",
+      "update_prompt", "trace", "tracesep", "traceindent", "traceexpand", "tracenumber",
+      "tracehilite", "matastrict", "matalnum", "mataoptimize", "matafavor", "matalibs",
+      "matamofirst", "java_heapmax", "java_home", "lapack_openblas", "docx_hardbreak",
+      "docx_paramode", "python_exec", "python_userpath", "rng", "rng_current", "rngstate",
+      "sortmethod", "sort_current", "sortrngstate", "locale_ui", "locale_functions",
+      "locale_icudflt", "type", "searchdefault", "varabbrev", "emptycells", "fvtrack", "fvbase",
+      "odbcmgr", "odbcdriver", "fredkey", "collect_double", "reshape_favor", "doeditbackup",
+      "alpha", "ALPHA", "Mons", "Months", "Wdays", "Weekdays", "obs_t", "seed", "flavor",
+      "virtual", "sysdir_updates", "sortseed"};
+  return kNames.count(name) != 0;
+}
+
+// BUG-1330: every bare c(name) outside string literals in an inline `=exp'`,
+// replaced by its value through the c() hook (piet::substituteCRefs, which the
+// other expression sites run, is beyond this layer): a number as itself, any
+// other value as a string literal. A name the hook does not answer stays for
+// the classifier's refusal.
+std::string substituteBareCRefs(const std::string& expr, EvalSession& session) {
+  if (!session.cValue || expr.find("c(") == std::string::npos) return expr;
+  static const std::regex reBareC(R"(\bc\(\s*([A-Za-z_]\w*)\s*\))");
+  std::vector<std::string> spans;
+  std::string work = protectLiterals(expr, &spans);
+  std::string out;
+  size_t last = 0;
+  for (auto it = std::sregex_iterator(work.begin(), work.end(), reBareC);
+       it != std::sregex_iterator(); ++it) {
+    const std::string name = (*it)[1].str();
+    std::optional<std::string> cv = session.cValue(name);
+    if (!cv || cv->find('"') != std::string::npos) continue;
+    char* end = nullptr;
+    const double d = std::strtod(cv->c_str(), &end);
+    const bool number = !isStataCClassStringName(name) && !cv->empty() &&
+                        ((end == cv->c_str() + cv->size() && std::isfinite(d)) || *cv == ".");
+    out.append(work, last, static_cast<size_t>(it->position(0)) - last);
+    out += number ? "(" + *cv + ")" : "\"" + *cv + "\"";
+    last = static_cast<size_t>(it->position(0) + it->length(0));
+  }
+  if (last == 0) return expr;
+  out.append(work, last, std::string::npos);
+  return restoreLiterals(out, spans);
+}
+}  // namespace
+
+std::string cClassRefusalRc(const std::string& name) {
+  return isStataCClassName(name) ? "198" : "133";
+}
+
+std::string cClassRefusalMessage(const std::string& name) {
+  return isStataCClassName(name)
+             ? "c(" + name + ") is a Stata system value this version of PIET does not provide"
+             : "c(" + name + ") undefined";
+}
+
+std::vector<std::string> takeInlineExpansionNotes() {
+  std::vector<std::string> out;
+  out.swap(tl_inlineNotes);
+  return out;
+}
+
 ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
-                        bool unsetRAsMissing) {
+                        bool unsetRAsMissing, bool verbatim) {
   dprof::EScope _z(dprof::kEExpandPass);
   std::string line = lineIn;
 
-  auto errorBlock = [](const std::string& message) {
-    ExpandResult r;
-    r.isError = true;
-    r.error = nlohmann::ordered_json{
-        {"type", "error"}, {"code", "engine_error"}, {"message", message}};
-    return r;
-  };
-
+  // The inline extended macro functions (findReadyInlineMacroFn), the leftmost
+  // ready span first: Stata expands a line left to right, and a span is ready
+  // only once the spans inside it are answered, so an inner span still comes
+  // before the span around it. The order shows when a span writes a macro
+  // (`: subinstr ..., count(local n)'): it runs after every reference to its
+  // left and before every one to its right. With x = `a b a' and n = `old',
+  // StataBE 19.5 prints O1|old|b b b|2| for `display "O1|`n'|`: subinstr local
+  // x "a" "b", all count(local n)'|`n'|"', and 3|z b a|1 for `: length local
+  // n' on either side of the count; so such a span's prefix is expanded first,
+  // and the references to its right wait for the spans and passes after it.
+  // They run FIRST so a class argument (`` `: colnames r(table)' ``, `` `:
+  // e(scalars)' ``) is consumed before the bare-r()/e() passes would read it as
+  // a scalar (BUG-629, w2c_postest.log:102/107/757). A function that fails stops
+  // the line at its rc, as the `local x : fn` form does -- but for BUG-1338: a
+  // reader that fails as Stata's own reader fails (`: type nosuch', `: format
+  // nosuch', `: char nosuch[x]', `: label (nosuch) 1', a stripe or `: word' of
+  // nothing; r(111) or r(198)) prints its message and expands to NOTHING at rc 0,
+  // as StataBE does on any line and under any prefix (`display "P|" 7 "|`: type
+  // nosuch'|"` prints `variable nosuch not found` and then `P|7||`; `local a
+  // "A`: type nosuch'B"` stores AB). It stopped the line at r(111). e() name
+  // lists and the other functions keep their refusal.
+  if (line.find("`:") != std::string::npos) {
+    // BUG-719: the variable readers see a plane refreshed first
+    // (EvalSession::syncVarPlane: the dispatcher syncs it only before
+    // `local`/`global`/`label` lines), once per line.
+    bool planeSynced = false;
+    static const std::regex reCountOpt(R"(,[\s\S]*\bc[a-z]*\s*\()");
+    for (;;) {
+      size_t p = std::string::npos, quote = 0;
+      for (size_t b = line.size(), at, q; (at = findReadyInlineMacroFn(line, b, &q)) != std::string::npos;
+           b = at) {
+        p = at;
+        quote = q;
+      }
+      if (p == std::string::npos) break;
+      const std::string body = line.substr(p + 2, quote - p - 2);
+      size_t h = 0;
+      while (h < body.size() && isPySpace(body[h])) ++h;
+      size_t he = h;
+      while (he < body.size() && isIdentChar(body[he])) ++he;
+      const std::string head = extMacroFnName(body.substr(h, he - h));
+      if (!planeSynced && session.syncVarPlane &&
+          (head == "type" || head == "format" || head == "label" || head == "char" ||
+           head == "variable" || head == "value")) {
+        session.syncVarPlane();
+        planeSynced = true;
+      }
+      if (head == "subinstr" && std::regex_search(body, reCountOpt)) {
+        std::string prefix = line.substr(0, p);
+        for (int pass = 0; pass < kMaxExpansionPasses && hasMacroRefs(prefix); ++pass) {
+          ExpandResult done = expandPass(prefix, session, unsetRAsMissing, verbatim);
+          if (done.isError) return done;
+          if (done.line == prefix) break;
+          prefix = done.line;
+        }
+        quote = quote - p + prefix.size();
+        line = prefix + line.substr(p);
+        p = prefix.size();
+      }
+      MacroFnError fe;
+      auto v = tryExtendedMacroFn(": " + body, session, &fe);
+      if (!v) {
+        if (!fe.failed()) break;  // left for the tokenizer's refusal
+        static const std::unordered_set<std::string> kReaders = {
+            "type", "format", "variable", "value", "label", "char", "sortedby", "word",
+            "rownames", "colnames", "roweq", "coleq", "rowfullnames", "colfullnames"};
+        if ((fe.rc != "111" && fe.rc != "198") || kReaders.count(head) == 0)
+          return rcErrorResult(fe.message, fe.rc);
+        noteInlineFailure(fe.message);  // BUG-1338: expands to nothing at rc 0
+        line.erase(p, quote - p + 1);
+        continue;
+      }
+      // EM13: a characteristic's text is spliced verbatim.
+      line.replace(p, quote - p + 1, verbatim && head == "char" ? encodeVerbatim(*v) : *v);
+    }
+  }
 
   // A3 pre-filters. Each block below opens with a full regex scan of the line;
   // every one of these constructs requires a literal character that a memchr-
@@ -2249,12 +4853,133 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
                                        ? findAll(reArithMacro(), line)
                                            : std::vector<std::pair<std::string, std::string>>{}) {
     std::smatch m;
-    if (!std::regex_search(inner, m, reLocalRef()) &&
-        !std::regex_search(inner, m, reGlobalRefBrace()) &&
-        !std::regex_search(inner, m, reGlobalRefBare()) &&
-        !std::regex_search(inner, m, reRRef()) && !std::regex_search(inner, m, reERef())) {
-      auto result = evalMacroExpr(inner, session);
-      if (result) line = replaceFirst(line, full, *result);
+    // `=e(N)'` / `=r(mean)'` inside a double-quoted string: the e()/r() layers
+    // below protect string literals (BUG-507), so a bare reference INSIDE an
+    // inline expression in quotes was never substituted, this guard skipped it
+    // forever, and `display "N=`=e(N)'"` died on "did not converge" (w2j_e3_rlasso
+    // _e3_x `s'=`=e(`s')'). Stata evaluates the expression: a scalar is its value,
+    // a macro its string, and a name that is neither is missing (`.`). A complete
+    // inner text only (no macro reference left); a posted matrix stays for the
+    // matrix layer.
+    std::string innerSub = inner;
+    if (innerSub.find('`') == std::string::npos && innerSub.find('$') == std::string::npos &&
+        (std::regex_search(innerSub, m, reERef()) || std::regex_search(innerSub, m, reRRef()))) {
+      bool matrixLeft = false;
+      for (const std::regex* rx : {&reERef(), &reRRef()}) {
+        const char cls = (rx == &reERef()) ? 'e' : 'r';
+        for (const auto& [ref, nm] : findAll(*rx, innerSub)) {
+          std::string text;
+          if (session.findClassMatrix(cls, nm) != nullptr || nm == "sample") {
+            matrixLeft = true;  // the matrix layer's / e(sample)'s, as before
+            continue;
+          }
+          if (cls == 'e') {
+            // The evaluator's own e() reading (resolveEstScalarRefs' arm):
+            // string -> scalar -> `.` for an absent name.
+            text = valueRefText(resolveERef(nm, session));
+          } else if (const double* v = session.rValues.find(nm)) {
+            text = std::isnan(*v) ? std::string(".") : valueRefText(pythonFloatRepr(*v));
+          } else if (const std::string* sv = session.rStrings.find(nm);
+                     sv != nullptr && sv->find('"') == std::string::npos) {
+            text = "\"" + *sv + "\"";
+          } else {
+            matrixLeft = true;  // an r() the r layer refuses by name: its path
+            continue;
+          }
+          innerSub = replaceFirst(innerSub, ref, text);
+        }
+      }
+      if (matrixLeft) innerSub = inner;
+    }
+    if (innerSub.find('`') == std::string::npos && innerSub.find('$') == std::string::npos)
+      innerSub = substituteBareCRefs(innerSub, session);  // BUG-1330
+    if (!std::regex_search(innerSub, m, reLocalRef()) &&
+        !hasGlobalRef(reGlobalRefBrace(), innerSub) &&
+        !hasGlobalRef(reGlobalRefBare(), innerSub) &&
+        !std::regex_search(innerSub, m, reRRef()) && !std::regex_search(innerSub, m, reERef())) {
+      auto result = evalMacroExpr(innerSub, session);
+      // name-binding-display-literals: `=exp' is the expression evaluator's,
+      // as `local l = exp` is. evalMacroExpr's namespace holds numbers only, so
+      // a string (`="a:b"'`), a variable (`=v'`, `=s'`), scalar() and a
+      // variable before a same-named scalar were left unexpanded, and the line
+      // died on "Macro expansion did not converge" (w2av_name_binding
+      // bd_inl_lit, bd_inl_varsc, bd_inl_scfn, bd_inl_strvar, bd_inl_abbr ...).
+      // evalArith answers them, a number in the local's own 16-digit form.
+      // An expression that fails as Stata's does -- a name that binds to
+      // nothing or to two variables r(111), a function Stata lacks r(133), a type
+      // mismatch r(109) -- prints its message and expands to NOTHING at rc 0,
+      // as StataBE does (bd_inl_unb, bd_inl_ambig, bd_inl_nofn, bd_inl_strunb,
+      // bd_inl_strnum, bd_dy_ilunb: `[]` at rc 0 after `foo not found`). Any
+      // other failure keeps its loud path below.
+      // Only a COMPLETE expression: an inner text that still holds a macro
+      // reference (`=x[`i']' is matched as `x[`i` before `i' expands) waits
+      // for the pass that expands it, as before.
+      if (!result && innerSub.find('`') == std::string::npos && innerSub.find('$') == std::string::npos) {
+        std::string raised;
+        bool isStr = false;
+        if (auto ar = evalArith(innerSub, &session, &raised, &isStr)) {
+          result = isStr ? *ar : capNumericTextToStataLocalDigits(*ar);
+        } else {
+          MacroFnError fe;
+          if (classifyFailedEqExpr(innerSub, raised, &fe, &session)) {
+            // The classifier names an unknown function `unknown function NAME()`.
+            // A NAME that is one of Stata's functions is a capability PIET
+            // lacks, not Stata's r(133): `=invFtail(2,3,.5)'` and `=invlogit(0)'
+            // expanded to nothing at rc 0 where Stata gives the value
+            // (corpus: 073 greshape `=ustrregexrf(...)'). That is
+            // refused by name and stops the line, at the rc its `local l =`
+            // sibling gives.
+            std::string fn;
+            static const std::string kUnknownFn = "unknown function ";
+            if (fe.rc == "133" && fe.message.rfind(kUnknownFn, 0) == 0 &&
+                fe.message.size() > kUnknownFn.size() + 2 &&
+                fe.message.compare(fe.message.size() - 2, 2, "()") == 0) {
+              fn = fe.message.substr(kUnknownFn.size(),
+                                     fe.message.size() - kUnknownFn.size() - 2);
+            }
+            // BUG-1330: a c() nothing answered. `c(name) undefined` is
+            // Stata's own failure, printed and then nothing at rc 0 as for a
+            // function Stata lacks (the arm below); a real c() name this build
+            // does not serve is refused by name.
+            static const std::string kUndefined = ") undefined";
+            const bool cRef = fe.rc == "133" && fe.message.rfind("c(", 0) == 0;
+            const bool cUndefined =
+                cRef && fe.message.size() > kUndefined.size() &&
+                fe.message.compare(fe.message.size() - kUndefined.size(), kUndefined.size(),
+                                   kUndefined) == 0;
+            if (cRef && !cUndefined) {
+              return rcErrorResult(fe.message + " (in `" + inner + "')", "133");
+            } else if (!cRef && fe.rc == "133" && (fn.empty() || isStataFunctionName(fn))) {
+              return rcErrorResult(
+                  (fn.empty() ? std::string("this function") : fn + "()") +
+                      " is a Stata function this version of PIET does not implement (in `" +
+                      inner + "')",
+                  "133");
+            }
+            if (fe.rc == "111" || fe.rc == "133" || fe.rc == "109") {
+              noteInlineFailure(fe.message);
+              result = std::string();
+            }
+          }
+        }
+      }
+      if (result) {
+        line = replaceFirst(line, full, *result);
+      } else if (session.varObs && inner.find('[') != std::string::npos) {
+        // BUG-718: a string (or missing) `VAR[i]` inside a larger expression
+        // (`` `=s[1]+"z"' ``) is beyond this layer's string-free whitelist. Left
+        // in place it never converged (rc 1); it is refused by name instead.
+        std::optional<std::string> whole;
+        bool stringLeft = false;
+        substituteVarSubscripts(substituteObsSpecials(strip(inner), session), session, &whole,
+                                &stringLeft);
+        if (stringLeft) {
+          ExpandResult r;
+          r.isError = true;
+          r.error = nlohmann::ordered_json(unsupportedMacro(full));
+          return r;
+        }
+      }
     }
   }
 
@@ -2285,7 +5010,11 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
       for (const auto& [full, ename] : findAll(reERef(), line)) {
         const double* v = session.eScalars.find(ename);
         if (v != nullptr) {
-          line = replaceFirst(line, full, pythonFloatRepr(*v));  // repr(float(...))
+          // A missing e() scalar is Stata's `.`, never the text "nan" (which the
+          // evaluator then read as a variable name: `display %21x e(slambda)` r(111)).
+          line = replaceFirst(line, full,
+                              std::isnan(*v) ? std::string(".")
+                                             : valueRefText(pythonFloatRepr(*v)));  // FU-842
         }
       }
       line = restoreStringLiterals(line, eSpans);
@@ -2302,7 +5031,11 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
   // rewrites the line.
   dprof::ezoneBegin(dprof::kEExpandRBlock);
   const bool matrixVerbLine = isMatrixVerbLine(line);
+  static const std::regex reMatrixList(R"(^\s*mat(?:r|ri|rix)?\s+l(?:i|is|ist)?\s)");
+  const bool matrixListLine = matrixVerbLine && std::regex_search(line, reMatrixList);
+  const bool estaddLine = isEstaddLine(line);
   for (const std::regex* rx : {&reRRefDelim(), &reRRef()}) {
+    if (rx == &reRRef() && estaddLine) continue;
     const bool reachable = (rx == &reRRefDelim()) ? line.find("`r(") != std::string::npos
                                                   : hasBareRParen(line);
     if (!reachable) continue;
@@ -2336,14 +5069,19 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
       // stranger message on a line the matrix layer cannot help either.
       if (rx == &reRRef() && matrixVerbLine && session.findClassMatrix('r', name) != nullptr)
         continue;
-      // BUG-560: the same exemption for el()'s matrix argument on ANY verb --
-      // `local F1=el(r(singleresults),1,4)` (paper 044) is answered by
-      // substituteMatrixRefs' reClsEl, which only ever sees the reference if
-      // this loop leaves it in place. Keyed on the posted matrix AND the
-      // el(r(NAME), spelling, so a bare `display r(table)` keeps its refusal.
+      // `matrix list r(NAME)` names a MATRIX: r(mean) after summarize is none,
+      // and StataBE answers r(111) `matrix r(mean) not found` (2026-11-03
+      // oracle, BUG-1409), so the handler answers it, never a spliced value.
+      if (rx == &reRRef() && matrixListLine) continue;
+      // BUG-560 / BUG-629: the same exemption on ANY verb when every reference
+      // to the posted matrix on the line is a matrix OPERAND (el(r(NAME),i,j),
+      // r(NAME)[i,j], rowsof/colsof(r(NAME)); see cutRMatrixOperands) --
+      // substituteMatrixRefs answers those, and only ever sees them if this loop
+      // leaves them in place. `local F1=el(r(singleresults),1,4)` (paper 044),
+      // `display rowsof(r(table))` and `local x = r(table)[1,1]` (w2c_postest.log
+      // family (1)). A bare `display r(table)` still refuses, below.
       if (rx == &reRRef() && session.findClassMatrix('r', name) != nullptr &&
-          std::regex_search(line, std::regex(R"(\bel\s*\(\s*r\()" + name + R"(\)\s*,)",
-                                             std::regex::icase)))
+          !usesRRefAsScalar(line, name))
         continue;
       const std::string* s = session.rStrings.find(name);
       if (s != nullptr) {
@@ -2360,29 +5098,104 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
         // worse, could go SILENT: a single-word value such as r(varlist) with one
         // variable resolved as a DATASET VARIABLE and printed that column's first
         // observation instead of the name.
+        // AN-6: a value holding '"' arrives as Stata's compound literal `"..."',
+        // the one spelling that can carry it (`strlen(r(labels))` over coefplot's
+        // `1 `"First regressor"' ...`, w2an_coefplot_family.log:355). The old
+        // `\"` escape is not Stata (BUG-502: no escapes in a literal) and ended
+        // the string at the first inner quote. A value is never macro text, so
+        // its own ` and $ are spliced encoded.
         if (rx == &reRRef()) {
-          std::string lit = "\"";
-          for (char ch : *s) {
-            if (ch == '"') lit += "\\\"";
-            else lit += ch;
-          }
-          lit += "\"";
+          const std::string body = verbatim ? encodeVerbatim(*s) : *s;
+          const std::string lit = s->find('"') == std::string::npos
+                                      ? "\"" + body + "\""
+                                      : "`\"" + body + "\"'";
           line = replaceFirst(line, full, lit);
         } else {
           line = replaceFirst(line, full, *s);
         }
       } else if (const double* v = session.rValues.find(name)) {
-        line = replaceFirst(line, full, pythonFloatRepr(*v));  // repr(float(val))
+        // repr(float(val)); a missing r() (meanonly's r(sd)) goes in as its token.
+        // FU-842: the bare r(NAME) is a value (one operand); `r(NAME)' is macro text.
+        line = replaceFirst(line, full,
+                            barePass ? valueRefText(matrixElementText(*v)) : macroRealText(*v));
+      } else if (auto why = unpostedRRefusal(session, name)) {
+        // RULING.md C.1 rule 1: a result Stata posts for the live r-class command
+        // and PIET did not -- refused in every form and on every path.
+        dprof::ezoneEnd(dprof::kEExpandRBlock);
+        return rcErrorResult(*why, "111");
       } else if (unsetRAsMissing) {
         // Stata: an unset r() in a numeric expression is missing (`.`). Used by
         // the if/while condition path so `!missing(r(estimate))` guards work
         // after a failed capture (the `.` becomes the missing sentinel in
-        // evalBoolExpr's replaceBareDot). No error — this is legal Stata.
+        // evalBoolExpr's replaceStataMissingLiterals). No error — this is legal Stata.
+        line = replaceFirst(line, full, ".");
+      } else if (rx == &reRRef()) {
+        // BUG-629: a posted MATRIX used as a scalar (`display r(table)`). It is
+        // set, so "is not set" was the wrong reason, and rc 1 no code at all.
+        // r(109) "type mismatch": w2f_residuals.log:1625
+        // `PREC|e_rtable_display|0|109|` (and the mirror case, a scalar where a
+        // matrix is needed, w2c_postest.log:377-384).
+        if (session.findClassMatrix('r', name) != nullptr) {
+          dprof::ezoneEnd(dprof::kEExpandRBlock);
+          return rcErrorResult("type mismatch: r(" + name +
+                                   ") is a matrix; read it as r(" + name +
+                                   ")[i,j], rowsof(), colsof(), or copy it with `matrix`",
+                               "109");
+        }
+        // An estimation (or margins, or a replicating prefix) after which Stata
+        // posts r(table) but this build does not -- interaction (#) columns, say --
+        // leaves the reason in EvalSession::rTableRefusal (handlers_aer_estim.cpp),
+        // so a read is a NAMED refusal instead of the r(198)/r(109) of a table
+        // Stata would not have either.
+        if (name == "table" && !session.rTableRefusal.empty()) {
+          dprof::ezoneEnd(dprof::kEExpandRBlock);
+          return rcErrorResult(session.rTableRefusal, "111");
+        }
+        // On a MATRIX verb an absent name is the matrix layer's to answer, as a
+        // posted one is (the exemption at the top of this loop): `matrix T =
+        // r(nosuch)` is rc 0 in Stata (w2f_residuals.log:1675) with content no arm
+        // pins yet, and that grammar lives in handlers_m3.cpp runMatrixDef.
+        // A `matrix NAME = ...` definition reads an absent r(NAME) as the missing
+        // value, a 1x1 `.` matrix (w2f_residuals.log:1675 `matrix T = r(nosuch)`
+        // rc 0; w2n_followups.log:938 E05, :1027 E10, :1043 E11 `capture matrix
+        // __w2nT = r(table)` rc 0 after r-class commands that post no table).
+        if (matrixVerbLine) {
+          static const std::regex reMatDefine(R"(^\s*mat(?:r|ri|rix)?\s+[A-Za-z_\x80-\xff][\w\x80-\xff]*\s*=)");
+          if (std::regex_search(line, reMatDefine)) line = replaceFirst(line, full, ".");
+          continue;
+        }
+        // RULING.md C.1 rule 2, after the matrix-verb hand-off (R5) and before
+        // the 198/109 below, which assert a Stata error this build cannot know
+        // Stata raises after an undeclared command.
+        if (auto why = unknownSetRRefusal(session, name)) {
+          dprof::ezoneEnd(dprof::kEExpandRBlock);
+          return rcErrorResult(*why, "111");
+        }
+        const std::string rc = absentRMatrixRc(line, name);
+        if (!rc.empty()) {
+          dprof::ezoneEnd(dprof::kEExpandRBlock);
+          return rcErrorResult(rc == "198" ? "invalid syntax: r(" + name + ") is not set"
+                                           : "type mismatch: r(" + name + ") is not set",
+                               rc);
+        }
+        // An r() name outside the posted set of the live r-class command (or
+        // after a class-X command: an rclass program's return set, an emptied
+        // r()) is the missing value in an expression, at rc 0 (w2n_followups.log:968
+        // E07 prints `.` for r(N)/r(mean) after `regress`; RULING.md C.1 rule 3).
+        // It was a refusal at rc 1 here, and `local v = r(N)` then stored the TEXT
+        // `r(N)` (FU-91). The display twin, `generate` and the `count if` CiParser
+        // see the line after this pass, so they inherit the `.`.
         line = replaceFirst(line, full, ".");
       } else {
-        dprof::ezoneEnd(dprof::kEExpandRBlock);
-        return errorBlock("r(" + name + ") is not set — run an r-class command "
-                           "(e.g. `summarize varname`) first.");
+        // The delimited form `r(NAME)' is MACRO expansion: outside the live
+        // command's posted set an unset name expands to the empty string at rc 0,
+        // as an undefined local and an unset `e(NAME)' do (the e() block below;
+        // BUG-294). After an undeclared command it refuses (C.1 rule 2).
+        if (auto why = unknownSetRRefusal(session, name)) {
+          dprof::ezoneEnd(dprof::kEExpandRBlock);
+          return rcErrorResult(*why, "111");
+        }
+        line = replaceFirst(line, full, std::string());
       }
     }
   }
@@ -2399,14 +5212,41 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
       if (const std::string* es = session.eStrings.find(name)) {
         line = replaceFirst(line, full, *es);
       } else if (const double* ev = session.eScalars.find(name)) {
-        line = replaceFirst(line, full, pythonFloatRepr(*ev));
+        line = replaceFirst(line, full, macroRealText(*ev));  // BUG-1006
       } else {
         // Stata macro semantics: an unset e() macro reference expands to the
         // empty string at rc 0 — the same rule BUG-294 measured for an
         // undefined local, and the reason `if "`e(nosuch)'" == ""` works.
         const std::string sub = resolveEScalar(name, session);
-        line = replaceFirst(line, full, sub == "." ? std::string() : sub);
+        line = replaceFirst(line, full,
+                            sub == "." ? std::string() : capNumericTextToStataLocalDigits(sub));
       }
+    }
+  }
+
+  // --- c() references (BUG-1006): delimited form `c(name)' only. The bare
+  // c(name) is an expression reference and belongs to substituteCRefs at the
+  // expression call sites. Every hk_*_g record of w2aq_histogram_family.log
+  // prints `c(k)' inside a display string. A name Stata has no c() value for
+  // expands to "", as in Stata (isStataCClassName). A real c() name outside
+  // resolveCValue's spine is refused here, by name and with its code, as the
+  // bare form is: left in the line it was stored as raw text by `local x
+  // "`c(name)'"` (FU-1413), and a nested `c(`k')' never converged.
+  // A numeric value is spliced as macro text, the stored-local rule `r(N)'
+  // takes: `c(maxdouble)' is 8.9884656743e+307 and `c(pi)' 3.141592653589793
+  // (StataBE 19.5). The hook's own text keeps every bit, for the inline
+  // `=c(epsdouble)*2^52' (substituteBareCRefs), which is 1.
+  if (session.cValue && line.find("`c(") != std::string::npos) {
+    for (const auto& [full, name] : findAll(reCRefDelim(), line)) {
+      std::optional<std::string> cv = session.cValue(name);
+      if (!cv && !isStataCClassName(name)) cv = std::string();
+      if (!cv) return rcErrorResult(cClassRefusalMessage(name), cClassRefusalRc(name));  // coded: `local` stops too
+      if (!isStataCClassStringName(name) && !cv->empty()) {
+        char* end = nullptr;
+        const double d = std::strtod(cv->c_str(), &end);
+        if (end == cv->c_str() + cv->size() && std::isfinite(d)) cv = stataMacroRealText(d);
+      }
+      line = replaceFirst(line, full, *cv);
     }
   }
 
@@ -2415,21 +5255,16 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
   // same store r()-strings use) under kSClassKeyPrefix so they can never
   // collide with a real r()-name (those are captured by an identifier-only
   // regex — reRRefDelim/reRRef above — so no r()-set key can ever equal our
-  // prefixed form). Mirrors r()'s own unset-reference handling exactly,
-  // including the unsetRAsMissing if/while-condition carve-out.
+  // prefixed form). An unset s() name is a macro that expands to nothing, on
+  // every path: the s() store holds exactly what sclass programs posted, and
+  // regress, logit, lincom, ... empty it (BUG-1512; StataBE 19.5, rlife/s3.do:
+  // `[`s(nosuch)']` is `[]` and `if "`s(foo)'" == ""` is true after `regress`).
   for (const auto& [full, name] : (line.find('`') != std::string::npos &&
                                    line.find("s(") != std::string::npos)
                                      ? findAll(reSRefDelim(), line)
                                      : std::vector<std::pair<std::string, std::string>>{}) {
     const std::string* s = session.rStrings.find(std::string(kSClassKeyPrefix) + name);
-    if (s != nullptr) {
-      line = replaceFirst(line, full, *s);
-    } else if (unsetRAsMissing) {
-      line = replaceFirst(line, full, ".");
-    } else {
-      return errorBlock("s(" + name + ") is not set — run an sclass program's "
-                         "`sreturn local` first.");
-    }
+    line = replaceFirst(line, full, s != nullptr ? *s : std::string());
   }
 
   // --- local macro references: `name' ---
@@ -2443,7 +5278,8 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
   // loop body.
   //
   // The name grammar is reLocalRef()'s, transcribed rather than approximated:
-  // an identifier ([A-Za-z_][A-Za-z0-9_]*) or a positional digit run ([0-9]+),
+  // an identifier ([A-Za-z_][A-Za-z0-9_]*, plus the bytes >= 0x80 of a
+  // Unicode name -- isIdentStart/isIdentChar) or a positional digit run ([0-9]+),
   // closed by an apostrophe. Anything else after a backtick is not a reference,
   // and — exactly like the regex iterator — scanning resumes one character
   // past that backtick, so a nested `` `x' `` inside a non-reference is still
@@ -2468,14 +5304,34 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
         break;
       }
       size_t j = tick + 1;
-      const size_t nameStart = j;
-      if (j < line.size() &&
-          (std::isalpha(static_cast<unsigned char>(line[j])) || line[j] == '_')) {
-        ++j;
-        while (j < line.size() &&
-               (std::isalnum(static_cast<unsigned char>(line[j])) || line[j] == '_')) {
-          ++j;
+      // EM3a: `macval(NAME)' inserts NAME's value WITHOUT expanding the
+      // references inside it (w2af_macro_text_file.log:983 mt_mv_tick `<p`mtl'q>`,
+      // :995 mt_mv_dollar `<p$mtg q>`, mt_mv_undef `<>` for an undefined local).
+      // A plain `NAME' re-expands them on the next pass (mt_mv_tick_plain
+      // `<pLVALq>`). The NAME grammar is the reference's own; anything else after
+      // `macval(` is not this form and is copied through like any non-reference.
+      if (line.compare(j, 7, "macval(") == 0) {
+        size_t k = j + 7;
+        const size_t mvStart = k;
+        if (k < line.size() && isIdentStart(line[k])) {  // Unicode names: shared rule
+          ++k;
+          while (k < line.size() && isIdentChar(line[k])) ++k;
+        } else {
+          while (k < line.size() && std::isdigit(static_cast<unsigned char>(line[k]))) ++k;
         }
+        if (k > mvStart && k + 1 < line.size() && line[k] == ')' && line[k + 1] == '\'') {
+          const std::string* mv = session.locals.find(line.substr(mvStart, k - mvStart));
+          out.append(line, i, tick - i);
+          if (mv != nullptr) out += verbatim ? encodeVerbatim(*mv) : *mv;
+          i = k + 2;
+          spliced = true;
+          continue;
+        }
+      }
+      const size_t nameStart = j;
+      if (j < line.size() && isIdentStart(line[j])) {  // Unicode names: shared rule
+        ++j;
+        while (j < line.size() && isIdentChar(line[j])) ++j;
       } else if (j < line.size() && std::isdigit(static_cast<unsigned char>(line[j]))) {
         ++j;
         while (j < line.size() && std::isdigit(static_cast<unsigned char>(line[j]))) ++j;
@@ -2510,7 +5366,7 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
 
   // --- global macro references: ${name} then $name ---
   for (const auto& [full, name] : line.find('$') != std::string::npos
-                                      ? findAll(reGlobalRefBrace(), line)
+                                      ? findAllGlobalRefs(reGlobalRefBrace(), line)
                                       : std::vector<std::pair<std::string, std::string>>{}) {
     const std::string* v = session.globals.find(name);
     static const std::string kEmpty;  // BUG-294 — see the local arm above.
@@ -2518,7 +5374,7 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
     line = replaceFirst(line, full, *v);
   }
   for (const auto& [full, name] : line.find('$') != std::string::npos
-                                      ? findAll(reGlobalRefBare(), line)
+                                      ? findAllGlobalRefs(reGlobalRefBare(), line)
                                       : std::vector<std::pair<std::string, std::string>>{}) {
     const std::string* v = session.globals.find(name);
     static const std::string kEmpty;  // BUG-294 — see the local arm above.
@@ -2534,23 +5390,47 @@ ExpandResult expandPass(const std::string& lineIn, EvalSession& session,
 // ---------------------------------------------------------------------------
 // expand_macros
 
+// LBL-DOLLAR: Stata's `\$` escape -- a literal dollar that is never a global
+// reference. It travels as the verbatim-dollar sentinel and decodes to `$`.
+static std::string encodeDollarEscapes(const std::string& s) {
+  if (s.find("\\$") == std::string::npos) return s;
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '$') {
+      out += kVerbatimDollar;
+      ++i;
+    } else {
+      out += s[i];
+    }
+  }
+  return out;
+}
+
 ExpandResult expandMacros(const std::string& rawLine, EvalSession& session,
-                          bool unsetRAsMissing) {
-  std::string line = rawLine;
+                          bool unsetRAsMissing, bool keepVerbatim) {
+  std::string line = encodeDollarEscapes(rawLine);
 
   for (int pass = 0; pass < kMaxExpansionPasses; ++pass) {
     if (!hasMacroRefs(line)) break;  // fully resolved
-    ExpandResult result = expandPass(line, session, unsetRAsMissing);
+    ExpandResult result = expandPass(line, session, unsetRAsMissing, /*verbatim=*/true);
     if (result.isError) return result;  // propagate error immediately
     if (result.line == line) break;     // no progress — stuck
     line = result.line;
   }
 
-  // Compound double-quotes `"..."' are STRING delimiters — strip to plain
-  // "..." so the tokenizer doesn't mistake the ` for an unexpanded macro.
-  if (line.find("`\"") != std::string::npos) {
-    static const std::regex reCompound(R"re(`"(.*?)"')re");
-    line = std::regex_replace(line, reCompound, "\"$1\"");
+  // Compound double-quotes `"..."' are STRING delimiters. EM3b: a span whose body
+  // holds no '"' becomes a plain "..." (what the tokenizer and every literal
+  // scanner read); one that holds a quote, or nests, stays compound -- the old
+  // non-greedy regex ended such a span at its first inner "' and handed the
+  // evaluator `strlen("a "b" c")` (w2af mt_fn_strlen, w2k do:697). The scan
+  // counts a macval()-encoded tick as a tick, so a value's own `"..."' nests.
+  // BUG-1527: a fold only shortens the line; the unfolded one is kept for r.typed.
+  std::string typedLine;
+  {
+    std::string folded = normalizeCompoundQuotes(line);
+    if (folded.size() != line.size()) typedLine.swap(line);
+    line = std::move(folded);
   }
 
   std::string lineNoEBuf;  // storage for the stripped copy, when one is needed
@@ -2566,7 +5446,15 @@ ExpandResult expandMacros(const std::string& rawLine, EvalSession& session,
   // BUG-507: a class reference inside a string literal is TEXT, and the splices
   // above now leave it -- so the guard reads a copy with the parentheses inside
   // literals blanked. Macro references there stay visible on purpose.
-  const std::string lineMasked = maskParensInQuotes(line);
+  // BUG-1006: a `c(name)' the c() pass could not resolve is left for the
+  // unsupported-macro refusal downstream, which names it; it is not a runaway.
+  // Cut before the mask: blanking its parentheses would leave `c_name_', which
+  // reads as a local reference.
+  std::string lineNoCBuf;
+  if (line.find("`c(") != std::string::npos) {
+    lineNoCBuf = std::regex_replace(line, reCRefDelim(), "");
+  }
+  const std::string lineMasked = maskParensInQuotes(lineNoCBuf.empty() ? line : lineNoCBuf);
   const std::string& lineNoE = hasBareEParen(lineMasked)  // EXPRLAYER-3
                                    ? (lineNoEBuf = std::regex_replace(lineMasked, reERef(), ""))
                                    : lineMasked;
@@ -2575,31 +5463,26 @@ ExpandResult expandMacros(const std::string& rawLine, EvalSession& session,
   // matrix layer (see its comment), so without this the guard would read an
   // intentionally-unexpanded reference as a runaway macro and report a
   // circular definition for a line that is simply not the macro layer's to
-  // finish. Modelled on the e() strip immediately above, and as narrow: only
-  // names that ARE posted r-matrices are removed.
+  // finish. On a matrix verb the pass leaves every bare r(NAME) it does not
+  // splice -- a posted matrix, and an absent name, which the handler answers
+  // (BUG-1409: `matrix list r(nosuch)` is r(111) `matrix r(nosuch) not found`
+  // in StataBE, whether or not any r() matrix is posted) -- so all of them go.
   std::string lineNoRBuf;
   const std::string* checkLine = &lineNoE;
-  if (hasBareRParen(*checkLine) && !session.rMatrices.empty() && isMatrixVerbLine(line)) {
-    lineNoRBuf = *checkLine;
-    for (const auto& [nm, mtx] : session.rMatrices) {
-      (void)mtx;
-      const std::string needle = "r(" + nm + ")";
-      size_t pos = 0;
-      while ((pos = lineNoRBuf.find(needle, pos)) != std::string::npos) {
-        lineNoRBuf.erase(pos, needle.size());
-      }
-    }
+  if (hasBareRParen(*checkLine) && (isEstaddLine(line) || isMatrixVerbLine(line))) {
+    // W2AK: the bare r() pass leaves an estadd line's r() references for the
+    // handler (isEstaddLine); they are not a runaway.
+    lineNoRBuf = std::regex_replace(*checkLine, reRRef(), "");
     checkLine = &lineNoRBuf;
-  } else if (hasBareRParen(*checkLine) && !session.rMatrices.empty() &&
-             checkLine->find("el(") != std::string::npos) {
-    // BUG-560: the bare-r() pass also leaves el()'s matrix argument
-    // (`el(r(table),1,4)`) for substituteMatrixRefs. Strip only that
-    // spelling, so any other r() left on the line still reads as unexpanded.
+  } else if (hasBareRParen(*checkLine) && !session.rMatrices.empty()) {
+    // BUG-560 / BUG-629: the bare-r() pass also leaves a posted matrix's OPERAND
+    // spellings (el(r(NAME),i,j), r(NAME)[i,j], rowsof/colsof(r(NAME))) for
+    // substituteMatrixRefs. Strip only those, the same cut the pass decided by,
+    // so any other r() left on the line still reads as unexpanded.
     lineNoRBuf = *checkLine;
     for (const auto& [nm, mtx] : session.rMatrices) {
       (void)mtx;
-      lineNoRBuf = std::regex_replace(
-          lineNoRBuf, std::regex(R"(\bel\s*\(\s*r\()" + nm + R"(\))", std::regex::icase), "el(");
+      lineNoRBuf = cutRMatrixOperands(lineNoRBuf, nm);
     }
     checkLine = &lineNoRBuf;
   }
@@ -2612,12 +5495,32 @@ ExpandResult expandMacros(const std::string& rawLine, EvalSession& session,
         {"message",
          "Macro expansion did not converge after " + std::to_string(kMaxExpansionPasses) +
              " passes. This usually indicates a self-referential or circular macro "
-             "definition. Line after expansion: " + pyRepr(line)}};
+             "definition. Line after expansion: " + pyRepr(decodeVerbatim(line))}};
     return r;
   }
 
   ExpandResult r;
-  r.line = line;
+  r.line = keepVerbatim ? line : decodeVerbatim(line);
+  if (!typedLine.empty()) r.typed = keepVerbatim ? typedLine : decodeVerbatim(typedLine);
+  return r;
+}
+
+ExpandResult expandDefinitionText(const std::string& text, EvalSession& session) {
+  std::string line = encodeDollarEscapes(text);
+  for (int pass = 0; pass < kMaxExpansionPasses; ++pass) {
+    if (!hasMacroRefs(line)) break;
+    ExpandResult result = expandPass(line, session, false, /*verbatim=*/true);
+    if (result.isError) {
+      if (result.error.is_object() && result.error.contains("message") &&
+          result.error["message"].is_string())
+        result.error["message"] = decodeVerbatim(result.error["message"].get<std::string>());
+      return result;
+    }
+    if (result.line == line) break;
+    line = result.line;
+  }
+  ExpandResult r;
+  r.line = decodeVerbatim(std::move(line));
   return r;
 }
 
@@ -2655,6 +5558,92 @@ bool varKnownMissing(const EvalSession& session, const std::string& name) {
   return session.varLabels.find(std::string(kVarExistsPrefix) + name) == nullptr;
 }
 
+// BUG-718: every `VAR[i]` in a macro-context expression that names a dataset
+// variable (EvalSession::varObs) and not a matrix (a one-index subscript of a
+// matrix stays for substituteMatrixRefs, as before) is read at observation i:
+//   - a numeric value becomes `(value)` and the expression evaluates on;
+//   - a STRING value, or a missing one, is answered only when the subscript is
+//     the WHOLE expression (`` `=s[1]' `` -- the form the w2c_functions records
+//     print): *whole gets the text verbatim and the caller returns it. This
+//     layer's whitelist admits no string literal, so inside a larger expression
+//     the reference is left in place, exactly as before this fix.
+// The index is an integer literal (after `_N`/`_n`) or an expression this layer
+// evaluates to an integer; anything else is left in place. Outside 1.._N the
+// value is missing (Stata [U] 13.7: `x[0]`, `x[100]` copy a missing value) --
+// `.` for a numeric column, "" for a string one (the reader reports the kind).
+// Quoted text is data: string literals are protected around the scan.
+// `stringLeft` (optional) is set when a string or missing reading was left in
+// place inside a larger expression -- the caller's cue to refuse by name.
+// BUG-710: `outerSpans` set = evalArith's mode. Its input has had its literals
+// protected already (they ARE `outerSpans`), and EVERY reading is substituted,
+// in any position, through varReadText: a string becomes a literal on
+// `outerSpans`, a missing value its token, so `s[1] + 1` reaches the evaluator
+// as `"ab1" + 1` and is its r(109) (w2i_varsub d_05), and `xd[_N]` is `.a`
+// (a_03). `whole` is not used in that mode.
+std::string substituteVarSubscripts(const std::string& in, EvalSession& session,
+                                    std::optional<std::string>* whole, bool* stringLeft,
+                                    std::vector<std::string>* outerSpans) {
+  if (!session.varObs || in.find('[') == std::string::npos) return in;
+  static const std::regex reSub(R"((^|[^\w.$`\x80-\xff])([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\[([^\[\],]+)\])");
+  static const std::regex reInt(R"(^\s*(-?\d+)\s*$)");
+  std::vector<std::string> spans;
+  const std::string s = outerSpans != nullptr ? in : protectStringLiterals(in, &spans);
+  std::string out;
+  size_t last = 0;
+  bool changed = false;
+  for (auto it = std::sregex_iterator(s.begin(), s.end(), reSub); it != std::sregex_iterator();
+       ++it) {
+    const std::smatch& m = *it;
+    const std::string name = m.str(2);
+    const size_t refPos = static_cast<size_t>(m.position(2));
+    const size_t refEnd = static_cast<size_t>(m.position(0) + m.length(0));
+    if (session.findMatrix(name) != nullptr) continue;
+    std::string idxText = m.str(3);
+    std::smatch im;
+    if (!std::regex_match(idxText, im, reInt)) {
+      std::optional<std::string> v = evalMacroExpr(idxText, session);
+      if (!v || !std::regex_match(*v, im, reInt)) continue;
+      idxText = *v;
+      std::regex_match(idxText, im, reInt);
+    }
+    long long idx = 0;
+    try {
+      idx = std::stoll(im.str(1));
+    } catch (...) {
+      continue;
+    }
+    std::optional<EvalSession::VarObsReading> r = session.varObs(name, idx);
+    if (!r) continue;
+    if (outerSpans != nullptr) {
+      std::optional<std::string> lit = varReadText(*r, *outerSpans);
+      if (!lit) continue;
+      out += s.substr(last, refPos - last);
+      out += *lit;
+      last = refEnd;
+      changed = true;
+      continue;
+    }
+    std::string text = r->text;
+    bool isString = r->isString;
+    if (!r->inRange) text = isString ? std::string() : std::string(".");
+    if (isString || text.empty() || text[0] == '.') {
+      if (refPos == 0 && strip(s.substr(refEnd)).empty() && spans.empty()) {
+        *whole = text;
+        return in;
+      }
+      if (stringLeft != nullptr) *stringLeft = true;
+      continue;
+    }
+    out += s.substr(last, refPos - last);
+    out += "(" + text + ")";
+    last = refEnd;
+    changed = true;
+  }
+  if (!changed) return in;
+  out += s.substr(last);
+  return outerSpans != nullptr ? out : restoreStringLiterals(out, spans);
+}
+
 std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSession& session,
                                               MacroFnError* err) {
   std::string rhs = strip(rhsIn);
@@ -2671,19 +5660,187 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
     }
   };
 
+  // r(198): a form whose arguments do not parse, a bad macro name
+  // (macroNameError), or a variable reader with no variable (StataBE 19.5:
+  // `: type`, `: format`, `: var l` "nothing found where name expected").
+  auto rejectSyntax = [&](const std::string& message = "invalid syntax") {
+    if (err != nullptr) {
+      err->rc = "198";
+      err->message = message;
+    }
+    return std::nullopt;
+  };
+
+  // The function's name, written out in full (extMacroFnName): `: lab ul 1` is
+  // answered as `: label ul 1`. The second word of `value label`, `variable
+  // label` and `data label` abbreviates to `l`; after value/variable anything
+  // else is "<word> not allowed" r(101) (StataBE 19.5 `: variable LABEL u`,
+  // `: var lbl u`), after data it is r(198).
+  size_t tokEnd = 1;
+  while (tokEnd < rhs.size() && isPySpace(rhs[tokEnd])) ++tokEnd;
+  const size_t tokStart = tokEnd;
+  while (tokEnd < rhs.size() && isIdentChar(rhs[tokEnd])) ++tokEnd;
+  const std::string tok = rhs.substr(tokStart, tokEnd - tokStart);
+  const std::string fn = extMacroFnName(tok);
+  if (!fn.empty()) {
+    std::string rest = rhs.substr(tokEnd);
+    if (fn == "value" || fn == "variable" || fn == "data") {
+      size_t w = 0;
+      while (w < rest.size() && isPySpace(rest[w])) ++w;
+      size_t we = w;
+      while (we < rest.size() && isIdentChar(rest[we])) ++we;
+      const std::string word = rest.substr(w, we - w);
+      if (word.empty() || std::string("label").compare(0, word.size(), word) != 0) {
+        if (fn == "data") return rejectSyntax();
+        if (err != nullptr) {
+          err->rc = "101";
+          err->message = word + " not allowed";
+        }
+        return std::nullopt;
+      }
+      rest = " label" + rest.substr(we);
+    }
+    rhs = ": " + fn + rest;
+  }
+  // A form Stata knows that this layer does not answer: a refusal naming it, the
+  // r(101) an unknown function gets.
+  auto refuseUnanswered = [&]() {
+    if (err != nullptr) {
+      std::string head = strip(rhs.substr(1));
+      head = head.substr(0, head.find_first_of(" \t"));
+      err->rc = "101";
+      err->message = (head.empty() ? std::string("extended macro function") : head) + " not allowed";
+    }
+    return std::nullopt;
+  };
+
   std::smatch m;
 
+  // These are names of the actual live postings, in publication order. No
+  // sorting, deleted entries, or zero/missing placeholders are manufactured.
+  // Fixed oracle: w2v_estpost_ematrix.log ep13_ematrices / ep13_escalars.
+  // `e(` with anything else is r(198) (StataBE 19.5 `: e(SCALARS)`, `: e(foo)`,
+  // `: e()`, `: e`), except Stata's own `: e(functions)`, not answered here.
+  static const std::regex reENames(R"(^:\s*e\(\s*(scalars|macros|matrices)\s*\)\s*$)");
+  if (tok == "e" && !std::regex_match(rhs, m, reENames)) {
+    static const std::regex reEFunctions(R"(^:\s*e\(\s*functions\s*\)\s*$)");
+    return std::regex_match(rhs, reEFunctions) ? refuseUnanswered() : rejectSyntax();
+  }
+  if (std::regex_match(rhs, m, reENames)) {
+    std::string kind = m.str(1), out;
+    // A fit that published Stata's ordered list for this kind (and whose e() is
+    // still exactly that posting) answers in Stata's order, which is not the
+    // stores' insertion order (SessionState::eNameOrderFor).
+    if (session.eNameOrder) {
+      if (const auto names = session.eNameOrder(kind)) {
+        for (const auto& n : *names) {
+          if (!out.empty()) out += ' ';
+          out += n;
+        }
+        return out;
+      }
+    }
+    const bool complete = session.eNameListsComplete
+                              ? session.eNameListsComplete(kind)
+                              : !session.lastModelResult.has_value();
+    if (!complete) {
+      if (err != nullptr) {
+        err->rc = "111";
+        err->message = ": e(" + m.str(1) + ") is not available for this fit: its complete "
+                       "ordered result namespace has not been published";
+      }
+      return std::nullopt;
+    }
+    auto append = [&](const std::string& name) {
+      if (name.empty() || isReservedStoreKey(name)) return;
+      if (!out.empty()) out += ' ';
+      out += name;
+    };
+    if (kind == "scalars") {
+      for (const auto& item : session.eScalars.items()) append(item.first);
+    } else if (kind == "macros") {
+      for (const auto& item : session.eStrings.items()) append(item.first);
+    } else {
+      for (const auto& item : session.eMatrices) append(item.first);
+    }
+    return out;
+  }
+
+  // name-binding-display-literals: Stata's words -- blanks separate them and a
+  // double-quoted string, simple or compound, is ONE word without its quotes.
+  // The split on blanks alone kept the quotes, so `local w : word 2 of `"
+  // "a-b" "c-d" "'` stored `"c-d"`, which display then had to echo as a bare
+  // name (w2af_macro_text_file.log:780 `<Clickbait-Incentives>`, :840 `<10>|<0.2>`
+  // for a list of quoted labels, :939 `<2>|<one two>` for `"one two" three`).
+  // Each element is kept both as written (`raw`, quotes on: what `: list uniq`
+  // and its siblings hand back) and as compared (`text`, quotes off).
+  struct ListElem {
+    std::string raw, text;
+  };
+  const auto stataElems = [](const std::string& lst) {
+    std::vector<ListElem> words;
+    size_t i = 0;
+    while (i < lst.size()) {
+      if (std::isspace(static_cast<unsigned char>(lst[i]))) {
+        ++i;
+      } else if (lst[i] == '"') {
+        const size_t j = lst.find('"', i + 1);
+        if (j == std::string::npos) {  // unclosed: the rest is the string (StataBE
+          // 19.5: `a "b c` has sizeof 2, word 2 `b c`, retok `a "b c"`)
+          words.push_back({lst.substr(i) + "\"", lst.substr(i + 1)});
+          break;
+        }
+        words.push_back({lst.substr(i, j + 1 - i), lst.substr(i + 1, j - i - 1)});
+        i = j + 1;
+      } else if (lst[i] == '`' && i + 1 < lst.size() && lst[i + 1] == '"') {
+        int depth = 0;
+        size_t j = i;
+        while (j < lst.size()) {
+          if (j + 1 < lst.size() && lst[j] == '`' && lst[j + 1] == '"') {
+            ++depth;
+            j += 2;
+          } else if (j + 1 < lst.size() && lst[j] == '"' && lst[j + 1] == '\'') {
+            j += 2;
+            if (--depth == 0) break;
+          } else {
+            ++j;
+          }
+        }
+        const size_t innerEnd = depth == 0 ? j - 2 : lst.size();
+        words.push_back({lst.substr(i, j - i),
+                         lst.substr(i + 2, innerEnd > i + 2 ? innerEnd - (i + 2) : 0)});
+        i = j;
+      } else {
+        size_t j = i;
+        while (j < lst.size() && !std::isspace(static_cast<unsigned char>(lst[j]))) ++j;
+        words.push_back({lst.substr(i, j - i), lst.substr(i, j - i)});
+        i = j;
+      }
+    }
+    return words;
+  };
+  const auto stataWords = [&stataElems](const std::string& lst) {
+    std::vector<std::string> words;
+    for (auto& e : stataElems(lst)) words.push_back(std::move(e.text));
+    return words;
+  };
+
   // word count of <list>
-  static const std::regex reWordCount(R"(^:?\s*word\s+count\s+(?:of\s+)?(.*)$)",
-                                       std::regex::icase);
+  // serset-twoway: the list may be EMPTY after expansion (`: word count `vl''` with
+  // vl empty), which leaves no blank after `count`; that is 0, not `word not
+  // allowed` (the same for `word # of` below: w2al tf_ss's `local sv : word `j' of
+  // `svl'' with no sort-variable list, w2al_twoway_family.do:125). `of` here is
+  // a word of the list (StataBE 19.5 `: word count of a b` is 3).
+  static const std::regex reWordCount(R"(^:\s*word\s+count(?:\s+([\s\S]*))?$)");
   if (std::regex_match(rhs, m, reWordCount)) {
     std::string lst = strip(m.str(1));
-    auto words = lst.empty() ? std::vector<std::string>{} : pySplit(lst);
+    auto words = lst.empty() ? std::vector<std::string>{} : stataWords(lst);
     return std::to_string(words.size());
   }
 
-  // word N of <list>
-  static const std::regex reWordN(R"(^:?\s*word\s+(\d+)\s+of\s+(.*)$)", std::regex::icase);
+  // word N of <list>; N is a positive integer (StataBE 19.5: `: word 0 of a b`,
+  // `-1`, `1.5` r(198); `01` is 1).
+  static const std::regex reWordN(R"(^:\s*word\s+(\d+)\s+of(?:\s+([\s\S]*))?$)");
   if (std::regex_match(rhs, m, reWordN)) {
     long long n = 0;
     try {
@@ -2691,36 +5848,142 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
     } catch (const std::exception&) {
       return std::string();  // absurd index -> out of range -> ""
     }
+    if (n == 0) return rejectSyntax();
     std::string lst = strip(m.str(2));
-    auto words = lst.empty() ? std::vector<std::string>{} : pySplit(lst);
+    auto words = lst.empty() ? std::vector<std::string>{} : stataWords(lst);
     if (1 <= n && n <= static_cast<long long>(words.size())) {
       return words[static_cast<size_t>(n - 1)];
     }
     return std::string();  // out of range -> empty (Stata-faithful)
   }
 
-  // length local <name>  |  length "<str>"
-  static const std::regex reLength(R"re(^:?\s*length\s+(?:local\s+([A-Za-z_][A-Za-z0-9_]*)|"([^"]*)")$)re",
-                                    std::regex::icase);
+  // `local` and `global`, as `: length` and `: subinstr` take them: StataBE 19.5
+  // answers `l`, `lo`, `loc`, `g`, `gl`, `glob` and refuses `L`, `LOCAL` r(198).
+  static const std::string kLocalOrGlobal = R"((l(?:o(?:c(?:al?)?)?)?|g(?:l(?:o(?:b(?:al?)?)?)?)?))";
+
+  // length local|global <name>. No string form: `: length "abc"` is r(198) in
+  // StataBE 19.5.
+  static const std::regex reLength(R"(^:\s*length\s+)" + kLocalOrGlobal +
+                                   R"(\s+([\w\x80-\xff]+)\s*$)");
   if (std::regex_match(rhs, m, reLength)) {
-    if (m[1].matched) {
-      return std::to_string(utf8Len(session.locals.get(m.str(1), "")));
-    }
-    return std::to_string(utf8Len(m.str(2)));
+    const bool global = m.str(1)[0] == 'g';
+    const std::string bad = macroNameError(global, m.str(2));
+    if (!bad.empty()) return rejectSyntax(bad);
+    return std::to_string(
+        utf8Len(global ? session.globals.get(m.str(2), "") : session.locals.get(m.str(2), "")));
   }
 
-  // subinstr local <name> "<old>" "<new>"[, all]
-  static const std::regex reSubinstrLocal(
-      R"re(^:?\s*subinstr\s+local\s+([A-Za-z_][A-Za-z0-9_]*)\s+"([^"]*)"\s+"([^"]*)"(?:\s*,\s*all)?$)re",
-      std::regex::icase);
-  if (std::regex_match(rhs, m, reSubinstrLocal)) {
-    std::string val = session.locals.get(m.str(1), "");
-    std::string oldS = m.str(2);
-    std::string newS = m.str(3);
-    // ,all searched on the WHOLE rhs (Python quirk — bug-for-bug).
-    static const std::regex reAll(R"(,\s*all)", std::regex::icase);
-    std::smatch am;
-    bool allFlag = std::regex_search(rhs, am, reAll);
+  // subinstr local|global <name> <from> <to> [, all word count(local|global <n>)]
+  // EM10: <from>/<to> are "..." or compound `"..."' (nesting, inner quotes kept),
+  // and the options come in any order (w2af_macro_text_file.log :1393
+  // mt_xmf_subinstr_q `say QhiQ now` for `"""' -> "Q"; :1407 count(local nch)).
+  // Measured on StataBE 19.5: `word` abbreviates to `w` and `count` to `c`, `all`
+  // not at all, and the names are case-sensitive (`, a`, `, ALL`, `, Word`:
+  // "option a not allowed" r(198)); an option given twice is "option all not
+  // allowed" / "option c() not allowed"; count() holds `local|global NAME` or is
+  // r(198), or "option count() incorrectly specified" with more after the name;
+  // text after <to> that is not an option is "varlist not allowed" r(101).
+  static const std::regex reSubinstrHead(R"(^:\s*subinstr\s+)" + kLocalOrGlobal +
+                                         R"(\s+([\w\x80-\xff]+)\s+)");
+  if (fn == "subinstr") {
+    if (!std::regex_search(rhs, m, reSubinstrHead)) return rejectSyntax();
+    const bool fromGlobal = m.str(1)[0] == 'g';
+    const std::string srcName = m.str(2);
+    if (const std::string bad = macroNameError(fromGlobal, srcName); !bad.empty())
+      return rejectSyntax(bad);
+    size_t pos = static_cast<size_t>(m.length(0));
+    auto readArg = [&](std::string* out) -> bool {
+      while (pos < rhs.size() && isPySpace(rhs[pos])) ++pos;
+      if (startsCompound(rhs, pos)) {
+        const size_t e = compoundSpanEnd(rhs, pos);
+        if (e == std::string::npos) return false;
+        *out = rhs.substr(pos + 2, e - pos - 4);
+        pos = e;
+        return true;
+      }
+      if (pos < rhs.size() && rhs[pos] == '"') {
+        const size_t e = rhs.find('"', pos + 1);
+        if (e == std::string::npos) return false;
+        *out = rhs.substr(pos + 1, e - pos - 1);
+        pos = e + 1;
+        return true;
+      }
+      return false;
+    };
+    std::string oldS, newS;
+    if (!readArg(&oldS) || !readArg(&newS)) return rejectSyntax();
+    bool allFlag = false, wordFlag = false, countFlag = false;
+    std::string countKind, countName;
+    while (pos < rhs.size() && isPySpace(rhs[pos])) ++pos;
+    if (pos < rhs.size() && rhs[pos] != ',') {
+      if (err != nullptr) {
+        err->rc = "101";
+        err->message = "varlist not allowed";
+      }
+      return std::nullopt;
+    }
+    const std::string opts = pos < rhs.size() ? rhs.substr(pos + 1) : std::string();
+    static const std::regex reOpt(R"(\s*([\w\x80-\xff]+)(\s*\(([^)]*)\))?\s*)");
+    static const std::regex reCountArg(R"(^\s*)" + kLocalOrGlobal + R"(\s+([\w\x80-\xff]+)\s*([\s\S]*)$)");
+    size_t op = 0;
+    std::smatch om, cm;
+    while (op < opts.size() && !strip(opts.substr(op)).empty()) {
+      const std::string tail = opts.substr(op);
+      if (!std::regex_search(tail, om, reOpt, std::regex_constants::match_continuous))
+        return rejectSyntax();
+      const std::string name = om.str(1);
+      const bool isAll = name == "all" && !om[2].matched;
+      const bool isWord = !om[2].matched && std::string("word").compare(0, name.size(), name) == 0;
+      const bool isCount = om[2].matched && std::string("count").compare(0, name.size(), name) == 0;
+      bool* flag = isAll ? &allFlag : isWord ? &wordFlag : isCount ? &countFlag : nullptr;
+      if (flag == nullptr || *flag)
+        return rejectSyntax("option " + name + (om[2].matched ? "()" : "") + " not allowed");
+      *flag = true;
+      if (isCount) {
+        const std::string arg = om.str(3);
+        if (!std::regex_match(arg, cm, reCountArg)) return rejectSyntax();
+        if (!cm.str(3).empty()) return rejectSyntax("option count() incorrectly specified");
+        countKind = cm.str(1)[0] == 'g' ? "global" : "local";
+        countName = cm.str(2);
+        if (const std::string bad = macroNameError(countKind == "global", countName); !bad.empty())
+          return rejectSyntax(bad);
+      }
+      op += static_cast<size_t>(om.length(0));
+    }
+    const std::string* srcVal = fromGlobal ? session.globals.find(srcName)
+                                           : session.locals.find(srcName);
+    std::string val = srcVal != nullptr ? *srcVal : std::string();
+    long long nSubs = 0;
+    auto setCount = [&]() {
+      if (countKind.empty()) return;
+      if (countKind == "global") session.globals.set(countName, std::to_string(nSubs));
+      else session.locals.set(countName, std::to_string(nSubs));
+    };
+    if (wordFlag && !oldS.empty()) {
+      // whole blank-delimited words only
+      std::string out;
+      size_t i = 0;
+      bool done = false;
+      while (i < val.size()) {
+        if (val[i] == ' ') {
+          out += val[i++];
+          continue;
+        }
+        size_t e = val.find(' ', i);
+        if (e == std::string::npos) e = val.size();
+        const std::string w = val.substr(i, e - i);
+        if (!done && w == oldS) {
+          out += newS;
+          ++nSubs;
+          if (!allFlag) done = true;
+        } else {
+          out += w;
+        }
+        i = e;
+      }
+      setCount();
+      return out;
+    }
     if (oldS.empty()) {
       // Python str.replace("", new): inserts `new` at every position
       // (between chars and at both ends); with count=1, only at the start.
@@ -2742,44 +6005,238 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
     if (allFlag) {
       // replace all occurrences
       std::string out;
-      size_t pos = 0;
+      size_t at = 0;
       while (true) {
-        size_t hit = val.find(oldS, pos);
+        size_t hit = val.find(oldS, at);
         if (hit == std::string::npos) break;
-        out.append(val, pos, hit - pos);
+        out.append(val, at, hit - at);
         out.append(newS);
-        pos = hit + oldS.size();
+        at = hit + oldS.size();
+        ++nSubs;
       }
-      out.append(val, pos, val.size() - pos);
+      out.append(val, at, val.size() - at);
+      setCount();
       return out;
     }
+    nSubs = val.find(oldS) == std::string::npos ? 0 : 1;
+    setCount();
     return replaceFirst(val, oldS, newS);
   }
 
-  // list uniq <name>
-  static const std::regex reListUniq(R"(^:?\s*list\s+uniq\s+([A-Za-z_][A-Za-z0-9_]*)$)",
-                                      std::regex::icase);
-  if (std::regex_match(rhs, m, reListUniq)) {
-    auto words = pySplit(session.locals.get(m.str(1), ""));
-    std::vector<std::string> seen;
-    for (const auto& w : words) {
-      if (std::find(seen.begin(), seen.end(), w) == seen.end()) seen.push_back(w);
+  // BUG-1377/1378: `: list` ([P] macro lists) as ONE grammar. It served uniq,
+  // posof and the set operators over blank-split words with set semantics; every
+  // other function (sizeof ...) was `list not allowed` r(101), and duplicates and
+  // quoted elements came out unlike Stata's. Measured on StataBE 19.5:
+  //  * an element is a Stata word: a "..." or `"..."' string is one element,
+  //    compared by its text and handed back as written (`a "b c" d "b c"` uniq ->
+  //    `a "b c" d`; `a "a" b` uniq -> `a b`; sizeof of `a "b c" d "b c"` is 4);
+  //  * the operators count duplicates: `A - B` takes one copy out of A per copy in
+  //    B, from A's right end (`a b c d b` - `b d e` -> `a b c`; `a b a c a b` -
+  //    `a b` -> `a b a c`); `A & B` keeps A's first min(#A, #B) copies (`a a b` &
+  //    `a a a` -> `a a`); `A | B` is A then what `B - A` leaves (`a a b` | `a a a`
+  //    -> `a a b a`); `A === B` is the same copies in any order (`a a b` === `a b`
+  //    is 0) and `A in B` needs every copy (`a a` in `a b` is 0);
+  //  * sort/rsort order by the text, stably (`z "b c" a "a"` -> `a "a" "b c" z`);
+  //    clean re-adorns each element minimally (`"zz"` -> `zz`; `` `"x y"' `` ->
+  //    `"x y"`) and an empty one as nothing, with one blank before every element
+  //    once the result is non-empty (`"" "" a` -> `a`; `a "" b` -> `a  b`; `a ""`
+  //    -> `a `, blank kept); retok[enize] hands every element back as written;
+  //  * an operand is a macro NAME (bare or local(), or global()); a missing one is
+  //    an empty list (`: list sizeof` is 0, `: list A -` is A); a name Stata
+  //    cannot store is r(198) "<name> invalid name" (macroNameError: `global(1A)`,
+  //    a 32-character local); posof's element must be quoted; the function names
+  //    are case-sensitive and anything else (`: list foo A`, `: list Sort A`,
+  //    `: list A ~ B`, `: list A - B C`) is r(198) "invalid syntax".
+  // The w2al helper tf_ss1 runs `local rest : list vl - sv` outside capture for
+  // every sorted serset (w2al_twoway_family.do:54); posof is BUG-1006's
+  // (w2aq_histogram_family.log, the positions field of every hk_*_g record).
+  static const std::regex reListFn(R"(^:\s*list(?:\s+([\s\S]*))?$)");
+  if (std::regex_match(rhs, m, reListFn)) {
+    const std::string body = strip(m.str(1));
+    // Stata's tokens here: a run of name characters, `==`, or any other single
+    // character; an operand is the token where one is due, so `- A` is "_-
+    // invalid name" and `A ====B` "_== invalid name" (the operand after `==` is
+    // the token `==`), while `A ===B` is `===`. posof's quoted element is read
+    // before the rest is cut into tokens.
+    std::vector<std::string> toks;
+    std::string posofElem;
+    bool posof = false;
+    {
+      size_t from = 0;
+      if (body.compare(0, 5, "posof") == 0 && (body.size() == 5 || isPySpace(body[5]))) {
+        posof = true;
+        size_t q = 5;
+        while (q < body.size() && isPySpace(body[q])) ++q;
+        if (startsCompound(body, q)) {
+          const size_t e = compoundSpanEnd(body, q);
+          if (e == std::string::npos) return rejectSyntax();
+          posofElem = body.substr(q + 2, e - q - 4);
+          from = e;
+        } else if (q < body.size() && body[q] == '"') {
+          const size_t e = body.find('"', q + 1);
+          if (e == std::string::npos) return rejectSyntax();
+          posofElem = body.substr(q + 1, e - q - 1);
+          from = e + 1;
+        } else {
+          return rejectSyntax();
+        }
+      }
+      for (size_t i = from; i < body.size();) {
+        if (isPySpace(body[i])) {
+          ++i;
+          continue;
+        }
+        size_t j = i;
+        while (j < body.size() && isIdentChar(body[j])) ++j;
+        if (j == i) j = i + (body.compare(i, 2, "==") == 0 ? 2 : 1);
+        toks.push_back(body.substr(i, j - i));
+        i = j;
+      }
     }
-    std::string out;
-    for (size_t i = 0; i < seen.size(); ++i) {
-      if (i) out += " ";
-      out += seen[i];
+    size_t k = 0;  // the next token
+    // The operand at toks[k] (a local NAME, local(NAME) or global(NAME)) into
+    // *out; none left is an empty list. False when it is not one (err is set).
+    std::string operandError;
+    const auto operand = [&](std::vector<ListElem>* out) {
+      out->clear();
+      if (k == toks.size()) return true;
+      std::string name = toks[k++];
+      const bool global = name == "global";
+      const bool wrapped = (global || name == "local") && k < toks.size() && toks[k] == "(";
+      if (wrapped) {
+        ++k;
+        name = k < toks.size() ? toks[k++] : std::string();
+      }
+      operandError = macroNameError(global && wrapped, name);
+      if (operandError.empty() && wrapped) {
+        if (k < toks.size() && toks[k] == ")") ++k;
+        else operandError = "invalid syntax";
+      }
+      if (!operandError.empty()) return false;
+      *out = stataElems(global && wrapped ? session.globals.get(name, "") : session.locals.get(name, ""));
+      return true;
+    };
+    const auto join = [](const std::vector<ListElem>& es) {
+      std::string out;
+      for (const auto& e : es) {
+        if (!out.empty()) out += ' ';
+        out += e.raw;
+      }
+      return out;
+    };
+    const auto counts = [](const std::vector<ListElem>& es) {
+      std::map<std::string, size_t> n;
+      for (const auto& e : es) ++n[e.text];
+      return n;
+    };
+    // The first quota[text] copies of each element of `es`, in order.
+    const auto keepFirst = [](const std::vector<ListElem>& es, std::map<std::string, size_t> quota) {
+      std::vector<ListElem> out;
+      for (const auto& e : es) {
+        auto it = quota.find(e.text);
+        if (it != quota.end() && it->second > 0) {
+          out.push_back(e);
+          --it->second;
+        }
+      }
+      return out;
+    };
+    // What is left of `a` once one copy per copy in `b` is taken out (from the right).
+    const auto minus = [&](const std::vector<ListElem>& a, const std::vector<ListElem>& b) {
+      auto quota = counts(a);
+      const auto nb = counts(b);
+      for (auto& [text, n] : quota) {
+        const auto it = nb.find(text);
+        n -= std::min(n, it == nb.end() ? size_t{0} : it->second);
+      }
+      return keepFirst(a, quota);
+    };
+    const auto isListFn = [](const std::string& t) {
+      return t == "uniq" || t == "dups" || t == "sort" || t == "rsort" || t == "clean" ||
+             t == "sizeof" || (t.size() >= 5 && std::string("retokenize").compare(0, t.size(), t) == 0);
+    };
+    std::vector<ListElem> a, b;
+    if (posof) {
+      if (toks.empty() || toks[k++] != "in") return rejectSyntax();
+      if (!operand(&a)) return rejectSyntax(operandError);
+      if (k != toks.size()) return rejectSyntax();
+      for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].text == posofElem) return std::to_string(i + 1);
+      return std::string("0");
     }
-    return out;
+    if (!toks.empty() && isListFn(toks[0])) {
+      const std::string lf = toks[k++];
+      if (!operand(&a)) return rejectSyntax(operandError);
+      if (k != toks.size()) return rejectSyntax();
+      if (lf == "sizeof") return std::to_string(a.size());
+      if (lf == "uniq" || lf == "dups") {
+        std::vector<ListElem> out;
+        std::set<std::string> seen;
+        for (const auto& e : a)
+          if (seen.insert(e.text).second == (lf == "uniq")) out.push_back(e);
+        return join(out);
+      }
+      if (lf == "sort" || lf == "rsort") {
+        const bool up = lf == "sort";
+        std::stable_sort(a.begin(), a.end(), [up](const ListElem& x, const ListElem& y) {
+          return up ? x.text < y.text : y.text < x.text;
+        });
+        return join(a);
+      }
+      if (lf == "clean") {
+        std::string out;
+        for (const auto& e : a) {
+          if (!out.empty()) out += ' ';
+          const bool blank = std::any_of(e.text.begin(), e.text.end(), [](unsigned char c) {
+            return std::isspace(c) != 0;
+          });
+          const bool quote = e.text.find('"') != std::string::npos;
+          out += quote ? "`\"" + e.text + "\"'" : blank ? "\"" + e.text + "\"" : e.text;
+        }
+        return out;
+      }
+      return join(a);  // retokenize
+    }
+    if (toks.empty()) return rejectSyntax();
+    if (!operand(&a)) return rejectSyntax(operandError);
+    if (k == toks.size()) return rejectSyntax();
+    std::string op = toks[k++];
+    if (op == "==" && k < toks.size() && toks[k] == "=") {
+      op = "===";
+      ++k;
+    }
+    if (op != "-" && op != "|" && op != "&" && op != "==" && op != "===" && op != "in")
+      return rejectSyntax();
+    if (!operand(&b)) return rejectSyntax(operandError);
+    if (k != toks.size()) return rejectSyntax();
+    if (op == "-") return join(minus(a, b));
+    if (op == "|") {
+      auto out = a;
+      for (const auto& e : minus(b, a)) out.push_back(e);
+      return join(out);
+    }
+    if (op == "&") {
+      auto quota = counts(a);
+      const auto nb = counts(b);
+      for (auto& [text, n] : quota) {
+        const auto it = nb.find(text);
+        n = std::min(n, it == nb.end() ? size_t{0} : it->second);
+      }
+      return join(keepFirst(a, quota));
+    }
+    if (op == "==") {
+      bool same = a.size() == b.size();
+      for (size_t i = 0; same && i < a.size(); ++i) same = a[i].text == b[i].text;
+      return std::string(same ? "1" : "0");
+    }
+    if (op == "===") return std::string(counts(a) == counts(b) ? "1" : "0");
+    return std::string(minus(a, b).empty() ? "1" : "0");  // in
   }
 
-  // sizeof <name>
-  static const std::regex reSizeof(R"(^:?\s*sizeof\s+([A-Za-z_][A-Za-z0-9_]*)$)",
-                                    std::regex::icase);
-  if (std::regex_match(rhs, m, reSizeof)) {
-    std::string val = session.locals.get(m.str(1), "");
-    return std::to_string(val.empty() ? 0 : pySplit(val).size());
-  }
+  // The variable readers given no variable (StataBE 19.5 r(198) for `: type`,
+  // `: format`, `: var l`, `: val l`).
+  static const std::regex reNoVar(R"(^:\s*(?:type|format|variable label|value label)\s*$)");
+  if (std::regex_match(rhs, reNoVar)) return rejectSyntax("nothing found where name expected");
 
   // variable label <varname> — NOTE: requires the leading ':' (^: not ^:?).
   //
@@ -2803,8 +6260,12 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
   // raises r(111). The distinction is decidable now only because the projection
   // carries an explicit existence marker — the label map alone could not express
   // it, since an empty label was simply not stored.
-  static const std::regex reVarLabel(R"(^:\s*var(?:iable)?\s+label\s+(\w+)\s*$)",
-                                      std::regex::icase);
+  //
+  // BUG-1379: both words abbreviate, `var`..`variable` then `l`..`label` (paper
+  // 069 writes `: var lab y`; extMacroFnName writes them out); StataBE 19.5
+  // serves `var l`, `variable la`, `var labe` and refuses `va lab` ("va not
+  // allowed") and `VAR LAB` ("VAR not allowed"), r(101).
+  static const std::regex reVarLabel(R"(^:\s*variable label\s+([\w\x80-\xff]+)\s*$)");
   if (std::regex_match(rhs, m, reVarLabel)) {
     if (varKnownMissing(session, m.str(1))) {
       rejectMissingVar(m.str(1));
@@ -2841,7 +6302,7 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
   // trade this whole stint exists to avoid. Filed as BUG-250 with the probe.
   // Until then `: type` takes the r(101) tail — honest, and wrong in the direction
   // that stops a do-file instead of feeding it a bad value.
-  static const std::regex reVarFormat(R"(^:\s*format\s+(\w+)\s*$)", std::regex::icase);
+  static const std::regex reVarFormat(R"(^:\s*format\s+([\w\x80-\xff]+)\s*$)");
   if (std::regex_match(rhs, m, reVarFormat)) {
     if (varKnownMissing(session, m.str(1))) {
       rejectMissingVar(m.str(1));
@@ -2849,13 +6310,135 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
     }
     return session.varLabels.get(std::string(kVarFormatPrefix) + m.str(1), "%9.0g");
   }
-  static const std::regex reVarLblset(R"(^:\s*value\s+label\s+(\w+)\s*$)", std::regex::icase);
+  // EM13 / LBL-CHAR: `: char NAME[CHAR]` -- the characteristic's text, "" when it
+  // is unset ([P] char; notes.ado keeps noteN/note0 there: w2ao log:1630
+  // lb_note_gereg; after `xtset, clear` `_dta[_TSpanel]` is "", w2d_uncovered.log
+  // :314 xtset_clear). A NAME that is neither _dta nor a variable is r(111).
+  static const std::regex reCharFn(
+      R"(^:\s*char\s+([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\[\s*([\w\x80-\xff]*)\s*\]\s*$)");
+  if (std::regex_match(rhs, m, reCharFn)) {
+    const std::string target = m.str(1);
+    if (target != "_dta" && varKnownMissing(session, target)) {
+      rejectMissingVar(target);
+      return std::nullopt;
+    }
+    if (m.str(2).empty() || !session.characteristic) return std::string();
+    return session.characteristic(target, m.str(2)).value_or(std::string());
+  }
+  // LBL-DATALABEL: `: data label` -- the dataset label, "" when none is set
+  // (w2ao_label_family.log lb_data, lb_data_clear).
+  // `: sortedby` -- the variables the data are sorted by, "" when none
+  // (w2d_uncovered.log merge_sorted_ctl `|id|`, merge_sorted_unsorted_master `||`).
+  static const std::regex reSortedBy(R"(^:\s*sortedby\s*$)");
+  if (std::regex_match(rhs, m, reSortedBy)) {
+    return session.sortedBy ? session.sortedBy() : std::string();
+  }
+  // BUG-441: `: pwd` -- the working directory, what `pwd` and c(pwd) answer
+  // (paper 020's master opens with `global rootdir : pwd`). StataBE 19.5 ignores
+  // anything after the word (`: pwd x`, `: pwd(x)`) and refuses `: PWD` r(101).
+  if (fn == "pwd") {
+    if (!session.cwd.empty()) return session.cwd;
+    std::error_code ec;
+    const std::filesystem::path cwd = std::filesystem::current_path(ec);
+    return ec ? std::string() : cwd.u8string();
+  }
+  static const std::regex reDataLabel(R"(^:\s*data label\s*$)");
+  if (std::regex_match(rhs, m, reDataLabel)) {
+    return session.dataLabel ? session.dataLabel() : std::string();
+  }
+  // BUG-1379: `val`..`value` then `l`..`label` (StataBE 19.5: `val l u`, `value
+  // labe u` -> the set name; `va l u` r(101)).
+  static const std::regex reVarLblset(R"(^:\s*value label\s+([\w\x80-\xff]+)\s*$)");
   if (std::regex_match(rhs, m, reVarLblset)) {
     if (varKnownMissing(session, m.str(1))) {
       rejectMissingVar(m.str(1));
       return std::nullopt;
     }
     return session.varLabels.get(std::string(kVarLblsetPrefix) + m.str(1), "");
+  }
+
+  // FU-1111: `: label lblname # [#2] [, strict]`, `: label (varname) ...` and
+  // `: label ... maxlength` ([P] macro, "label valuelabelname"). The text # maps
+  // to in the set; # itself when the set is undefined, the variable has no value
+  // label or # is unmapped (nothing under `strict'); #2 truncates. The returned
+  // text is trimmed: w2ah_data_verbs.log ah_encode_spaces reads a label whose
+  // text is two blanks as [] and w2af_macro_text_file.log mt_lab_def_069 reads
+  // `"Other "' as <Other>. Oracle arms: ah_rename_lab, ah_ren_lab, ah_clone_byte,
+  // ah_encode_gen/g/generate/label_new/label_again/label_exist/spaces,
+  // ah_recode_g_lab. Before, this fell to the r(101) tail below. Layer: the
+  // macro/arith layer only (the set is read through EvalSession::valueLabelSet).
+  // Measured on StataBE 19.5: # is a number or a missing code (`: label ul abc`
+  // is r(198), `1e0`, `+1`, `01` read as 1, `.a` its own code); `maxlength` and
+  // `strict` are case-sensitive, strict abbreviates to `s`, and maxlength takes
+  // no #2 or option (`MAXLENGTH`, `maxl`, `maxlength, strict` r(198)); a third
+  // word is "varlist not allowed" r(101); `: label(u) 1` needs no blank.
+  static const std::regex reLabelFn(
+      R"(^:\s*label\s*(\(\s*[\w\x80-\xff]+\s*\)|[\w\x80-\xff]+)\s+([^,]*?)\s*(?:,\s*(\w*)\s*)?$)");
+  if (std::regex_match(rhs, m, reLabelFn)) {
+    std::string setName = m.str(1);
+    const std::string args = strip(m.str(2));
+    const std::string opt = m.str(3);
+    if (!opt.empty() && std::string("strict").compare(0, opt.size(), opt) != 0)
+      return rejectSyntax("option " + opt + " not allowed");
+    const bool strict = !opt.empty();
+    if (setName.front() == '(') {
+      const std::string var = strip(setName.substr(1, setName.size() - 2));
+      if (varKnownMissing(session, var)) {
+        rejectMissingVar(var);
+        return std::nullopt;
+      }
+      setName = session.varLabels.get(std::string(kVarLblsetPrefix) + var, "");
+    }
+    const std::map<std::string, std::string>* set =
+        setName.empty() || !session.valueLabelSet ? nullptr : session.valueLabelSet(setName);
+    const std::vector<std::string> words = args.empty() ? std::vector<std::string>{} : pySplit(args);
+    if (words.size() == 1 && words[0] == "maxlength" && !m[3].matched) {
+      size_t mx = 0;
+      if (set != nullptr)
+        for (const auto& kv : *set) mx = std::max(mx, kv.second.size());
+      return std::to_string(mx);
+    }
+    if (words.size() > 2) {
+      if (err != nullptr) {
+        err->rc = "101";
+        err->message = "varlist not allowed";
+      }
+      return std::nullopt;
+    }
+    static const std::regex reCode(R"(^([+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?|\.[a-z]?)$)");
+    if (words.empty() || !std::regex_match(words[0], reCode)) return rejectSyntax();
+    std::string key = words[0];
+    {
+      // labelDefs keys are the integer codes as std::to_string writes them.
+      char* end = nullptr;
+      const double v = std::strtod(words[0].c_str(), &end);
+      if (end != nullptr && *end == '\0' && std::isfinite(v) && v == std::floor(v) &&
+          std::fabs(v) < 2147483648.0)
+        key = std::to_string(static_cast<long long>(v));
+    }
+    std::string text;
+    bool mapped = false;
+    if (set != nullptr) {
+      auto it = set->find(key);
+      if (it != set->end()) {
+        text = strip(it->second);
+        mapped = true;
+      }
+    }
+    if (!mapped) text = strict ? std::string() : words[0];
+    if (words.size() == 2) {
+      char* end = nullptr;
+      const long n2 = std::strtol(words[1].c_str(), &end, 10);
+      if (end == nullptr || *end != '\0' || n2 < 0) {
+        if (err != nullptr) {
+          err->rc = "198";
+          err->message = "invalid syntax";
+        }
+        return std::nullopt;
+      }
+      if (text.size() > static_cast<size_t>(n2)) text = text.substr(0, static_cast<size_t>(n2));
+    }
+    return text;
   }
 
   // BUG-250: `: type <varname>` — the reader half of the storage-subtype plane.
@@ -2871,12 +6454,12 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
   // z = _n` -> float; `: type nosuchvar` -> r(111) "variable ... not found".
   //
   // A variable the projection has NO type row for — a string column whose
-  // width was never declared or imported (encode/tostring/CSV output) — falls
-  // through to the r(101) tail below, deliberately: its true `str#` width is
+  // width was never declared or imported (encode/tostring/CSV output) — is
+  // refused "type not allowed" r(101), deliberately: its true `str#` width is
   // not recorded anywhere in this engine, and a fabricated one would be the
   // exact silent-wrong-answer BUG-216 exists to prevent. Named in BUG-250's
   // ledger close as the measured remainder.
-  static const std::regex reVarType(R"(^:\s*type\s+(\w+)\s*$)", std::regex::icase);
+  static const std::regex reVarType(R"(^:\s*type\s+([\w\x80-\xff]+)\s*$)");
   if (std::regex_match(rhs, m, reVarType)) {
     if (varKnownMissing(session, m.str(1))) {
       rejectMissingVar(m.str(1));
@@ -2885,40 +6468,98 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
     if (const std::string* t = session.varLabels.find(std::string(kVarTypePrefix) + m.str(1))) {
       return *t;
     }
-    // fall through: unrecorded subtype (or a plane that never synced) keeps
-    // the honest r(101) reject.
+    // An unrecorded subtype (or a plane that never synced) keeps the honest
+    // r(101) reject.
+    return refuseUnanswered();
   }
 
-  // WS-C (C-5): matrix introspection.
-  static const std::regex reColnames(R"(^:?\s*colnames\s+([A-Za-z_]\w*)$)", std::regex::icase);
-  if (std::regex_match(rhs, m, reColnames)) {
-    const EvalMatrix* mat = session.findMatrix(m.str(1));
-    if (mat == nullptr) return std::string();  // undefined matrix -> ""
+  // WS-C (C-5): matrix introspection. BUG-629 adds the FULL-name forms
+  // (`: rowfullnames M` / `: colfullnames M`, w2c_postest.log:102/107/757 over
+  // copies of r(table) and of nlcom's posted e(b)) and a class-matrix argument
+  // (`r(table)`, `e(NAME)`). The stripes are stored as Stata prints them,
+  // equation prefix included, so a full name is the stored string.
+  // eb-order T-P1: the short forms answer the name WITHOUT its equation, as
+  // Stata does (w2g_ebmat.log:963 e6_te_colnames_eb `r1vs0.yb` for the posted
+  // `ATE:r1vs0.yb`), and an e() matrix is EvalSession::resolveEMatrix's: e(b)
+  // and e(V) of a fit are its canonical stripes (w2g_ebmat.log:230 `x1 x2 _cons`)
+  // at rc 0, no longer the BUG-629 r(111) "copy it first" divergence.
+  // gfx-binscatter: `: roweq M` / `: coleq M` answer the equation part of each
+  // stripe name and `_` for a name without one (w2k_binscatter.log:248
+  // BS_ctl0_c1_names `_`, :621 BS_by_c1_names `by1 by2` over `by1:= by2:=`).
+  // `, quoted` (`q`..`quoted`) quotes each name as StataBE 19.5 does: `"r1"' `"r
+  // 2"' for rownames, "e1" "e2" for coleq, `""e1":c1"' for colfullnames over
+  // e1:c1 and `"x"' for a full name with no equation; `, QUOTED` is "option
+  // QUOTED not allowed" r(198).
+  static const std::regex reMatNames(
+      R"(^:\s*(rownames|colnames|rowfullnames|colfullnames|roweq|coleq)\s+([A-Za-z_\x80-\xff][\w\x80-\xff]*|[er]\(\s*[A-Za-z_\x80-\xff][\w\x80-\xff]*\s*\))\s*(?:,\s*(\w*)\s*)?$)");
+  if (std::regex_match(rhs, m, reMatNames)) {
+    const std::string arg = m.str(2);
+    const std::string opt = m.str(3);
+    if (!opt.empty() && std::string("quoted").compare(0, opt.size(), opt) != 0)
+      return rejectSyntax("option " + opt + " not allowed");
+    const bool quoted = !opt.empty();
+    const EvalMatrix* mat = nullptr;
+    std::optional<EvalMatrix> resolved;
+    if (arg.find('(') == std::string::npos) {
+      mat = session.findMatrix(arg);
+      if (mat == nullptr) return std::string();  // undefined matrix -> ""
+    } else {
+      const size_t open = arg.find('(');
+      const std::string inner = strip(arg.substr(open + 1, arg.size() - open - 2));
+      int rc = 111;
+      std::string why;
+      if (arg[0] == 'e') {
+        resolved = session.resolveEMatrix(inner, &rc, &why, EvalSession::EReader::kNames);
+        if (resolved.has_value()) mat = &*resolved;
+        // `: colnames e(b)` with no e(b) is r(111) "matrix e(b) not found"
+        // with or without a live e() (w2v_estpost_ematrix.log ep13_colnames_eb,
+        // ep15c_colnames_eb, ep15f_colnames_eb) -- not matrix-copy's r(301).
+        if (mat == nullptr && rc == 301) {
+          rc = 111;
+          why = "matrix e(" + inner + ") not found";
+        }
+      } else {
+        mat = session.findClassMatrix(arg[0], inner);
+        why = "matrix r(" + inner + ") not found";
+      }
+      // A class matrix that is not there is a named refusal at the resolver's
+      // rc (111, or an e(V) the engine did not send), never the "" of an empty
+      // stripe.
+      if (mat == nullptr) {
+        if (err != nullptr) {
+          err->rc = std::to_string(rc);
+          err->message = why;
+        }
+        return std::nullopt;
+      }
+    }
+    const std::string which = m.str(1);
+    const bool full = which.find("full") != std::string::npos;
+    const bool eq = which.compare(which.size() - 2, 2, "eq") == 0;
+    const std::vector<std::string>& names = which.rfind("row", 0) == 0 ? mat->rownames : mat->colnames;
     std::string out;
-    for (size_t i = 0; i < mat->colnames.size(); ++i) {
+    for (size_t i = 0; i < names.size(); ++i) {
       if (i) out += " ";
-      out += mat->colnames[i];
+      const size_t colon = names[i].find(':');
+      if (eq) {
+        const std::string e = colon == std::string::npos ? std::string("_") : names[i].substr(0, colon);
+        out += quoted ? "\"" + e + "\"" : e;
+        continue;
+      }
+      std::string name = colon == std::string::npos || full ? names[i] : names[i].substr(colon + 1);
+      if (quoted && full && colon != std::string::npos)
+        name = "\"" + names[i].substr(0, colon) + "\"" + names[i].substr(colon);
+      out += quoted ? "`\"" + name + "\"'" : name;
     }
     return out;
   }
-  static const std::regex reRownames(R"(^:?\s*rownames\s+([A-Za-z_]\w*)$)", std::regex::icase);
-  if (std::regex_match(rhs, m, reRownames)) {
-    const EvalMatrix* mat = session.findMatrix(m.str(1));
-    if (mat == nullptr) return std::string();
-    std::string out;
-    for (size_t i = 0; i < mat->rownames.size(); ++i) {
-      if (i) out += " ";
-      out += mat->rownames[i];
-    }
-    return out;
-  }
-  static const std::regex reExtColsof(R"(^:?\s*colsof\s+([A-Za-z_]\w*)$)", std::regex::icase);
+  static const std::regex reExtColsof(R"(^:\s*colsof\s+([A-Za-z_\x80-\xff][\w\x80-\xff]*)$)");
   if (std::regex_match(rhs, m, reExtColsof)) {
     const EvalMatrix* mat = session.findMatrix(m.str(1));
     if (mat == nullptr) return std::string("0");
     return std::to_string(mat->data.empty() ? 0 : mat->data[0].size());
   }
-  static const std::regex reExtRowsof(R"(^:?\s*rowsof\s+([A-Za-z_]\w*)$)", std::regex::icase);
+  static const std::regex reExtRowsof(R"(^:\s*rowsof\s+([A-Za-z_\x80-\xff][\w\x80-\xff]*)$)");
   if (std::regex_match(rhs, m, reExtRowsof)) {
     const EvalMatrix* mat = session.findMatrix(m.str(1));
     if (mat == nullptr) return std::string("0");
@@ -2988,11 +6629,14 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
 #endif
 
   // U7/S9: `: dir "DIRNAME" files "PATTERN"` — directory glob.
+  // `file`..`files`; `dir`..`dirs` and `other` are Stata's too and not answered
+  // here (StataBE 19.5: `: dir . file *` answers, `: dir . FILES *` r(198)).
   static const std::regex reDir(
-      R"re(^:?\s*dir\s+(?:"([^"]*)"|(\S+))\s+files\s+(?:"([^"]*)"|(\S+)))re", std::regex::icase);
+      R"re(^:\s*dir\s+(?:"([^"]*)"|(\S+))\s+(files?|dirs?|other)\s+(?:"([^"]*)"|(\S+)))re");
   if (std::regex_search(rhs, m, reDir)) {  // re.match = prefix match
+    if (m.str(3)[0] != 'f') return refuseUnanswered();
     std::string dirPart = m[1].matched ? m.str(1) : (m[2].matched ? m.str(2) : ".");
-    std::string pattern = m[3].matched ? m.str(3) : (m[4].matched ? m.str(4) : "*");
+    std::string pattern = m[4].matched ? m.str(4) : (m[5].matched ? m.str(5) : "*");
     try {
       namespace fs = std::filesystem;
       std::string base = !session.cwd.empty() ? session.cwd : fs::current_path().u8string();
@@ -3043,7 +6687,7 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
   // BLAST RADIUS, measured before landing rather than assumed. Every
   // `local|global NAME : ...` line in tests/ and waves/ was enumerated and
   // classified. The only ones PIET actually executes are
-  // tests/kitchensink/pangram/p2perf_bench.do:144-149 — `word count`, `word N of`,
+  // internal script p2perf_bench.do:144-149 — `word count`, `word N of`,
   // `length local`, `subinstr local`, `list uniq`, `variable label` — all six
   // implemented arms above. The forms that are NOT implemented
   // (`: list xvars - v`, `: colnames e(b)`, `: colfullnames e(b)`) appear only in
@@ -3053,14 +6697,18 @@ std::optional<std::string> tryExtendedMacroFn(const std::string& rhsIn, EvalSess
   // run_eval.py never invokes a .do file at all (it reads golden CSVs). So zero
   // PIET-executed lines depended on the literal echo, and nothing was consuming
   // the echoed text as data.
+  //
+  // A function this layer answers whose arguments did not parse is Stata's
+  // r(198) "invalid syntax" (`: word COUNT a`, `: data LABEL`, `: sortedby x`).
+  if (!fn.empty()) return rejectSyntax();
+  // Stata names the offending FUNCTION token, not the whole tail, cut at the
+  // first character a name cannot hold (`: E(scalars)` "E not allowed"). The
+  // r()/s() readers are Stata's and not answered here: named in full.
+  if (tok.empty() || ((tok == "r" || tok == "s") && tokEnd < rhs.size() && rhs[tokEnd] == '('))
+    return refuseUnanswered();
   if (err != nullptr) {
-    // Stata names the offending FUNCTION token, not the whole tail.
-    std::string tok = strip(rhs.substr(1));
-    const size_t cut = tok.find_first_of(" \t");
-    if (cut != std::string::npos) tok = tok.substr(0, cut);
     err->rc = "101";
-    err->message = (tok.empty() ? std::string("extended macro function")
-                                : tok) + " not allowed";
+    err->message = tok + " not allowed";
   }
   return std::nullopt;  // unknown function form
 }
@@ -3106,8 +6754,15 @@ static bool hasStataLogicalOperator(const std::string& e) {
   return false;
 }
 
+// BUG-710: `session` (optional) is the caller's EvalSession. When it carries the
+// variable reader (EvalSession::varObs, installed by SessionState), the bare-
+// identifier shape below is no longer undecidable: evalArith has already read
+// every name that IS a dataset variable (bindBareVariables), so a NameError on a
+// bare name means no variable, scalar or result of that name exists, and Stata's
+// answer is `NAME not found`, r(111), with nothing assigned (w2i_varsub h_03;
+// h_02 for `scalar =`). Without the reader the arm stays unclaimed, as before.
 bool classifyFailedEqExpr(const std::string& exprIn, const std::string& raised,
-                          MacroFnError* err) {
+                          MacroFnError* err, const EvalSession* session = nullptr) {
   if (err == nullptr) return false;
   const std::string e = strip(exprIn);
   const bool stringLiteralRhs = !e.empty() && (e[0] == '"' || e.rfind("`\"", 0) == 0);
@@ -3117,7 +6772,52 @@ bool classifyFailedEqExpr(const std::string& exprIn, const std::string& raised,
   // a form this evaluator failed to cover: `local a = "a" & 1` and
   // `local k = "a" + 1` are r(109) in StataBE 19.5, but the exemption stored
   // the literal text `a & 1` / `"a" + 1` with rc 0.
-  if (stringLiteralRhs && raised.rfind("r(", 0) != 0) return false;  // string-literal RHS
+  static const char* kNameErrPrefix = "NameError: name '";
+  // BUG-1330: a bare c(NAME) that the c() pre-pass (piet::substituteCRefs) left
+  // in place is no function call. StataBE answers r(133) `c(NAME) undefined` for
+  // a name it has no value for; a real name this build does not serve is
+  // refused by name, with PIET's unsupported code (cClassRefusalRc; `unknown
+  // function c()` before).
+  const auto cClassRefusal = [&]() {
+    static const std::regex reCRef(R"(\bc\(\s*([A-Za-z_]\w*)\s*\))");
+    std::smatch cm;
+    if (raised.rfind(std::string(kNameErrPrefix) + "c'", 0) != 0 ||
+        !std::regex_search(e, cm, reCRef))
+      return false;
+    err->rc = cClassRefusalRc(cm.str(1));
+    err->message = cClassRefusalMessage(cm.str(1));
+    return true;
+  };
+  if (cClassRefusal()) return true;
+  if (stringLiteralRhs && raised.rfind("r(", 0) != 0) {
+    // FU-225 sweep (BUG-710): an unknown FUNCTION is r(133) whatever the
+    // right-hand side starts with. `local z = "a" + nosuchfn_q(1)` stored the
+    // text `"a" + nosuchfn_q(1)` at rc 0 under the exemption below, which is
+    // for a string expression this evaluator does not cover, not for a call to
+    // a function that does not exist (exprfns_contract_oracle.log:454-458).
+    if (raised.rfind(kNameErrPrefix, 0) == 0) {
+      const size_t start = std::string(kNameErrPrefix).size();
+      const size_t end = raised.find('\'', start);
+      const std::string fn = end == std::string::npos ? std::string()
+                                                      : raised.substr(start, end - start);
+      if (!fn.empty() && fn != "scalar" && e.find(fn + "(") != std::string::npos) {
+        err->rc = "133";
+        err->message = "unknown function " + fn + "()";
+        return true;
+      }
+      // name-binding-display-literals (FU-1356): a bare name that binds to
+      // nothing is r(111) beside a literal too. `local l = "a" + foo` stored
+      // its own text at rc 0 and `scalar s = "a" + foo` was r(198), where
+      // StataBE answers `foo not found` (w2av_name_binding bd_loc_strunb,
+      // bd_sca_strunb). The reader decides, as for the bare-name shape below.
+      if (!fn.empty() && fn != "scalar" && session != nullptr && session->varObs) {
+        err->rc = "111";
+        err->message = fn + " not found";
+        return true;
+      }
+    }
+    return false;  // string-literal RHS
+  }
   if (raised.rfind("r(", 0) == 0) {
     const size_t close = raised.find(')');
     if (close != std::string::npos && close > 2) {
@@ -3131,14 +6831,13 @@ bool classifyFailedEqExpr(const std::string& exprIn, const std::string& raised,
       }
     }
   }
-  static const char* kNameErrPrefix = "NameError: name '";
   if (raised.rfind(kNameErrPrefix, 0) == 0) {
     const size_t start = std::string(kNameErrPrefix).size();
     const size_t end = raised.find('\'', start);
     const std::string name = (end == std::string::npos) ? std::string()
                                                         : raised.substr(start, end - start);
     if (name == "scalar") {
-      static const std::regex reScalarArg(R"(scalar\(\s*([A-Za-z_]\w*)\s*\))");
+      static const std::regex reScalarArg(R"(scalar\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\))");
       std::smatch sm;
       if (std::regex_search(e, sm, reScalarArg)) {
         err->rc = "111";
@@ -3159,6 +6858,11 @@ bool classifyFailedEqExpr(const std::string& exprIn, const std::string& raised,
       // Reading the first observation is the missing capability named
       // above, so this refuses rather than echo.
       if (!hasStataLogicalOperator(e)) {
+        if (session != nullptr && session->varObs) {  // BUG-710
+          err->rc = "111";
+          err->message = name + " not found";
+          return true;
+        }
         return false;  // bare identifier — the dataset-variable shape, unclaimed
       }
       err->rc = "198";
@@ -3166,12 +6870,29 @@ bool classifyFailedEqExpr(const std::string& exprIn, const std::string& raised,
       return true;
     }
   }
-  static const std::regex reSubscript(R"(^([A-Za-z_]\w*)\s*\[)");
+  static const std::regex reSubscript(R"(^([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\[)");
   std::smatch sm;
   if (std::regex_search(e, sm, reSubscript)) {
     err->rc = "111";
     err->message = sm.str(1) + " not found";
     return true;
+  }
+  // name-binding-display-literals (FU-1359): a subscripted name that is no
+  // matrix and no variable is r(111) inside a larger expression too, as it is
+  // alone above: `local l = 1 + Vr[1]` and `scalar s = max(0, abs(Vr[1,1]))`
+  // were r(198) (w2av_name_binding bd_loc_subabs, bd_sca_subabs2). Only with a
+  // session, which can tell an absent name from a present one.
+  if (session != nullptr) {
+    static const std::regex reAnySub(R"((?:^|[^A-Za-z0-9_.\x80-\xff])([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\[)");
+    for (std::sregex_iterator it(e.begin(), e.end(), reAnySub), end; it != end; ++it) {
+      const std::string name = (*it)[1].str();
+      if (name == "_b" || name == "_se" || name == "_coef") continue;
+      if (session->findMatrix(name) != nullptr) continue;
+      if (session->varObs && session->varObs(name, 1)) continue;
+      err->rc = "111";
+      err->message = name + " not found";
+      return true;
+    }
   }
   // BUG-339 diagnostic. An expression that still carries a macro reference is a
   // different fact from "invalid syntax", and saying so is what turns a
@@ -3189,6 +6910,22 @@ bool classifyFailedEqExpr(const std::string& exprIn, const std::string& raised,
   return true;
 }
 
+// FU-225 sweep (BUG-710): the `= expr` forms' answer to an expansion error that
+// carries no Stata code of its own (takeCodedExpandError took those): a named
+// refusal at the block's coarse code, r(198) where that is the generic 1.
+// Without an errorOut (session-less callers) the line is still consumed and
+// nothing is stored. true = the error was taken.
+bool refuseFailedExpansion(const ExpandResult& exp, MacroFnError* err) {
+  if (!exp.isError) return false;
+  if (err != nullptr) {
+    std::string rc = coarseRc(exp.error);
+    if (rc.empty() || rc == "1") rc = "198";
+    err->rc = rc;
+    err->message = exp.error.value("message", std::string("macro expansion failed"));
+  }
+  return true;
+}
+
 // _strip_outer_dquotes
 std::string stripOuterDquotes(const std::string& rhs) {
   if (rhs.size() >= 2 && rhs.front() == '"' && rhs.back() == '"') {
@@ -3201,8 +6938,9 @@ std::string stripOuterDquotes(const std::string& rhs) {
 }  // namespace
 
 // BUG-293(b): public face of classifyFailedEqExpr (see macros.h).
-bool classifyFailedExpr(const std::string& expr, const std::string& raised, MacroFnError* err) {
-  return classifyFailedEqExpr(expr, raised, err);
+bool classifyFailedExpr(const std::string& expr, const std::string& raised, MacroFnError* err,
+                        const EvalSession* session) {
+  return classifyFailedEqExpr(expr, raised, err, session);
 }
 
 // ---------------------------------------------------------------------------
@@ -3245,6 +6983,16 @@ const std::vector<std::string>& exprLayerCorpus() {
       "scalar\tdrop\tx", "scalar\ndrop\nx", "scalar list", "scalar dir",
       "scalar x = scalar(y) + 1", "scalar 1x = 2", "scalar _x = 2",
       "scalar x = a\nb", "scalar define define = 1",
+      // Unicode names (lane M): UTF-8 names in every shape above. Each must
+      // answer ext=1 / basic=0, and the scans must agree with their regex twins
+      // (which carry the same `\x80-\xff` widening) name for name -- the
+      // mixed-script `دخل_2020` is one name, never `دخل` + `_2020`.
+      "ملاحظات[1]", "قيمة + 1", "upper(\"مرحبا\")", "دخل_2020 * 2", "x_ق", "ق1",
+      "scalar(سعر)", "scalar(سعر) + 1", "scalar( سعر )", "مscalar(y)", "xscalar(y)",
+      "scalar سعر = 5", "scalar define قيمة = 1", "SCALAR سعر=1", "scalar 1ق = 2",
+      "scalar _ق = 2", "scalar drop سعر", "y ملاحظات", "yملاحظات", "ملاحظاتy", "y+سعر",
+      "سعر + 1", "سعرx", "xسعر", "سعر(1)", "دخل_2020 + _2020", "_2020", "_2020y",
+      "lnسعر", "log(سعر)",
   };
   return k;
 }
@@ -3274,6 +7022,8 @@ bool selftestLocalRefScanMatchesRegex(std::string* firstDisagreement) {
       "``x''", "`'", "``'", "`x`y''", "a`b'c", "`9x'", "`x9'", "`x-y'", "`x y'",
       "no ticks here", "`", "``", "`\"a b\"'", "`=2+3'", "`r(mean)'", "`s(k)'",
       "`x' `y'", "``", "`0'", "`x_1'", "`X'", "`_'",
+      // Unicode names (lane M)
+      "`م'", "`ملاحظات'", "`دخل_2020'", "`ق1'", "`1ق'", "`x م'", "``م''", "`م",
   };
   auto one = [&](const std::string& c) {
     std::smatch m;
@@ -3322,7 +7072,12 @@ bool selftestBarePrefilterIsStrict(std::string* firstDisagreement) {
 
 bool selftestScalarScansMatchRegex(std::string* firstDisagreement) {
   static const std::regex reScalarDropRx(R"(^scalar\s+drop\s+(.+)$)", std::regex::icase);
-  static const std::regex reScalarCallRx(R"(\bscalar\(\s*([A-Za-z_]\w*)\s*\))");
+  // Unicode names (lane M): `\b` is ECMAScript's ASCII word boundary, under
+  // which an Arabic byte is a NON-word character -- so the twin spells the
+  // boundary as the identifier class itself (group 1 = the character before),
+  // which is what the scan's isIdentChar test is.
+  static const std::regex reScalarCallRx(
+      R"((^|[^A-Za-z0-9_\x80-\xff])scalar\(\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*\))");
 
   // A session with a couple of scalars so the substitutions have something to
   // find, plus one name that also occurs as a function call (`scalar(...)`) so
@@ -3331,14 +7086,16 @@ bool selftestScalarScansMatchRegex(std::string* firstDisagreement) {
   s.scalars.set("bp_s", "12.5");
   s.scalars.set("y", "7");
   s.scalars.set("log", "99");  // shadows a function name on purpose
+  s.scalars.set("سعر", "3");  // Unicode names (lane M)
+  s.scalars.set("_2020", "99");  // the ASCII tail of the mixed-script `دخل_2020`
 
   for (const auto& c : exprLayerCorpus()) {
     std::smatch m;
 
     // scalar( ... ) substitution
     const std::string viaRegex = regexSubFn(reScalarCallRx, c, [&s](const std::smatch& mm) {
-      const std::string* v = s.scalars.find(mm.str(1));
-      return v ? *v : mm.str(0);
+      const std::string* v = s.scalars.find(mm.str(2));
+      return mm.str(1) + (v ? valueRefText(*v) : mm.str(0).substr(mm.length(1)));
     });
     const std::string viaScan = substituteScalarCalls(c, s);
     if (viaRegex != viaScan) {
@@ -3351,10 +7108,13 @@ bool selftestScalarScansMatchRegex(std::string* firstDisagreement) {
 
     // bare-name substitution, once per stored scalar
     for (const auto& [sn, sv] : s.scalars.items()) {
-      std::regex reName("\\b" + regexEscape(sn) + "\\b(?!\\s*\\()");
+      // Identifier-class boundaries for the same reason as reScalarCallRx
+      // (every name in this session begins and ends with an identifier byte).
+      std::regex reName("(^|[^A-Za-z0-9_\\x80-\\xff])" + regexEscape(sn) +
+                        "(?![A-Za-z0-9_\\x80-\\xff])(?!\\s*\\()");
       std::string value = sv;
       const std::string bRegex =
-          regexSubFn(reName, c, [&value](const std::smatch&) { return value; });
+          regexSubFn(reName, c, [&value](const std::smatch& mm) { return mm.str(1) + value; });
       const std::string bScan = substituteBareName(c, sn, sv);
       if (bRegex != bScan) {
         if (firstDisagreement) {
@@ -3493,11 +7253,16 @@ bool selftestMacroDefScanMatchesRegex(std::string* firstDisagreement) {
       "local\tq\t5", "local\t \tq 5", "local   q   5   ", "local\nq 5", "global\vg 1",
       // non-matches
       "localq 5", "local", "local ", "local  ", "local 1x 3", "local -x 3", "local `k' 5",
+      // BUG-923: positional locals match `local`, never `global`
+      "local 1 alpha", "local 12 \"b c\"", "local 1=3", "local 12abc 1", "local 1_ 2", "global 1 a",
       "globalg 1", "global", "global 9z 1", "scalar a = 1", "display 1", "",
       // the newline boundary: `.` cannot cross one, so the tail decides
       "local q a\nb", "global g a\nb", "local q 5\n",
       // name/rest boundaries
       "local q:word count x", "local q:", "local q,", "local q)", "global g:",
+      // Unicode names (lane M): local/global names are UTF-8 too
+      "local م \"abc\"", "global ج \"gval\"", "local دخل_2020 = 5", "global ق1 x",
+      "local 1ق 3", "local مx=1", "LOCAL م 1", "global ٥ 3", "global €x 1", "local €x 3",
   };
   for (const auto& c : kCases) {
     for (int which = 0; which < 2; ++which) {
@@ -3505,7 +7270,9 @@ bool selftestMacroDefScanMatchesRegex(std::string* firstDisagreement) {
       const size_t kwLen = which == 0 ? 5 : 6;
       const std::regex& re = which == 0 ? reLocalDef() : reGlobalDef();
       std::smatch rm;
-      const bool reOk = std::regex_match(c, rm, re);
+      // The `^global` regex cannot say "a Unicode LETTER"; matchMacroDef adds
+      // globalNameStartOk on top of it, so the twin applies the same filter.
+      const bool reOk = std::regex_match(c, rm, re) && (which == 0 || globalNameStartOk(rm.str(1)));
       std::string sName, sRest;
       const bool scanOk = matchMacroDef(c, kw, kwLen, sName, sRest);
       bool agree = (reOk == scanOk);
@@ -3539,8 +7306,11 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
     std::string headLower;
     for (char c : head) headLower += static_cast<char>(std::tolower((unsigned char)c));
     const char* canon = nullptr;
-    if (headLower == "loc") canon = "local";
-    else if (headLower == "gl") canon = "global";
+    // BUG-1381: every abbreviation Stata takes (loc/loca, gl/glo/glob/globa).
+    if (headLower == "loc" || headLower == "loca") canon = "local";
+    else if (headLower == "gl" || headLower == "glo" || headLower == "glob" ||
+             headLower == "globa")
+      canon = "global";
     else if (headLower == "sca") canon = "scalar";
     if (canon != nullptr) {
       stripped = std::string(canon) + (sp == std::string::npos ? std::string() : stripped.substr(sp));
@@ -3565,13 +7335,15 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
       if (std::tolower(static_cast<unsigned char>(t[i])) != kS[i]) return false;
     if (t.size() == 6) return true;
     char c = t[6];
-    return !(std::isalnum(static_cast<unsigned char>(c)) || c == '_');
+    return !isIdentChar(c);  // Unicode names: `scalarم` is one word
   };
   if (isScalarPrefix(stripped)) {
     std::string scLine = stripped;
+    std::optional<ExpandResult> failedExp;
     if (hasMacroRefs(scLine)) {
       ExpandResult exp = expandPass(scLine, session);
       if (!exp.isError) scLine = exp.line;
+      else failedExp = std::move(exp);
     }
     // EXPRLAYER-5: matchScalarDrop/matchScalarDef walk the same two grammars
     // left to right; selftestScalarScansMatchRegex() holds them to the regexes.
@@ -3580,8 +7352,12 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
       auto targets = pySplit(sdRest);
       if (targets.size() == 1 && targets[0] == "_all") {
         session.scalars.clear();
+        session.stringScalars.clear();  // BUG-710
       } else {
-        for (const auto& t : targets) session.scalars.erase(t);
+        for (const auto& t : targets) {
+          session.scalars.erase(t);
+          session.stringScalars.erase(t);  // BUG-710
+        }
       }
       return true;
     }
@@ -3601,6 +7377,11 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
     // this function to `return false` at the very end, unchanged.
     std::string sdName, sdExpr;
     if (matchScalarDef(scLine, sdName, sdExpr)) {
+      // BUG-1490: an expansion that failed with a Stata code (the named r(111) for
+      // an r() name PIET cannot read as missing) is that refusal, as on `local =`
+      // and `display`. It used to reach evalArith unexpanded and come back r(133)
+      // "unknown function r()".
+      if (failedExp.has_value() && takeCodedExpandError(*failedExp, errorOut)) return true;
       std::string name = sdName;
       std::string expr = strip(sdExpr);
       {
@@ -3619,28 +7400,50 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
           return true;
         }
       }
-      dprof::ezoneBegin(dprof::kECapDefScalarSub);
-      for (const auto& [sname, sval] : session.scalars.items()) {
-        if (expr.find(sname) != std::string::npos) {
-          expr = substituteBareName(expr, sname, sval);  // EXPRLAYER-5
-        }
-      }
-      dprof::ezoneEnd(dprof::kECapDefScalarSub);
+      // name-binding-display-literals (FU-1360): the stored scalars are
+      // evalArith's to substitute, over literal-protected text. This branch ran
+      // its own pass over the RAW right-hand side first, so a scalar's name
+      // inside a string literal was replaced: with `scalar a = 7`, `scalar s =
+      // "a:b"` stored `7:b` and `scalar s = "x is a"` stored `x is 7`, where
+      // `local l = "a:b"` was right (w2av_name_binding bd_sca_lit, bd_sca_lit2,
+      // bd_sca_litN, bd_sca_litcat, bd_sca_strvarcat).
       std::string raisedSc;
-      auto arith = evalArith(expr, &session, &raisedSc);
-      // BUG-456: a function announcing Stata's EXACT code (`("regress"==1)` ->
-      // pyEquals' r(109)) is an error here as it is on `local =`, not the
-      // legacy store-the-text fallback -- which kept `scalar s = (e(cmd)==1)`
-      // at rc 0 with the expression text as its value. Only the r(NNN) channel
-      // is claimed; every other unevaluable shape keeps the fallback.
-      if (!arith && raisedSc.rfind("r(", 0) == 0) {
+      bool scIsString = false;
+      auto arith = evalArith(expr, &session, &raisedSc, &scIsString);
+      // BUG-710 / FU-225 / FU-1324: an expression that FAILED to evaluate is an
+      // error, never a value. The store used to keep the expression's SOURCE
+      // TEXT whenever evalArith failed without an r(NNN) code (`scalar fx =
+      // nosuchfn_q(1)` at rc 0, `scalar b = xd[1]` holding `xd[1]`), and every
+      // later read re-evaluated that text against the data of its own moment.
+      // The rc is the `local =` sibling's (classifyFailedEqExpr, the one
+      // classifier; exprfns_contract_oracle.log:454-458 gives an unknown
+      // function r(133)), and the scalar is neither created nor changed, as
+      // after any failed `scalar =` under capture (w2i_varsub h_02). What the
+      // classifier leaves unclaimed -- a string-literal right-hand side this
+      // evaluator cannot finish -- is refused by name at r(198) rather than
+      // stored as text; no oracle line pins that shape's rc.
+      if (!arith) {
         MacroFnError scErr;
-        if (classifyFailedEqExpr(expr, raisedSc, &scErr)) {
-          if (errorOut != nullptr) *errorOut = scErr;
-          return true;
+        if (!classifyFailedEqExpr(expr, raisedSc, &scErr, &session)) {
+          scErr.rc = "198";
+          scErr.message = "scalar " + name + " = " + expr +
+                          ": the expression could not be evaluated; no scalar was stored";
         }
+        if (errorOut != nullptr) *errorOut = scErr;
+        return true;
       }
-      session.scalars.set(name, arith ? *arith : expr);
+      session.scalars.set(name, *arith);
+      // Scalars and matrices share one namespace ([P] matrix define,
+      // "Namespace"): defining the scalar destroys a matrix of the same name.
+      session.matrices.erase(std::remove_if(session.matrices.begin(), session.matrices.end(),
+                                            [&name](const auto& p) { return p.first == name; }),
+                             session.matrices.end());
+      // BUG-710: the type travels with the value (EvalSession::stringScalars).
+      if (scIsString) {
+        session.stringScalars[name] = *arith;
+      } else {
+        session.stringScalars.erase(name);
+      }
       return true;
     }
     // unrecognized `scalar` line — fall through (don't swallow)
@@ -3693,7 +7496,7 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
   // only deleting the old postfix branch. PREFIX (`local ++i`) is
   // UNCHANGED — it IS real Stata increment syntax.
   // A3: the prefix-increment form needs a literal `++` or `--`.
-  static const std::regex reIncPre(R"(^local\s+(\+\+|--)\s*([A-Za-z_]\w*)\s*$)");
+  static const std::regex reIncPre(R"(^local\s+(\+\+|--)\s*([A-Za-z_\x80-\xff][\w\x80-\xff]*)\s*$)");
   if ((stripped.find("++") != std::string::npos || stripped.find("--") != std::string::npos) &&
       std::regex_match(stripped, m, reIncPre)) {
     std::string incOp = m.str(1);
@@ -3716,12 +7519,15 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
     std::string name = mdName;
     std::string rhs = strip(mdRest);
 
-    // Compound double-quote RHS: `local x `"...."'`
-    if (rhs.size() >= 4 && rhs.rfind("`\"", 0) == 0 &&
-        rhs.compare(rhs.size() - 2, 2, "\"'") == 0) {
+    // Compound double-quote RHS: `local x `"...."'` -- ONE span from the first
+    // `" to the end (EM3b: nesting-aware, so `"a"' `"b"' is not one span). EM3a:
+    // the body is expanded to a fixed point with macval() verbatim
+    // (expandDefinitionText; w2af mt_mv_copy `<7>|<6>`).
+    if (rhs.size() >= 4 && rhs.rfind("`\"", 0) == 0 && compoundSpanEnd(rhs, 0) == rhs.size()) {
       std::string inner = rhs.substr(2, rhs.size() - 4);
       if (hasMacroRefs(inner)) {
-        ExpandResult exp = expandPass(inner, session);
+        ExpandResult exp = expandDefinitionText(inner, session);
+        if (takeCodedExpandError(exp, errorOut)) return true;
         if (!exp.isError) inner = exp.line;
       }
       session.locals.set(name, inner);
@@ -3779,11 +7585,12 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
         // so the corpus was accidentally right by deferral, and making the
         // failure honest is what exposed the missing pass here.
         ExpandResult exp = expandMacros(expr, session);
-        if (exp.isError) {
-          // Expansion error — store just the expr part (not the `=` prefix).
-          session.locals.set(name, expr);
-          return true;
-        }
+        if (takeCodedExpandError(exp, errorOut)) return true;  // BUG-629
+        // FU-225 sweep (BUG-710): an expansion that failed is an error, not a
+        // value. This stored the expression's own text at rc 0 (`local x =
+        // `=s[1]+"z"'` kept those characters); it is refused by name now, at the
+        // block's code (198 when it names none), and the local stays unset.
+        if (refuseFailedExpansion(exp, errorOut)) return true;
         expr = exp.line;
       }
       std::string raised246;
@@ -3794,7 +7601,7 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
       // shapes that deliberately keep the legacy literal fallback. The local
       // stays UNSET on the error path (Stata: after `capture local e = 1%2`,
       // `e` is empty — oracle section H).
-      if (!arith && classifyFailedEqExpr(expr, raised246, errorOut)) return true;
+      if (!arith && classifyFailedEqExpr(expr, raised246, errorOut, &session)) return true;
       // NEVER store the `= expr` form with the leading `=`.
       //
       // stripOuterDquotes on the non-arithmetic fallback: in Stata `local x =
@@ -3819,10 +7626,19 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
       return true;
     }
 
-    // Append / nested idiom: expand RHS refs (ONE pass) before storing.
+    // Append / nested idiom: expand RHS refs before storing -- to a fixed point
+    // (EM3a, expandDefinitionText).
     if (hasMacroRefs(rhs)) {
-      ExpandResult exp = expandPass(rhs, session);
-      if (!exp.isError) rhs = exp.line;
+      ExpandResult exp = expandDefinitionText(rhs, session);
+      // name-binding-display-literals (review, round 5): an expansion that
+      // failed with a Stata code (an inline `=invFtail(2,3,.5)'` PIET refuses by
+      // name) is that refusal, not the source text stored at rc 0. Under
+      // `capture` the line reached here unexpanded and `_rc` came back 0.
+      if (takeCodedExpandError(exp, errorOut)) return true;
+      // X-1: Stata trims the blanks an expansion leaves at either end of an
+      // unquoted value: `local tl `tl' `t'` from an empty tl stores `double`,
+      // not ` double` (w2ai_graph_family.log:219; w2an cf_cmd_subgr_gb :742).
+      if (!exp.isError) rhs = strip(exp.line);
       // expansion failure (undefined ref): store the literal RHS
     }
 
@@ -3870,17 +7686,15 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
       if (hasMacroRefs(expr)) {
         // BUG-339, global twin — see the local branch above for the mechanism.
         ExpandResult exp = expandMacros(expr, session);
-        if (exp.isError) {
-          session.globals.set(name, expr);
-          return true;
-        }
+        if (takeCodedExpandError(exp, errorOut)) return true;  // BUG-629, global twin
+        if (refuseFailedExpansion(exp, errorOut)) return true;  // FU-225 sweep, global twin
         expr = exp.line;
       }
       std::string raised246g;
       bool isStrResult246g = false;
       auto arith = evalArith(expr, &session, &raised246g, &isStrResult246g);
       // BUG-246, global twin — same conversion, same two retained fallbacks.
-      if (!arith && classifyFailedEqExpr(expr, raised246g, errorOut)) return true;
+      if (!arith && classifyFailedEqExpr(expr, raised246g, errorOut, &session)) return true;
       // BUG-660 fix round: same cap-at-store-site rule as local's branch above.
       session.globals.set(name, arith ? (isStrResult246g
                                               ? *arith
@@ -3889,9 +7703,22 @@ bool tryCaptureDefinition(const std::string& rawLine, EvalSession& session,
       return true;
     }
 
+    // EM3b: the compound-quoted RHS, as `local`'s (`global g `"g "q" x"'` stores
+    // g "q" x, w2af_macro_text_file.log:887).
+    if (rhs.size() >= 4 && rhs.rfind("`\"", 0) == 0 && compoundSpanEnd(rhs, 0) == rhs.size()) {
+      std::string inner = rhs.substr(2, rhs.size() - 4);
+      if (hasMacroRefs(inner)) {
+        ExpandResult exp = expandDefinitionText(inner, session);
+        if (takeCodedExpandError(exp, errorOut)) return true;
+        if (!exp.isError) inner = exp.line;
+      }
+      session.globals.set(name, inner);
+      return true;
+    }
     if (hasMacroRefs(rhs)) {
-      ExpandResult exp = expandPass(rhs, session);
-      if (!exp.isError) rhs = exp.line;
+      ExpandResult exp = expandDefinitionText(rhs, session);
+      if (takeCodedExpandError(exp, errorOut)) return true;  // as `local` above
+      if (!exp.isError) rhs = strip(exp.line);              // X-1, as `local` above
     }
     rhs = stripOuterDquotes(rhs);
     session.globals.set(name, rhs);
@@ -3939,10 +7766,10 @@ void captureRFromBlock(const nlohmann::ordered_json& block, EvalSession& session
       double sd = *newR.find("sd");
       newR.set("Var", sd * sd);
     }
-    // median alias for p50.
-    if (newR.contains("p50") && !newR.contains("median")) {
-      newR.set("median", *newR.find("p50"));
-    }
+    // No r(median): Stata's summarize posts r(p50) only, and a read of r(median)
+    // after `summarize, detail` is `.` (FU-268, BUG-1013; w2o_rnames N16,
+    // w2as_summary_stats_family sx_sum_d_u). The p50 alias this branch used to
+    // post answered 5.25 there.
     session.rValues = newR;  // replace entire r() store (Stata semantics)
     return;
   }
@@ -3967,16 +7794,36 @@ void captureRFromBlock(const nlohmann::ordered_json& block, EvalSession& session
     // form (no F on the block) sets {chi2, df, p}. The chi2 keys are now a
     // FALLBACK, applied only when the block carries no F.
     OrderedFloatDict newR;
-    const bool fForm = block.contains("p_F") && !block.at("p_F").is_null();
+    // The least-squares form carries F and p_F (both null when R V R' is exactly
+    // zero: an exact `regress` fit, where Stata prints F(1, 48) = . and posts
+    // r(F) = r(p) = missing at rc 0). A null there is Stata's missing value, so it
+    // is posted as `.`; the chi2 form (no p_F key) keeps its present-only map.
+    const bool fZero = block.contains("p_F") && block.at("p_F").is_null() &&
+                       block.contains("F") && block.at("F").is_null();
+    const bool fForm = block.contains("p_F") && (!block.at("p_F").is_null() || fZero);
     static const std::vector<std::pair<std::string, std::string>> kFMap = {
         {"F", "F"}, {"p_F", "p"}, {"df1", "df"}, {"df2", "df_r"}};
     static const std::vector<std::pair<std::string, std::string>> kChi2Map = {
         {"chi2", "chi2"}, {"p_chi2", "p"}, {"df1", "df"}};
+    // BUG-1276: with every constraint dropped (df1 0) the chi2 form's statistic and
+    // p are missing too, and Stata still posts them (`test x1` after `logit y x1 xs,
+    // asis`: r(chi2) = r(p) = ., r(df) 0, r(dropped_1) 1).
+    const bool allDropped = block.contains("dropped_rows") && block.contains("df1") &&
+                            block.at("df1").is_number() && block.at("df1").get<double>() == 0;
     for (const auto& [src, dst] : (fForm ? kFMap : kChi2Map)) {
       if (block.contains(src) && !block.at(src).is_null()) {
         auto f = jsonToFloat(block.at(src));
         if (f) newR.set(dst, *f);
+      } else if ((fZero && (src == "F" || src == "p_F")) ||
+                 (allDropped && (src == "chi2" || src == "p_chi2"))) {
+        newR.set(dst, std::nan(""));
       }
+    }
+    // r(dropped_#): the number of each constraint the engine dropped, in order.
+    if (block.contains("dropped_rows") && block.at("dropped_rows").is_array()) {
+      int k = 0;
+      for (const auto& row : block.at("dropped_rows"))
+        if (row.is_number()) newR.set("dropped_" + std::to_string(++k), row.get<double>());
     }
     // A malformed/empty test block must leave r() alone rather than clearing
     // it — F is the one key every shape of this block carries.
@@ -3998,10 +7845,17 @@ void captureRFromBlock(const nlohmann::ordered_json& block, EvalSession& session
         {"b", "estimate"}, {"se", "se"}, {"t", "t"}, {"p", "p"}, {"ci_lo", "lb"}, {"ci_hi", "ub"},
     };
     OrderedFloatDict newR;
+    // A zero-variance combination (an exact `regress` fit): the engine posts se 0
+    // with t, p and the interval null, and Stata's lincom posts r(se) 0 with r(t),
+    // r(p), r(lb), r(ub) missing (StataBE `lincom x` after `regress yx x`).
+    const bool zeroSe = row.contains("se") && row.at("se").is_number() &&
+                        row.at("se").get<double>() == 0.0;
     for (const auto& [src, dst] : kMap) {
       if (row.contains(src) && !row.at(src).is_null()) {
         auto f = jsonToFloat(row.at(src));
         if (f) newR.set(dst, *f);
+      } else if (zeroSe && row.contains(src) && src != "b" && src != "se") {
+        newR.set(dst, std::nan(""));
       }
     }
     if (block.contains("df") && !block.at("df").is_null()) {

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // xtlogit, fe — Chamberlain (1980) conditional logit for binary panels.
 //
 // Conditional on the panel sum K_i = Σ_t y_it, the unit fixed effect drops out.
@@ -27,17 +29,25 @@ struct XtlogitFeResult {
     int64_t n_obs = 0, n_groups = 0;
     int64_t n_dropped_const = 0;   // K_i ∈ {0, T_i}
     int64_t n_dropped_size = 0;    // T_i < 2
+    // Row counts of the panels used (after the drops): Stata's e(g_min)/e(g_avg)/
+    // e(g_max) over e(sample). 0 when no panel is kept.
+    int64_t g_min = 0, g_max = 0;
+    double g_avg = 0;
     std::vector<double> beta;
     std::vector<double> se_iid;
     std::vector<double> se_robust;
+    std::vector<double> V_iid, V_robust;  // complete fitted covariance, column-major
     double loglik = 0;
     int iters = 0;
     bool converged = false;
 };
 
+// Optimizer: Newton-Raphson with halving / forward steps and ml's default stop
+// rule from the start xtlogit_fe_start chooses; see xtlogit.cpp section 3.
+// `iters` is e(ic); `loglik` is e(ll) at beta.
 XtlogitFeResult xtlogit_fe(const double* X, int64_t n_obs, int k,
                            const double* y, const double* ivar,
-                           int maxit = 100, double tol = 1e-10);
+                           int maxit = 300);
 
 // Thread count xtlogit_fe's per-panel fan-out uses for a fit of `ng` panels
 // whose longest panel is `Tmax` with `k` regressors: src/core/threads.h

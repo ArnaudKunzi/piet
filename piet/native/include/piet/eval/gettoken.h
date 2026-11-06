@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // gettoken — C++ port of piet/backend/piet/router/gettoken.py.
 //
 // `gettoken TOK REST : SRC [, bind]` peels the first quote-aware token off
@@ -21,6 +23,10 @@ namespace piet::eval {
 struct LocalsStore {
   std::function<std::string(const std::string&)> get;
   std::function<void(const std::string&, const std::string&)> set;
+  // gettoken's `(global) name` ([P] gettoken); empty where the caller keeps no
+  // globals, and a (global) name then refuses.
+  std::function<std::string(const std::string&)> getGlobal;
+  std::function<void(const std::string&, const std::string&)> setGlobal;
 };
 
 // Executes `gettoken TOK REST : SRC [, bind]`.

@@ -1,0 +1,5 @@
+{
+  "code": "engine_error",
+  "message": "joinby using: file not found: '/path/to/definitely_missing_file_xyz.dta'",
+  "type": "error"
+}

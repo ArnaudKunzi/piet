@@ -1,0 +1,10 @@
+# Generated graph artifacts from running the demo .do files (run_demos.sh /
+# a manual `graph export`) — reproducible outputs, never committed.
+*.svg
+*.png
+*.pdf
+
+# Kit datasets ARE part of the deliverable (self-contained kits). Re-include
+# them: the repo-root .gitignore blanket-ignores *.csv, so each kit's data file
+# must be negated here (one line per kit).
+!fatalities/fatalities.csv

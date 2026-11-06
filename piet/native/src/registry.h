@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Phase A0 (BETA campaign) — the command registry: a single hand-transcribed
 // table describing TODAY's dispatcher.cpp routing behavior, one row per
 // canonical Stata command PIET actually routes. NOT a self-registration
@@ -8,14 +10,14 @@
 // built by hand against dispatcher.cpp:809-2203 (the routing table),
 // eval/tokenizer.cpp:507-519/529-539 (the weight/`in` allow-lists), and
 // dispatcher.cpp:596-678 (the by/bysort gate) — see
-// private-notes/plans/BETA-20260712-campaign/A0-anchor-map.md for the full
+// internal note A0-anchor-map.md for the full
 // scouting trail this transcription is built from.
 //
 // Consumers:
 //   - `piet_native --dump-registry` (this file's runDumpRegistry(), wired in
 //     main.cpp's flag loop) dumps every row as JSON to stdout.
 //   - tools/freeze_matrix.py reads that JSON to enumerate one frozen
-//     invocation per registered command against tests/kitchensink/debug_all.do.
+//     invocation per registered command against internal script debug_all.do.
 //   - selftest.cpp's testRegistryRoutes() is the drift guard: for every
 //     canonical/abbrev spelling here, dispatch a minimal probe and assert
 //     dispatcher.cpp never silently answers with the generic
@@ -70,8 +72,8 @@ enum class Family {
 // gate EXACTLY: each row names the ONE allow-set the engine actually accepts
 // for that command; the gate rejects any spelling outside that row's set,
 // naming the command AND (for a non-None row) the allowed set in its reject
-// message. This is a per-command field now (P3 weights wave, project-owned
-// engine work) — the pre-P3 law ("fw/fweight only, a narrow allow-list;
+// message. This is a per-command field now (P3 weights wave, an
+// engine work item) — the pre-P3 law ("fw/fweight only, a narrow allow-list;
 // aw/pw/iw rejected everywhere, no exceptions") is retired; None is still a
 // real, common case (most commands), just no longer the ONLY non-FweightOnly
 // case.
@@ -80,6 +82,7 @@ enum class WeightPolicy {
   FweightOnly,    // [fw=]/[fweight=] only (tabulate/tab1/tab2, collapse)
   AweightFweight, // [aw=]/[aweight=] or [fw=]/[fweight=] only (summarize)
   PweightOnly,    // [pw=]/[pweight=] only (mean, proportion)
+  AweightPweight, // [aw=]/[aweight=] or [pw=]/[pweight=] only (ivreg2)
   AllWeights,     // [aw=]/[fw=]/[pw=]/[iw=] all forwarded (regress/reg/r/feols/reghdfe)
 };
 
@@ -170,6 +173,15 @@ struct CommandSpec {
   // been confirmed to be a plain one. Set by name in commandRegistry(), so the
   // ~298 row literals need no edit and the opt-in list reads as a list.
   bool varlistIsPlain = false;
+
+  // BUG-1422: true iff Stata's own syntax for this command takes neither an `in`
+  // range nor weights, and the arm itself refuses them as Stata does, in
+  // Stata's order (varlist, if, in, weights): r(101) "in range not allowed" /
+  // "weights not allowed". The tokenizer's two feature-gap gates (r(198) "does
+  // not support the `in` row-range qualifier ...") stand aside for these rows,
+  // which would otherwise answer a Stata refusal as a PIET gap. Set by name in
+  // commandRegistry(), like varlistIsPlain.
+  bool qualifiersRefusedByArm = false;
 };
 
 // WS-B (extcompat, 2026-08-06): the attribution record behind the gate
@@ -234,7 +246,7 @@ const CommandSpec* findByName(const std::string& lowerName);
 // The POLICY is unchanged and deliberately NOT a computed prefix rule: real
 // Stata's accepted-spelling union is non-contiguous (`hist` runs, `histo` does
 // not; `tab` runs, `tabl` does not; `d`=describe but `dr`=nothing), measured
-// live against StataBE — see plans/BUG105-ABBREV-SOURCING-20260731.md §2. Only
+// live against StataBE — see internal note BUG105-ABBREV-SOURCING-20260731.md §2. Only
 // declared spellings resolve.
 //
 // ONE deliberate exemption: a spelling this row lists in `communityNames` is
@@ -281,7 +293,7 @@ const std::vector<PrefixSpec>& prefixRegistry();
 // `piet_native --dump-prefix-registry`: prefixRegistry() as a JSON array.
 // A SEPARATE flag, not extra keys on --dump-registry, because that dump's
 // array-of-command-rows shape is already parsed by tools/freeze_matrix.py and
-// tests/kitchensink/pangram/coverage_check.py.
+// internal script coverage_check.py.
 int runDumpPrefixRegistry();
 
 // `piet_native --dump-registry`: prints commandRegistry() as a JSON array

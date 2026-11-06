@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — a mutable in-memory table for data prep (generate / keep / summarize),
 // the start of the Stata-compatible data layer. Loads from an .hbin Dataset,
 // applies transformations, and can write a new .hbin for the estimators.
@@ -5,7 +7,6 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -68,6 +69,19 @@ inline std::mutex& column_wide_stripe(const void* p) {
 // not a dtype: the payload stays f64. Double = identity, so every caller that does
 // not ask stays byte-identical. Rules: frame_detail::round_to_store (frame_internal.h).
 enum class StoreType { Double, Float, Byte, Int, Long };
+
+// Frame::generate/bygen's qualifiers besides the `if` mask (BUG-841/842).
+struct GenQualifier {
+    // Stata's `in a/b`: 1-based observation numbers, inclusive; in_first == 0 means
+    // no range. A row outside it is not selected (like a false `if`), and group()
+    // numbers its rows WITHIN the range (w2m_bymask G05 :514, `group(2) in 3/6`
+    // gives . . 1 1 2 2). An `if` mask does not renumber (GRPIF, G02 :482).
+    int64_t in_first = 0, in_last = 0;
+    // Stata's replace: an excluded row keeps the column's current value rather than
+    // becoming missing (w2m_bymask C09 :361). A new column has none, so its
+    // excluded rows are missing either way.
+    bool keep_unselected = false;
+};
 
 struct ColumnData {
     // ---- storage ladder (RAMDIET-2, 2026-08-15) ----
@@ -604,6 +618,12 @@ public:
 
     int64_t n_rows() const { return n_; }
     int n_cols() const { return static_cast<int>(cols_.size()); }
+    // How many values a non-Double store turned into missing because the storage
+    // type cannot hold them (round_to_store: `gen byte b = 300`), over this Frame's
+    // life. `cobra eval` reports its own call's share as `store_overflow`: Stata's
+    // "(N missing values generated)" counts the expression's missing values, not
+    // these (BUG-1123).
+    int64_t store_overflow() const { return store_overflow_; }
     const std::vector<FrameColumn>& columns() const { return cols_; }
     bool has(const std::string& name) const { return idx_.count(name) > 0; }
     const FrameColumn& col(const std::string& name) const;
@@ -658,7 +678,9 @@ public:
     // RETURN a fresh Frame (append, merge, reshape, collapse, joinby, expand, cross,
     // contract, fillin, tsfill, duplicates_drop, from_csv, bulk-build) are claimless
     // by construction: a default-constructed Frame has no claim, and none of them
-    // copies one in — safe by default, blank on export.
+    // copies one in — safe by default, blank on export. One exception mints a claim
+    // it can prove: merge_frames under stata_plan, for a keyed 1:1 merge left with no
+    // using-only row (Stata's merge re-sorts by the keys there).
     const std::vector<std::string>& sorted_by() const { return sort_keys_; }
     // Install a claim. Keys must name existing, DISTINCT columns of this Frame —
     // anything else (a hand-edited header, a stale caller) clears instead of
@@ -711,8 +733,11 @@ public:
     // `st` (BUG-471 T1): the storage type the result is rounded to on the way in —
     // see StoreType above. The default keeps the double every caller had; the egen
     // family, row_egen and bygen below take the same trailing parameter.
+    // `q` (BUG-841/842): Stata's `in a/b` range, carried apart from the `if` mask,
+    // and replace's rule for the rows the qualifiers exclude. See GenQualifier.
     void generate(const std::string& name, const std::string& expr, bool require_new = false,
-                  const std::string& mask_expr = "", StoreType st = StoreType::Double);
+                  const std::string& mask_expr = "", StoreType st = StoreType::Double,
+                  const GenQualifier& q = GenQualifier());
 
     // `keep if expr` — keep rows where the expression is nonzero; a missing value is
     // nonzero, so its row is kept (Stata's `if`). Returns the number of rows kept.
@@ -736,7 +761,7 @@ public:
     //            p supplied via the `pctile_p` argument (default 50).
     //   Iqr    = p75 - p25 (Stata pctile method) broadcast to the group.
     //
-    // B4/W6 rank family and `var`. Oracle tests/eval/golden/aer_b4/private_oracle_b.log
+    // B4/W6 rank family and `var`. Oracle B4 oracle capture b
     // and _c.log, on r = 10,10,20,30,30,30,40,.,.,. — a fixture built with heavy ties
     // BECAUSE batch A's (price, rep78) had none, which made track==default and
     // maxmode==default and so proved nothing:
@@ -756,16 +781,42 @@ public:
     // third-party ado's spelling and semantics are the contract here. Reopen if the
     // bundled _gvar.ado is ever replaced by a differently-behaving one, or if
     // StataCorp ships an official `var`.
+    //   Pc         `pc()`: p*x/T per row, T the sum of the group's non-missing values
+    //              and p 100 (or 1 under `prop`) -- p*x over the group's sum, so a group whose
+    //              T is 0 (all missing, or all zero) is missing. Oracle
+    //              w2ap_egen_family eg_pc_plain / _prop / _if, eg_pc_byp_prop.
+    //   Count      over a STRING column counts its non-empty values: it is
+    //              the non-missing count, and "" is a string's missing (" " is not).
+    //              Oracle eg_count_byopt_str.
     enum class EgenFn { Max, Min, Mean, Median, Sum, Count, Sd, Rank, Pctile, Std, Iqr,
-                        RankTrack, RankField, RankUnique, Var };
-    // `st` rounds the result once (one `gen <type>` per ado); default Rank under
-    // Byte/Int/Long throws bad_input (_grank.ado widens tied ranks with replace).
+                        RankTrack, RankField, RankUnique, Var, Pc };
+    // The option values the expression family reads, each from the egen function it belongs to:
+    //   missing   sum()/total(): a group with no non-missing value is `.`, not 0
+    //             (total's `missing` option; oracle eg_sum_byp_miss, eg_total_*_miss).
+    //   pc_prop   pc(): a proportion, p = 1 instead of 100 (pc's `prop` option).
+    //   std_mean, std_sd   std(): sd*(x - mean)/s + mean, with the mean() (default 0)
+    //             and sd() (default 1) options. Oracle eg_std_plain_ms, _ms2.
+    //   data_order  sum()/total()/mean() as gtools' gegen computes them: the
+    //             group's sum in data order even without by(), where official egen
+    //             reads summarize's exact sum (StataBE 19.5, gtools 1.x: gegen
+    //             total of 1e16, twenty-two 1s and -1e16 is 0, of ten 0.1s
+    //             +1.fffffffffffffX-001; egen gives 22 and 1).
+    // (A constructor, not member initializers: the struct is a default argument of
+    // egen_by inside the class, where clang cannot use them yet.)
+    struct EgenOpts {
+        bool missing, pc_prop, data_order;
+        double std_mean, std_sd;
+        EgenOpts()
+            : missing(false), pc_prop(false), data_order(false), std_mean(0.0), std_sd(1.0) {}
+    };
+    // `st` rounds the result once (one generate per function); default Rank under
+    // Byte/Int/Long throws bad_input (Stata widens tied ranks with replace).
     void egen_by(const std::string& out, EgenFn fn, const std::string& expr,
                  const std::vector<std::string>& by_cols, double pctile_p = 50.0,
-                 StoreType st = StoreType::Double);
+                 StoreType st = StoreType::Double, const EgenOpts& eo = EgenOpts());
 
     // egen mode: `egen out = mode(x) [, by(g) minmode|maxmode|nummode(#) missing]`.
-    // Oracle private_oracle_b.log on t = 1,1,2,2 + six missings (a deliberate TIE):
+    // Oracle capture b on t = 1,1,2,2 + six missings (a deliberate TIE):
     //   default            -> MISSING for every row (Stata also warns)
     //   maxmode / minmode  -> the largest / smallest of the tied modes (2 / 1)
     //   missing            -> `.` counts as a value; here it wins with 6 and the
@@ -775,15 +826,23 @@ public:
     // missing for a group with fewer than k modes — the egen-six capture's
     // nummode(2) is 3 where the modes are {1,3} and missing where there is only one.
     // A nummode(k) larger than the mode count of EVERY group is Stata's r(198).
-    // `mode` over a string variable is not implemented — see egen_mode's definition.
+    // A STRING source (a factor column named alone) takes the same rule over its text:
+    // "" is its missing, values order by their bytes, and the answer is text (oracle
+    // w2ap_egen_family eg_mode_byp_str). See egen_mode's definition.
     struct ModeOpts {
         int nummode = 0;            // 0 = not given
         bool minmode = false, maxmode = false;
         bool missing_as_value = false;
     };
-    // No store type: _gmode.ado:19 replaces the requested type with the source variable's own type and :122 copies a source value, so the result is exact.
+    // No store type: egen mode replaces the requested type with the source variable's own type and copies a source value, so the result is exact.
     void egen_mode(const std::string& out, const std::string& expr,
                    const std::vector<std::string>& by_cols, const ModeOpts& mo);
+    // egen_mode's string branch (the source is a factor column); `order` and `K` are
+    // egen_mode's by-sort, `one_group` when there is no by().
+    void egen_mode_text(const std::string& out, const FrameColumn& src,
+                        const std::vector<int64_t>& order,
+                        const std::vector<std::vector<double>>& K, bool one_group,
+                        const ModeOpts& mo);
 
     // egen nvals (egenmore, ACCEPTED-NAMED — see EgenFn::Var above for the rule):
     // `egen out = nvals(varlist) [, by(g) missing]` — the count of DISTINCT values,
@@ -792,34 +851,48 @@ public:
     // as `nvals(s)`'s 5 distinct strings). oracle_c: nvals(r) = 4 on
     // 10,10,20,30,30,30,40. Rows with any missing component are excluded unless
     // `missing`; a group with nothing left is missing.
-    // `st`: Float rounds the count once; byte/int/long store it exact (_gnvals.ado's replace widens).
+    // `st`: Float rounds the count once; byte/int/long store it exact (Stata's replace widens).
     void egen_nvals(const std::string& out, const std::vector<std::string>& vars,
                     const std::vector<std::string>& by_cols, bool missing_as_value = false,
                     StoreType st = StoreType::Double);
 
-    // Row-wise string concatenation; numeric value labels are optional caller metadata.
+    // egen concat: `egen out = concat(varlist) [, punct(s) format(%fmt) maxlength(#)]`.
+    // Text result (a factor column).
     struct ConcatOpts {
-        std::string punct;    // separator between fields ("" = none)
+        std::string punct;    // separator appended after every field ("" = none)
         std::string format;   // Stata %fmt for NUMERIC inputs ("" = string()'s %9.0g)
-        int maxlength = 0;    // decoded-label byte limit; 0 = default 32000
-        bool decode = false;
-        std::map<std::string, std::map<int, std::string>> valueLabels;
+        int maxlength = 0;    // 0 = not given
+        bool decode = false;  // refused: cobra has no value-label decode
     };
     void egen_concat(const std::string& out, const std::vector<std::string>& vars,
                      const ConcatOpts& co);
 
-    // Interval grouping; group() keeps equal input values in the same group.
+    // egen cut: `egen out = cut(var), at(numlist) | group(#) [icodes] [label]`.
+    // Oracle capture b, at(0 10 20 30) on c = 0,5,10,15,20,25:
+    //   0->0  5->0  10->10  15->10  20->20  25->20
+    // — LEFT-CLOSED, RIGHT-OPEN intervals whose value is the LEFT EDGE, with the top
+    // edge exclusive (a value >= the last edge, or below the first, is missing: the
+    // egen-six capture's v=7 against at(1 2 3 5) is missing).
+    //   `icodes` stores the 0-based interval number instead of the left edge.
+    //   `label`  stores the icode AND attaches a value label per interval, spelled
+    //            "<left edge>-" (egen-six `label list`: 0 "1-", 1 "2-", 2 "3-",
+    //            3 "5-" — one label per at() value, including the top edge that no
+    //            observation can reach). cobra carries that as a FACTOR column: the
+    //            code is the icode and the level string is the label, which is the
+    //            same (code, text) pair.
+    //   `group(k)` cuts at k quantiles instead and always stores the 0-based code.
+    // Stata refuses two forms here and so does this: an expression rather than a
+    // variable name is r(198), and a `by` prefix is r(190).
     struct CutOpts {
         std::vector<double> at;   // explicit edges (ascending, >= 2)
         int group = 0;            // 0 = not given
         bool icodes = false, label = false;
     };
-    // `label` implies integer codes; optional metadata preserves the numeric result.
-    // Integer storage requests widen when needed; storedTypeOut reports that choice.
+    // `st` reaches the numeric result only; the `label` form is a factor (codes).
+    // Under Byte/Int/Long, integer results are stored exact (Stata's replace widens)
+    // and a non-integer cut point throws bad_input.
     void egen_cut(const std::string& out, const std::string& var, const CutOpts& co,
-                  StoreType st = StoreType::Double,
-                  std::map<int, std::string>* labelsOut = nullptr,
-                  StoreType* storedTypeOut = nullptr);
+                  StoreType st = StoreType::Double);
 
     // egen tag: `egen out = tag(varlist)` — 1 on the FIRST observation (in the data's
     // current order) of each distinct combination of varlist, 0 on the rest, and
@@ -835,30 +908,17 @@ public:
     void egen_group(const std::string& out, const std::vector<std::string>& by_cols,
                     bool missing_as_group = false, StoreType st = StoreType::Double);
 
-    // egen seq: `egen out = seq()` [, by(by_cols)] — running sequence 1..N over the
-    // data's current order; resets to 1 at the start of each by-group (no by => 1..N
-    // over the whole dataset). (Stata seq() — no input variable.)
-    // BUG-433: `egen seq(), from(f) to(t) block(b)` — the sequence runs f..t with
-    // each value repeated b times and RESTARTS at f when it passes t. Defaults
-    // f=1, b=1, t=absent (no wrap), which is the bare `seq()` this used to be.
-    // No store type: _gseq.ado ignores the requested type and `replace`s into a byte
-    // variable, which widens, so the integers are always exact.
+    // egen seq: `egen out = seq() [, from(f) to(t) block(b)]`, optionally within
+    // by-groups. has_to=false means to() was not given. No store type.
     void egen_seq(const std::string& out, const std::vector<std::string>& by_cols,
                   double from = 1.0, double to = 0.0, bool has_to = false,
                   int64_t block = 1);
 
-    // egen ROW functions: `egen out = fn(varlist)` computed ACROSS the listed
-    // columns within each row. Missing (NaN) handling matches Stata: mean/sd/max/min
-    // ignore missing (all-missing => missing; sd needs >=2 non-missing); total treats
-    // missing as 0 (all-missing => 0); miss/nonmiss count missing/non-missing.
-    // `st`: mean/sd round once; under Float, total rounds every PARTIAL sum (Stata's
-    // _growtotal.ado replaces into the new variable) and max/min round the pick (equal
-    // to the ado's per-step rounding within float's range; FD-T1-A); miss/nonmiss
-    // counts are stored exact. Byte/Int/Long on total/max/min throw
-    // bad_input: Stata's replace widens an integer variable (see row_egen).
+    // egen ROW functions: `egen out = fn(varlist)` computed across the listed
+    // columns within each row. `missing` is rowtotal's option, `strok` rownonmiss's.
     enum class RowFn { Mean, Sd, Total, Max, Min, Miss, NonMiss };
     void row_egen(const std::string& out, RowFn fn, const std::vector<std::string>& cols,
-                  StoreType st = StoreType::Double);
+                  StoreType st = StoreType::Double, bool missing = false, bool strok = false);
 
     // classic `mkspline stub = var, cubic` — restricted cubic spline (Harrell RCS)
     // basis on RAW x. Generates stub1..stub(nk-1) (stub1 = x, then nk-2 nonlinear
@@ -871,7 +931,11 @@ public:
     // `xtile out = var, nq(k)` — assign each row to its quantile group 1..k using
     // Stata pctile cutpoints (k-1 of them); missing var => missing. Ties at a
     // cutpoint fall in the lower group (group = 1 + #cutpoints strictly below v).
-    void xtile(const std::string& out, const std::string& var, int nq);
+    // `wvar` (optional): [aw=]/[fw=] -- the cutpoints are the weighted percentiles
+    // (pctile with weights: the summarize, detail rule); a row with a missing or
+    // non-positive weight is outside the sample and gets missing (xtile.ado marks
+    // the weight). BUG-1015, w2as_summary_stats_family sx_xtile_n_aw.
+    void xtile(const std::string& out, const std::string& var, int nq, const std::string& wvar = "");
     // BUG-371: Stata `xtile … , cutpoints(cvar)` — the bin edges come from ANOTHER
     // variable's non-missing values instead of being derived from quantiles of
     // `var`. Same grouping rule either way (group = 1 + #cutpoints strictly below),
@@ -892,11 +956,14 @@ public:
     // x[k] resolving WITHIN each by-group in (sort_cols ascending) order. x[k] is
     // missing for k<1 or k>_N (Stata out-of-bounds rule). `mask_expr` (the `if`,
     // see generate) is evaluated in the same by-group context, and a missing
-    // value selects the row, as Stata's `if` does (BUG-836/837).
+    // value selects the row, as Stata's `if` does (BUG-836/837). `q` as in
+    // generate; an `in` range with a non-empty by-list is refused (PIET sends a
+    // range only with an empty by-list, egen.cpp runBysortGen).
     void bygen(const std::string& out, const std::string& expr,
                const std::vector<std::string>& by_cols,
                const std::vector<std::string>& sort_cols,
-               const std::string& mask_expr = "", StoreType st = StoreType::Double);
+               const std::string& mask_expr = "", StoreType st = StoreType::Double,
+               const GenQualifier& q = GenQualifier());
 
     struct Summary {
         int64_t n = 0;
@@ -922,8 +989,15 @@ public:
     // the weights are rescaled to sum to n before the variance so Var = Sum(w*)(x-mean)²/(n-1),
     // and non-integer weights are legal. mean/min/max are computed identically either way.
     // pweight/iweight are NOT implemented here and are rejected upstream.
+    //
+    // `keep` (optional, length n_rows()): restricts the summary to the rows with a
+    // nonzero entry -- one by()-group of tabstat, which is summarize run on each
+    // group (summarize restricted to that group's rows). nullptr = every row.
+    // `importance` (Stata `[iw=wvar]`): the fweight formulas (sum_w = Sum(w), Var divides
+    // by Sum(w)-1) with N = the ROW count and any real weight legal.
     Summary summarize(const std::string& var, bool detail = false, const std::string& wvar = "",
-                      bool analytic = false) const;
+                      bool analytic = false, const std::vector<char>* keep = nullptr,
+                      bool importance = false) const;
 
     // Add (or replace) a raw f64 column of length n_rows(). Used by `predict` to
     // append fitted values / residuals computed outside the expression evaluator.
@@ -953,13 +1027,25 @@ public:
     // which intentionally alphabetizes). Numeric by-vars and the aggregated `specs`
     // columns (which still require f64 — factor stat vars remain unsupported) are
     // byte-identical to before this existed.
+    // `wtype` (aw|fw|iw|pw; "" = fw) and the statistics semean, sebinomial,
+    // sepoisson, rawsum, percent and iqr match Stata's collapse (aw
+    // rescales the weights per group, remakew); any weighted observation with a
+    // missing or zero weight is marked out before the groups form. A factor stat
+    // column serves first/last/firstnm/lastnm (a fresh dictionary, like a factor
+    // by-column). `stata_by_order` orders a factor by-column's groups by their
+    // text, as Stata's `sort` does, instead of by first-seen dictionary code.
     Frame collapse(const std::vector<CollapseSpec>& specs, const std::vector<std::string>& by,
-                   const std::string& wvar = "") const;
+                   const std::string& wvar = "", const std::string& wtype = "",
+                   bool stata_by_order = false) const;
 
     // `tsfill` — insert rows for missing time periods within each panel (per-panel
     // [min,max] gaps at step `delta`). New rows have the panel id + time set and all
-    // other columns missing. Returns a new (larger) Frame sorted by (panel,time).
-    Frame tsfill(const std::string& timevar, const std::string& panelvar, double delta) const;
+    // other columns missing. Returns a new (larger) Frame sorted by (panel,time);
+    // rows with a missing time stay, last in their panel. `full` (Stata `tsfill,
+    // full`, BUG-897) spans every panel over the OVERALL [min,max] instead and
+    // refuses a missing time.
+    Frame tsfill(const std::string& timevar, const std::string& panelvar, double delta,
+                 bool full = false) const;
 
     // Save dispatcher (public API + on-wire format unchanged). When this Frame was
     // loaded from an .hbin and only had columns added/replaced (row count and column
@@ -1178,7 +1264,14 @@ public:
     // matches what runJoinby's CSV+`cobra convert` round-trip actually
     // produces (Frame::from_csv rebuilds every factor dictionary from
     // scratch, per column, in row-scan order — frame.cpp ~899-925).
-    Frame joinby(const Frame& usingf, const std::vector<std::string>& keys) const;
+    // `unmatched` (joinby.ado UnMatch: "none" (default) | "master" | "using" |
+    // "both") keeps the master rows with no using match (code 1) and/or the
+    // using rows whose key the master lacks (code 2, keys from the using, every
+    // other master column missing). `marker`, when non-empty, adds the byte
+    // 1/2/3 column after the master's columns and before the using's.
+    // unmatched none with no marker is the bare join, byte-identical.
+    Frame joinby(const Frame& usingf, const std::vector<std::string>& keys,
+                 const std::string& unmatched = "", const std::string& marker = "") const;
 
     // --- P1 wave data verbs (Stata `expand` / `fillin` / `cross` / `contract`).
     // Every semantic below is oracle-pinned against StataBE 19.5 on the P1
@@ -1202,8 +1295,8 @@ public:
     // columns whose names the master does NOT already have: a shared name is
     // taken from the MASTER and the using copy dropped (oracle-pinned — the P1
     // fixture crosses datasets sharing id/cluster/stratum/group and only
-    // `region_using` is added). Row order: for each master row in order, every
-    // using row in order.
+    // `region_using` is added). Row order is cross.ado's: every master row beside
+    // using row 1, then the other pairings master by master (Frame::cross).
     Frame cross(const Frame& usingf) const;
 
     // `contract varlist` — collapse to the distinct combinations of varlist
@@ -1236,6 +1329,21 @@ public:
                                const std::vector<std::string>& i_vars, const std::string& j_var) const;
     ReshapeResult reshape_wide(const std::vector<std::string>& stubs,
                                const std::vector<std::string>& i_vars, const std::string& j_var) const;
+    // Stata's reshape (reshape.ado), opted into with `cobra reshape --stata`:
+    // long — j is the union of every stub's suffixes (a stub missing one gets
+    // missing cells), rows in (i, j) order, a string j (`jstring`) holds the
+    // suffixes as text; wide — one row per i in i order, columns j-major
+    // (p1 q1 p2 q2), a string j's values are the suffixes. Refusals throw
+    // EngineError codes "reshape_498" (non-numeric suffix without string, a
+    // missing j), "reshape_9" (i not unique / (i,j) not unique / a variable
+    // not constant within i) and "reshape_109" (string j without string, or
+    // a numeric j with it), leaving the caller's data as it was.
+    ReshapeResult reshape_long_stata(const std::vector<std::string>& stubs,
+                                     const std::vector<std::string>& i_vars,
+                                     const std::string& j_var, bool jstring) const;
+    ReshapeResult reshape_wide_stata(const std::vector<std::string>& stubs,
+                                     const std::vector<std::string>& i_vars,
+                                     const std::string& j_var, bool jstring) const;
 
 private:
     int64_t n_ = 0;
@@ -1245,6 +1353,7 @@ private:
     std::string panel_time_col_;
     std::string ts_format_;
     double ts_delta_ = 1.0;  // Stata tsset delta(); 1 unless a caller sets it
+    int64_t store_overflow_ = 0;  // see store_overflow()
     std::string src_path_;               // .hbin this Frame borrows from (from_dataset)
     std::shared_ptr<const Dataset> src_; // keeps the borrowed mmap alive for this Frame's life
     bool structure_dirty_ = false;       // set by row/column-set-changing verbs
@@ -1261,10 +1370,19 @@ private:
     // the Double default is the untouched move every other caller relies on.
     void set_or_replace(const std::string& name, std::vector<double> v,
                         StoreType st = StoreType::Double);
+    // round_to_store, counting a value it turns into missing (store_overflow()).
+    double store_round(double v, StoreType st);
     // Factor twin of set_or_replace: same replace-in-place-or-append and the same
-    // sort-claim invalidation, for text results such as egen concat().
+    // sort-claim invalidation, for the egen functions whose result is text
+    // (cut ,label — the level string IS Stata's value label).
     void set_or_replace_factor(const std::string& name, std::vector<int32_t> codes,
                                std::vector<std::string> levels);
+    // generate/bygen's GenQualifier: the range's bounds and replace's target type are
+    // checked before anything is computed; store_qualified writes the excluded rows
+    // (missing, or the current value under keep_unselected) and stores the column.
+    void check_gen_qualifier(const std::string& name, const GenQualifier& q) const;
+    void store_qualified(const std::string& name, std::vector<double> out,
+                         const std::vector<double>& mask, StoreType st, const GenQualifier& q);
     void reindex();
     // Fill cols_ (and n_) by BORROWING every column span of `s` (no copy). Shared by
     // from_dataset (mmap / view) and from_dataset_shared.
@@ -1296,7 +1414,7 @@ struct Frame::ReshapeResult {
 // rich options/result struct). Stata semantics documented at merge_frames()'s
 // definition in frame.cpp (mirrors PIET's merge_op.py exactly).
 struct MergeOpts {
-    std::string type;               // "1:1" | "m:1" | "1:m"
+    std::string type;               // "1:1" | "m:1" | "1:m" (| "m:m" under stata_plan)
     std::vector<std::string> keylist;
     std::vector<std::string> keepusing;  // empty = keep all using columns
     bool nogenerate = false;
@@ -1305,15 +1423,32 @@ struct MergeOpts {
     // W6 / B4 paper 034 (`merge ..., update [replace]`, ~45 uses). An UPDATE merge:
     // overlapping non-key variables are no longer silently dropped from the using
     // side — they feed the master's column, and the marker gains codes 4 and 5.
-    // Oracle: tests/eval/golden/aer_b4/private_oracle_i.log (clean fixture) and
-    // private_oracle_h.log (the same test with a marker variable that conflicts in
+    // Oracle: B4 oracle capture i (clean fixture) and
+    // capture h (the same test with a marker variable that conflicts in
     // every row, which is what proves the code is per ROW, not per variable).
     bool update = false;            // fill master's MISSING cells from the using
     bool replace = false;           // ... and overwrite nonmissing conflicts too (implies update)
     // `generate(newvar)`: the marker's name. Empty = Stata's default `_merge`.
-    // Oracle private_oracle_h.log:`generate` — after generate(mm), `confirm variable
+    // Oracle capture h:`generate` — after generate(mm), `confirm variable
     // _merge` is r(111): the option RENAMES the marker, it does not add a second one.
     std::string generate;
+    // Stata's built-in _merge row plan (Stata's merge sorts both sides by the keys), opted into by PIET with `--stata-plan`. Off = the pandas-order
+    // plan above, byte-identical. On:
+    //  - master rows in key order, each paired with its key group's using row
+    //    (m:m pairs the i-th master with the min(i,q-1)-th using row); then the
+    //    appended rows in using key order: a group's using rows beyond its
+    //    master rows (paired with the group's last master row, code 3) and the
+    //    using-only rows (code 2);
+    //  - a shared non-key variable takes the USING value on a using-only row
+    //    (w2aw_data_combine_family.log dc_m11_v4c `[m1]|[m2]|[]|[m4]|[]|[m8]|[u5]|[u7]`),
+    //    unless the two sides disagree on string-vs-numeric (`force`: master only);
+    //  - columns in master order (keys where the master has them), then the
+    //    using-only columns, then the marker;
+    //  - keep()/assert() codes are exact (merge.ado buildexpr/checkmresults: 3
+    //    never covers 4/5), and a failed assert() throws code "merge_assert".
+    bool stata_plan = false;
+    bool sequential = false;  // `merge 1:1 _n`: row i with row i, no keys, no sort
+    bool presorted = false;   // `sorted`: both sides already in key order (PIET checked)
 };
 struct MergeResult {
     Frame frame;
@@ -1378,6 +1513,17 @@ const std::vector<ExprFnInfo>& expr_function_table();
 // session (the engine is a subprocess and remembers nothing between calls), so
 // the seed and a per-call stream number ride the argv the way tsset does.
 void set_rng_coords(long long seed, long long stream);
+// Drops them again. A Frame expression call spends them when it returns; this is
+// for a caller that can leave before any such call ran (cmd_eval's guard).
+void clear_rng_coords();
+
+// Stata's session stream (core/rng_mt64.h) for ONE eval call: `state` is the
+// c(rngstate)-format string PIET sends as --rng-mt64. While it is on, every
+// runiform()/uniform()/runiformint()/rnormal() draws from it in evaluation order
+// instead of from the Philox coordinates. end_rng_mt64() turns it off and returns
+// how many raw 64-bit draws the call took. begin returns false on a malformed state.
+bool begin_rng_mt64(const std::string& state);
+uint64_t end_rng_mt64();
 
 // ---- Stata's numeric -> string rendering (B4/W7) ---------------------------
 // `%w.0g`, Stata's GENERAL format — the one `string()`/`strofreal()` apply when the
@@ -1385,7 +1531,7 @@ void set_rng_coords(long long seed, long long stream);
 // numeric field. cobra had no %g renderer anywhere, which is why W6 declined to land
 // concat instead of guessing one.
 //
-// The rule below is read off tests/eval/golden/aer_b4/private_oracle_g2.log
+// The rule below is read off B4 oracle capture g2
 // (21 values x {default, %9.0g, %10.0g, %12.0g} = 84 cells), NOT off any prose:
 //   * the DEFAULT is exactly %9.0g — every `default` cell equals its `w9` cell.
 //   * the width sets a significant-digit budget S = w-2: 7 at w9, 8 at w10, 10 at

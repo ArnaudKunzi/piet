@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 
@@ -67,7 +69,7 @@ int cmd_mlogit(const std::vector<std::string>& a) {
     std::vector<std::string> cluster_names;
     if (!cluster_var.empty()) cluster_names.push_back(cluster_var);
     GlmInputs g = load_glm(ds, "mlogit", y, split_csv(xcsv), cluster_names);
-    if (g.n == 0) { std::fprintf(stderr, "mlogit: no rows after dropping missing.\n"); return 1; }
+    require_sample(g.n);  // BUG-1269: r(2000) "no observations" / r(2001) for one row
     if (vce == "cluster" && (g.cluster.empty() || g.cluster[0].n_levels < 2))
         throw EngineError("bad_input",
             "mlogit: vce(cluster) requires at least 2 clusters, but the cluster variable has " +
@@ -209,6 +211,20 @@ int cmd_mlogit(const std::vector<std::string>& a) {
     if (vce == "cluster") { out["cluster_var"] = cluster_var; out["n_clusters"] = n_clusters; }
     if (level_set) out["level"] = level;
     add_warnings(out, g.warnings);
+    // --emit-v (BUG-1196): the fit's V over the non-base equations in θ's order,
+    // each name `<outcome value>:<coefficient>`. Stata's e(V) also carries the
+    // base outcome's equation as zero rows/columns (StataBE 19.5 colfullnames
+    // e(b) `1:o.x1 1:o.x2 1:o._cons 2:x1 ...`); that stripe is PIET's to build.
+    if (has(a, "--emit-v")) {
+        std::vector<std::string> names;
+        for (int m = 0; m < K; ++m) {
+            if (m == base) continue;
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%.17g", cat_values[static_cast<size_t>(m)]);
+            for (int c = 0; c < g.k; ++c) names.push_back(std::string(buf) + ":" + g.names[static_cast<size_t>(c)]);
+        }
+        add_e_v(out, names, V);
+    }
     emit(out, opt(a, "--out"));
     return 0;
 }

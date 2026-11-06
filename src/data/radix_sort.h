@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // C2-F8 — value-identical radix sort for gsort keys (Step 3a data-layer perf).
 //
 // The former Frame::gsort used std::stable_sort with a comparator whose total

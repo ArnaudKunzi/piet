@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "estimators/ols.h"
 #include "core/error.h"
 
@@ -16,8 +18,7 @@ OlsResult ols_fit(const DesignMatrix& dm) {
     r.n = n;
     r.n_dropped = dm.n_dropped;
 
-    // Omit collinear regressors (Stata `regress` parity): keep the earlier column
-    // of each collinear set, drop the later one. Operate on the original design
+    // Omit collinear regressors using a norm-pivoted basis. Operate on the original design
     // when full rank (the common case, zero copy); only materialize a reduced
     // copy when something is actually dropped.
     int k = dm.k;
@@ -25,7 +26,10 @@ OlsResult ols_fit(const DesignMatrix& dm) {
     std::vector<std::string> names = dm.xnames;
     std::vector<double> Xreduced;
     {
-        std::vector<char> keep = collinear_keep_mask(X, n, k);
+        int intercept = -1;
+        for (int j = 0; j < k; ++j)
+            if (names[j] == "(intercept)" || names[j] == "_cons") intercept = j;
+        std::vector<char> keep = collinear_pivot_keep_mask(X, n, k, intercept);
         int nkeep = 0;
         for (char c : keep) nkeep += c;
         if (nkeep < k) {
@@ -34,6 +38,7 @@ OlsResult ols_fit(const DesignMatrix& dm) {
             X = Xreduced.data();
         }
     }
+    require_sample(n);
     if (n <= k) throw EngineError("no_obs", "not enough observations: n <= k");
     r.k = k;
     r.names = names;
@@ -68,6 +73,30 @@ OlsResult ols_fit(const DesignMatrix& dm) {
     r.ssr = ssr;
     r.tss = tss;
     r.r2 = (tss > 0) ? 1.0 - ssr / tss : 0.0;
+    for (int intercept = 0; intercept < k; ++intercept) {
+        if (names[intercept] != "(intercept)" && names[intercept] != "_cons") continue;
+        std::vector<double> centered_fit(static_cast<size_t>(n), 0.0);
+        for (int j = 0; j < k; ++j) {
+            if (j == intercept) continue;
+            const double* x = X + static_cast<int64_t>(j) * n;
+            const double mean = la::sum(x, n) / static_cast<double>(n);
+            for (int64_t i = 0; i < n; ++i) centered_fit[i] += (x[i] - mean) * r.beta[j];
+        }
+        std::vector<double> centered_y(static_cast<size_t>(n));
+        for (int64_t i = 0; i < n; ++i) centered_y[i] = dm.y[i] - ybar;
+        double mss = la::dot(centered_fit.data(), centered_y.data(), n);
+        if (k == 2) {
+            const double* x = X + static_cast<int64_t>(1 - intercept) * n;
+            const double xbar = la::sum(x, n) / static_cast<double>(n);
+            std::vector<double> centered_x(static_cast<size_t>(n));
+            for (int64_t i = 0; i < n; ++i) centered_x[i] = x[i] - xbar;
+            const double sxx = la::sumsq(centered_x.data(), n);
+            const double sxy = la::dot(centered_x.data(), centered_y.data(), n);
+            mss = sxx > 0.0 ? sxy * (sxy / sxx) : 0.0;
+        }
+        r.r2 = mss + ssr > 0.0 ? mss / (mss + ssr) : 0.0;
+        break;
+    }
     r.sigma2 = ssr / static_cast<double>(n - k);
 
     // classic SE: sigma2 * diag(bread)

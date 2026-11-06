@@ -1,7 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 
 #include "estimators/neweyprais.h"
+#include "estimators/posthest.h"  // wald_test (newey's model F)
 #include "estimators/unitroot.h"
 #include "estimators/ts_diag.h"
 
@@ -10,21 +13,26 @@ namespace cli {
 
 namespace {
 
-// Shared loader for the single-series time-series regressions (newey/prais):
-// listwise X,y over (y, x..., timevar), returning the design plus the time column.
+// Shared loader for the time-series regressions (newey/prais): listwise X,y over
+// (y, x..., timevar[, panelvar]), returning the design plus the time column and,
+// after xtset (BUG-1503 / BUG-1507), the panel column (empty for one series).
 // Only used by cmd_newey/cmd_prais below (same TU) — no external linkage needed.
 struct TsRegInputs {
     GlmInputs g;
-    std::vector<double> time;
+    std::vector<double> time, panel;
+    const double* panel_or_null() const { return panel.empty() ? nullptr : panel.data(); }
 };
 TsRegInputs load_tsreg(const Dataset& ds, const char* cmd, const std::string& y,
-                       const std::vector<std::string>& xs, const std::string& tvar) {
+                       const std::vector<std::string>& xs, const std::string& tvar,
+                       const std::string& pvar) {
     TsRegInputs r;
     const double* traw = require_num(ds, cmd, tvar);
     int64_t n_raw = ds.n_rows();
     const double* yraw = require_num(ds, cmd, y);
     int kx = static_cast<int>(xs.size());
     std::vector<const double*> all = {yraw, traw};
+    const double* praw = pvar.empty() ? nullptr : require_num(ds, cmd, pvar);
+    if (praw) all.push_back(praw);
     std::vector<const double*> xraw(kx);
     for (int c = 0; c < kx; ++c) { xraw[c] = require_num(ds, cmd, xs[c]); all.push_back(xraw[c]); }
     auto keep = listwise_keep(all, n_raw);
@@ -42,6 +50,7 @@ TsRegInputs load_tsreg(const Dataset& ds, const char* cmd, const std::string& y,
     g.names.push_back("(intercept)");
     g.y = gather_rows(yraw, keep);
     r.time = gather_rows(traw, keep);
+    if (praw) r.panel = gather_rows(praw, keep);
     return r;
 }
 
@@ -52,22 +61,57 @@ int cmd_newey(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data"), y = opt(a, "--y"), xcsv = opt(a, "--x"), tvar = opt(a, "--timevar");
     if (data_missing(data) || y.empty() || xcsv.empty() || tvar.empty() || opt(a, "--lag").empty()) {
         std::fprintf(stderr, "usage: cobra newey --data f.hbin --y Y --x X1,X2 --timevar T --lag M "
-                             "[--delta D] [--keepif EXPR] "
+                             "[--panelvar P] [--force] [--delta D] [--keepif EXPR] "
                              "[--esample-out PATH [--esample-index COL --esample-n N]] [--out f.json]\n"
                              "  Newey-West HAC SE (Bartlett kernel, lag M); lag 0 == robust OLS.\n"
+                             "  --panelvar P  xtset panel: lags pair rows of one panel only.\n"
+                             "  --force  fit although the time variable is not regularly spaced.\n"
                              "  --esample-out PATH  write e(sample), one 1/0 line per --data row (see feols).\n");
         return 2;
     }
     int lag = std::stoi(opt(a, "--lag"));
     double delta = std::stod(opt(a, "--delta", "1"));
+    const std::string pvar = opt(a, "--panelvar");
+    const bool force = has(a, "--force");
     const EsampleRequest esreq = esample_request(a, "newey");
     const std::string src_data = data, keepif = opt(a, "--keepif");
     data = maybe_keepif(data, keepif);
     const Dataset& ds = acquire_data(data);
-    TsRegInputs in = load_tsreg(ds, "newey", y, split_csv(xcsv), tvar);
-    if (in.g.n == 0) { std::fprintf(stderr, "newey: no rows after dropping missing.\n"); return 1; }
-    NeweyResult r = newey_fit(in.g.X.data(), in.g.n, in.g.k, in.g.y.data(), in.time.data(), delta, lag);
+    TsRegInputs in = load_tsreg(ds, "newey", y, split_csv(xcsv), tvar, pvar);
+    // BUG-1269: r(2000) "no observations". One row is not r(2001) here: StataBE
+    // refuses it as "t is regularly spaced, but does not have intervals of 1"
+    // (the Checkt block below).
+    if (in.g.n == 0) require_sample(in.g.n);
+    // newey.ado's Checkt (BUG-1503): the sample's time values sorted (panels pooled),
+    // successive differences in units of delta. Unequal differences are "not
+    // regularly spaced" (r(198) when lag > 0, unless force); equal differences
+    // above 1 are refused even with force. After `xtset id t` the time variable
+    // repeats across panels, so the differences are 0 and 1 (StataBE 19.5, i3.do).
+    {
+        std::vector<double> ts = in.time;
+        std::sort(ts.begin(), ts.end());
+        double dmin = 0, dmax = 0, dsum = 0;
+        for (size_t i = 1; i < ts.size(); ++i) {
+            const double d = (ts[i] - ts[i - 1]) / delta;
+            if (i == 1 || d < dmin) dmin = d;
+            if (i == 1 || d > dmax) dmax = d;
+            dsum += d;
+        }
+        // One row leaves no difference: Stata's missing min/max/mean read as equal and > 1.
+        const bool none = ts.size() < 2;
+        const bool unequal = !none && dmin != dmax;
+        if (none || (!unequal && dsum / static_cast<double>(ts.size() - 1) > 1.0))
+            throw EngineError("bad_input", tvar + " is regularly spaced, but does not have intervals of 1",
+                              "ts_not_regular");
+        if (unequal && lag > 0 && !force)
+            throw EngineError("bad_input", tvar + " is not regularly spaced", "ts_not_regular");
+    }
+    NeweyResult r = newey_fit(in.g.X.data(), in.g.n, in.g.k, in.g.y.data(), in.time.data(), delta, lag,
+                              in.panel_or_null());
     if (!r.ok) { std::fprintf(stderr, "newey: regression failed (collinear?).\n"); return 1; }
+    if (r.short_lag_pairs == 0) throw EngineError("no_obs", "no observations", "no_obs");
+    if (r.short_lag_pairs == 1)
+        throw EngineError("no_obs", "insufficient observations", "insufficient_obs");
     double dof = static_cast<double>(r.n - r.k);
     double tc = (dof > 0) ? t_critical(0.05, dof) : 0.0;
     json coefs = json::array();
@@ -78,6 +122,22 @@ int cmd_newey(const std::vector<std::string>& a) {
                          {"ci_lo", r.beta[j] - tc * se}, {"ci_hi", r.beta[j] + tc * se}});
     }
     json out = {{"estimator", "newey"}, {"lag", lag}, {"n_obs", r.n}, {"df_r", dof}, {"coefs", coefs}};
+    // e(df_m)/e(F): newey.ado's `test indv, min` on the HAC V, the slopes (every
+    // coefficient but the intercept, which is last) jointly zero; F = W / q over df_r.
+    // StataBE 19.5 (BUG-1503 i3.do): F(2, 197) = 187.20427640633693.
+    const int q = r.k - 1;
+    if (q > 0) {
+        std::vector<double> R(static_cast<size_t>(q) * r.k, 0.0);  // q x k row-major
+        for (int j = 0; j < q; ++j) R[static_cast<size_t>(j) * r.k + j] = 1.0;
+        const WaldResult w = wald_test(r.beta.data(), r.vcov.data(), r.k, R.data(), nullptr, q);
+        out["df_m"] = q;
+        if (w.ok && std::isfinite(w.chi2) && dof > 0) {
+            out["F"] = w.chi2 / q;
+            out["p_F"] = f_pvalue(w.chi2 / q, static_cast<double>(q), dof);
+        }
+    }
+    // --emit-v (BUG-1196): the fit's full HAC covariance, in the coefficients' order.
+    if (has(a, "--emit-v")) add_e_v(out, in.g.names, r.vcov);
     // e(sample) T1a: newey's sample is load_tsreg's listwise set, all of it fitted.
     if (esreq.active()) {
         EsampleRows rows;
@@ -96,14 +156,16 @@ int cmd_prais(const std::vector<std::string>& a) {
     std::string rhotype = opt(a, "--rhotype", "regress");
     if (data_missing(data) || y.empty() || xcsv.empty() || tvar.empty()) {
         std::fprintf(stderr, "usage: cobra prais --data f.hbin --y Y --x X1,X2 --timevar T "
-                             "[--corc] [--twostep] [--rhotype regress|tscorr] [--delta D] "
+                             "[--panelvar P] [--corc] [--twostep] [--rhotype regress|tscorr] [--delta D] "
                              "[--keepif EXPR] [--esample-out PATH [--esample-index COL --esample-n N]] "
                              "[--out f.json]\n"
+                             "  --panelvar P  xtset panel: rho restarts at every panel change.\n"
                              "  --esample-out PATH  write e(sample), one 1/0 line per --data row (see feols);\n"
                              "               Prais-Winsten only (refused with --corc).\n");
         return 2;
     }
     double delta = std::stod(opt(a, "--delta", "1"));
+    const std::string pvar = opt(a, "--panelvar");
     const EsampleRequest esreq = esample_request(a, "prais");
     // Cochrane-Orcutt drops every row without an in-sample predecessor, and Stata's
     // e(sample) is that final transformed regression's sample (prais.ado prais_e).
@@ -116,10 +178,10 @@ int cmd_prais(const std::vector<std::string>& a) {
     const std::string src_data = data, keepif = opt(a, "--keepif");
     data = maybe_keepif(data, keepif);
     const Dataset& ds = acquire_data(data);
-    TsRegInputs in = load_tsreg(ds, "prais", y, split_csv(xcsv), tvar);
-    if (in.g.n == 0) { std::fprintf(stderr, "prais: no rows after dropping missing.\n"); return 1; }
+    TsRegInputs in = load_tsreg(ds, "prais", y, split_csv(xcsv), tvar, pvar);
+    require_sample(in.g.n);  // BUG-1269: r(2000) "no observations" / r(2001) for one row
     PraisResult r = prais_fit(in.g.X.data(), in.g.n, in.g.k, in.g.y.data(), in.time.data(),
-                              delta, corc, twostep, rhotype);
+                              delta, corc, twostep, rhotype, 100, 1e-6, in.panel_or_null());
     if (!r.ok) { std::fprintf(stderr, "prais: estimation failed.\n"); return 1; }
     double dof = static_cast<double>(r.n - r.k);
     double tc = (dof > 0) ? t_critical(0.05, dof) : 0.0;
@@ -133,7 +195,12 @@ int cmd_prais(const std::vector<std::string>& a) {
     json out = {{"estimator", "prais"}, {"tranmeth", corc ? "corc" : "prais"},
                 {"method", r.method}, {"rhotype", r.rhotype}, {"rho", r.rho},
                 {"n_obs", r.n}, {"df_r", dof}, {"iters", r.iters}, {"converged", r.converged},
-                {"dw", r.dw}, {"dw_0", r.dw_0}, {"coefs", coefs}};
+                {"dw", r.dw}, {"dw_0", r.dw_0}, {"N_gaps", r.n_gaps}, {"coefs", coefs}};
+    // Stata's prais prints this note when tsreport counts a gap (BUG-1507; a panel
+    // change is one: StataBE 19.5, 40 panels of 5, e(N_gaps) 39).
+    if (r.n_gaps > 0) add_warnings(out, {"computations for rho restarted at each gap."});
+    // --emit-v (BUG-1196): the final transformed regression's full covariance.
+    if (has(a, "--emit-v")) add_e_v(out, in.g.names, r.vcov);
     // e(sample) T1a: Prais-Winsten keeps every listwise row (run starts are scaled by
     // sqrt(1-rho^2), not dropped), so the sample is load_tsreg's keep.
     if (esreq.active()) {
@@ -302,19 +369,21 @@ int cmd_pperron(const std::vector<std::string>& a) {
 }
 
 // tsfill — insert rows for missing time periods within each panel (Stata tsfill).
+// --full (Stata `tsfill, full`, BUG-897): every panel over the overall time range.
 int cmd_tsfill(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data"), tvar = opt(a, "--timevar"), pvar = opt(a, "--panelvar"),
                 out = opt(a, "--out");
     if (data_missing(data) || tvar.empty() || out_missing(out)) {
         std::fprintf(stderr, "usage: cobra tsfill --data f.hbin --timevar T [--panelvar ID] "
-                             "[--delta D] [--keepif EXPR] --out new.hbin\n");
+                             "[--delta D] [--full] [--keepif EXPR] --out new.hbin\n");
         return 2;
     }
     data = maybe_keepif(data, opt(a, "--keepif"));
     double delta = std::stod(opt(a, "--delta", "1"));
+    const bool full = has(a, "--full");
     const Dataset& ds = acquire_data(data);
     Frame fr = frame_from_acquired(ds);
-    Frame res = fr.tsfill(tvar, pvar, delta);
+    Frame res = fr.tsfill(tvar, pvar, delta, full);
     int64_t nrows = res.n_rows();  // capture before the move into commit_frame (fr is NOT moved)
     if (!commit_frame(std::move(res), out))  // §26: stage into resident session, or write+notice one-shot
         std::fprintf(stderr, "wrote %s (%lld rows, was %lld)\n", out.c_str(),

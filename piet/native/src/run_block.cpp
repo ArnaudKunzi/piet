@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // --run-block — the M2 candidate JSON adapter: reads a piet2-corpus cell
 // (JSON object) from stdin, executes it through the SAME dispatch() the
 // interactive UI would call, and emits the canonical block-JSON stream to
@@ -88,6 +90,17 @@
 
 namespace piet {
 
+namespace {
+
+// BUG-1372: a string function works on bytes, as Stata's do, so a block may
+// carry a split UTF-8 sequence; it is written as U+FFFD, as the do paths write
+// it (main.cpp), instead of aborting the adapter.
+std::string dumpBlocks(const nlohmann::ordered_json& out) {
+  return out.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace);
+}
+
+}  // namespace
+
 int runBlockAdapter() {
   std::ostringstream ss;
   ss << std::cin.rdbuf();
@@ -100,7 +113,7 @@ int runBlockAdapter() {
   } catch (const std::exception& e) {
     out["ok"] = false;
     out["driver_error"] = std::string("bad JSON on stdin: ") + e.what();
-    std::fputs(out.dump().c_str(), stdout);
+    std::fputs(dumpBlocks(out).c_str(), stdout);
     std::fputc('\n', stdout);
     return 1;
   }
@@ -110,7 +123,7 @@ int runBlockAdapter() {
     out["ok"] = false;
     out["driver_error"] =
         "kind '" + kind + "' not implemented (M3a supports 'dispatch'/'execute_do_source'/'steps')";
-    std::fputs(out.dump().c_str(), stdout);
+    std::fputs(dumpBlocks(out).c_str(), stdout);
     std::fputc('\n', stdout);
     return 1;
   }
@@ -144,7 +157,7 @@ int runBlockAdapter() {
     } catch (const std::exception& e) {
       out["ok"] = false;
       out["driver_error"] = std::string("pre_hbin load failed: ") + e.what();
-      std::fputs(out.dump().c_str(), stdout);
+      std::fputs(dumpBlocks(out).c_str(), stdout);
       std::fputc('\n', stdout);
       return 1;
     }
@@ -176,13 +189,13 @@ int runBlockAdapter() {
     } catch (const std::exception& e) {
       out["ok"] = false;
       out["driver_error"] = std::string("step execution threw mid-sequence: ") + e.what();
-      std::fputs(out.dump().c_str(), stdout);
+      std::fputs(dumpBlocks(out).c_str(), stdout);
       std::fputc('\n', stdout);
       return 1;
     }
     out["ok"] = true;
     out["block_lists"] = blockLists;
-    std::fputs(out.dump().c_str(), stdout);
+    std::fputs(dumpBlocks(out).c_str(), stdout);
     std::fputc('\n', stdout);
     return 0;
   }
@@ -201,11 +214,11 @@ int runBlockAdapter() {
     } catch (const std::exception& e) {
       out["ok"] = false;
       out["driver_error"] = std::string("executeDoSource() threw: ") + e.what();
-      std::fputs(out.dump().c_str(), stdout);
+      std::fputs(dumpBlocks(out).c_str(), stdout);
       std::fputc('\n', stdout);
       return 1;
     }
-    std::fputs(out.dump().c_str(), stdout);
+    std::fputs(dumpBlocks(out).c_str(), stdout);
     std::fputc('\n', stdout);
     return 0;
   }
@@ -224,13 +237,13 @@ int runBlockAdapter() {
     } catch (const std::exception& e) {
       out["ok"] = false;
       out["driver_error"] = std::string("dispatch() threw mid-sequence: ") + e.what();
-      std::fputs(out.dump().c_str(), stdout);
+      std::fputs(dumpBlocks(out).c_str(), stdout);
       std::fputc('\n', stdout);
       return 1;
     }
     out["ok"] = true;
     out["block_lists"] = blockLists;
-    std::fputs(out.dump().c_str(), stdout);
+    std::fputs(dumpBlocks(out).c_str(), stdout);
     std::fputc('\n', stdout);
     return 0;
   }
@@ -243,12 +256,12 @@ int runBlockAdapter() {
   } catch (const std::exception& e) {
     out["ok"] = false;
     out["driver_error"] = std::string("dispatch() threw: ") + e.what();
-    std::fputs(out.dump().c_str(), stdout);
+    std::fputs(dumpBlocks(out).c_str(), stdout);
     std::fputc('\n', stdout);
     return 1;
   }
 
-  std::fputs(out.dump().c_str(), stdout);
+  std::fputs(dumpBlocks(out).c_str(), stdout);
   std::fputc('\n', stdout);
   return 0;
 }

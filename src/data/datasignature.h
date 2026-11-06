@@ -1,6 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — `datasignature`: a reproducible fingerprint of a Frame's CONTENT.
 //
-// P1-A3-DATASIG-VERB (plans/P1-A345-RESCOPE-20260730.md §2.4, DESIGN-dta-writer.md
+// P1-A3-DATASIG-VERB (internal note P1-A345-RESCOPE-20260730.md §2.4, DESIGN-dta-writer.md
 // §4.2 sequencing step 1). This is the head of P1 ARC 3 and the lynchpin of the
 // .dta writer's reverse oracle: once a signature exists, "did the writer preserve
 // the data?" becomes one string comparison instead of a bespoke diff.
@@ -34,7 +36,9 @@
 // shared hot file whose manifest surface should not be widened for a read-only
 // derivation (P1-A3-DATASIG-VERB row, SPRINT).
 #pragma once
+#include <map>
 #include <string>
+#include <vector>
 
 #include "data/frame.h"
 
@@ -43,6 +47,27 @@ namespace cecon {
 // Fingerprint `fr`'s content. Read-only: every column is read through the const
 // CowVec proxies, so a BORROWED (mmap-backed) column is never materialized by
 // signing it — computing a signature must not cost what loading a copy costs.
-std::string data_signature(const Frame& fr);
+// BUG-1461: what PIET's user-facing `datasignature` adds to the fingerprint so
+// that it answers the questions Stata's does. Default-constructed, both
+// signatures are exactly the ones above and below (the writer's round-trip
+// oracle keeps row order in the value plane).
+struct SignatureOptions {
+    // Each column's values sign as an order-free multiset: sorting the rows, or
+    // swapping two values within a column, leaves the signature unchanged
+    // (StataBE 19.5: `gsort -x` then `datasignature confirm` is "data unchanged").
+    bool unordered = false;
+    // Column name -> Stata storage type (`byte`, `double`, `str12`, ...), signed
+    // ahead of that column's values; the engine keeps no storage types of its own,
+    // and Stata's signature is a function of them ([D] datasignature).
+    std::map<std::string, std::string> types;
+};
+
+std::string data_signature(const Frame& fr, const SignatureOptions& opts = {});
+
+// `<rows>:<k>:<vals-a>:<vals-b>` over `vars` in order (repeats allowed) and all of
+// `fr`'s rows: the nonames shape e(datasignature) takes after an estimation
+// command (signestimationsample). Throws std::runtime_error for an unknown name.
+std::string data_signature_vars(const Frame& fr, const std::vector<std::string>& vars,
+                                const SignatureOptions& opts = {});
 
 }  // namespace cecon

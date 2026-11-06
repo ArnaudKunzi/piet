@@ -1,0 +1,51 @@
+{
+ "tobit": {
+  "a_median_s": 6.133,
+  "rc_a": 0,
+  "b_median_s": 1.696,
+  "rc_b": 0,
+  "ratio_b_over_a": 0.2765
+ },
+ "ivtobit": {
+  "a_median_s": 9.372,
+  "rc_a": 0,
+  "b_median_s": 4.335,
+  "rc_b": 0,
+  "ratio_b_over_a": 0.4625
+ },
+ "mixed": {
+  "a_median_s": 17.349,
+  "rc_a": 0,
+  "b_median_s": 4.905,
+  "rc_b": 0,
+  "ratio_b_over_a": 0.2827
+ },
+ "ologit": {
+  "a_median_s": 0.568,
+  "rc_a": 0,
+  "b_median_s": 0.228,
+  "rc_b": 0,
+  "ratio_b_over_a": 0.402
+ },
+ "mlogit": {
+  "a_median_s": 32.876,
+  "rc_a": 0,
+  "b_median_s": 8.052,
+  "rc_b": 0,
+  "ratio_b_over_a": 0.2449
+ },
+ "streg": {
+  "a_median_s": 1.181,
+  "rc_a": 0,
+  "b_median_s": 0.443,
+  "rc_b": 0,
+  "ratio_b_over_a": 0.3749
+ },
+ "qreg": {
+  "a_median_s": 8.098,
+  "rc_a": 0,
+  "b_median_s": 6.794,
+  "rc_b": 0,
+  "ratio_b_over_a": 0.839
+ }
+}

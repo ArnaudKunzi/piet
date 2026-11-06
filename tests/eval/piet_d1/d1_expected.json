@@ -1,0 +1,233 @@
+{
+  "_meta": {
+    "purpose": "Phase-D1 golden set (BETA campaign) — authored golden-FIRST against the real StataBE 19.5 oracle, BEFORE the D1 wiring lands on op/piet. Every 'golden' case is expected to FAIL RED against the current op-piet build (RED-baseline.txt records that state) and must turn GREEN once ivregress/reg3/reghdfe(2-way)/ivreghdfe land.",
+    "oracle_log": "internal capture d1-oracle-stata.log (real StataBE 19.5, `import delimited piet/packaging/sample/fatalities.csv, clear`, 336 obs, sections D1a..D1i). d1x was upgraded from structural-only to numeric golden using the user-run StataNow professor-pangram log at pangram_stata_results.log (internal capture) (2026-08-01, 336 obs).",
+    "dataset_loader": "sysuse fatalities, clear  (piet's own bundled-sample shortcut, ALREADY supported today — dispatcher.cpp `cmd==\"sysuse\"` arm, verified live against the fatalities.csv identical to the oracle's `import delimited` load: 336 obs, same columns). The driver prepends this line to every case's do_body — it is NOT part of a case's own do_body list.",
+    "n_obs_all_cases": 336,
+    "tolerance_policy": {
+      "rationale": "Oracle values are STATA'S DISPLAYED coeftable/scalar numbers (default format), not e(b)/e(V) full float64 precision — each number's own true precision is bounded by its last displayed digit. Surveyed every pinned value across all D1a-i cases: worst-case coefficient/SE relative precision implied by display rounding is ~6.3e-4 (reg3 SURE emppop:income se = .0000799, 3 sig figs); worst-case scalar (chi2/F) relative precision is ~1.6e-3 (D1a chi2=3.05, 2 decimals). Tolerances below add a >1.5x safety margin over both, per Eval's own existing convention of 'display-precision tolerance, not full cross-impl float precision' (contrast tests/eval/piet2/tolerances.py's CROSS_IMPL table, which assumes BOTH sides have full float64 precision — not true here since one side is Stata's rounded display text).",
+      "coef_rtol": 1e-3,
+      "coef_atol": 1e-6,
+      "scalar_rtol": 3e-3,
+      "scalar_atol": 1e-6,
+      "n_obs": "EXACT (integer, no tolerance)",
+      "n_clusters": "EXACT (integer, no tolerance)",
+      "df1_df2": "EXACT (integer, no tolerance)"
+    },
+    "coeftable_name_aliases": {
+      "_cons": ["_cons", "(intercept)"],
+      "__note": "PIET's existing feols coeftable rows use '(intercept)' (verified live, tests/eval/piet2/streams/debug_all.json block idx 134) while Stata's own display uses '_cons'. The D1 wiring may adopt either spelling for ivregress/reg3/reghdfe — the driver tries both before failing a coeftable lookup."
+    },
+    "known_engine_gaps": {
+      "iv-se-denominator": "Operator gate feedback on the post-D1 build (2026-07-15): d1a-d coefficient cells PASS but their SE cells miss — a CHARACTERIZED engine gap, not a mystery RED. cobra's iv estimator uses an N-K small-sample denominator where Stata's ivregress defaults to asymptotic N; verified: sqrt(336/333)=1.0045 matches the got/want ratio exactly (e.g. 4274.77/4255.64 on d1c's beertax se). Engine fix queued for Phase F (cobra MINOR). Per Art 10 the tolerances and expected values stay EXACTLY as pinned — they are the Stata truth, and the affected cases MUST stay RED until the engine matches. Affected cases carry a per-case `known_engine_gap` key."
+    },
+    "block_schema_expectation": {
+      "single_equation": "block['coeftable'] — list of {name,b,se,...} — plus top-level scalars (chi2, F, rmse, r2, adj_r2, r2_within, n_clusters, df1, df2), matching the EXISTING cobraToEstimation()/cobraToEstimationM4() passthrough whitelist (piet/native/src/handlers.cpp ~787, piet/native/src/estimation_m4.cpp ~167). Verified live against the current build's feols block (see tests/eval/piet2/streams/debug_all.json idx 134).",
+      "multi_equation_reg3": "block['outcomes'] — list of {depvar, coeftable, r2, r2_within, dof_resid}, matched by `depvar`. This is NOT a guess: piet/native/src/estimation_m4.cpp lines 140-165 (BS-065 comment) ALREADY documents that cobra's `reg3 --tidy` payload carries per-equation results under 'equations' ({depvar,coefs,coeftable}) and that estimation_m4.cpp's converter reuses the SAME 'outcomes' array shape other multi-model commands use, falling back to null for r2_within/dof_resid (reg3 doesn't emit those per-eq). The DISPATCH arm that recognizes Stata's `reg3 (...) (...)` syntax and calls this converter is what's still missing (the actual D1g/D1h gap) — the conversion plumbing is pre-existing. The driver also tries a flat 'equations' key and a colon-qualified flat coeftable ('depvar:varname') as fallbacks, in case the eventual wiring differs from this documented plan.",
+      "ivreghdfe": "The professor-pangram StataNow run supplies the previously missing numeric oracle. d1x now pins the endogenous-regressor coefficient and clustered small-sample SE instead of accepting any finite positive SE."
+    }
+  },
+  "cases": {
+    "d1a_ivregress_2sls_justid": {
+      "oracle_section": "D1a",
+      "stata": "ivregress 2sls income (beertax = spirits)",
+      "do_body": ["ivregress 2sls income (beertax = spirits)"],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": -23827.7, "se": 13643.68},
+        "_cons":   {"b": 26109.89, "se": 7026.879}
+      },
+      "scalars": {"chi2": 3.05, "rmse": 10676},
+      "scalar_dof": {"chi2_df": 1},
+      "endogenous": ["beertax"],
+      "exogenous": ["spirits"],
+      "known_engine_gap": "iv-se-denominator (N-K vs N), fix queued Phase F",
+      "notes": "Just-identified 2SLS: 1 endogenous regressor, 1 excluded instrument, no included exogenous controls."
+    },
+    "d1b_ivregress_2sls_overid": {
+      "oracle_section": "D1b",
+      "stata": "ivregress 2sls income emppop (beertax = spirits unemp)",
+      "do_body": ["ivregress 2sls income emppop (beertax = spirits unemp)"],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": 8230.191, "se": 4621.599},
+        "emppop":  {"b": 384.0945, "se": 94.75767},
+        "_cons":   {"b": -13699.14, "se": 7793.808}
+      },
+      "scalars": {"chi2": 22.32, "rmse": 4922},
+      "scalar_dof": {"chi2_df": 2},
+      "endogenous": ["beertax"],
+      "exogenous": ["emppop", "spirits", "unemp"],
+      "known_engine_gap": "iv-se-denominator (N-K vs N), fix queued Phase F",
+      "notes": "Over-identified (2 instruments, 1 endogenous) + 1 included exogenous control (emppop)."
+    },
+    "d1c_ivregress_2sls_robust": {
+      "oracle_section": "D1c",
+      "stata": "ivregress 2sls income emppop (beertax = spirits unemp), vce(robust)",
+      "do_body": ["ivregress 2sls income emppop (beertax = spirits unemp), vce(robust)"],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": 8230.191, "se": 4255.64},
+        "emppop":  {"b": 384.0945, "se": 91.75157},
+        "_cons":   {"b": -13699.14, "se": 7484.613}
+      },
+      "scalars": {"chi2": 27.54, "rmse": 4922},
+      "scalar_dof": {"chi2_df": 2},
+      "endogenous": ["beertax"],
+      "exogenous": ["emppop", "spirits", "unemp"],
+      "known_engine_gap": "iv-se-denominator (N-K vs N), fix queued Phase F",
+      "notes": "Same point estimates as D1b (vcov choice never changes 2SLS coefficients) — only SE/chi2 change under HC-robust. This is itself part of the gate: a correct wiring must reproduce IDENTICAL b's to d1b_ivregress_2sls_overid but DIFFERENT se's."
+    },
+    "d1d_ivregress_2sls_cluster": {
+      "oracle_section": "D1d",
+      "stata": "ivregress 2sls income emppop (beertax = spirits unemp), vce(cluster state)",
+      "do_body": ["ivregress 2sls income emppop (beertax = spirits unemp), vce(cluster state)"],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": 8230.191, "se": 7416.062},
+        "emppop":  {"b": 384.0945, "se": 155.8767},
+        "_cons":   {"b": -13699.14, "se": 12235.53}
+      },
+      "scalars": {"chi2": 6.81, "rmse": 4922, "n_clusters": 48},
+      "scalar_dof": {"chi2_df": 2},
+      "endogenous": ["beertax"],
+      "exogenous": ["emppop", "spirits", "unemp"],
+      "known_engine_gap": "iv-se-denominator (N-K vs N), fix queued Phase F",
+      "notes": "Same b's as D1b/D1c again; se/chi2 change under 1-way cluster(state), 48 clusters."
+    },
+    "d1e_ivregress_gmm": {
+      "oracle_section": "D1e",
+      "stata": "ivregress gmm income emppop (beertax = spirits unemp)",
+      "do_body": ["ivregress gmm income emppop (beertax = spirits unemp)"],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": 4675.645, "se": 3034.074},
+        "emppop":  {"b": 363.5284, "se": 66.48682},
+        "_cons":   {"b": -10839.98, "se": 5396.207}
+      },
+      "scalars": {"chi2": 67.34, "rmse": 3427.3},
+      "scalar_dof": {"chi2_df": 2},
+      "endogenous": ["beertax"],
+      "exogenous": ["emppop", "spirits", "unemp"],
+      "notes": "Two-step efficient GMM, robust weight matrix (Stata default). Coefficients genuinely differ from 2SLS/LIML — this is a real estimator, not a display variant."
+    },
+    "d1f_ivregress_liml": {
+      "oracle_section": "D1f",
+      "stata": "ivregress liml income emppop (beertax = spirits unemp)",
+      "do_body": ["ivregress liml income emppop (beertax = spirits unemp)"],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": 22287.68, "se": 16577.55},
+        "emppop":  {"b": 614.4468, "se": 301.7193},
+        "_cons":   {"b": -34920.95, "se": 26276.33}
+      },
+      "scalars": {"chi2": 5.41, "rmse": 11348},
+      "scalar_dof": {"chi2_df": 2},
+      "endogenous": ["beertax"],
+      "exogenous": ["emppop", "spirits", "unemp"],
+      "notes": "LIML — a genuinely different estimator (minimum eigenvalue), distinct closed-form from 2SLS/GMM."
+    },
+    "d1g_reg3_3sls": {
+      "oracle_section": "D1g",
+      "stata": "reg3 (income beertax spirits) (emppop unemp income)",
+      "do_body": ["reg3 (income beertax spirits) (emppop unemp income)"],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "equations": {
+        "income": {
+          "coefs": {
+            "beertax": {"b": -1564.062, "se": 198.693},
+            "spirits": {"b": 1485.074, "se": 137.3153},
+            "_cons":   {"b": 12078.59, "se": 276.7662}
+          },
+          "scalars": {"r2": 0.3314, "rmse": 1839.563, "chi2": 172.80}
+        },
+        "emppop": {
+          "coefs": {
+            "unemp":  {"b": -1.378884, "se": 0.0964493},
+            "income": {"b": 0.0008609, "se": 0.0001596},
+            "_cons":  {"b": 58.98638, "se": 2.810978}
+          },
+          "scalars": {"r2": 0.5613, "rmse": 3.122773, "chi2": 921.66}
+        }
+      },
+      "endogenous": ["income", "emppop"],
+      "exogenous": ["beertax", "spirits", "unemp"],
+      "notes": "3SLS default (simultaneous system: emppop appears as a regressor in the income-side... actually income appears as regressor in the emppop equation, making income endogenous system-wide). chi2/rmse per equation are a SECONDARY check per _meta.block_schema_expectation (estimation_m4.cpp's current 'outcomes' remap does not carry per-eq chi2 at all — documented honest engine-data gap, BS-065 comment); if the eventual wiring also omits them, treat their absence as a schema note, not a numeric failure — only missing/mismatched coefs or r2 should fail the case."
+    },
+    "d1h_reg3_sure": {
+      "oracle_section": "D1h",
+      "stata": "reg3 (income beertax spirits) (emppop unemp income), sure",
+      "do_body": ["reg3 (income beertax spirits) (emppop unemp income), sure"],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "equations": {
+        "income": {
+          "coefs": {
+            "beertax": {"b": -1732.268, "se": 206.824},
+            "spirits": {"b": 1515.996, "se": 144.605},
+            "_cons":   {"b": 12110.69, "se": 300.0526}
+          },
+          "scalars": {"r2": 0.3312, "rmse": 1839.741, "chi2": 195.74}
+        },
+        "emppop": {
+          "coefs": {
+            "unemp":  {"b": -1.401931, "se": 0.0706007},
+            "income": {"b": 0.0004321, "se": 0.0000799},
+            "_cons":  {"b": 65.1075, "se": 1.46905}
+          },
+          "scalars": {"r2": 0.6399, "rmse": 2.829064, "chi2": 781.33}
+        }
+      },
+      "notes": "SURE (all-exogenous system, `sure` option) — different Sigma-weighting than 3SLS default, hence different b's/se's from D1g despite the identical equation specification. Confirms `sure` genuinely changes the estimator, not just a cosmetic flag."
+    },
+    "d1i_reghdfe_cluster2way": {
+      "oracle_section": "D1i",
+      "stata": "reghdfe income beertax, absorb(state) vce(cluster state year)",
+      "do_body": ["reghdfe income beertax, absorb(state) vce(cluster state year)"],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": -4181.244, "se": 1867.524},
+        "_cons":   {"b": 16026.23, "se": 1101.388}
+      },
+      "scalars": {"F": 5.01, "rmse": 835.2659, "r2": 0.8823, "adj_r2": 0.8626, "r2_within": 0.0819},
+      "scalar_dof": {"df1": 1, "df2": 6},
+      "n_clusters": 7,
+      "n_clusters_note": "Stata reports 48 state-clusters AND 7 year-clusters for the ABSORB/cluster-count listing, but the SE-adjustment line ('Std. err. adjusted for 7 clusters in state year') uses 7 — the min(G_state, G_year) convention 2-way clustering's dof correction uses. Pin n_clusters==7 (the effective/reported adjustment count); if the eventual JSON instead exposes a list/dict of per-dim counts, that is a genuine schema question for the maintainer to resolve at wiring time, not a value this golden got wrong.",
+      "notes": "THE defining test of this case is `se` under 2-way cluster(state year) — the point estimates (b) do not depend on vcov choice at all, so a wiring that silently only supports 1-way cluster (dropping to 1-way on `state` alone, i.e. ignoring `year`) would still get `b` right but MUST get `se` wrong versus these pinned values — that discrepancy is the actual signal 'reghdfe vce(cluster A B) 2-way' is really wired, not just parsed-and-ignored. Confirmed live (2026-07-15): reghdfe already dispatches today (aliased onto the same regress/feols path as 'regress'/'reg'/'feols' — piet/native/src/dispatcher.cpp ~1733) and absorb() already works; the gap is specifically that vce(cluster A B) with >1 cluster variable is NOT supported (piet/native/src/handlers.cpp ~841: 'twoway clustering is OUT of the M2 slice')."
+    },
+    "d1x_ivreghdfe_absorb": {
+      "oracle_section": "Professor pangram S08 (user-run StataNow, 2026-08-01)",
+      "stata": "ivreghdfe income emppop (beertax = spirits unemp), absorb(snum) cluster(snum)",
+      "do_body": ["encode state, gen(snum)", "ivreghdfe income emppop (beertax = spirits unemp), absorb(snum) cluster(snum)"],
+      "oracle_kind": "golden",
+      "n_obs": 336,
+      "coefs": {
+        "beertax": {"b": -22647.04913100959, "se": 10139.1830291201}
+      },
+      "endogenous": ["beertax"],
+      "exogenous": ["emppop", "spirits", "unemp"],
+      "notes": "Upgraded on 2026-08-01 from structural-only to a real StataNow golden. The coefficient was already aligned; the defining pin is the cluster small-sample SE. The pre-fix PIET path omitted ivreghdfe's small-sample correction and returned 10003.01652769641, a 1.34% miss that this case rejects."
+    },
+    "d1_boottest_engine_parity": {
+      "oracle_section": "NONE (by design — boottest is an SSC package, no Stata license entitlement gate here; see mission spec)",
+      "stata_setup": "regress income beertax spirits, vce(cluster state)",
+      "stata": "boottest beertax, reps(499) seed(20260715)",
+      "do_body": ["regress income beertax spirits, vce(cluster state)", "boottest beertax, reps(499) seed(20260715)"],
+      "oracle_kind": "engine_parity",
+      "reps_requested": 499,
+      "seed": 20260715,
+      "parity_fields": ["p_symmetric", "p_equaltail", "beta", "t0", "seed"],
+      "required_fields": ["p_symmetric", "p_equaltail"],
+      "grading": "Run the SAME do_body through piet_native TWICE (two separate --do invocations, cold session each time, identical fixed seed). PASS iff: (1) both runs succeed (rc==0, no stopped_at_reason) — two IDENTICAL failures are NOT a pass (there is no p-value to compare — 'engine-parity' can only be claimed for a real result); (2) every field in required_fields is PRESENT in both runs' boottest block (guards against a vacuous pass where parity_fields are all simply absent); (3) every field in parity_fields that is present in run 1's block is present and byte-identical (exact float equality, not tolerance — same seed through the same binary must reproduce bit-for-bit) in run 2's block; (4) a 'reps' field is present in the output and equals reps_requested (499) — proving reps was actually forwarded to the engine, not silently dropped.",
+      "notes": "Engine-parity-only per mission spec: no external Stata SSC boottest oracle is used. The wired implementation maps onto cobra's wild-cluster-bootstrap estimator (block estimator 'wild_cluster_bootstrap', fields p_symmetric/p_equaltail/seed/reps/t0/beta — coordinator-live-verified on the post-D1 build 2026-07-15). FIXTURE NOTE (operator gate feedback, 2026-07-15): the prerequisite fit MUST be a vce(cluster ...) regression — boottest is a WILD CLUSTER bootstrap and the wiring honest-rejects with 'boottest requires a preceding regression with vce(cluster ...)' after a plain-iid fit. The original authoring of this case used an unclustered `regress income beertax spirits` prerequisite, which kept the case RED on the post-D1 build for a FIXTURE reason, not a wiring reason; fixed to the clustered form."
+    }
+  }
+}

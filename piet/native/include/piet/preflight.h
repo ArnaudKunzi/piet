@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // SPEC II-4 — "Pre-flight warning, never OOM" (wired 2026-09-02, User directive).
 //
 // Before a data-size-scaling operation (merge · joinby · append · reshape ·

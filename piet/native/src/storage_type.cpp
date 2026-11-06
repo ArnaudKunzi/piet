@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // BUG-471 T2: the storage-type resolver. See piet/storage_type.h for the rules
 // and the oracle arms each one rests on.
 #include "piet/storage_type.h"
@@ -54,6 +56,17 @@ std::string resolveCreateType(const SessionState& session, const std::string& de
   return session.defaultStorageType;
 }
 
+void recordCreateType(SessionState& session, const std::string& varname,
+                      const std::string& declaredToken, const std::string& stored) {
+  if (varname.empty() || stored.empty()) return;
+  if (declaredToken.empty() && stored == "float") {
+    session.implicitFloatVars.insert(varname);
+    return;
+  }
+  session.implicitFloatVars.erase(varname);  // an explicit declaration wins
+  session.varMeta[varname].stataType = stored;
+}
+
 std::string resolveReplaceType(SessionState& session, const std::string& varname) {
   auto it = session.varMeta.find(varname);
   if (it != session.varMeta.end() && it->second.stataType.has_value()) {
@@ -65,6 +78,26 @@ std::string resolveReplaceType(SessionState& session, const std::string& varname
   ++session.unrecordedReplaceFallbacks;
   ++gUnrecordedReplaceFallbacks;
   return "double";
+}
+
+void carryTypeClaim(SessionState& session, const std::string& from, const std::string& to,
+                    bool move) {
+  if (from.empty() || to.empty() || from == to) return;
+  std::optional<std::string> declared;
+  auto it = session.varMeta.find(from);
+  if (it != session.varMeta.end() && it->second.stataType.has_value())
+    declared = *it->second.stataType;
+  const bool implicitFloat = session.implicitFloatVars.count(from) != 0;
+  if (declared.has_value()) {
+    session.varMeta[to].stataType = *declared;
+    session.implicitFloatVars.erase(to);
+  } else {
+    auto toIt = session.varMeta.find(to);
+    if (toIt != session.varMeta.end()) toIt->second.stataType.reset();
+    if (implicitFloat) session.implicitFloatVars.insert(to);
+    else session.implicitFloatVars.erase(to);
+  }
+  if (move) session.implicitFloatVars.erase(from);
 }
 
 int64_t unrecordedReplaceFallbackTotal() { return gUnrecordedReplaceFallbacks.load(); }
@@ -193,11 +226,27 @@ ReplaceTypeDecision decideReplaceStoreType(SessionState& session, const std::str
   return d;
 }
 
+std::string stataDefaultFormat(const std::optional<std::string>& t) {
+  if (t == std::string("double")) return "%10.0g";
+  if (t == std::string("long")) return "%12.0g";
+  if (t == std::string("byte") || t == std::string("int")) return "%8.0g";
+  return "%9.0g";
+}
+
 void recordReplaceType(SessionState& session, const std::string& varname,
                        const std::string& resolved, const std::string& stored) {
   if (varname.empty() || stored.empty() || stored == resolved) return;
   session.implicitFloatVars.erase(varname);
-  session.varMeta[varname].stataType = stored;
+  VarMeta& vm = session.varMeta[varname];
+  // The widened variable keeps the display format it had (byte -> float keeps
+  // %8.0g, exprfns_contract_oracle.log:646/736; int -> long keeps %8.0g,
+  // :655/737). Only a recorded pre-widening type says what that was, and an
+  // explicit `format` stays as it is.
+  if (vm.stataType.has_value() && *vm.stataType == resolved &&
+      (!vm.format.has_value() || vm.format->empty())) {
+    vm.format = stataDefaultFormat(vm.stataType);
+  }
+  vm.stataType = stored;
 }
 
 std::string egenFunctionName(const std::string& rhs) {
@@ -208,47 +257,47 @@ std::string egenFunctionName(const std::string& rhs) {
 }
 
 bool egenIgnoresStoreType(const std::string& fn) {
-  return fn == "tag" || fn == "seq" || fn == "mode" || fn == "concat";
+  return fn == "tag" || fn == "seq" || fn == "mode";
 }
 
 bool recordEgenFixedType(SessionState& session, const std::string& newvar,
-                         const std::string& rhs, const std::string& seqType) {
+                         const std::string& rhs, const std::string& fixedType) {
   const std::string fn = egenFunctionName(rhs);
-  if (fn == "cut" && !seqType.empty() && !newvar.empty()) {
+  if (newvar.empty()) return false;
+  if (!egenIgnoresStoreType(fn)) {
+    // cut(), anyvalue(), anycount(), anymatch() and concat() with punct()/format()
+    // (egen.cpp runEgenAdoFunction) recorded the result's type themselves: cut's
+    // declared byte widened to float by a .5 edge, anycount's byte whatever was
+    // declared, concat's str#.
+    if (fixedType.empty()) return false;
     session.implicitFloatVars.erase(newvar);
-    session.varMeta[newvar].stataType = seqType;
-    return true;
-  }
-  if (!egenIgnoresStoreType(fn) || newvar.empty()) return false;
-  if (fn == "concat") {
-    // The string column's actual width determines its type. A numeric default
-    // or declaration must not disguise it as a numeric column in describe.
-    session.implicitFloatVars.erase(newvar);
-    session.varMeta[newvar].stataType.reset();
+    session.varMeta[newvar].stataType = fixedType;
     return true;
   }
   if (fn == "tag" || fn == "seq") {
     session.implicitFloatVars.erase(newvar);
-    // seq: `gen byte` widened by its replace (_gseq.ado:42, :45-49) to
-    // int/long once a value leaves byte's range (the lattice of :876/:893).
+    // seq: `gen byte` widened by its replace (egen seq()) to
+    // int/long once a value leaves byte's range (the promotion lattice).
     session.varMeta[newvar].stataType =
-        fn == "seq" && isIntegerType(seqType) ? seqType : std::string("byte");
+        fn == "seq" && isIntegerType(fixedType) ? fixedType : std::string("byte");
     return true;
   }
   // mode: `gen `type' g = varlist[_N]` with type = the source's own type
-  // (_gmode.ado:19, :122). The source is the one variable inside mode(...).
+  // (egen mode()), compressed for a string source unless the function left
+  // early (runEgen hands back the str# then, BUG-1109).
+  session.implicitFloatVars.erase(newvar);
+  if (!fixedType.empty()) {
+    session.varMeta[newvar].stataType = fixedType;
+    return true;
+  }
+  // The source is the one variable inside mode(...).
   static const std::regex reSrc(R"(^\s*\w+\s*\(\s*([A-Za-z_]\w*)\s*\))");
   std::smatch m;
   std::string src;
   if (std::regex_search(rhs, m, reSrc)) src = m.str(1);
-  session.implicitFloatVars.erase(newvar);
-  auto it = session.varMeta.find(src);
-  if (!src.empty() && it != session.varMeta.end() && it->second.stataType.has_value()) {
-    session.varMeta[newvar].stataType = *it->second.stataType;
-  } else if (!src.empty() && session.implicitFloatVars.count(src)) {
-    session.implicitFloatVars.insert(newvar);
-  }
-  // else: the source's type was never recorded, and neither is the copy's.
+  // The source's claim, copied (carryTypeClaim, FU-243's one carry rule); a
+  // source whose type was never recorded leaves the copy with none.
+  if (!src.empty()) carryTypeClaim(session, src, newvar, /*move=*/false);
   return true;
 }
 

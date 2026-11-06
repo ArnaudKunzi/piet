@@ -1,0 +1,721 @@
+{
+ "_meta": {
+  "purpose": "Phase-D4+D5 golden set (BETA campaign) — same architecture as tests/eval/piet_d1 and piet_d2d3 (isolated per-case --do invocations, oracle-verbatim expected values, display-precision tolerances, standalone leg not wired into run_eval.py). UNLIKE the earlier legs, the D4/D5 wirings were ALREADY LANDED (op/piet @ff9d06a) when this leg was authored — this leg is the independent Eval-owned regression net documenting CURRENT STATUS (the golden-first RED proof for D4/D5 lives in the wirings' own oracle-pinned selftest legs on op/piet, not here). See CURRENT-STATUS.txt.",
+  "oracle_log": "internal capture d45-oracle-stata.log (real StataBE 19.5, import delimited fatalities.csv, 336 obs; preamble: gen high=(beertax>.5) + encode state, gen(snum) + gen t=_n + tsset t). The 2026-08-01 professor-pangram additions use the user-run StataNow log at pangram_stata_results.log (internal capture); its prepared dataset ran xtset snum year before gen t=_n, so the physical panel/time sort is part of those two cases' oracle semantics.",
+  "dataset_loader": "sysuse fatalities, clear (bundled sample, byte-identical to the oracle's import — established in piet_d1). Every case's do_body is fully self-contained (preamble included).",
+  "tolerance_policy": {
+   "rationale": "Same display-precision derivation as piet_d1/piet_d2d3. Worst display-precision pins in this leg: hausman chi2=2.62 (3 sig figs, ~1.9e-3 relative) and sdtest p_upper=.0258 (~1.9e-3) — both inside scalar_rtol=3e-3. Oracle p-values displayed as '0.0000' are pinned as 0.0 with the 1e-4 atol floor ONLY as SECONDARY checks (the engine emits the true tiny p, e.g. 4e-83, which passes |got-0|<=1e-4... it does not: 4e-83 <= 1e-4 is true — the atol floor is exactly what makes a '0.0000'-displayed p gradeable).",
+   "coef_rtol": 0.001,
+   "coef_atol": 1e-06,
+   "scalar_rtol": 0.003,
+   "scalar_atol": 0.0001,
+   "integer_and_string_fields": "EXACT (lags, df, dof, G, group_sizes, case labels)"
+  },
+  "scalar_path_syntax": "Scalar keys in required_scalars/exact_scalars/scalars are jget-style JSON paths into the estimation block: dots descend into dicts ('classic.F'), [name] matches an array element by its 'name' field ('firststage[beertax].F', 'coefs[beertax].diff'), [N] is a list index. A resolved SINGLE-ELEMENT LIST is unwrapped before numeric compare (estat durbinalt emits chi2/F/df/p as per-lag one-element arrays — live-verified @ff9d06a).",
+  "coeftable_name_aliases": {
+   "_cons": [
+    "_cons",
+    "(intercept)"
+   ]
+  },
+  "schema_provenance": "ALL graded field names live-verified against op/piet @ff9d06a (2026-07-15) probe runs: newey (lag/df_r), prais (rho/dw/dw_0/method), dfuller & pperron (Zt/Zrho/cv_1/cv_5/cv_10/lags/newey_west_lags/case/p), wntestq (Q/df/lags/p), sdtest (F/df1/df2/p/p_lower/p_upper/sd_1/sd_2/combined.*), estat durbinalt (chi2/F/df/df_r/p arrays), estat firststage (firststage[{name,F}]), margins-dydx (coeftable), hausman (chi2/p/dof/coefs[{name,b_fe,b_re,diff}]), chow (classic.{F,df1,df2}/G/group_sizes), mkspline (summarize stats shape), tsfill (count -> display blocks).",
+  "check_severity_model": "Same as piet_d2d3: coefs + n_obs (where declared) + required_scalars + exact_scalars are FATAL; 'scalars' are SECONDARY (absent = note, present-but-wrong = fatal); unpinned_oracle_reference blocks are NOT GRADED (oracle values the landed schema demonstrably does not emit, or values deliberately not pinned)."
+ },
+ "cases": {
+  "d4a_newey_lag2": {
+   "oracle_section": "D4a",
+   "stata": "newey income beertax spirits, lag(2)",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "newey income beertax spirits, lag(2)"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 336,
+   "coefs": {
+    "beertax": {
+     "b": -1697.15,
+     "se": 353.9058
+    },
+    "spirits": {
+     "b": 1384.099,
+     "se": 292.4321
+    },
+    "_cons": {
+     "b": 12323.98,
+     "se": 533.9508
+    }
+   },
+   "exact_scalars": {
+    "lag": 2,
+    "df_r": 333
+   },
+   "unpinned_oracle_reference": {
+    "F_2_333": 23.09,
+    "__why": "the landed newey block carries no F field (live-verified)"
+   },
+   "notes": "Newey-West HAC SEs at lag(2). The b's equal plain OLS by construction; the HAC se's (353.9058 vs OLS's 211.8775 for beertax) are the actual signal the lag window is applied."
+  },
+  "d4b_prais_twostep": {
+   "oracle_section": "D4b (first run)",
+   "stata": "prais income beertax, twostep",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "prais income beertax, twostep"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 336,
+   "coefs": {
+    "beertax": {
+     "b": -1997.243,
+     "se": 281.7461
+    },
+    "_cons": {
+     "b": 14869.57,
+     "se": 368.4819
+    }
+   },
+   "required_scalars": {
+    "rho": 0.8034461,
+    "dw_0": 0.392886,
+    "dw": 1.902251
+   },
+   "unpinned_oracle_reference": {
+    "F_1_334": 55.89,
+    "r2": 0.1433,
+    "adj_r2": 0.1408,
+    "rmse": 1232.9,
+    "__why": "the landed prais block carries no F/r2/rmse fields (live-verified); dw/dw_0 ARE carried and pinned"
+   },
+   "notes": "Prais-Winsten (twostep): n_obs stays 336 (first obs retained via the PW transform). dw_0 = Stata's 'Durbin-Watson statistic (original)', dw = '(transformed)'."
+  },
+  "d4a2_newey_lag2_after_xtset_sort": {
+   "oracle_section": "Professor pangram S07 (user-run StataNow, 2026-08-01)",
+   "stata": "xtset snum year; gen t=_n; tsset t; newey income beertax spirits, lag(2)",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "encode state, gen(snum)",
+    "xtset snum year",
+    "gen t = _n",
+    "tsset t",
+    "newey income beertax spirits, lag(2)"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 336,
+   "coefs": {
+    "beertax": {
+     "b": -1697.150380387997,
+     "se": 351.36885739
+    }
+   },
+   "tol_override": {
+    "coef_rtol": 1e-06,
+    "coef_atol": 1e-06
+   },
+   "exact_scalars": {
+    "lag": 2,
+    "df_r": 333
+   },
+   "notes": "Pins Stata's physical-sort side effect of xtset. The standalone d4a case remains valid for raw CSV row order; this case deliberately xtsets before generating t=_n, so a metadata-only xtset yields the old wrong se=353.9057519462703 and fails."
+  },
+  "d4b2_prais_twostep_after_xtset_sort": {
+   "oracle_section": "Professor pangram S07 (user-run StataNow, 2026-08-01)",
+   "stata": "xtset snum year; gen t=_n; tsset t; prais income beertax, twostep",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "encode state, gen(snum)",
+    "xtset snum year",
+    "gen t = _n",
+    "tsset t",
+    "prais income beertax, twostep"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 336,
+   "coefs": {
+    "beertax": {
+     "b": -1840.89476261709,
+     "se": 288.89748468
+    }
+   },
+   "required_scalars": {
+    "rho": 0.804135384117678
+   },
+   "tol_override": {
+    "coef_rtol": 1e-06,
+    "coef_atol": 1e-06,
+    "scalar_rtol": 1e-06,
+    "scalar_atol": 1e-06
+   },
+   "notes": "Companion physical-sort pin to d4a2. A metadata-only xtset leaves raw CSV order and produces the old wrong rho=.8034460644, b=-1997.2434770, se=281.7460888; the corrected Stata-compatible sort must reach this oracle instead."
+  },
+  "d4b_prais_corc": {
+   "oracle_section": "D4b (second run)",
+   "stata": "prais income beertax, corc",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "prais income beertax, corc"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 335,
+   "coefs": {
+    "beertax": {
+     "b": -1972.609,
+     "se": 284.8613
+    },
+    "_cons": {
+     "b": 14891.7,
+     "se": 371.1296
+    }
+   },
+   "required_scalars": {
+    "rho": 0.8038026,
+    "dw_0": 0.392886,
+    "dw": 1.902573
+   },
+   "unpinned_oracle_reference": {
+    "F_1_333": 47.95,
+    "r2": 0.1259,
+    "rmse": 1234.1,
+    "__why": "same as d4b_prais_twostep"
+   },
+   "notes": "Cochrane-Orcutt (iterated): n_obs=335 EXACT — CO drops the first observation, PW keeps it; the 336-vs-335 pair across the two prais cases is the sharpest twostep-vs-corc semantic check. Different converged rho (.8038 vs .8034) confirms genuine iteration."
+  },
+  "d4c_dfuller_bare": {
+   "oracle_section": "D4c (first run)",
+   "stata": "dfuller income",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "dfuller income"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 335,
+   "required_scalars": {
+    "Zt": -6.004,
+    "cv_1": -3.453,
+    "cv_5": -2.877,
+    "cv_10": -2.57
+   },
+   "exact_scalars": {
+    "lags": 0
+   },
+   "scalars": {
+    "p": 0.0
+   },
+   "notes": "Bare Dickey-Fuller (no lags, no trend — Stata's 'Random walk without drift' case). The MacKinnon approximate p displays as 0.0000 in the oracle; pinned 0.0 as SECONDARY under the 1e-4 atol floor (the engine emits the true tiny p)."
+  },
+  "d4c_dfuller_lags2_trend": {
+   "oracle_section": "D4c (second run)",
+   "stata": "dfuller income, lags(2) trend",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "dfuller income, lags(2) trend"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 333,
+   "required_scalars": {
+    "Zt": -5.873,
+    "cv_1": -3.987,
+    "cv_5": -3.427,
+    "cv_10": -3.13
+   },
+   "exact_scalars": {
+    "lags": 2,
+    "case": "trend"
+   },
+   "scalars": {
+    "p": 0.0
+   },
+   "notes": "Augmented DF with 2 lags + trend: DIFFERENT critical-value row than the bare case (-3.987/-3.427/-3.130 vs -3.453/-2.877/-2.570) — proves the cv table actually switches on the deterministic-term case, not just echoes one hardcoded row. n_obs drops to 333 (2 lags + 1 difference)."
+  },
+  "d4d_pperron": {
+   "oracle_section": "D4d",
+   "stata": "pperron income",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "pperron income"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 335,
+   "required_scalars": {
+    "Zt": -6.041,
+    "Zrho": -65.302,
+    "cv_1": -3.453,
+    "cv_5": -2.877,
+    "cv_10": -2.57
+   },
+   "exact_scalars": {
+    "newey_west_lags": 5
+   },
+   "scalars": {
+    "p": 0.0
+   },
+   "unpinned_oracle_reference": {
+    "Zrho_cv_1": -20.368,
+    "Zrho_cv_5": -14.0,
+    "Zrho_cv_10": -11.2,
+    "__why": "the landed pperron block emits ONE cv set (the Zt row); Stata's separate Z(rho) critical-value row is not carried (live-verified) — recorded for a future schema extension"
+   },
+   "notes": "Phillips-Perron: both Z(rho) and Z(t) statistics pinned; default Newey-West lag choice (5 = trunc(4*(n/100)^(2/9))) pinned EXACT as the bandwidth-selection proof."
+  },
+  "d4e_wntestq_bare": {
+   "oracle_section": "D4e (first run)",
+   "stata": "wntestq income",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "wntestq income"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 336,
+   "required_scalars": {
+    "Q": 839.9262
+   },
+   "exact_scalars": {
+    "df": 40,
+    "lags": 40
+   },
+   "scalars": {
+    "p": 0.0
+   },
+   "notes": "Portmanteau Q, default lag choice (min(n/2-2, 40) = 40 here) — df=40 EXACT is the default-lag-rule proof."
+  },
+  "d4e_wntestq_lags10": {
+   "oracle_section": "D4e (second run)",
+   "stata": "wntestq income, lags(10)",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "wntestq income, lags(10)"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 336,
+   "required_scalars": {
+    "Q": 557.2013
+   },
+   "exact_scalars": {
+    "df": 10,
+    "lags": 10
+   },
+   "scalars": {
+    "p": 0.0
+   },
+   "notes": "Explicit lags(10) — different Q and df than the bare case proves the option forwards."
+  },
+  "d4f_tsfill_gapfill": {
+   "oracle_section": "D4f (coordinator-adapted fixture: drop t in [100,106], NOT the oracle's mod(t,7) — mod() is unimplemented until Phase G)",
+   "stata": "drop if t>=100 & t<=106  ->  count (329)  ->  tsfill  ->  count (336)",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "drop if t >= 100 & t <= 106",
+    "count",
+    "tsfill",
+    "count"
+   ],
+   "oracle_kind": "mechanical",
+   "display_sequence": [
+    "329",
+    "336"
+   ],
+   "notes": "Mechanical gap-fill semantics: dropping the 7 interior periods t=100..106 leaves 329 obs; tsfill must restore the panel to exactly 336 rows (new rows with missing data). Graded off the two `count` display blocks in order. The oracle's own construction used mod(t,7) (dropping 48 obs, restoring interior gaps to 335) — deliberately NOT mirrored per the coordinator's directive because mod() is unimplemented in PIET until Phase G; the [100,106] contiguous-gap variant tests the same tsfill semantics with arithmetic PIET supports today (live-verified: 329 -> 336)."
+  },
+  "d5a_sdtest_by": {
+   "oracle_section": "D5a",
+   "stata": "sdtest income, by(high)",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "sdtest income, by(high)"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 336,
+   "required_scalars": {
+    "F": 1.3992,
+    "p": 0.0516,
+    "p_lower": 0.9742,
+    "p_upper": 0.0258,
+    "sd_1": 2208.156,
+    "sd_2": 1866.791,
+    "combined.mean": 13880.18,
+    "combined.sd": 2253.046
+   },
+   "exact_scalars": {
+    "df1": 229,
+    "df2": 105
+   },
+   "notes": "Variance-ratio test by group. p = Stata's two-sided 2*Pr(F>f)=0.0516, p_lower = Pr(F<f)=0.9742, p_upper = Pr(F>f)=0.0258 (field mapping live-verified). df 229/105 EXACT."
+  },
+  "d5b_durbinalt_chi2": {
+   "oracle_section": "D5b (bare)",
+   "stata": "regress income beertax spirits  ->  estat durbinalt",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "regress income beertax spirits",
+    "estat durbinalt"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 336,
+   "required_scalars": {
+    "chi2": 372.934
+   },
+   "exact_scalars": {
+    "df": 1
+   },
+   "scalars": {
+    "p": 0.0
+   },
+   "notes": "Durbin's alternative, default (chi2 form, 1 lag). The block's chi2/df/p are per-lag ONE-ELEMENT ARRAYS (live-verified) — the driver's path resolver unwraps single-element lists before compare."
+  },
+  "d5b_durbinalt_small_lags2": {
+   "oracle_section": "D5b (small lags(2))",
+   "stata": "regress income beertax spirits  ->  estat durbinalt, small lags(2)",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "regress income beertax spirits",
+    "estat durbinalt, small lags(2)"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 336,
+   "required_scalars": {
+    "F": 189.005
+   },
+   "exact_scalars": {
+    "df": 2,
+    "df_r": 331
+   },
+   "scalars": {
+    "p": 0.0
+   },
+   "notes": "small -> F form instead of chi2 (F(2,331)=189.005); lags(2) -> df=2. The F-vs-chi2 switch plus the df pair is the whole point of this second case."
+  },
+  "d5c_estat_firststage": {
+   "oracle_section": "D5c (estat firststage)",
+   "stata": "ivregress 2sls income emppop (beertax = spirits unemp)  ->  estat firststage",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "ivregress 2sls income emppop (beertax = spirits unemp)",
+    "estat firststage"
+   ],
+   "oracle_kind": "golden",
+   "required_scalars": {
+    "firststage[beertax].F": 2.56678
+   },
+   "unpinned_oracle_reference": {
+    "r2": 0.041,
+    "adj_r2": 0.0324,
+    "partial_r2": 0.0152,
+    "p_F": 0.0783,
+    "min_eigenvalue": 2.56678,
+    "__why": "the landed block carries ONLY the first-stage F per endogenous regressor, with an honest note field disclosing that R-sq/partial-R-sq/min-eigenvalue/critical-value table are not computed (not fabricated) — live-verified. The Stock-Yogo cv table is likewise not carried."
+   },
+   "notes": "First-stage F (2,332)=2.56678 pinned via the firststage[beertax].F path. No n_obs field on this block (postestimation summary) — n_obs check omitted."
+  },
+  "d5c_estat_endogenous": {
+   "oracle_section": "D5c (estat endogenous)",
+   "stata": "ivregress 2sls ...  ->  estat endogenous",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "ivregress 2sls income emppop (beertax = spirits unemp)",
+    "estat endogenous"
+   ],
+   "oracle_kind": "golden",
+   "required_scalars": {
+    "durbin_chi2": 34.4916,
+    "wu_hausman_F": 37.9797
+   },
+   "exact_scalars": {
+    "durbin_df": 1,
+    "wu_hausman_df": 1,
+    "wu_hausman_df_r": 332
+   },
+   "scalars": {
+    "durbin_p": 0.0,
+    "wu_hausman_p": 0.0
+   },
+   "notes": "MI-216 (B.0.1) flip: was reject (engine had no Durbin/Wu-Hausman test); the G-sweep wired `estat endogenous` to cobra `iv-diag`, so this now SUCCEEDS with the real statistic. Live-verified @op-piet/piet/native/build/piet_native (2026-07-15): durbin_chi2=34.49124374706312 (oracle 34.4916, display-precision match, well inside scalar_rtol=0.003), durbin_p=4.281731642552534e-09 (oracle-displayed 0.0000), wu_hausman_F=37.979304701912504 (oracle 37.9797), wu_hausman_df_r=332.0, wu_hausman_p=2.07070988229323e-09 (oracle-displayed 0.0000). Oracle: internal capture d45-oracle-stata.log (real StataBE 19.5). Was `d5c_estat_endogenous_reject`; id renamed on flip (same convention as d5g_mkspline_nknots's earlier reject->golden flip)."
+  },
+  "d5c_estat_overid": {
+   "oracle_section": "D5c (estat overid)",
+   "stata": "ivregress 2sls ...  ->  estat overid",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "ivregress 2sls income emppop (beertax = spirits unemp)",
+    "estat overid"
+   ],
+   "oracle_kind": "golden",
+   "required_scalars": {
+    "sargan_chi2": 6.80951,
+    "sargan_p": 0.0091,
+    "basmann_chi2": 6.86762,
+    "basmann_p": 0.0088
+   },
+   "exact_scalars": {
+    "sargan_df": 1,
+    "basmann_df": 1
+   },
+   "notes": "MI-216 (B.0.1) flip: was reject (engine had no Sargan/Basmann); the G-sweep wired `estat overid` to cobra `iv-diag`, so this now SUCCEEDS with the real statistic. Live-verified @op-piet/piet/native/build/piet_native (2026-07-15): sargan_chi2=6.809560061754693 (oracle 6.80951), sargan_p=0.009067110110573061 (oracle 0.0091), basmann_chi2=6.867677994921935 (oracle 6.86762), basmann_p=0.008776861935915755 (oracle 0.0088) — all well inside scalar_rtol=0.003/scalar_atol=1e-4. Oracle: internal capture d45-oracle-stata.log (real StataBE 19.5). Was `d5c_estat_overid_reject`; id renamed on flip (same convention as d5g_mkspline_nknots's earlier reject->golden flip)."
+  },
+  "d5d_margins_dydx_logit": {
+   "oracle_section": "D5d (dydx)",
+   "stata": "logit high income unemp  ->  margins, dydx(income)",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "logit high income unemp",
+    "margins, dydx(income)"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 336,
+   "coefs": {
+    "income": {
+     "b": -0.0001192,
+     "se": 1.12e-05
+    }
+   },
+   "notes": "Average marginal effect of income after logit: dydx -.0001192, delta-method se .0000112 — REAL logit AMEs (the engine's margins dydx path handles non-OLS models; contrast the at() case below, where the predictive-margins path does not)."
+  },
+  "d5d_margins_at_logit": {
+   "oracle_section": "D5d (at)",
+   "stata": "logit high income unemp  ->  margins, at(income=13000)",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "logit high income unemp",
+    "margins, at(income=13000)"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 336,
+   "coefs": {
+    "income=13000": {
+     "b": 0.4074234,
+     "se": 0.029638
+    }
+   },
+   "notes": "Pr(high) at income=13000 after logit — Stata's predictive margin (the oracle values recorded as `unpinned_oracle_reference` when this case was a REJECT). Flipped 2026-09-02 (BUG-399): the engine's margins path learned non-OLS prediction in P7 (margins dydx()x at(), 2026-08-05) and the run completes with the real logit margin, so the reject expectation had been stale since then (identical on the archived B.15.0 app). Art 10: corrected TOWARD the oracle."
+  },
+  "d5e_hausman_fe_re": {
+   "oracle_section": "D5e",
+   "stata": "xtreg fe -> estimates store feM -> xtreg re -> store reM -> hausman feM reM",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "xtset snum year",
+    "xtreg income beertax unemp, fe",
+    "estimates store feM",
+    "xtreg income beertax unemp, re",
+    "estimates store reM",
+    "hausman feM reM"
+   ],
+   "oracle_kind": "golden",
+   "required_scalars": {
+    "chi2": 2.62,
+    "p": 0.2697,
+    "coefs[beertax].diff": 376.6603,
+    "coefs[unemp].diff": -0.6916189
+   },
+   "exact_scalars": {
+    "dof": 2
+   },
+   "unpinned_oracle_reference": {
+    "se_diff_beertax": 372.2769,
+    "se_diff_unemp": 4.062066,
+    "__why": "sqrt(diag(V_b-V_B)) per-coef SEs are not carried in the landed hausman block (live-verified: coefs rows have b_fe/b_re/diff only)"
+   },
+   "notes": "The full estimates-store idiom: two xtreg fits, two named stores, hausman by store name. chi2(2)=2.62, p=.2697. The landed block's n_obs is 0 (postestimation-block quirk, live-verified) — n_obs check deliberately omitted rather than pinning a meaningless 0. Per-coef diffs pinned via coefs[name].diff paths."
+  },
+  "d5f_chow_by_high": {
+   "oracle_section": "D5f (manual-formula oracle)",
+   "stata": "PIET: chow income beertax, by(high)  — vs the oracle's manual pooled/split RSS formula",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "chow income beertax, by(high)"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 336,
+   "required_scalars": {
+    "classic.F": 28.074171
+   },
+   "exact_scalars": {
+    "classic.df1": 2,
+    "classic.df2": 332,
+    "G": 2,
+    "by": "high",
+    "group_sizes": [
+     106,
+     230
+    ]
+   },
+   "unpinned_oracle_reference": {
+    "rss_pooled": 1431815461,
+    "rss_groups_sum": 1224693452,
+    "__why": "derivable from the oracle's sub-regressions (rss_p=1.4318e+09; rss_0+rss_1=869786133+354907320) and matched by the block's classic.ssr_* fields to ~7 digits, but the oracle log only displays them at 5 sig figs — the F (computed by Stata at full precision, displayed to 8 digits via the di line) is the sharper pin. The block's 'robust' sub-object (HC1 chow variant) has NO Stata oracle and is not graded."
+   },
+   "notes": "Real Stata has NO chow command — the oracle is a manual F construction (pooled vs split-sample RSS: F=((rss_p-rss_0-rss_1)/k)/((rss_0+rss_1)/(n-2k))=28.074171, df 2/332, computed in StataBE and displayed via di at 8 digits). PIET's `chow ..., by()` convenience wrapper must reproduce exactly that classic formula in its classic.* sub-object (live-verified it does, to 10 significant digits)."
+  },
+  "d5g_mkspline_knots_mech": {
+   "oracle_section": "D5g (explicit-knots form — NO oracle numbers by design)",
+   "stata": "mkspline inc_sp = income, cubic knots(11000 13000 15000 17000)",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "mkspline inc_sp = income, cubic knots(11000 13000 15000 17000)",
+    "summarize inc_sp1 inc_sp2 inc_sp3"
+   ],
+   "oracle_kind": "mechanical",
+   "summarize_check": {
+    "vars": [
+     "inc_sp1",
+     "inc_sp2",
+     "inc_sp3"
+    ],
+    "n": 336
+   },
+   "notes": "MECHANICAL-PASS ONLY (coordinator directive): the explicit knots() form runs and materializes the k-1=3 cubic-spline basis variables, each with N=336 and no missings. The knot values (11000/13000/15000/17000) are Eval-chosen round numbers with NO Stata oracle — the oracle only ran nknots(4), whose default knot PLACEMENT (percentile-based) was not recorded, so no numeric pin is possible for the explicit form without a new StataBE run (note-don't-guess). Numeric spline-basis parity is deferred to the nknots case's future flip (below)."
+  },
+  "d5g_mkspline_nknots": {
+   "oracle_section": "D5g (nknots(4) — FLIPPED 2026-07-15: Phase-F engine fix computes correct percentile knot placement; oracle numbers now graded)",
+   "stata": "mkspline inc_sp = income, cubic nknots(4)  ->  regress high inc_sp1 inc_sp2 inc_sp3 (check regression)",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "gen high = (beertax > .5)",
+    "encode state, gen(snum)",
+    "gen t = _n",
+    "tsset t",
+    "mkspline inc_sp = income, cubic nknots(4)",
+    "regress high inc_sp1 inc_sp2 inc_sp3"
+   ],
+   "oracle_kind": "golden",
+   "n_obs": 336,
+   "required_scalars": {
+    "coeftable[inc_sp1].b": -0.0001655,
+    "coeftable[inc_sp2].b": 0.0001789,
+    "coeftable[inc_sp3].b": -0.0002423
+   },
+   "unpinned_oracle_reference": {
+    "knots": [
+     10745.9,
+     12815.69,
+     14541.8,
+     18077.87
+    ],
+    "cons_b": 2.446967,
+    "inc_sp1": {
+     "mean": 13880.18,
+     "sd": 2253.046,
+     "min": 9513.762,
+     "max": 22193.46
+    },
+    "inc_sp2": {
+     "mean": 1279.797,
+     "sd": 1959.585,
+     "min": 0,
+     "max": 12018.73
+    },
+    "inc_sp3": {
+     "mean": 261.0969,
+     "sd": 547.1339,
+     "min": 0,
+     "max": 3572.722
+    },
+    "n_each": 336,
+    "__why": "knot placement (5/35/65/95 pctiles) and the basis summarize stats have no gradable path in this driver: mkspline itself emits no 'estimation'-type block, and the driver's mechanical summarize_check (see d5g_mkspline_knots_mech) only compares N, not mean/sd — recorded here for provenance only. The actual numeric gate for correct knot placement is the check-regression's inc_sp1/inc_sp2/inc_sp3 coefficients above (required_scalars), which ARE knot-placement-sensitive. _cons is recorded but not gated: informational only, and it sidesteps the coeftable name-alias question for '_cons' under this driver's bracket-path jget, which — unlike the 'coefs' b+se convenience dict used by other cases — does NOT apply the _cons/(intercept) alias."
+   },
+   "notes": "FLIPPED 2026-07-15 from reject to golden: Phase-F engine fix (branch op/cobra-beta-f @d2588a9) landed correct percentile knot placement for mkspline nknots() (previously errored 'need at least 3 knots' before computing anything — see the prior reject-pin this replaces). Oracle: internal note f-oracle-pins.md §mkspline (StataBE 19.5, captured 2026-07-15): nknots(4) knots = 5/35/65/95 pctiles of income = {10745.9, 12815.69, 14541.8, 18077.87}. No independent se's were recorded for the check regression, so the coefficient check is graded via required_scalars (b only, coeftable[name].b jget paths) rather than the stricter 'coefs' b+se dict used elsewhere in this file. Case id dropped its '_reject' suffix (was d5g_mkspline_nknots_reject) to match the leg's own convention that a plain (unsuffixed) id denotes a golden case, mirroring d5g_mkspline_knots_mech's '_mech' suffix for its mechanical kind."
+  },
+  "stata_success_resets_rc": {
+   "oracle_section": "Professor pangram successful-command rc rows (user-run StataNow, 2026-08-01)",
+   "stata": "captured r(111), then successful reg3/test/lincom each leave _rc=0",
+   "do_body": [
+    "sysuse fatalities, clear",
+    "capture confirm variable __stata_red_missing",
+    "reg3 (income beertax spirits) (emppop unemp income)",
+    "display _rc",
+    "regress income beertax spirits unemp",
+    "capture confirm variable __stata_red_missing",
+    "test beertax spirits",
+    "display _rc",
+    "capture confirm variable __stata_red_missing",
+    "lincom beertax - spirits",
+    "display _rc"
+   ],
+   "oracle_kind": "mechanical",
+   "display_sequence": [
+    "0",
+    "0",
+    "0"
+   ],
+   "notes": "Seeds nonzero _rc=111 immediately before each successful command. A stale return code caused the professor-pangram comparison to report reg3=198 and test/lincom=1 even though all three commands produced valid results. This black-box case requires the three successful commands to reset _rc to Stata's 0 in order."
+  }
+ }
+}

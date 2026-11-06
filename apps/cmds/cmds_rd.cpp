@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 
@@ -6,7 +8,7 @@
 // P-QE wave — regression-discontinuity commands: rdrobust, rddensity, rdplot.
 //
 // All three share one local-polynomial core (src/estimators/rdlocal.{h,cpp});
-// see that header for the method sources and the clean-room provenance note.
+// see that header for the method sources.
 // This file is only argument wiring and the JSON projection: every quantity
 // Stata's rdrobust/rddensity/rdplot PRINT gets its own named field, because
 // the PIET rendering layer builds its tables from this JSON and cannot invent

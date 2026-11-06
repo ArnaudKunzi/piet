@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — thin wrappers over Accelerate (CBLAS + LAPACK), column-major.
 // All matrices are column-major with leading dimension = number of rows.
 #pragma once

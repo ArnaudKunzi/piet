@@ -1,0 +1,2 @@
+# MI-099 DOM test runner — npm install artifacts (reproducible via package-lock.json)
+node_modules/

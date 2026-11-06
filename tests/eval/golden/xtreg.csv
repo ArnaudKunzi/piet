@@ -1,0 +1,12 @@
+key,value
+coeftable[treated].b,3.708166171508869e+00
+coeftable[treated].se,4.275470589572826e-01
+coeftable[age_z].b,-9.309468527405008e-01
+coeftable[age_z].se,1.440731966525472e-01
+coeftable[edu_hi].b,-7.088414882784551e+00
+coeftable[edu_hi].se,4.220203592942782e-01
+coeftable[_cons].b,2.818452374980402e+01
+coeftable[_cons].se,2.793506589337990e-01
+sigma_e,2.638045276116058e+01
+sigma_u,1.580693068033037e+01
+rho,2.641810114542325e-01

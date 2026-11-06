@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Sharp regression-discontinuity local-polynomial estimation and density
 // manipulation testing, implemented from the published methodology papers:
 //
@@ -15,7 +17,7 @@
 //           Part IV ("Implementation Details", Section 12) is the source for
 //           the CURRENT mserd bandwidth chain (v-hat rule of thumb -> d-hat
 //           -> b-hat -> h-hat) that superseded CCT14's own selector.  Its
-//           Section 12.1-12.3 formulas are transcribed in rdlocal.cpp.
+//           Section 12.1-12.3 formulas are implemented in rdlocal.cpp.
 //   [CCFT17] Calonico, S., M.D. Cattaneo, M.H. Farrell and R. Titiunik (2017),
 //           "rdrobust: Software for regression-discontinuity designs", Stata
 //           Journal 17(2), 372-404 — the printed-output contract these
@@ -35,13 +37,10 @@
 //           evenly-spaced IMSE-optimal and mimicking-variance bin-count
 //           selectors in rd_plot_run (its equations (1), (3) and (14)-(16)).
 //
-// Clean-room provenance: implemented from the papers cited above only.  No
-// existing rdrobust/rddensity/rdplot implementation (the CCT/CJM R and Stata
-// packages, or any other prior art) was read or consulted; conventions the
-// papers leave open (mass-point handling, bandwidth truncation at the support
-// boundary, bin construction) are pinned by this project's own committed
-// goldens and unit tests, per the clean-room precedent set for csdid
-// (docs/legal/CSDID_CLEANROOM_WALL.md).
+// Method source: the papers cited above. Conventions the papers leave open
+// (mass-point handling, bandwidth truncation at the support boundary, bin
+// construction) are pinned by this project's own committed goldens and unit
+// tests.
 //
 // rd_robust_run is the CCT14 driver: local-polynomial point estimate (order
 // p) either side of the cutoff, a bias estimate from an auxiliary local

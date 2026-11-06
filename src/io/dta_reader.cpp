@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "io/dta_reader.h"
 #include "core/eng_counters.h"  // WS-D2: physical dataset-file open counter
 #include "io/win_compat.h"  // to_native_path: wide open on Windows for non-ASCII paths (BUG-050)
@@ -494,24 +496,29 @@ std::map<std::string, std::string> read_strls(Cursor& c, size_t seek_strls, int 
 // ---------------------------------------------------------------------------
 // <characteristics> table (117/118 only). Byte layout mirrors the writer exactly
 // (dta_writer.h/.cpp, MEASURED not doc-derived): repeated `<ch>` blocks, each
-// `<ch>` + u4 len + varname(129) + charname(129) + value bytes + NUL + `</ch>`,
-// where len = 258 + value.size() + 1 (the two 129-byte name fields + value +
-// its terminating NUL). The section ends at `</characteristics>` — distinguished
-// from a `<ch>` block start by peeking the next 4 bytes ("<ch>" vs "</ch", the
-// common prefix of "</characteristics>").
+// `<ch>` + u4 len + varname(W) + charname(W) + value bytes + NUL + `</ch>`,
+// where len = 2W + value.size() + 1 (the two name fields + value + its
+// terminating NUL). W is the release's name width, as in the variable-name
+// table: 129 from 118 on, 33 in 117 (BUG-658: reading a 117 file's 33-byte
+// fields as 129 failed every Stata 13 file that carries a char -- an xtset, a
+// note -- with "malformed <ch> length"). The section ends at
+// `</characteristics>` — distinguished from a `<ch>` block start by peeking
+// the next 4 bytes ("<ch>" vs "</ch", the common prefix of "</characteristics>").
 std::vector<DtaChar> read_characteristics(Cursor& c, const Header& h) {
     std::vector<DtaChar> out;
     if (!h.is_xml) return out;  // old (<=115) format predates <characteristics>
+    const size_t name_w = (h.format_version >= 118) ? 129 : 33;
     c.seek(h.seek_characteristics);
     while (true) {
         if (c.pos + 4 > c.len) break;
         std::string peek = c.raw(4);
         if (peek != "<ch>") break;  // "</characteristics>" (or truncated file) reached
         uint32_t len = c.u32le();
-        std::string varname = c.cstr_field(129);
-        std::string charname = c.cstr_field(129);
-        if (len < 259) throw EngineError("data_io", "dta: malformed <ch> length " + std::to_string(len));
-        size_t value_len = static_cast<size_t>(len) - 258 - 1;
+        std::string varname = c.cstr_field(name_w);
+        std::string charname = c.cstr_field(name_w);
+        if (len < 2 * name_w + 1)
+            throw EngineError("data_io", "dta: malformed <ch> length " + std::to_string(len));
+        size_t value_len = static_cast<size_t>(len) - 2 * name_w - 1;
         std::string value = c.raw(value_len);
         c.skip(1);  // trailing NUL (counted in len, per the writer's layout)
         c.skip(5);  // "</ch>"
@@ -787,8 +794,14 @@ DtaResult read_dta(const std::string& path) {
         bool handled = true;
         switch (code) {
             case 'd': scale_to_days = 1.0; break;               // %td: days
-            case 'c': scale_to_days = 1.0 / 86400000.0; break;  // %tc: ms since epoch
-            case 'C': scale_to_days = 1.0 / 86400000.0; break;  // %tC: ms (leap-adjusted; treated same)
+            // %tc/%tC keep Stata's milliseconds, as %tw/%tm/%tq/%th keep their
+            // index (BUG-1091): every reader of the column -- clock() in
+            // generate, the %tc display, dofc() -- works in ms, so the old
+            // days rescale made a StataBE file's `display %tc x` print
+            // 01jan1960 00:00:22 and `summarize` report days (AER 007's
+            // Wave3_combinedrawdata.dta EndDate2).
+            case 'c': scale_to_days = 1.0; break;  // %tc: ms since 01jan1960
+            case 'C': scale_to_days = 1.0; break;  // %tC: ms (leap-adjusted; treated same)
             case 'w':
                 // %tw is Stata's fixed-52-week-year calendar (52 weeks/year;
                 // weeks 1-51 are 7 days, week 52 absorbs the 8-9 day remainder),

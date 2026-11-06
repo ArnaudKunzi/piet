@@ -1,13 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — native writer for Stata format-118 .dta files. The inverse of
 // io/dta_reader.{h,cpp}: for every byte that reader parses, this writer emits the
 // byte real Stata (and therefore our own reader) will read back unchanged.
 //
-// P1-A3-WRITER-NUMERIC (plans/P1-A3-WRITER-IMPL-brief.md · plans/DESIGN-dta-writer.md
+// P1-A3-WRITER-NUMERIC (internal note P1-A3-WRITER-IMPL-brief.md · internal note DESIGN-dta-writer.md
 // §3) laid out the container and wrote the five NUMERIC types.
 // P1-A3-WRITER-STRINGS-IMPL (ARC 3 step 4) FILLS the four fields step 3 deliberately
 // emitted empty — it did not re-lay out the file: `str#` columns
 // (<variable_types> + the data matrix), <variable_labels>, <value_label_names> +
-// <value_labels>, <characteristics>. strL write stays out of scope (Q4).
+// <value_labels>, <characteristics>, and strL text/binary GSOs.
 //
 // BYTE LAYOUTS ARE MEASURED, NOT DOC-DERIVED (step 4's one real trap). Two of the
 // three new sections have a length prefix whose span the Stata manual states only in
@@ -53,9 +55,10 @@
 //                         invariant. The stop-line that WOULD be Art-13 and is NOT
 //                         crossed here: needing a format hint or a container-version
 //                         bump to make narrowing work.
-//   Q4 strL / str cap    — a level longer than 2045 UTF-8 bytes is an honest reject,
-//                         never a truncation and never a strL promotion (strL write is
-//                         out of scope by DOSSIER directive).
+//   Q4 strL / str cap    — extended by the interactive persistence continuation:
+//                         117/118 write real strL references and GSO records for
+//                         long/binary strings and declared strL (see [P] dta §5.11).
+//                         Format 115 still refuses unrepresentable strings.
 //   Q5 extended missing  — CLOSED 2026-08-05 (P6 rider). All 27 missing values round-trip:
 //                         emit_cell writes base+kind per storage type, the exact mirror of
 //                         the reader's missing_code_raw(). Before this, a `.a` read in
@@ -156,12 +159,19 @@ struct DtaWriteOptions {
     // write instead, for callers that would rather fail than let the Frame's
     // missing/`""` distinction collapse. See THE FACTOR ASYMMETRY below.
     bool strict_string_missing = false;
+    // The .dta release written: 118 (default; Stata 14+), 117 (Stata 13: the same
+    // XML container with 33-byte names, 49-byte formats, 81-byte variable labels,
+    // a 4-byte N and a 1-byte data-label length) or 115 (Stata 12: the old binary
+    // layout -- a 109-byte header, one-byte type codes 251..255 / str1..str244,
+    // expansion fields for the characteristics). `saveold`'s version(): 11/12 ->
+    // 115, 13 -> 117, 14 -> 118 (w2ar_data_io_family.log dx_svo_*).
+    int release = 118;
 };
 
 // Write `fr` to `path` as a Stata format-118 .dta (LSF byte order).
 // Throws EngineError("data_io", …) — never truncates, never silently narrows — on:
 // a non-finite non-NaN value (Stata has no infinity, so storing one would read back as
-// `.` = a silent value change), a factor level >2045 UTF-8 bytes (Q4), a MISSING cell
+// `.` = a silent value change), a value exceeding the strL GSO length limit, a MISSING cell
 // in a factor column ONLY when strict_string_missing is set (see below), a value-label
 // name with no table, a value-label code
 // outside int32, a name/format/label too long for its fixed-width field, or >65535

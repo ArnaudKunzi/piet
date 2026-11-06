@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // strmutate.h — row-wise PIET evaluator for STRING-valued / STRING-gated
 // `gen`/`replace`/`count`/`keep if`/`drop if`. C++ port of
 // piet/backend/piet/strmutate.py (the frozen 1.16.0 oracle).
@@ -41,29 +43,50 @@ bool needsStringEval(SessionState& session, const std::string& varname, const st
 bool needsStringCount(SessionState& session, const std::optional<std::string>& ifExpr);
 
 // run_string_gen / run_string_replace: row-wise gen/replace. Returns the
-// data_mutation block (or an error block on a bad expression).
+// data_mutation block (or an error block on a bad expression, and r(109) when
+// the expression's type is not the variable's: BUG-1122).
+// `storeType`: the numeric storage type the new variable takes when the result is
+// numeric (storage::resolveCreateType: the declared type, else c(type)); "" keeps
+// the double the evaluator produced. `numTyped`: the generate declared a numeric
+// type, so a string expression is r(109).
+// `inRange`: the command's own `in a/b`, which the caller has already folded into
+// `ifExpr`; it is read again only where the `if` holds a form the engine computes
+// (a running sum() starts at the range's first row: see materializeTsIf).
 nlohmann::ordered_json runStringGen(SessionState& session, const std::string& expr,
-                                    const std::optional<std::string>& ifExpr, bool strTyped);
+                                    const std::optional<std::string>& ifExpr, bool strTyped,
+                                    const std::string& storeType = std::string(),
+                                    bool numTyped = false,
+                                    const std::optional<std::string>& inRange = std::nullopt);
+// `noPromote` (replace's `nopromote`): an integer target keeps its own type and
+// the stored values truncate (w2e_float_default replace_byte_nopromote :827); a
+// str# target keeps its width and longer values truncate (BUG-1143), and the
+// "(N values truncated because of storage type)" line is appended to `notes`.
 nlohmann::ordered_json runStringReplace(SessionState& session, const std::string& expr,
-                                        const std::optional<std::string>& ifExpr, bool strTyped);
+                                        const std::optional<std::string>& ifExpr, bool strTyped,
+                                        bool noPromote = false,
+                                        std::vector<std::string>* notes = nullptr,
+                                        const std::optional<std::string>& inRange = std::nullopt);
 
 // count_rows_if: number of rows where a (possibly string-referencing)
 // condition is true. Sets `ok=false` on an un-evaluatable condition (message
 // carried in `errMsg`). `inRange` (BS-090, BETA Phase G): an optional `in
 // a/b` row-range, ANDed into the SAME per-row mask this already builds
-// (count/filter use this for string/factor conditions; calendar creation also
-// reuses its full-length mask for numeric conditions). Callers must never silently
+// (Doctrine ①: this path is only reachable when `if` references a
+// string/factor column, and dispatcher.cpp's caller must never silently
 // drop a co-occurring `in` just because the `if` half took the row-wise
-// detour — malformed/out-of-range forms set `ok=false` the same way an
-// un-evaluatable `if` expression does, `errMsg` carries the same wording
-// family as piet::handlers::inRangeRejectError.
+// detour — a malformed or out-of-range `in` sets `ok=false` and
+// `inRangeError`, with `errMsg` holding Stata's refusal sentence (empty for a
+// malformed string) for the caller to hand to piet::handlers::inRangeRejectError).
 struct CountResult {
   bool ok = true;
   bool inRangeError = false;  // true iff a failing `ok=false` is the `in` bound, not `if`
   long long n = 0;
   std::string errMsg;
-  // Full-length sample mask, in original row order, when ok is true.
-  std::vector<bool> selected;
+  // "r(NNN)" when the row evaluator named Stata's code for the failure (r(109):
+  // a string used as a truth value, `count if s`), and `errMsg` is then its own
+  // words ("type mismatch") when it gave any; "" when it could not read the
+  // condition at all (a subscript, `x[_n-1]`).
+  std::string errReason;
 };
 CountResult countRowsIf(SessionState& session, const std::string& ifExpr,
                         const std::optional<std::string>& inRange = std::nullopt);
@@ -74,6 +97,71 @@ CountResult countRowsIf(SessionState& session, const std::string& ifExpr,
 // mask before the keep/drop split is applied.
 nlohmann::ordered_json filterRowsIf(SessionState& session, const std::string& ifExpr, bool keep,
                                     const std::optional<std::string>& inRange = std::nullopt);
+
+// The ONE route for an `if` on an engine-routed command whose condition the
+// engine's f64 evaluator cannot read: a string function (strpos, regexm, substr,
+// ...), a compare against the empty string `""` (the engine reads `s != ""` on
+// a string column as true for the empty row: w2aj_qualifiers qf_if_str_ne_empty
+// r(N) 11, PIET 12), or a string column used any other way than `s ==/!=
+// "text"` (`missing(s)`, `inlist(s, ...)`, `s > "a"`). count/keep/drop/generate/
+// replace keep their own row-wise detours above; every other command takes this
+// one, and so do the by: prefix's sub-commands.
+//
+// needsConditionMask: does `cond` take the route. A plain `s == "text"` does not
+// (the engine's factor compare serves it).
+bool needsConditionMask(SessionState& session, const std::string& cond);
+// installConditionMask: evaluates `cond` with the evaluator countRowsIf uses (no
+// second evaluator), installs the row mask on the working frame as the hidden f64
+// column `column` (piet/datastore.h kQualifierColumnPrefix) and returns the
+// condition every engine `--keepif` and applyIfAndInFilter then receive,
+// `(column!=0)`. c(changed) is left as it was. On failure `ok` is false and
+// `error` is the block to show (the evaluator's own message and rc). With
+// `groupKeys` (a by-prefixed generate/replace), `_n` and `_N` count within each
+// group of those keys over the rows as they stand (handlers::groupObsNumberFrame).
+struct ConditionMaskInstall {
+  bool ok = true;
+  std::string column;
+  std::string condition;
+  nlohmann::ordered_json error;
+  // installRowExpression only: the row evaluator could not read the expression
+  // (it has no subscript, `x[_n-1]`); `error` is its message, and the caller
+  // keeps the engine's own answer instead.
+  bool declined = false;
+};
+ConditionMaskInstall installConditionMask(SessionState& session, const std::string& cond,
+                                          const std::vector<std::string>& groupKeys = {});
+// writeConditionMaskColumn: the same evaluation over the frame at `dataPath` (a
+// by: driver's sorted scratch copy, not the head), whose mask is written as the
+// f64 0/1 column `column` onto a copy at `outPath`; the session's frame is left
+// alone. `_n`/`_N` are that frame's own row numbers. Same `ok`/`error` contract.
+ConditionMaskInstall writeConditionMaskColumn(SessionState& session, const std::string& dataPath,
+                                              const std::string& cond, const std::string& column,
+                                              const std::string& outPath);
+// installWeightExpression: a weight that is an expression, not a variable
+// (`[pw=1/wf]`, w2aj_qualifiers qf_rw_pw_expr, qf_sw_aw_expr), is generated once
+// by the engine into the hidden column `column`, which the command then receives
+// as its weight variable. Same `ok`/`error` contract as installConditionMask.
+ConditionMaskInstall installWeightExpression(SessionState& session, const std::string& expr);
+// installRowExpression: an egen argument evaluated once, by the row evaluator
+// installConditionMask uses, over the whole frame into the hidden f64 column
+// `column`, which the egen function then receives as its argument -- the egen
+// ados generate the expression into a temporary first. It serves an argument
+// the engine's f64 evaluator cannot read (a string function, bofd(): BUG-464),
+// and one naming _n or _N under a by-list or if/in, which the engine evaluated
+// on the if/in-filtered copy and over the whole frame under by(). `byVars` (the
+// by() option's text, for the functions whose ados generate the argument by the
+// groups; the caller passes "" for the others) makes _n and _N count within
+// each by-group. A string value is r(109), except for `countValues` (count()),
+// where it counts when it is not "". Same `ok`/`error` contract as
+// installConditionMask, plus `declined`.
+ConditionMaskInstall installRowExpression(SessionState& session, const std::string& expr,
+                                          const std::string& byVars, bool countValues);
+// namesObsPosition: `expr` names _n or _N outside a "..." literal.
+bool namesObsPosition(const std::string& expr);
+// removeConditionMask: drops a qualifier column from the working frame when it is
+// still there (a command that rebuilt the data, collapse, has none left).
+// c(changed) is left as the command left it.
+void removeConditionMask(SessionState& session, const std::string& column);
 
 // --- Selftest instrumentation (FLOOR campaign: slot-compiled evalRows) ------
 //

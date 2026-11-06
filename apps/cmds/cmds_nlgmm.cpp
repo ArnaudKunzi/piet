@@ -1,7 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 
 #include "core/expr_eval.h"
+#include "core/ident.h"
 #include "estimators/nlgmm.h"
 
 // P7 wave — nl, gmm.
@@ -26,7 +29,7 @@
 //        the two stages distinguishable because y's 22 missings and x2's 129 are
 //        disjoint sets.
 //
-// Oracle: tests/kitchensink/pangram/waves/_oracle/p7_stata.log lines 833-886.
+// Oracle: internal capture p7_stata.log lines 833-886.
 
 namespace cecon {
 namespace cli {
@@ -78,9 +81,9 @@ size_t top_level_assign(const std::string& s) {
 
 bool is_var_token(const std::string& s) {
     if (s.empty()) return false;
-    if (!(std::isalpha((unsigned char)s[0]) || s[0] == '_')) return false;
+    if (!cecon::ident::isIdentStartByte(s[0])) return false;
     for (char c : s)
-        if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
+        if (!cecon::ident::isIdentByte(c)) return false;
     return true;
 }
 
@@ -160,20 +163,39 @@ int cmd_nl(const std::vector<std::string>& a) {
     if (data_missing(data) || spec.empty()) {
         std::fprintf(stderr,
                      "usage: cobra nl --data f.hbin --expr \"(Y = <expr in {params} and vars>)\" "
-                     "[--vce iid] [--level P] [--keepif EXPR] [--out f.json]\n"
+                     "[--vce iid] [--weight W --wtype aw|pw] [--level P] [--keepif EXPR] "
+                     "[--out f.json]\n"
                      "  nonlinear least squares (Stata `nl`). Parameters are written {name=init}\n"
                      "  and are solved for; every other identifier is a variable in the data.\n"
-                     "  e.g. --expr \"(y = {b0=2}+{b1=.5}*x1+{b2=-.2}*x2)\"\n");
+                     "  e.g. --expr \"(y = {b0=2}+{b1=.5}*x1+{b2=-.2}*x2)\"\n"
+                     "  --weight W --wtype aw|pw  Stata [aweight=]/[pweight=]: normalized to sum to\n"
+                     "               the row count; pw takes the robust sandwich (vce robust).\n");
         return 2;
     }
     // --vce: only the model-based (iid) covariance is pinned against Stata. A
     // robust NLS sandwich differs from Stata's only in the small-sample factor,
     // which is exactly the part no oracle here fixes — so it is rejected rather
     // than emitted as a number nothing verified.
-    if (vce != "iid")
+    // BUG-1283: Stata's [aweight=] / [pweight=]. A pweight implies the robust sandwich,
+    // whose n/(n-k) factor the pweight oracle pins (StataBE `nl (y = {b0} + {b1}*x1 +
+    // {b2}*x2) [pw=w]`: _se[/b1] .071775268345285762); fw/iw would make N the sum of
+    // the weights and are not served here.
+    const std::string weight_var = opt(a, "--weight"), wtype = opt(a, "--wtype");
+    bool pweight = false;
+    if (!weight_var.empty() || !wtype.empty()) {
+        if (weight_var.empty()) throw EngineError("bad_input", "nl: --wtype requires --weight");
+        if (wtype.empty() || wtype == "aw" || wtype == "aweight") pweight = false;
+        else if (wtype == "pw" || wtype == "pweight") pweight = true;
+        else
+            throw EngineError("unsupported",
+                "nl: --wtype must be aw or pw (got '" + wtype + "'); fweight and iweight are "
+                "not implemented for nl");
+    }
+    if (vce != "iid" && !(pweight && vce == "robust"))
         throw EngineError("unsupported",
             "nl: --vce " + vce + " is not implemented; only the model-based (iid) covariance "
-            "sigma2*(J'J)^-1 is pinned against Stata in this build");
+            "sigma2*(J'J)^-1, and a pweight's robust sandwich, are pinned against Stata in this "
+            "build");
     const bool level_set = has(a, "--level");
     const double level = std::stod(opt(a, "--level", "95"));
     if (level_set && (level < 10.0 || level > 99.99)) {
@@ -201,8 +223,44 @@ int cmd_nl(const std::vector<std::string>& a) {
     data = maybe_keepif(data, opt(a, "--keepif"));
     const Dataset& ds = acquire_data(data);
     const double* depcol = require_num(ds, "nl", dep);
-    const ExprData d = gather_expr_vars(ds, "nl", prog.variables(), {dep}, /*listwise_vars=*/true);
-    if (d.n == 0) { std::fprintf(stderr, "nl: no rows after dropping missing.\n"); return 1; }
+    std::vector<std::string> listwise_extra{dep};
+    if (!weight_var.empty()) listwise_extra.push_back(weight_var);
+    ExprData d = gather_expr_vars(ds, "nl", prog.variables(), listwise_extra, /*listwise_vars=*/true);
+    // A zero weight marks the row out (Stata's mark), a negative one is an error; the
+    // rest are normalized to sum to the row count (nl.ado).
+    std::vector<double> wn;
+    double sum_w = 0;
+    if (!weight_var.empty()) {
+        const double* wcol = require_num(ds, "nl", weight_var);
+        std::vector<int64_t> keep2;
+        std::vector<double> vals2;
+        for (int64_t i = 0; i < d.n; ++i) {
+            const double wi = wcol[d.keep[static_cast<size_t>(i)]];
+            if (wi < 0)
+                throw EngineError("bad_input", "nl: weight '" + weight_var + "' has a negative value");
+            if (wi == 0) continue;
+            keep2.push_back(d.keep[static_cast<size_t>(i)]);
+            for (int j = 0; j < d.nv; ++j)
+                vals2.push_back(d.vals[static_cast<size_t>(i) * static_cast<size_t>(d.nv) +
+                                       static_cast<size_t>(j)]);
+            wn.push_back(wi);
+            sum_w += wi;
+        }
+        d.keep = std::move(keep2);
+        if (d.nv > 0) d.vals = std::move(vals2);
+        d.n = static_cast<int64_t>(d.keep.size());
+        for (double& v : wn) v *= static_cast<double>(d.n) / sum_w;
+    }
+    // BUG-1269: nl words its empty and too-small samples itself (StataBE 19.5,
+    // `nl (y = {b0} + {b1}*x) if x > 20` / `if x == 1`), r(2000) / r(2001).
+    const int64_t n_params = static_cast<int64_t>(prog.params().size());
+    if (d.n == 0)
+        throw EngineError("no_obs", "estimation sample indicator variable eliminates all observations",
+                          "r(2000)");
+    if (d.n < n_params)
+        throw EngineError("no_obs", "cannot have fewer observations (" + std::to_string(d.n) +
+                                        ") than parameters (" + std::to_string(n_params) + ")",
+                          "r(2001)");
     std::vector<double> Y = gather_rows(depcol, d.keep);
 
     const int nv = d.nv;
@@ -215,7 +273,8 @@ int cmd_nl(const std::vector<std::string>& a) {
 
     std::vector<std::string> pnames;
     for (const expr::Param& p : prog.params()) pnames.push_back(p.name);
-    const NlResult r = nl_fit(resid, Y.data(), d.n, initial_values(prog), pnames);
+    const NlResult r = nl_fit(resid, Y.data(), d.n, initial_values(prog), pnames,
+                              wn.empty() ? nullptr : wn.data(), pweight);
     if (!r.ok) throw EngineError("no_convergence", r.err.empty() ? "nl: the fit failed" : r.err);
 
     const double tc = t_critical(level == 95.0 ? 0.05 : 1.0 - level / 100.0, r.df_r);
@@ -231,7 +290,8 @@ int cmd_nl(const std::vector<std::string>& a) {
 
     json out = {{"estimator", "nl"}, {"depvar", dep}, {"expr", spec},
                 {"n_obs", d.n}, {"n_dropped_missing", ds.n_rows() - d.n},
-                {"n_params", r.k}, {"vce", vce}, {"coefs", coefs},
+                {"n_params", r.k}, {"vce", pweight ? std::string("robust") : vce},
+                {"coefs", coefs},
                 {"rss", r.rss}, {"mss", r.mss}, {"tss", r.tss},
                 {"df_r", r.df_r}, {"df_m", r.df_m}, {"df_t", r.df_t},
                 {"ms_r", r.rss / r.df_r}, {"ms_m", r.df_m > 0 ? r.mss / r.df_m : 0.0},
@@ -241,6 +301,9 @@ int cmd_nl(const std::vector<std::string>& a) {
                 {"iterations", iteration_log(r.iters, "rss")},
                 {"converged", r.converged}};
     if (level_set) out["level"] = level;
+    // Weighted only, so an unweighted reply is unchanged: e(wtype), e(sum_w).
+    if (!weight_var.empty())
+        out["weight"] = {{"var", weight_var}, {"type", pweight ? "pw" : "aw"}, {"sum_w", sum_w}};
     std::vector<std::string> notes;
     if (r.cons_param >= 0)
         notes.push_back("Parameter " + r.names[static_cast<size_t>(r.cons_param)] +
@@ -312,7 +375,7 @@ int cmd_gmm(const std::vector<std::string>& a) {
     // whose expression variable is missing but whose instruments are complete
     // survives this stage and is caught by stage 2.
     const ExprData d = gather_expr_vars(ds, "gmm", prog.variables(), zs, /*listwise_vars=*/false);
-    if (d.n == 0) { std::fprintf(stderr, "gmm: no rows after dropping missing.\n"); return 1; }
+    require_sample(d.n);  // BUG-1269: r(2000) "no observations" / r(2001) for one row
     const int64_t n_markout = d.n;
 
     const int nv = d.nv;

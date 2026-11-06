@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "oglm.h"
 
 // The ordered logit/probit core is header-only (like estimators/tobit.h): every

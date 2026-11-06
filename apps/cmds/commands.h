@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #pragma once
 
 // Prototypes for every cobra subcommand handler (99 cmd_* functions), formerly
@@ -48,6 +50,7 @@ int cmd_csdid(const std::vector<std::string>& a);
 // cmds_mle.cpp
 int cmd_logit(const std::vector<std::string>& a);
 int cmd_probit(const std::vector<std::string>& a);
+int cmd_cloglog(const std::vector<std::string>& a);
 int cmd_tobit(const std::vector<std::string>& a);
 
 // --- P7 wave -------------------------------------------------------------

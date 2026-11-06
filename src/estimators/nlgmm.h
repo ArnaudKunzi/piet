@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — `nl` (nonlinear least squares) and `gmm` (single-equation nonlinear
 // GMM), the P7 nonlinear pair.
 //
@@ -9,7 +11,7 @@
 // Jacobian routine, a line search and a convergence rule instead of two.
 //
 // Every formula here is pinned against StataBE 19.5 on the P7 pangram wave
-// (tests/kitchensink/pangram/waves/_oracle/p7_stata.log, lines 833-886); the
+// (internal capture p7_stata.log, lines 833-886); the
 // assertions live in tests/unit/test_nlgmm.cpp.
 #pragma once
 #include <cstdint>
@@ -86,8 +88,17 @@ struct NlResult {
 // `y` is the dependent variable on the estimation sample (length n) — needed
 // only for the total sum of squares, since the residual callback already
 // carries it. `b0` is the vector of {name=init} starting values.
+//
+// `w` (optional, length n; BUG-1283): Stata's aweight/pweight normalized to mean 1
+// (nl.ado normalizes them to the observation count). The fit minimises sum w e^2,
+// rss/tss/mss are the weighted sums (tss centred about the weighted mean), the
+// constant-term test reads the unweighted derivative, and Res. dev. subtracts n times
+// the mean log weight (nl.ado e(dev)). `robust` (Stata's pweight VCE): the sandwich
+// (J'WJ)^-1 sum (w e J)(w e J)' (J'WJ)^-1 * n/(n-k) in place of sigma2 (J'WJ)^-1.
+// StataBE `nl (y = {b0} + {b1}*x1 + {b2}*x2) [aw=w]` / `[pw=w]` on probe BUG-1283.do.
 NlResult nl_fit(const NlResidFn& resid, const double* y, int64_t n, const std::vector<double>& b0,
-                const std::vector<std::string>& names);
+                const std::vector<std::string>& names, const double* w = nullptr,
+                bool robust = false);
 
 // ---------------------------------------------------------------------------
 // gmm — single-equation GMM, one-step, unadjusted initial weight matrix

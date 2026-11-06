@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — `xtabond`: Arellano–Bond linear dynamic panel-data estimation
 // (one-step difference GMM), Stata-compatible.
 //
@@ -57,7 +59,7 @@
 // under another name.
 //
 // Every number is pinned against StataBE 19.5 on the P7 pangram wave
-// (tests/kitchensink/pangram/waves/_oracle/p7_stata.log, `xtset id t` then
+// (internal capture p7_stata.log, `xtset id t` then
 // `xtabond y L.y x1 x2, lags(1) vce(robust)`); the assertions live in
 // tests/unit/test_xtabond.cpp.
 #pragma once

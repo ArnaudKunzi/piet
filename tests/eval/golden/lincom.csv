@@ -1,0 +1,9 @@
+key,value
+coeftable[age_z + edu_hi].b,-6.549240338494334e+00
+coeftable[age_z + edu_hi].se,2.925485779866836e-01
+coeftable[2*age_z - age2].b,4.093042988379556e+00
+coeftable[2*age_z - age2].se,3.087341831276978e-01
+coeftable[edu_hi + 1.5].b,-6.058663115348852e+00
+coeftable[edu_hi + 1.5].se,2.399320098915450e-01
+coeftable[_cons - age_z].b,3.091352393367633e+01
+coeftable[_cons - age_z].se,2.044217642265216e-01

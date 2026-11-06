@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // P7 wave — the shared scalar-expression evaluator.
 //
 // Promoted from src/estimators/nlcom.h's recursive-descent parser so `nl` and
@@ -17,10 +19,11 @@
 // GRAMMAR (unchanged from nlcom's, deliberately — widening it would widen
 // nlcom's accepted input too):
 //     expr   := term   (('+'|'-') term)*            left-associative
-//     term   := factor (('*'|'/') factor)*          left-associative
-//     factor := base ['^' factor]                   RIGHT-associative
-//     base   := ['-'|'+'] base
-//             | '(' expr ')'
+//     term   := unary  (('*'|'/') unary)*           left-associative
+//     unary  := ('-'|'+') unary | factor
+//     factor := base ('^' powrhs)*                  LEFT-associative
+//     powrhs := ('-'|'+') powrhs | base
+//     base   := '(' expr ')'
 //             | '_b[' NAME ']'                       (allow_coefs)
 //             | '{' NAME ['=' NUMBER] '}'            (allow_params)
 //             | ('ln'|'log'|'exp'|'sqrt'|'abs'
@@ -29,10 +32,15 @@
 //             | IDENT                                (allow_vars)
 //             | NUMBER
 //
-// NOTE the precedence of unary minus: it is handled inside `base`, so it binds
-// TIGHTER than '^' — `-2^2` is `(-2)^2` = 4, not -(2^2). That is what nlcom has
-// always done; tests/unit/test_nlgmm.cpp pins it so the behaviour is a decision
-// on the record rather than an accident.
+// NOTE the precedence of unary minus and '^' (FU-811), from the StataBE oracle
+// w2ac_expr_precedence: negation binds looser than '^', so `-2^2` is -(2^2) = -4
+// and `-_b[x]^2` is -(_b[x]^2) (disp_neg_pow, nlcom_negpow, nlcom_const); '^' is
+// LEFT-associative, so `2^3^2` is (2^3)^2 = 64 and `_b[x]^2^3` is _b[x]^6
+// (disp_chain_const, nlcom_chain); a sign right of '^' covers only the next base,
+// so `2^-2` = .25, `-2^-b` = -(2^(-b)) (nlcom_negexp) and `2^-3^2` = (2^-3)^2
+// (disp_pow_neg_pow). Until FU-811 the minus sat inside `base` (binding TIGHTER
+// than '^') and '^' was right-associative: silent wrong answers in nlcom/nl/gmm.
+// tests/unit/test_nlgmm.cpp pins the oracle's values.
 //
 // COMPILE ONCE, EVALUATE MANY. nlcom re-parsed the string for every evaluation,
 // which is fine for a handful of delta-method perturbations but not for `nl`,
@@ -41,6 +49,10 @@
 // recursive descent; only the thing it returns changed (a node instead of a
 // double).
 #pragma once
+#include "core/distributions.h"
+#include "core/ident.h"  // non-ASCII bytes are identifier bytes (Unicode names)
+#include "core/stata_arith.h"
+
 #include <cctype>
 #include <cmath>
 #include <functional>
@@ -96,7 +108,7 @@ struct Options {
 
 enum class Op {
     Num, Add, Sub, Mul, Div, Pow, Neg,
-    Ln, Exp, Sqrt, Abs,
+    Ln, Exp, Sqrt, Abs, Float, Cond,
     Invlogit, Logit, Normal, Normalden, Pi,
     ParamRef, VarRef, CoefRef,
 };
@@ -109,7 +121,7 @@ struct Node {
     double num = 0.0;
     int idx = -1;       // ParamRef / VarRef: index into params()/variables()
     std::string name;   // VarRef / CoefRef: the name, for the resolver and diagnostics
-    NodeP a, b;
+    NodeP a, b, c;
 };
 
 class Program {
@@ -156,18 +168,37 @@ class Program {
             case Op::Sub: return eval_node(*n.a, params, vars, coefs) - eval_node(*n.b, params, vars, coefs);
             case Op::Mul: return eval_node(*n.a, params, vars, coefs) * eval_node(*n.b, params, vars, coefs);
             case Op::Div: return eval_node(*n.a, params, vars, coefs) / eval_node(*n.b, params, vars, coefs);
-            case Op::Pow: return std::pow(eval_node(*n.a, params, vars, coefs), eval_node(*n.b, params, vars, coefs));
+            case Op::Pow: {
+                // Stata's `^` (core/stata_arith.h), as generate computes it: x^2 is
+                // the correctly rounded x*x (this platform's pow(x, 2) misses it by 1 ulp
+                // on ~0.13% of doubles; on StataBE 19.5's lf_052 lnf columns x*x matches
+                // 1000/1000 values and pow() 998/1000, codex-recovery/shape-cross.log).
+                const double x = eval_node(*n.a, params, vars, coefs);
+                return stata_pow_value(x, eval_node(*n.b, params, vars, coefs));
+            }
             case Op::Neg: return -eval_node(*n.a, params, vars, coefs);
             case Op::Ln:  return std::log(eval_node(*n.a, params, vars, coefs));
-            case Op::Exp: return std::exp(eval_node(*n.a, params, vars, coefs));
+            case Op::Exp: return stata_exp_value(eval_node(*n.a, params, vars, coefs));
             case Op::Sqrt: return std::sqrt(eval_node(*n.a, params, vars, coefs));
             case Op::Abs: return std::fabs(eval_node(*n.a, params, vars, coefs));
+            case Op::Float:
+                return static_cast<double>(static_cast<float>(eval_node(*n.a, params, vars, coefs)));
+            case Op::Cond:
+                // Evaluate only the selected arm: 0 * NaN would not implement
+                // a conditional, and LF programs often have branch-only domains.
+                return eval_node(*n.a, params, vars, coefs) != 0.0
+                    ? eval_node(*n.b, params, vars, coefs)
+                    : eval_node(*n.c, params, vars, coefs);
             case Op::Invlogit: {
-                // 1/(1+exp(-x)): checked on this platform at x = ±800 — exp(-x)
-                // overflows/underflows to +-inf/0 rather than NaN, so the plain
-                // form already returns exactly 1 and 0, no safe branch needed.
-                const double x = eval_node(*n.a, params, vars, coefs);
-                return 1.0 / (1.0 + std::exp(-x));
+                // Stata's invlogit() is two-branched: 1/(1+exp(-x)) for x >= 0
+                // and exp(x)/(1+exp(x)) for x < 0. StataBE 19.5 %21x grid of 801
+                // z in [-8, 8] (2026-10-27, codex-recovery/invlogit-grid.log):
+                // this form matches 801/801; the single 1/(1+exp(-x)) form
+                // misses 177 of the 400 negative z by 1 ulp. Same as
+                // src/data/frame.cpp stata_invlogit. exp() is Stata's
+                // (core/stata_arith.h): 0 below -709, so invlogit(-717.5) is 0,
+                // not a subnormal.
+                return stata_invlogit_value(eval_node(*n.a, params, vars, coefs));
             }
             case Op::Logit: {
                 // Stata missing outside the open interval (0,1); NaN in is NaN out.
@@ -176,8 +207,9 @@ class Program {
                 return std::log(x / (1.0 - x));
             }
             case Op::Normal:
-                // Bit-identical to src/estimators/probit.cpp:10's norm_cdf.
-                return 0.5 * std::erfc(-eval_node(*n.a, params, vars, coefs) * 0.7071067811865476);
+                // Stata's normal(): Cody's ANORM, bit-identical to StataBE
+                // (src/core/distributions.h stata_normal).
+                return cecon::stata_normal(eval_node(*n.a, params, vars, coefs));
             case Op::Normalden: {
                 // Bit-identical to src/estimators/probit.cpp:11's norm_pdf.
                 const double z = eval_node(*n.a, params, vars, coefs);
@@ -214,9 +246,10 @@ struct Parser {
 
     Parser(const std::string& str, Program& prog) : s(str), p(prog) {}
 
-    // RAII recursion-depth guard: every nesting level passes through base(), so
-    // a cap there bounds total recursion and rejects pathological input before
-    // the call stack overflows.
+    // RAII recursion-depth guard: every nesting level passes through base(), and
+    // every sign unary()/powrhs() consumes takes one more level, so a cap there
+    // bounds total recursion and rejects pathological input before the call stack
+    // overflows.
     struct DepthGuard {
         const Program& p;
         int& d;
@@ -243,14 +276,32 @@ struct Parser {
         return v;
     }
 
+    // EM0: [U] 13.2.5 orders the binary operators /, *, -(subtraction), +, each level
+    // left-associative: a+b-c is a+(b-c), a*b/c is a*(b/c) (oracle w2am_expr_binary_order
+    // eo_nl_pm; 0.1+0.2-0.3 = 2^-55).
     NodeP expr() {
+        NodeP v = subx();
+        for (;;) {
+            ws();
+            if (i < s.size() && s[i] == '+') {
+                ++i;
+                NodeP r = subx();
+                v = mk(Op::Add, std::move(v), std::move(r));
+            } else {
+                break;
+            }
+        }
+        return v;
+    }
+
+    NodeP subx() {
         NodeP v = term();
         for (;;) {
             ws();
-            if (i < s.size() && (s[i] == '+' || s[i] == '-')) {
-                char op = s[i++];
+            if (i < s.size() && s[i] == '-') {
+                ++i;
                 NodeP r = term();
-                v = mk(op == '+' ? Op::Add : Op::Sub, std::move(v), std::move(r));
+                v = mk(Op::Sub, std::move(v), std::move(r));
             } else {
                 break;
             }
@@ -259,13 +310,13 @@ struct Parser {
     }
 
     NodeP term() {
-        NodeP v = factor();
+        NodeP v = divx();
         for (;;) {
             ws();
-            if (i < s.size() && (s[i] == '*' || s[i] == '/')) {
-                char op = s[i++];
-                NodeP r = factor();
-                v = mk(op == '*' ? Op::Mul : Op::Div, std::move(v), std::move(r));
+            if (i < s.size() && s[i] == '*') {
+                ++i;
+                NodeP r = divx();
+                v = mk(Op::Mul, std::move(v), std::move(r));
             } else {
                 break;
             }
@@ -273,22 +324,64 @@ struct Parser {
         return v;
     }
 
+    NodeP divx() {
+        NodeP v = unary();
+        for (;;) {
+            ws();
+            if (i < s.size() && s[i] == '/') {
+                ++i;
+                NodeP r = unary();
+                v = mk(Op::Div, std::move(v), std::move(r));
+            } else {
+                break;
+            }
+        }
+        return v;
+    }
+
+    // Negation binds looser than '^' (see the NOTE above).
+    // Only a consumed sign recurses here, so only that path takes a guard level:
+    // a parenthesis costs one level (in base()), as it did before FU-811.
+    NodeP unary() {
+        ws();
+        if (i < s.size() && (s[i] == '-' || s[i] == '+')) {
+            const bool minus = s[i++] == '-';
+            DepthGuard g(p, depth);
+            NodeP v = unary();
+            return minus ? mk(Op::Neg, std::move(v)) : std::move(v);
+        }
+        return factor();
+    }
+
+    // '^' is LEFT-associative and its right operand is a signed base, so
+    // 2^3^2 = (2^3)^2 and 2^-3^2 = (2^-3)^2 (see the NOTE above).
     NodeP factor() {
         NodeP v = base();
-        ws();
-        if (i < s.size() && s[i] == '^') {
+        for (;;) {
+            ws();
+            if (!(i < s.size() && s[i] == '^')) break;
             ++i;
-            NodeP r = factor();  // right-associative
+            NodeP r = powrhs();
             v = mk(Op::Pow, std::move(v), std::move(r));
         }
         return v;
     }
 
+    // The right operand of '^': leading signs apply to the next base only.
+    NodeP powrhs() {
+        ws();
+        if (i < s.size() && (s[i] == '-' || s[i] == '+')) {
+            const bool minus = s[i++] == '-';
+            DepthGuard g(p, depth);
+            NodeP v = powrhs();
+            return minus ? mk(Op::Neg, std::move(v)) : std::move(v);
+        }
+        return base();
+    }
+
     NodeP base() {
         DepthGuard g(p, depth);
         ws();
-        if (i < s.size() && s[i] == '-') { ++i; return mk(Op::Neg, base()); }
-        if (i < s.size() && s[i] == '+') { ++i; return base(); }
         if (i < s.size() && s[i] == '(') {
             ++i;
             NodeP v = expr();
@@ -308,21 +401,34 @@ struct Parser {
             return n;
         }
         if (p.opts_.allow_params && i < s.size() && s[i] == '{') return param_ref();
-        if (i < s.size() && (std::isalpha((unsigned char)s[i]) || s[i] == '_')) {
+        if (i < s.size() && cecon::ident::isIdentStartByte(s[i])) {
             size_t st = i;
-            while (i < s.size() && (std::isalnum((unsigned char)s[i]) || s[i] == '_')) ++i;
+            while (i < s.size() && cecon::ident::isIdentByte(s[i])) ++i;
             std::string id = s.substr(st, i - st);
             ws();
             if (i < s.size() && s[i] == '(') {
                 ++i;
                 NodeP x = expr();
                 ws();
+                if (id == "cond") {
+                    if (i >= s.size() || s[i++] != ',') p.die("cond() requires three arguments");
+                    NodeP yes = expr();
+                    ws();
+                    if (i >= s.size() || s[i++] != ',') p.die("cond() requires three arguments");
+                    NodeP no = expr();
+                    ws();
+                    if (i >= s.size() || s[i++] != ')') p.die("missing ')'");
+                    NodeP n = mk(Op::Cond, std::move(x), std::move(yes));
+                    n->c = std::move(no);
+                    return n;
+                }
                 if (i >= s.size() || s[i] != ')') p.die("missing ')'");
                 ++i;
                 if (id == "ln" || id == "log") return mk(Op::Ln, std::move(x));
                 if (id == "exp") return mk(Op::Exp, std::move(x));
                 if (id == "sqrt") return mk(Op::Sqrt, std::move(x));
                 if (id == "abs") return mk(Op::Abs, std::move(x));
+                if (id == "float") return mk(Op::Float, std::move(x));
                 if (id == "invlogit") return mk(Op::Invlogit, std::move(x));
                 if (id == "logit") return mk(Op::Logit, std::move(x));
                 if (id == "normal") return mk(Op::Normal, std::move(x));
@@ -361,8 +467,8 @@ struct Parser {
         std::string nm = trim(s.substr(st, i - st));
         if (nm.empty()) p.die("empty parameter name in '{}'");
         for (char c : nm)
-            if (!(std::isalnum((unsigned char)c) || c == '_'))
-                p.die("bad parameter name '" + nm + "' (letters, digits and _ only)");
+            if (!cecon::ident::isIdentByte(c))
+                p.die("bad parameter name '" + nm + "' (letters, digits, _ and non-ASCII characters only)");
         bool has_init = false;
         double init = 0.0;
         if (s[i] == '=') {

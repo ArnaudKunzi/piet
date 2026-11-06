@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 
@@ -59,7 +61,7 @@ int run_oglm(const std::vector<std::string>& a, OrdLink link, const char* cmd) {
     std::vector<std::string> cluster_names;
     if (!cluster_var.empty()) cluster_names.push_back(cluster_var);
     GlmInputs g = load_glm(ds, cmd, y, split_csv(xcsv), cluster_names);
-    if (g.n == 0) { std::fprintf(stderr, "%s: no rows after dropping missing.\n", cmd); return 1; }
+    require_sample(g.n);  // BUG-1269: r(2000) "no observations" / r(2001) for one row
     // Drop the trailing intercept (see the file header). Pure truncation: it is the
     // LAST column of the col-major design, so the surviving bytes do not move.
     if (g.k > 0 && !g.names.empty() && g.names.back() == "(intercept)") {
@@ -172,6 +174,13 @@ int run_oglm(const std::vector<std::string>& a, OrdLink link, const char* cmd) {
     if (vce == "cluster") { out["cluster_var"] = cluster_var; out["n_clusters"] = n_clusters; }
     if (level_set) out["level"] = level;
     add_warnings(out, g.warnings);
+    // --emit-v (BUG-1196): the fit's V, slopes then cutpoints -- Stata's e(V)
+    // order and metric (StataBE 19.5 colfullnames e(b) `yo:x1 yo:x2 /cut1 /cut2`).
+    if (has(a, "--emit-v")) {
+        std::vector<std::string> names = g.names;
+        for (int c = 0; c < J - 1; ++c) names.push_back("/cut" + std::to_string(c + 1));
+        add_e_v(out, names, V);
+    }
     emit(out, opt(a, "--out"));
     return 0;
 }

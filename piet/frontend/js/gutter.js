@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // gutter.js — Do-file Editor line-number gutter (T4, P8.1).
 // Self-contained ES module; no index.html edit — the gutter DOM is built
 // here at init time, same panes.js-style JS-injection idiom (panes.js

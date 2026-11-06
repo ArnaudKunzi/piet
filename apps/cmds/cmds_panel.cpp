@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 
@@ -19,7 +21,7 @@ int cmd_csdid(const std::vector<std::string>& a) {
     std::string gvar = opt(a, "--gvar");
     std::string xcsv = opt(a, "--x");
     std::string winstr = opt(a, "--window");
-    std::string method = opt(a, "--method", "dripw");
+    std::string method = opt(a, "--method");
     std::string comparison = opt(a, "--comparison", "never");
     std::string clvar = opt(a, "--cluster");
     double pstrim = std::stod(opt(a, "--pscoretrim", "0.995"));
@@ -27,16 +29,21 @@ int cmd_csdid(const std::vector<std::string>& a) {
     if (data_missing(data) || y.empty() || ivar.empty() || tvar.empty() || gvar.empty()) {
         std::fprintf(stderr,
             "usage: cobra csdid --data f.hbin --y Y --ivar ID --time T --gvar G "
-            "[--x X1,X2,...] [--method dripw] [--comparison never|notyet] "
+            "[--x X1,X2,...] [--method dripw|reg] [--comparison never|notyet] "
             "[--cluster CL] [--pscoretrim 0.995] [--window LO,HI] [--long2] [--out f.json]\n");
         return 2;
     }
-    if (method != "dripw") {
-        std::fprintf(stderr, "cobra csdid: only method=dripw is implemented\n");
-        return 2;
+    // csdid's cell estimators: dripw (SZ20 §3.1) and reg (SZ20 §2). Stata's
+    // drimp, ipw and stdipw are not built; they are refused by name.
+    if (!method.empty() && method != "dripw" && method != "reg") {
+        throw cecon::EngineError(
+            "unsupported",
+            "csdid: method(" + method + ") is not implemented in this version; "
+            "the built cell estimators are dripw and reg",
+            method);
     }
-    // BUG-040 (input-validation parity): black-box probing of Stata csdid (clean-
-    // room; no .ado/.mata read — docs/legal/CSDID_CLEANROOM_WALL.md) confirmed
+    // BUG-040 (input-validation parity): black-box probing of Stata csdid
+    // (observed behaviour only) confirmed
     // Stata refuses `ivar(X) ... cluster(X)` — the SAME variable named as both the
     // panel identifier and the cluster variable — with r(198) "X may not be both
     // target and by()". The trigger is a literal name match between the --ivar and
@@ -72,9 +79,8 @@ int cmd_csdid(const std::vector<std::string>& a) {
     const double* clv = clvar.empty() ? nullptr : get_f64(clvar);
     auto xs = split_csv(xcsv);
     int64_t n_obs = ds.n_rows();
-    // BUG-043 (input-validation parity): black-box probing of Stata csdid (clean-
-    // room; no .ado/.mata read — docs/legal/CSDID_CLEANROOM_WALL.md, 4 arms +
-    // xtset on/off) found Stata's real rule is NOT "cluster()==time()" as the
+    // BUG-043 (input-validation parity): black-box probing of Stata csdid
+    // (observed behaviour only; 4 arms + xtset on/off) found Stata's real rule is NOT "cluster()==time()" as the
     // bug title suggests but the general panel-clustering nesting requirement:
     // --cluster must be CONSTANT WITHIN each --ivar unit (r(498) "panels are
     // not nested within clusters"). Confirmed: (a) cluster naming the literal
@@ -118,7 +124,11 @@ int cmd_csdid(const std::vector<std::string>& a) {
             std::copy(xcols[c].second.begin(), xcols[c].second.end(),
                       X.data() + static_cast<int64_t>(c) * n_obs);
     }
+    // Stata's default (csdid-drdid LAYOUT.md 0): dripw, or reg when there is
+    // no covariate.
+    if (method.empty()) method = p > 0 ? "dripw" : "reg";
     CsdidConfig cfg;
+    cfg.method = method == "reg" ? CsdidMethod::Reg : CsdidMethod::Dripw;
     cfg.comparison = (comparison == "notyet" ? CsdidComparison::Notyet
                                               : CsdidComparison::Never);
     cfg.pscoretrim = pstrim;
@@ -163,9 +173,21 @@ int cmd_csdid(const std::vector<std::string>& a) {
         {"e_b", {{"names", R.event_names}, {"values", R.event_b}}},
         {"e_V", {{"names", R.event_names}, {"matrix", eV_rows}}},
     };
+    // csdid's own e(b)/e(V) per agg() form (csdid-drdid LAYOUT.md 1.1-1.6):
+    // {names (Stata's column full names), b, V (rows)}.
+    auto posting_j = [](const CsdidPosting& P) {
+        const size_t m = P.b.size();
+        json rows = json::array();
+        for (size_t r = 0; r < m; ++r) {
+            json row = json::array();
+            for (size_t c = 0; c < m; ++c) row.push_back(P.V[r * m + c]);
+            rows.push_back(std::move(row));
+        }
+        return json{{"names", P.names}, {"b", P.b}, {"V", std::move(rows)}};
+    };
     json out = {
         {"estimator", "csdid"},
-        {"method", "dripw"},
+        {"method", method},
         {"comparison", comparison},
         {"cluster", clvar},
         {"n_units", R.n_units},
@@ -185,6 +207,12 @@ int cmd_csdid(const std::vector<std::string>& a) {
         {"post_avg_se", R.post_avg_se},
         {"events", events_j},
         {"estat_event", estat_event_j},
+        {"attgt", posting_j(R.attgt)},
+        {"agg_simple", posting_j(R.agg_simple)},
+        {"agg_event", posting_j(R.agg_event)},
+        {"agg_group", posting_j(R.agg_group)},
+        {"agg_calendar", posting_j(R.agg_calendar)},
+        {"n_clusters", clv != nullptr ? json(R.n_clusters) : json(nullptr)},
         {"calendar", calendar_j},
         {"groups", groups_j},
         {"pretrend", {{"chi2", R.pretrend_chi2}, {"df", R.pretrend_df}, {"p", R.pretrend_p}}},
@@ -248,7 +276,7 @@ int cmd_xtpois(const std::vector<std::string>& a) {
     if (oraw) all.push_back(oraw);
     for (auto* p : xraw) all.push_back(p);
     auto keep = listwise_keep(all, n_raw);
-    if (keep.empty()) { std::fprintf(stderr, "xtpois: no rows left after dropping missing values.\n"); return 1; }
+    require_sample(static_cast<int64_t>(keep.size()));  // BUG-1269: r(2000) / r(2001)
     int64_t n_obs = static_cast<int64_t>(keep.size());
     auto yv_v = gather_rows(yraw, keep);
     auto iv_v = gather_rows(iraw, keep);
@@ -314,6 +342,7 @@ int cmd_xtpois(const std::vector<std::string>& a) {
         {"n_dropped_missing", n_dropped_missing},
         {"n_dropped_zero", R.n_dropped_zero},
         {"n_dropped_size", R.n_dropped_size},
+        {"g_min", R.g_min}, {"g_avg", R.g_avg}, {"g_max", R.g_max},
         {"k", R.k},
         {"omitted", omitted},
         {"loglik", R.loglik},
@@ -323,6 +352,10 @@ int cmd_xtpois(const std::vector<std::string>& a) {
         {"time_ms", std::chrono::duration<double, std::milli>(t1 - t0).count()},
     };
     out["level"] = level;  // always emitted, like Stata's e(level) (BUG-279)
+    // --emit-v: e(V), the covariance the reported se come from (ME06: margins
+    // after xtpoisson, fe answers from e(b)/e(V)).
+    if (has(a, "--emit-v"))
+        add_e_v(out, xk, vce == "robust" ? R.V_robust : R.V_iid, nullptr);
     emit(out, opt(a, "--out"));
     return R.converged ? 0 : 1;
 }
@@ -333,10 +366,21 @@ int cmd_xtreg(const std::vector<std::string>& a) {
     if (data_missing(data) || y.empty() || xcsv.empty() || ivar.empty()) {
         std::fprintf(stderr,
             "usage: cobra xtreg --data f.hbin --y Y --x X1,X2 --ivar ID [--keepif EXPR]\n"
+            "                   [--be [--level P]]\n"
             "                   [--esample-out PATH [--esample-index COL --esample-n N]] [--out f.json]\n"
             "  (random-effects Swamy-Arora; FE absorbs time-invariant vars in the within step)\n"
+            "  --be  between effects: OLS on the panel means (xtreg, be); --level P its t CIs.\n"
             "  --esample-out PATH  write e(sample), one 1/0 line per --data row (see feols).\n");
         return 2;
+    }
+    const bool be = has(a, "--be");
+    double level = 95.0;
+    if (be && has(a, "--level")) {
+        level = std::stod(opt(a, "--level"));
+        if (level < 10.0 || level > 99.99) {
+            std::fprintf(stderr, "xtreg: --level must be in [10, 99.99] (got %s).\n", opt(a, "--level").c_str());
+            return 2;
+        }
     }
     const EsampleRequest esreq = esample_request(a, "xtreg");
     const std::string src_data = data, keepif = opt(a, "--keepif");
@@ -352,7 +396,8 @@ int cmd_xtreg(const std::vector<std::string>& a) {
     std::vector<const double*> all = {yraw, iraw};
     for (auto* p : xraw) all.push_back(p);
     auto keep = listwise_keep(all, n_raw);
-    if (keep.empty()) { std::fprintf(stderr, "xtreg: no rows left after dropping missing values.\n"); return 1; }
+    // BUG-1269: Stata's `xtreg, re` refuses 0 rows r(2000) and 1 row r(2001).
+    require_sample(static_cast<int64_t>(keep.size()));
     int64_t n_obs = static_cast<int64_t>(keep.size());
     int64_t n_dropped_missing = n_raw - n_obs;
     auto yv_v = gather_rows(yraw, keep);
@@ -363,17 +408,34 @@ int cmd_xtreg(const std::vector<std::string>& a) {
         std::copy(col.begin(), col.end(), X.data() + static_cast<int64_t>(c) * n_obs);
     }
     auto t0 = std::chrono::steady_clock::now();
-    auto R = xtreg_re(X.data(), n_obs, k, yv_v.data(), iv_v.data());
+    XtregReResult R;
+    XtregBeResult B;
+    if (be) B = xtreg_be(X.data(), n_obs, k, yv_v.data(), iv_v.data());
+    else R = xtreg_re(X.data(), n_obs, k, yv_v.data(), iv_v.data());
     auto t1 = std::chrono::steady_clock::now();
-    if (static_cast<int>(R.beta.size()) < k + 1 || static_cast<int>(R.se.size()) < k + 1) {
+    if (be && !B.ok) {
+        std::fprintf(stderr, "xtreg: the between regression produced no coefficients (collinear panel means, or no more panels than parameters).\n");
+        return 1;
+    }
+    const std::vector<double>& beta = be ? B.beta : R.beta;
+    const std::vector<double>& sev = be ? B.se : R.se;
+    if (static_cast<int>(beta.size()) < k + 1 || static_cast<int>(sev.size()) < k + 1) {
         std::fprintf(stderr, "xtreg: estimation produced no coefficients (rank-deficient within design — collinear regressors, no within-panel variation, or too few observations).\n");
         return 1;
     }
     json coefs = json::array();
+    // xtreg, be is a least-squares fit on N_g means: t statistics on df_r = N_g - k - 1.
+    const double tc = be ? t_critical(1.0 - level / 100.0, B.df_r) : 0.0;
     for (int c = 0; c < k + 1; ++c) {
         std::string nm = (c < k) ? xs[static_cast<size_t>(c)] : std::string("_cons");
-        coefs.push_back({{"name", nm}, {"beta", R.beta[c]},
-                         {"se", R.se[c]}, {"t", tstat(R.beta[c], R.se[c])}});
+        const double t = tstat(beta[c], sev[c]);
+        json row = {{"name", nm}, {"beta", beta[c]}, {"se", sev[c]}, {"t", t}};
+        if (be) {
+            row["p"] = t_twosided_pvalue(t, B.df_r);
+            row["ci_lo"] = beta[c] - tc * sev[c];
+            row["ci_hi"] = beta[c] + tc * sev[c];
+        }
+        coefs.push_back(std::move(row));
     }
 
     // --- model-fit scalars (Stata xtreg, re): three R²s + Wald χ² (since contract A 1.5.0) ---
@@ -383,7 +445,7 @@ int cmd_xtreg(const std::vector<std::string>& a) {
     std::vector<double> xb(static_cast<size_t>(n_obs), 0.0);
     for (int c = 0; c < k; ++c)
         for (int64_t i = 0; i < n_obs; ++i)
-            xb[static_cast<size_t>(i)] += X[static_cast<int64_t>(c) * n_obs + i] * R.beta[c];
+            xb[static_cast<size_t>(i)] += X[static_cast<int64_t>(c) * n_obs + i] * beta[c];
     auto corr2 = [](const std::vector<double>& av, const std::vector<double>& bv) -> double {
         size_t m = av.size();
         if (m == 0) return 0.0;
@@ -426,6 +488,62 @@ int cmd_xtreg(const std::vector<std::string>& a) {
         yw[static_cast<size_t>(i)]  = yv_v[static_cast<size_t>(i)] - g_y[static_cast<size_t>(gi)];
     }
     double r2_within = corr2(xbw, yw);
+    // The panel sizes T_i over the estimation sample, Stata's e(g_min), e(g_avg),
+    // e(g_max) after be and re (and e(Tcon) = whether they are all equal; BUG-1515,
+    // BUG-1516).
+    int64_t g_min = 0, g_max = 0;
+    for (int g = 0; g < ng; ++g) {
+        const int64_t n_g = g_n[static_cast<size_t>(g)];
+        if (g == 0 || n_g < g_min) g_min = n_g;
+        if (g == 0 || n_g > g_max) g_max = n_g;
+    }
+    const double g_avg = (ng > 0) ? static_cast<double>(n_obs) / static_cast<double>(ng) : 0.0;
+
+    if (be) {
+        // BUG-1515: xtreg, be posts the regression on the means
+        // (one row per panel): e(r2_b) is
+        // its R-squared, e(F) its model F, e(rmse) sqrt(rss / df_r); e(r2_w) and
+        // e(r2_o) are the squared correlations computed above with the between b.
+        // e(Tbar) is the mean panel size (not RE's harmonic mean).
+        const double df_m = static_cast<double>(k);
+        const double s2 = B.rss / B.df_r;
+        const double F = (k > 0 && s2 > 0) ? (B.mss / df_m) / s2 : std::nan("");
+        const double r2b = B.mss / (B.mss + B.rss);
+        json out = {
+            {"estimator", "xtreg_be"}, {"depvar", y},
+            {"n_obs", B.n_obs}, {"n_groups", B.n_groups}, {"n_dropped_missing", n_dropped_missing},
+            {"df_m", df_m}, {"df_r", B.df_r}, {"rss", B.rss}, {"mss", B.mss},
+            {"rmse", std::sqrt(s2)}, {"r2", r2b},
+            {"adj_r2", 1.0 - (1.0 - r2b) * (static_cast<double>(B.n_groups) - 1.0) / B.df_r},
+            {"r2_within", r2_within}, {"r2_between", r2b},
+            {"r2_overall", r2_overall},
+            {"g_min", g_min}, {"g_avg", g_avg}, {"g_max", g_max},
+            {"level", level},
+            {"coefs", coefs},
+            {"time_ms", std::chrono::duration<double, std::milli>(t1 - t0).count()},
+        };
+        if (std::isfinite(F)) {
+            out["F"] = F;
+            out["p_F"] = f_pvalue(F, df_m, B.df_r);
+        } else {
+            out["F"] = nullptr;
+            out["p_F"] = nullptr;
+        }
+        if (esreq.active()) {
+            EsampleRows rows;
+            rows.keep = std::move(keep);
+            rows.loaded = &ds;
+            emit_esample(esreq, "xtreg", src_data, keepif, false, rows, out);
+        }
+        if (has(a, "--emit-v")) {
+            std::vector<std::string> names = xs;
+            names.push_back("_cons");
+            add_e_v(out, names, B.vcov_matrix);
+        }
+        emit(out, opt(a, "--out"));
+        return 0;
+    }
+
     // Wald χ²: H0 all k slopes = 0 (intercept = last coef, excluded). R selects the k slopes.
     int kk = k + 1;
     std::vector<double> Rsel(static_cast<size_t>(k) * kk, 0.0);  // k×(k+1) row-major selector
@@ -439,6 +557,7 @@ int cmd_xtreg(const std::vector<std::string>& a) {
         {"sigma_e", R.sigma_e}, {"sigma_u", R.sigma_u}, {"rho", R.rho}, {"T_h", R.T_h},
         {"r2_within", r2_within}, {"r2_between", r2_between}, {"r2_overall", r2_overall},
         {"df_chi2", k},
+        {"g_min", g_min}, {"g_avg", g_avg}, {"g_max", g_max},
         {"coefs", coefs},
         {"time_ms", std::chrono::duration<double, std::milli>(t1 - t0).count()},
     };
@@ -456,6 +575,12 @@ int cmd_xtreg(const std::vector<std::string>& a) {
         rows.loaded = &ds;
         emit_esample(esreq, "xtreg", src_data, keepif, false, rows, out);
     }
+    // --emit-v (BUG-1196): the FGLS covariance, slopes then `_cons`.
+    if (has(a, "--emit-v")) {
+        std::vector<std::string> names = xs;
+        names.push_back("_cons");
+        add_e_v(out, names, R.vcov_matrix);
+    }
     emit(out, opt(a, "--out"));
     return 0;
 }
@@ -465,11 +590,12 @@ int cmd_nbreg(const std::vector<std::string>& a) {
     std::string off = opt(a, "--offset");
     std::string cl  = opt(a, "--cluster");
     std::string vce = opt(a, "--vce", "iid");
+    const std::string weight_var = opt(a, "--weight"), wtype = opt(a, "--wtype");
     if (data_missing(data) || y.empty() || xcsv.empty()) {
         std::fprintf(stderr,
             "usage: cobra nbreg --data f.hbin --y Y --x X1,X2 "
             "[--no-intercept] [--offset O] [--vce iid|robust|cluster] [--cluster C] [--level P] "
-            "[--keepif EXPR] [--out f.json]\n"
+            "[--weight W --wtype fw|iw|pw] [--keepif EXPR] [--out f.json]\n"
             "  --level P  coeftable ci_lo/ci_hi at P%% (asymptotic z, matching Stata's own\n"
             "             nbreg table); default 95, matching Stata's default table\n"
             "             (BUG-202, BUG-279).\n");
@@ -487,6 +613,24 @@ int cmd_nbreg(const std::vector<std::string>& a) {
         return 2;
     }
     const double zc = z_critical(level == 95.0 ? 0.05 : 1.0 - level / 100.0);
+    // Stata fweight / iweight / pweight (BUG-1537; nbreg's aweight is Stata's r(101)):
+    // the weighted likelihood (nbreg.h), e(N) = Sum w under an fweight, and a pweight
+    // forces the sandwich, as cmd_logit (StataBE 19.5, scratch-laneA2/agents/wml/x1.log:
+    // `nbreg cnt x z [fw=wi]` e(N) 150, _se[x] .24856779361597398; [iw=wf] e(N) 60,
+    // .27197794625746341; [pw=wf] vce robust, .4424215353885973).
+    cecon::WeightKind wkind = cecon::WeightKind::None;
+    if (!weight_var.empty() || !wtype.empty()) {
+        if (weight_var.empty())
+            throw cecon::EngineError("bad_input", "nbreg: --wtype requires --weight");
+        if (wtype == "fw" || wtype == "fweight") wkind = cecon::WeightKind::Frequency;
+        else if (wtype == "iw" || wtype == "iweight") wkind = cecon::WeightKind::Importance;
+        else if (wtype == "pw" || wtype == "pweight") wkind = cecon::WeightKind::Probability;
+        else throw cecon::EngineError("bad_input", "nbreg: --wtype must be fw, iw or pw");
+        if (wkind == cecon::WeightKind::Probability && vce == "iid")
+            throw cecon::EngineError("bad_input",
+                "nbreg: [pweight=] requires vce(robust) or vce(cluster ...); Stata has no "
+                "iid VCE under pweight");
+    }
     data = maybe_keepif(data, opt(a, "--keepif"));
     const Dataset& ds = acquire_data(data);
     int64_t n_raw = ds.n_rows();
@@ -509,14 +653,34 @@ int cmd_nbreg(const std::vector<std::string>& a) {
     if (oraw) all.push_back(oraw);
     if (craw) all.push_back(craw);
     for (auto* p : xraw) all.push_back(p);
+    const double* wraw = weight_var.empty() ? nullptr : require_num(ds, "nbreg", weight_var);
+    if (wraw) all.push_back(wraw);  // a missing weight drops the row
     auto keep = listwise_keep(all, n_raw);
-    if (keep.empty())
-        throw cecon::EngineError("no_obs", "nbreg: no rows left after dropping missing values.");
+    if (wraw) {
+        // build_model's weight rules: a zero weight drops the row, a negative one or
+        // a non-integer fweight is refused.
+        std::vector<int64_t> kept;
+        for (int64_t i : keep) {
+            const double wv = wraw[i];
+            if (wv < 0.0)
+                throw cecon::EngineError("bad_input",
+                    "weight '" + weight_var + "' has a negative value (" + std::to_string(wv) +
+                    "); weights must be non-negative");
+            if (wkind == cecon::WeightKind::Frequency && wv != std::floor(wv))
+                throw cecon::EngineError("bad_input",
+                    "fweight '" + weight_var + "' has a non-integer value (" + std::to_string(wv) +
+                    "); Stata requires integer frequency weights");
+            if (wv != 0.0) kept.push_back(i);
+        }
+        keep.swap(kept);
+    }
+    require_sample(static_cast<int64_t>(keep.size()));  // BUG-1269: r(2000) / r(2001)
     int64_t n_obs = static_cast<int64_t>(keep.size());
     int64_t n_dropped_missing = n_raw - n_obs;
     auto yv_v = gather_rows(yraw, keep);
     std::vector<double> ov_v; if (oraw) ov_v = gather_rows(oraw, keep);
     std::vector<double> cv_v; if (craw) cv_v = gather_rows(craw, keep);
+    std::vector<double> wv_v; if (wraw) wv_v = gather_rows(wraw, keep);
     std::vector<double> X(static_cast<size_t>(n_obs) * k);
     for (int c = 0; c < kx; ++c) {
         auto col = gather_rows(xraw[c], keep);
@@ -532,7 +696,8 @@ int cmd_nbreg(const std::vector<std::string>& a) {
     auto t0 = std::chrono::steady_clock::now();
     auto R = nbreg(X.data(), n_obs, k, yv_v.data(),
                    ov_v.empty() ? nullptr : ov_v.data(),
-                   cv_v.empty() ? nullptr : cv_v.data());
+                   cv_v.empty() ? nullptr : cv_v.data(), 100, 1e-10,
+                   wv_v.empty() ? nullptr : wv_v.data(), wkind == cecon::WeightKind::Frequency);
     auto t1 = std::chrono::steady_clock::now();
     if (static_cast<int>(R.beta.size()) < k || static_cast<int>(R.se_iid.size()) < k ||
         static_cast<int>(R.se_robust.size()) < k) {
@@ -555,9 +720,16 @@ int cmd_nbreg(const std::vector<std::string>& a) {
         }
         coefs.push_back(std::move(row));
     }
+    // e(N) under an fweight is the observations the rows stand for.
+    int64_t n_out = R.n_obs;
+    if (wkind == cecon::WeightKind::Frequency) {
+        double sw = 0;
+        for (double wv : wv_v) sw += wv;
+        n_out = static_cast<int64_t>(sw);
+    }
     json out = {
         {"estimator", "nbreg"}, {"vce", vce},
-        {"n_obs", R.n_obs}, {"k", R.k}, {"n_dropped_missing", n_dropped_missing},
+        {"n_obs", n_out}, {"k", R.k}, {"n_dropped_missing", n_dropped_missing},
         {"alpha", R.alpha}, {"lnalpha", R.lnalpha},
         {"se_lnalpha_iid", R.se_lnalpha_iid},
         {"loglik", R.loglik}, {"iters", R.iters}, {"converged", R.converged},
@@ -565,6 +737,18 @@ int cmd_nbreg(const std::vector<std::string>& a) {
         {"time_ms", std::chrono::duration<double, std::milli>(t1 - t0).count()},
     };
     out["level"] = level;  // always emitted, like Stata's e(level) (BUG-279)
+    // --emit-v (BUG-1196): the fit's full covariance over (β, lnα), `/lnalpha` last
+    // (StataBE 19.5 colfullnames e(b) `cnt:x1 cnt:x2 cnt:_cons /lnalpha`), the one
+    // the reported SEs are read from. None at the α→0 boundary (lnα is not
+    // estimated there).
+    const std::vector<double>& Vfit = (vce == "iid") ? R.vcov_iid : R.vcov_robust;
+    if (has(a, "--emit-v") && !Vfit.empty()) {
+        std::vector<std::string> names;
+        for (int c = 0; c < k; ++c)
+            names.push_back((c < kx) ? xcols[static_cast<size_t>(c)].first : std::string("_cons"));
+        names.push_back("/lnalpha");
+        add_e_v(out, names, Vfit);
+    }
     emit(out, opt(a, "--out"));
     return R.converged ? 0 : 1;
 }
@@ -576,9 +760,12 @@ int cmd_xtlogit(const std::vector<std::string>& a) {
     if (data_missing(data) || y.empty() || xcsv.empty() || ivar.empty()) {
         std::fprintf(stderr,
             "usage: cobra xtlogit --data f.hbin --y Y --x X1,X2 --ivar ID "
-            "[--vce iid|robust] [--out f.json]\n");
+            "[--keepif EXPR] [--vce iid|robust] [--out f.json]\n");
         return 2;
     }
+    // BUG-1269: the fit's `if`, as xtpois reads it (PIET forwards it; this
+    // command refused the flag, so `xtlogit ..., fe` with an `if` was rc 1).
+    data = maybe_keepif(data, opt(a, "--keepif"));
     const Dataset& ds = acquire_data(data);
     int64_t n_raw = ds.n_rows();
     const double* yraw = require_num(ds, "xtlogit", y);
@@ -599,7 +786,7 @@ int cmd_xtlogit(const std::vector<std::string>& a) {
     std::vector<const double*> all = {yraw, iraw};
     for (auto* p : xraw) all.push_back(p);
     auto keep = listwise_keep(all, n_raw);
-    if (keep.empty()) { std::fprintf(stderr, "xtlogit: no rows left after dropping missing values.\n"); return 1; }
+    require_sample(static_cast<int64_t>(keep.size()));  // BUG-1269: r(2000) / r(2001)
     int64_t n_obs = static_cast<int64_t>(keep.size());
     int64_t n_dropped_missing = n_raw - n_obs;
     auto yv_v = gather_rows(yraw, keep);
@@ -656,10 +843,13 @@ int cmd_xtlogit(const std::vector<std::string>& a) {
         {"estimator", "xtlogit_fe"}, {"vce", vce}, {"omitted", omitted},
         {"n_obs", R.n_obs}, {"n_groups", R.n_groups}, {"n_dropped_missing", n_dropped_missing},
         {"n_dropped_const", R.n_dropped_const}, {"n_dropped_size", R.n_dropped_size},
+        {"g_min", R.g_min}, {"g_avg", R.g_avg}, {"g_max", R.g_max},
         {"loglik", R.loglik}, {"iters", R.iters}, {"converged", R.converged},
         {"coefs", coefs},
         {"time_ms", std::chrono::duration<double, std::milli>(t1 - t0).count()},
     };
+    if (has(a, "--emit-v"))
+        add_e_v(out, xk, vce == "robust" ? R.V_robust : R.V_iid);
     emit(out, opt(a, "--out"));
     return R.converged ? 0 : 1;
 }

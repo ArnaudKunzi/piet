@@ -1,0 +1,8 @@
+STAGED PLACEHOLDER — NOT SHIPPED IN CURRENT (macOS) BUILDS
+Component : MinGW-w64 winpthreads
+License   : MIT-style + BSD (dual notice as shipped in the MinGW-w64 tree)
+Activates : with static Windows builds linking winpthreads.
+Action    : at the first such build, copy the verbatim COPYING file from the
+            exact MinGW-w64 winpthreads used into a top-level
+            NN-mingw-winpthreads.txt in piet/packaging/licenses/ so it enters
+            THIRD_PARTY_NOTICES.txt.

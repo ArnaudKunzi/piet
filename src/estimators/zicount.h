@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — zero-inflated count MLEs: `zip` (zero-inflated Poisson) and `zinb`
 // (zero-inflated negative binomial), matching Stata `zip`/`zinb` with a
 // CONSTANT-ONLY inflation equation (`inflate(_cons)`).

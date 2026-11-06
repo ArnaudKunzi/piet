@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Stata string functions that have no engine counterpart.
 //
 // AER scope 2, B3 stage (a). cobra's expression grammar is numeric-only --

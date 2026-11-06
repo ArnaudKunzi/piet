@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Disk-backed spill for evicted Graphics-gallery thumbnails.
 // Blocks are JSON-serialised, gzip-compressed (CompressionStream when present)
 // and written to a store with the async interface

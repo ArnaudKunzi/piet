@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — multi-endogenous weak-instrument statistics (generalizes the 1-endog
 // first-stage / KP rk F to p>=2 endogenous regressors). Matches ivreg2 e(widstat):
 //   homoskedastic  -> Cragg-Donald minimum-eigenvalue F

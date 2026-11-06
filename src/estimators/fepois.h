@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — Poisson regression with high-dimensional fixed effects (PPML), via
 // IRLS where each step is a weighted HDFE-demeaned WLS. Matches fepois/ppmlhdfe.
 #pragma once
@@ -18,6 +20,7 @@ struct FepoisResult {
     std::vector<double> beta;
     std::vector<double> se;
     std::vector<double> vcov_matrix;
+    std::vector<double> full_vcov_matrix;  // absorbed fits: slopes followed by recovered _cons
     std::string vcov_type;
 
     double deviance = 0;
@@ -56,10 +59,13 @@ struct FepoisResult {
     double cons_b = 0;
     double cons_se = 0;
     bool has_cons = false;       // a recovered _cons row is available (absorb case)
-    bool cons_se_valid = false;  // cons_se is exact (single FE + robust); else omit se
+    bool cons_se_valid = false;  // recovered intercept has a full fitted covariance row
 };
 
 // Fit Poisson with HDFE. Uses md.offset if present (e.g. log population exposure).
-FepoisResult fepois_fit(ModelData& md, Vcov vt, int cluster_index = 0);
+// fe_sum_out (opt-in, absorbed fits only): per kept row, ppmlhdfe's `d` -- the sum
+// of the absorbed effects net of _cons, eta - offset - x'b - _cons.
+FepoisResult fepois_fit(ModelData& md, Vcov vt, int cluster_index = 0,
+                        std::vector<double>* fe_sum_out = nullptr);
 
 }  // namespace cecon

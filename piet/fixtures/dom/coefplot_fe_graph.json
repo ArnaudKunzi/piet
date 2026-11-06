@@ -1,0 +1,30 @@
+{
+ "type": "graph",
+ "kind": "coefplot",
+ "title": "Coefficient plot: y",
+ "x_label": "Coefficient estimate",
+ "y_label": "y",
+ "models": [
+  {
+   "name": "m_fe1",
+   "coefs": [
+    {
+     "name": "_cons",
+     "b": 1.9276284349679493,
+     "ci_lo": 1.834760988287547,
+     "ci_hi": 2.0204958816483516
+    },
+    {
+     "name": "x1",
+     "b": 0.5928075761491708,
+     "ci_lo": 0.4943269662521026,
+     "ci_hi": 0.691288186046239
+    }
+   ]
+  }
+ ],
+ "level": 95,
+ "n_models": 1,
+ "x_min": 0.41801852048229016,
+ "x_max": 2.0968043274181642
+}

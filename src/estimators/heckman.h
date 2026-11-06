@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — Heckman sample-selection model, two-step (Heckit) estimator matching
 // Stata `heckman depvar x, select(s = z) twostep`. Step 1: probit s on Z → γ̂, V_p.
 // Step 2: inverse Mills m_j=φ(z_jγ̂)/Φ(z_jγ̂), δ_j=m_j(m_j+z_jγ̂); augmented OLS of y
@@ -33,32 +35,25 @@ inline HeckmanResult heckman_twostep(const double* Z, int64_t n, int kz, const d
                                      const std::vector<char>& sel) {
     HeckmanResult r;
     r.n = n;
-    ProbitResult pr = probit_fit(Z, n, kz, S);
+    // Step 1 is NOT the default probit. Stata's heckman fits the selection probit
+    // with asis, a capped iteration count and no coefficient table, and takes bprb = e(b),
+    // Vprb = e(V). For a non-robust vce the probit runs with ltol(0) tol(1e-4) plus
+    // halfsteponly (MlMaxOptions, logit.h), measured on StataBE. Under it the posted b is
+    // p0 + delta (never evaluated) and V = invsym(-H(p0)) with rule-4 rows dropped:
+    // the iteration's own Hessian, which BinaryMlResult::bread carries. Z's last
+    // column is the selection constant (cmd_heckman), the start's b0 slot.
+    MlMaxOptions popt;
+    popt.tol = 1e-4;
+    popt.ltol = 0.0;
+    popt.nrtol = 1e-5;
+    popt.maxiter = 300;   // min(1000, c(maxiter)) at the default c(maxiter)
+    popt.doopt = true;
+    popt.step_forward = false;
+    popt.stata_invsym = true;
+    ProbitResult pr = probit_fit_ml(Z, n, kz, S, popt, nullptr, last_column_is_constant(Z, n, kz));
     r.sel_beta = pr.beta;
-    // Stata's probit (and heckman's selection VCE + the Q term) use the OBSERVED
-    // information, not the expected/IRLS one probit_fit returns. For probit the
-    // per-obs observed weight is w_i = λ_i(λ_i + z_iγ), λ_i = generalized residual.
-    std::vector<double> Vp(static_cast<size_t>(kz) * kz, 0.0);
-    {
-        std::vector<double> I(static_cast<size_t>(kz) * kz, 0.0);
-        for (int64_t i = 0; i < n; ++i) {
-            double zg = 0;
-            for (int c = 0; c < kz; ++c) zg += Z[static_cast<int64_t>(c) * n + i] * pr.beta[c];
-            double Phi = heck::ncdf(zg);
-            if (Phi < 1e-300) Phi = 1e-300;
-            if (Phi > 1.0 - 1e-16) Phi = 1.0 - 1e-16;
-            double phi = heck::npdf(zg);
-            double lam = (S[i] == 1.0) ? phi / Phi : -phi / (1.0 - Phi);
-            double w = lam * (lam + zg);
-            for (int c = 0; c < kz; ++c) {
-                double zc = w * Z[static_cast<int64_t>(c) * n + i];
-                for (int d = 0; d < kz; ++d)
-                    I[static_cast<size_t>(c) * kz + d] += zc * Z[static_cast<int64_t>(d) * n + i];
-            }
-        }
-        Vp = I;
-        if (la::spd_inverse(Vp.data(), kz) != 0) Vp = pr.V;  // fall back if singular
-    }
+    std::vector<double> Vp = pr.bread_oim;
+    if (pr.separated || Vp.size() != static_cast<size_t>(kz) * kz) Vp = pr.V;  // H not invertible
     r.sel_se.resize(kz);
     for (int c = 0; c < kz; ++c) r.sel_se[c] = std::sqrt(std::max(0.0, Vp[static_cast<size_t>(c) * kz + c]));
 

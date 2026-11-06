@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // P9 automode · call-site path substitution — the last thing standing between
 // the recognizer and a real corpus.
 //

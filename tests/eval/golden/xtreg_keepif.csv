@@ -1,0 +1,9 @@
+key,value
+coeftable[treated].b,4.422697646688750e+00
+coeftable[treated].se,5.596269115895750e-01
+coeftable[age_z].b,-5.777671837711680e+00
+coeftable[age_z].se,2.791079751249620e-01
+coeftable[edu_hi].b,-5.188056050722220e+00
+coeftable[edu_hi].se,6.182321582233000e-01
+coeftable[_cons].b,3.274553959436910e+01
+coeftable[_cons].se,4.273879144849220e-01

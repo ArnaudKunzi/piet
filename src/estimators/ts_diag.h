@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — time-series postestimation diagnostics on OLS residuals (the data is
 // assumed already in time order, contiguous / no gaps). Replicates Stata's
 // estat dwatson / durbinalt / bgodfrey / archlm.

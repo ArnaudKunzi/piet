@@ -1,9 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // Principal components, AER bundle H1.
 //
 // The arithmetic is ordinary; the POST-PROCESSING is where Stata's answer lives,
-// and almost none of it is in [MV] pca. Everything below that is not in the
-// manual was read out of pca.ado / pcamat.ado or measured live, and is marked
-// with where it came from -- see plans/ERRATA-AER-H-SPECS-20260904.md.
+// and much of it is not in [MV] pca. What the manual does not state was measured
+// on StataBE.
 #pragma once
 #include <string>
 #include <vector>
@@ -13,7 +14,7 @@ namespace cecon {
 struct PcaOpts {
     bool covariance = false;   // default is the correlation matrix
     int components = -1;       // <0 = all p
-    double mineigen = 1e-5;    // pcamat.ado: default is tol(), itself 1e-5
+    double mineigen = 1e-5;    // [MV] pca: the default is 1e-5
 };
 
 struct PcaResult {
@@ -39,7 +40,7 @@ struct PcaResult {
     std::vector<std::string> dropped;  // zero-variance columns, dropped with a note
 };
 
-// Throws EngineError for every screening failure pca.ado performs before it
+// Throws EngineError for every screening failure Stata's pca reports before it
 // decomposes anything: all variables dropped (498), fewer than two surviving
 // (102), zero rows (2000), one row (2001), and a negative eigenvalue where none
 // is expected (198).

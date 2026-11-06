@@ -1,10 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 
 #include "estimators/sdid.h"
 
 // P-QE wave — sdid (synthetic difference-in-differences), AAHIW21. See
-// src/estimators/sdid.h for the method sources, the clean-room provenance and
+// src/estimators/sdid.h for the method sources and
 // the conventions the paper leaves open that this implementation pins.
 //
 // The JSON below carries EVERY printed quantity as a named field (att/se/t/p/

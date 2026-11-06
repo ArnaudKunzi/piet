@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 
@@ -62,7 +64,7 @@ int cmd_iv(const std::vector<std::string>& a) {
             "usage: cobra iv --data f.hbin --y Y[,Y2,...] --endog D --instruments Z1,Z2\n"
             "                [--x EXOG] [--fe F1,F2] [--vcov iid|hc1|cluster|twoway] [--cluster C]\n"
             "                [--gmm] [--small] [--keep-singletons] [--keepif EXPR] [--out f.json]\n"
-            "                [--savefirst [--savefprefix P]]\n"
+            "                [--savefirst [--savefprefix P]] [--weight W --wtype aw|pw]\n"
             "                [--esample-out PATH [--esample-index COL --esample-n N]]\n"
             "  --gmm        efficient two-step GMM (Stata `ivregress gmm`): robust weight matrix +\n"
             "               robust SEs by default; over-identified GMM differs from 2SLS. With\n"
@@ -86,6 +88,22 @@ int cmd_iv(const std::vector<std::string>& a) {
             "               The stage is `regress ENDOG EXCLUDED_IVS EXOG` under the PARENT's vce with\n"
             "               the small-sample correction ALWAYS on, so --small does not move it.\n"
             "  --savefprefix P  prefix for those names (ivreg2 savefprefix()); default `_ivreg2_`.\n"
+            "  --weight W --wtype aw|pw  ivreg2's observation weights: wf*W with wf = N/sum(W),\n"
+            "               so N stays the row count; pw additionally needs --vcov hc1, cluster or\n"
+            "               twoway (ivreg2: pweight = aweight + robust). A missing or zero weight\n"
+            "               drops the row. With --fe the within transform is weighted (group means\n"
+            "               sum(W*v)/sum(W), xtivreg2's). A multi-outcome --y weights every\n"
+            "               outcome alike.\n"
+            "               With --savefirst each first stage also carries `ffirst`, ivreg2's\n"
+            "               e(first) column (rmse sheapr2 pr2 F df df_r pvalue SW... AP...).\n"
+            "  --dofminus-fe  xtivreg2's ivreg2 call (dofminus = the absorbed groups, needs --fe):\n"
+            "               sigma2 = RSS/(N-dofminus), robust meat * N/(N-dofminus), cluster\n"
+            "               meat untouched, rmse on that scale; --small's cluster K is the\n"
+            "               regressors alone; ffirst carries the same dofminus. Every panel must sit\n"
+            "               inside one cluster (else code cluster_spans_panel). Not with --gmm,\n"
+            "               twoway/multiway or a multi-outcome --y.\n"
+            "  --multiway-no-psd-fix  ivreg2's two-way variance S1+S2-S12 as summed: a negative\n"
+            "               eigenvalue is not repaired, so a negative variance is a missing SE.\n"
             "  --esample-out PATH  write e(sample): one 1/0 line per --data row (before --keepif),\n"
             "               1 = the row entered the fit; the JSON gains esample_n (# of 1s).\n"
             "               --esample-index COL --esample-n N: COL is each row's 1-based position\n"
@@ -106,6 +124,13 @@ int cmd_iv(const std::vector<std::string>& a) {
     std::vector<std::string> ys = split_csv(y);
     bool gmm = has(a, "--gmm");
     bool small = has(a, "--small");  // Stata `ivregress ..., small`; default = asymptotic
+    // --no-intercept: Stata `ivregress ..., noconstant` (w2d_uncovered.log
+    // ivregress_nocons_ctl). Absorbed effects already exclude the constant, and a
+    // batch has no slot for it: both refused.
+    const bool no_intercept = has(a, "--no-intercept");
+    if (no_intercept && (!split_csv(opt(a, "--fe")).empty() || ys.size() > 1))
+        throw EngineError("bad_input",
+            "iv: --no-intercept is not valid with --fe or a multi-outcome --y");
     // ivreg2 `savefirst [savefprefix(P)]`. The prefix is data, not a flag: an empty
     // one is the DOCUMENTED default `_ivreg2_`, so it is passed through as "" and
     // resolved where the name is minted (ivreg2_first_eqname in common.cpp).
@@ -117,15 +142,28 @@ int cmd_iv(const std::vector<std::string>& a) {
     // Stata `ivregress gmm` defaults to a robust weight matrix + robust SEs. When the
     // user asks for --gmm without an explicit --vcov, default to hc1 so the SEs match.
     std::string vcov = opt(a, "--vcov", gmm ? "hc1" : "iid");
+    // FU-387: Stata ivregress's `small` multiway variance (the built-in convention's
+    // per-combination factors). Without --small ivregress
+    // applies no factor at all, so the switch would be silently ignored there, and it
+    // has no measured meaning for gmm, absorbed effects or a batch: all refused.
+    const bool multiway_subset_factors = has(a, "--multiway-subset-factors");
+    if (multiway_subset_factors &&
+        (!small || gmm || (vcov != "twoway" && vcov != "multiway") ||
+         !split_csv(opt(a, "--fe")).empty() || ys.size() > 1))
+        throw EngineError("bad_input",
+            "iv: --multiway-subset-factors requires --small and --vcov twoway or multiway, "
+            "without --gmm, --fe or a multi-outcome --y (Stata ivregress's small multiway "
+            "variance)");
     cecon::TsMeta tsm = parse_tsmeta(a);
     const EsampleRequest esreq = esample_request(a, "iv");
     EsampleRows esrows;
     EsampleRows* es_p = esreq.active() ? &esrows : nullptr;
     // E1: --x / --endog / --instruments may all carry L./F./D./S. tokens (see
     // build_iv_model's ts_prepass calls) — route `if` through plan_keepif so they
-    // materialize against the FULL series before the sample filter applies.
+    // materialize against the FULL series before the sample filter applies. So may
+    // --y (BUG-1277).
     const std::string keepif = opt(a, "--keepif");
-    KeepifPlan kp = plan_keepif(data, keepif, &tsm, {&xs, &endogs, &insts});
+    KeepifPlan kp = plan_keepif(data, keepif, &tsm, {&xs, &endogs, &insts, &ys});
     const std::vector<char>* mask_p = kp.active ? &kp.mask : nullptr;
     // --emit-v: opt-in full e(V) of the fitted model (see add_e_v). A batch has one V per
     // outcome and no per-outcome slot for it, so it is refused rather than ignored.
@@ -133,15 +171,45 @@ int cmd_iv(const std::vector<std::string>& a) {
     if (emit_v && ys.size() > 1)
         throw EngineError("unsupported",
             "iv: --emit-v is not supported with a multi-outcome --y batch; run one outcome per invocation");
+    // ivreg2's two-way variance is posted unrepaired (compute_vcov no_psd_fix); only
+    // meaningful under a multiway VCE without the subset-factor convention.
+    const bool multiway_no_psd_fix = has(a, "--multiway-no-psd-fix");
+    if (multiway_no_psd_fix && ((vcov != "twoway" && vcov != "multiway") || multiway_subset_factors ||
+                                ys.size() > 1))
+        throw EngineError("bad_input",
+            "iv: --multiway-no-psd-fix requires --vcov twoway or multiway, without "
+            "--multiway-subset-factors or a multi-outcome --y");
+    const std::string weight_var = opt(a, "--weight"), wtype = opt(a, "--wtype");
+    cecon::WeightKind wkind = cecon::WeightKind::None;
+    if (!weight_var.empty() || !wtype.empty()) {
+        if (weight_var.empty()) throw EngineError("bad_input", "iv: --wtype requires --weight");
+        if (wtype.empty() || wtype == "aw" || wtype == "aweight") wkind = cecon::WeightKind::Analytic;
+        else if (wtype == "pw" || wtype == "pweight") wkind = cecon::WeightKind::Probability;
+        else
+            throw EngineError("bad_input",
+                "iv: --wtype must be aw or pw (got '" + wtype + "'); fweight and iweight are not "
+                "implemented for iv");
+        if (wkind == cecon::WeightKind::Probability && vcov != "hc1" && vcov != "HC1" &&
+            vcov != "cluster" && vcov != "twoway" && vcov != "multiway")
+            throw EngineError("bad_input",
+                "iv: [pweight=] requires --vcov hc1, cluster or twoway (ivreg2 makes pweight robust)");
+    }
+    const bool dofminus_fe = has(a, "--dofminus-fe");
+    if (dofminus_fe && (split_csv(opt(a, "--fe")).empty() || gmm || ys.size() > 1 ||
+                        (vcov != "iid" && vcov != "hc1" && vcov != "HC1" && vcov != "cluster")))
+        throw EngineError("bad_input",
+            "iv: --dofminus-fe requires --fe and --vcov iid, hc1 or cluster, without --gmm or a "
+            "multi-outcome --y");
     json out;
     if (ys.size() > 1)
         out = run_iv_multi(kp.data, ys, xs, endogs, insts, split_csv(opt(a, "--fe")), vcov,
                            clusters, gmm, &tsm, drop_singleton, mask_p, small, savefirst,
-                           savefprefix, es_p);
+                           savefprefix, es_p, weight_var, wkind);
     else
         out = run_iv(kp.data, y, xs, endogs, insts, split_csv(opt(a, "--fe")), vcov, clusters,
                      gmm, &tsm, drop_singleton, mask_p, small, savefirst, savefprefix, es_p,
-                     emit_v);
+                     emit_v, multiway_subset_factors, no_intercept, weight_var, wkind,
+                     multiway_no_psd_fix, dofminus_fe);
     emit_esample(esreq, "iv", data, keepif, kp.active, esrows, out);
     emit(out, opt(a, "--out"));
     return 0;
@@ -184,15 +252,40 @@ int cmd_feols(const std::vector<std::string>& a) {
                              "  --keep-nested-fe-dof  Stata `areg` clustered dof: the cluster small-sample\n"
                              "                  factor charges every absorbed FE, even one nested in the\n"
                              "                  cluster (default: reghdfe/xtreg,fe exempt it). Needs --fe and\n"
-                             "                  --vcov cluster|twoway.\n");
+                             "                  --vcov cluster|twoway.\n"
+                             "  --multiway-subset-factors  Stata `regress`/`areg` multiway cluster: every\n"
+                             "                  cluster combination's sandwich carries its own G/(G-1)*(N-1)/(N-K)\n"
+                             "                  (K charges every absorbed FE), and negative eigenvalues of the sum\n"
+                             "                  are set to 0 (default: reghdfe's single Gmin factor). Needs\n"
+                             "                  --vcov twoway|multiway. K follows --keep-nested-fe-dof (areg)\n"
+                             "                  or exempts an FE nested in a cluster (xtreg,fe).\n"
+                             "  --fe-nested-in-clusters  Stata `xtreg, fe` cluster rule: every --cluster\n"
+                             "                  variable must be constant within each level of the first\n"
+                             "                  --fe on the estimation sample; else bad_input with detail\n"
+                             "                  panels_not_nested (Stata r(498)). Needs --fe and a cluster VCE.\n"
+                             "  --regress-exact-fit  Stata `regress`/`areg` exact-fit rule: e(r2) > 1 - 1e-14\n"
+                             "                  is an exact fit (rss, V and se 0; t, p and the CI null).\n"
+                             "                  --vcov iid only; aw/fw/iw and --fe allowed, pw refused\n"
+                             "                  (reghdfe keeps the computed RSS).\n"
+                             "  --collinear-forward  Stata reghdfe/areg/xtreg,fe collinearity rule: of a\n"
+                             "                  collinear set the EARLIER term is kept and the later one\n"
+                             "                  omitted (default: the norm-pivoted basis of `regress`).\n");
         return 2;
     }
     std::string vcov_type = opt(a, "--vcov", "iid");
     std::vector<std::string> clusters = split_csv(opt(a, "--cluster"));
     std::vector<std::string> xs = split_csv(xcsv);
+    // regress-constant-only: `regress y [if]` (w2j_e3_builtin.log:288/:310/:332 F_C1-F_C3,
+    // rc 0) arrives as `--x (intercept)`: the constant is the design's own intercept
+    // column, so the token names no regressor and the x list is empty.
+    xs.erase(std::remove(xs.begin(), xs.end(), std::string("(intercept)")), xs.end());
     std::vector<std::string> fes = split_csv(opt(a, "--fe"));
     bool drop_singleton = !has(a, "--keep-singletons");
     bool no_intercept = has(a, "--no-intercept");
+    if (xs.empty() && no_intercept) {
+        std::fprintf(stderr, "feols: --x (intercept) with --no-intercept leaves no regressor.\n");
+        return 2;
+    }
     if (no_intercept && !fes.empty()) {
         std::fprintf(stderr, "feols: --no-intercept is not valid with --fe "
                              "(fixed effects already absorb the constant).\n");
@@ -262,6 +355,45 @@ int cmd_feols(const std::vector<std::string>& a) {
                 "feols: --keep-nested-fe-dof requires --fe and --vcov cluster or twoway (it "
                 "selects which absorbed parameters the cluster small-sample factor charges)");
     }
+    // FU-365: Stata's built-in multiway cluster convention (regress/areg), against
+    // reghdfe's Gmin factor (this command's default): w2l_vce_shape_det.log
+    // regress_vce_c2_se .0643525900770342 and areg_vce_c2_se .0778721308909151 vs
+    // reghdfe_vce_c2_se .0711126484294995. Only a multiway VCE reads it; anywhere
+    // else it would be silently ignored, so it is refused instead.
+    const bool multiway_subset_factors = has(a, "--multiway-subset-factors");
+    if (multiway_subset_factors && vcov_type != "twoway" && vcov_type != "multiway")
+        throw EngineError("bad_input",
+            "feols: --multiway-subset-factors requires --vcov twoway or multiway (it selects "
+            "the small-sample convention of a multiway cluster variance)");
+    // FU-401/FU-407: xtreg,fe's panels-nested-in-clusters rule (run_feols). Only
+    // meaningful with absorbed effects and a cluster VCE; refused elsewhere.
+    const bool fe_nested_in_clusters = has(a, "--fe-nested-in-clusters");
+    if (fe_nested_in_clusters &&
+        (fes.empty() || (vcov_type != "cluster" && vcov_type != "twoway" && vcov_type != "multiway")))
+        throw EngineError("bad_input",
+            "feols: --fe-nested-in-clusters requires --fe and --vcov cluster, twoway or multiway");
+    // Stata `regress`'s exact-fit rule (feols_fit): only the builtin fit has it
+    // (reghdfe keeps the computed RSS) -- regress, with or without [aw]/[fw]/[iw], and
+    // areg's absorbed fit (BUG-1055) -- and it was probed under the classic VCE only.
+    // Anywhere else (a pweight's robust VCE, any sandwich, svy) it would be silently
+    // ignored, so it is refused instead.
+    const bool regress_exact_fit = has(a, "--regress-exact-fit");
+    if (regress_exact_fit &&
+        (wkind == cecon::WeightKind::Probability || has(a, "--svy") ||
+         !(vcov_type == "iid" || vcov_type.empty())))
+        throw EngineError("bad_input",
+            "feols: --regress-exact-fit requires --vcov iid without --svy or a pweight (it "
+            "selects Stata regress/areg's exact-fit rule for the classic variance)");
+    // BUG-1067: which member of a collinear set is omitted. reghdfe, areg and
+    // xtreg,fe keep the earlier term (StataBE, z = 2*x: `x o.z`), where regress
+    // keeps the norm-pivoted basis this command defaults to (`o.x z`). areg carries
+    // both this and the exact-fit rule (BUG-1055), so only a fit without --fe refuses
+    // the pair.
+    const bool collinear_forward = has(a, "--collinear-forward");
+    if (collinear_forward && ((regress_exact_fit && fes.empty()) || has(a, "--svy")))
+        throw EngineError("bad_input",
+            "feols: --collinear-forward is not valid with --svy, or with --regress-exact-fit "
+            "without --fe (Stata regress keeps the norm-pivoted basis)");
     cecon::TsMeta tsm = parse_tsmeta(a);
     std::vector<std::string> ys = split_csv(y);
     // --emit-v: opt-in full e(V) of the fitted model (see add_e_v). The svy and the
@@ -274,18 +406,21 @@ int cmd_feols(const std::vector<std::string>& a) {
     EsampleRows esrows;
     EsampleRows* es_p = esreq.active() ? &esrows : nullptr;
     // E1: --x may carry L./F./D./S. tokens (build_model's ts_prepass) — route `if`
-    // through plan_keepif so they materialize against the FULL series first.
+    // through plan_keepif so they materialize against the FULL series first. So may
+    // --y (BUG-1277: `regress D.y x1 x2 if t>=3` reads y at t = 2).
     const std::string keepif = opt(a, "--keepif");
-    KeepifPlan kp = plan_keepif(data, keepif, &tsm, {&xs});
+    KeepifPlan kp = plan_keepif(data, keepif, &tsm, {&xs, &ys});
     const std::vector<char>* mask_p = kp.active ? &kp.mask : nullptr;
 
     // P7 `svy: regress`. A survey design is not a variant of --vcov: it replaces
     // both the meat and the reference distribution, so it takes its own path and
     // rejects the combinations that would otherwise be silently ignored.
     if (has(a, "--svy")) {
+        // --strata is optional: a design without strata() is one stratum
+        // (w2t_boottest_family.log:2455 H1 `svyset id [pweight=w]`, run_feols_svy).
         std::string psu = opt(a, "--psu"), strata = opt(a, "--strata");
-        if (psu.empty() || strata.empty())
-            throw EngineError("bad_input", "feols: --svy requires both --psu and --strata");
+        if (psu.empty())
+            throw EngineError("bad_input", "feols: --svy requires --psu");
         if (wkind != cecon::WeightKind::Probability)
             throw EngineError("bad_input",
                 "feols: --svy requires --weight W --wtype pw (a survey design is a "
@@ -323,55 +458,103 @@ int cmd_feols(const std::vector<std::string>& a) {
             throw EngineError("unsupported",
                 "feols: --keep-nested-fe-dof is not supported with a multi-outcome --y "
                 "batch; run one outcome per invocation");
+        if (multiway_subset_factors || fe_nested_in_clusters || regress_exact_fit)
+            throw EngineError("unsupported",
+                "feols: --multiway-subset-factors, --fe-nested-in-clusters and "
+                "--regress-exact-fit are not supported with a multi-outcome --y batch; run one "
+                "outcome per invocation");
         out = run_feols_multi(kp.data, ys, xs, fes, vcov_type, clusters, drop_singleton,
-                              &tsm, mask_p, no_intercept, level, level_set, es_p);
+                              &tsm, mask_p, no_intercept, level, level_set, es_p,
+                              collinear_forward);
     } else {
         out = run_feols(kp.data, y, xs, fes, vcov_type, clusters, drop_singleton, &tsm,
                         mask_p, no_intercept, level, level_set, weight_var, wkind, es_p,
-                        keep_nested_fe_dof, emit_v);
+                        keep_nested_fe_dof, emit_v, multiway_subset_factors,
+                        fe_nested_in_clusters, regress_exact_fit, collinear_forward);
     }
     emit_esample(esreq, "feols", data, keepif, kp.active, esrows, out);
     emit(out, opt(a, "--out"));
     return 0;
 }
 
+// apps/cmds/common.cpp: run_fepois with the opt-in --emit-v (FU-859). Declared
+// here rather than in common.h, which is outside this change set; the linker
+// checks the signature against the definition.
+json run_fepois_emit_v(const std::string& data, const std::string& y,
+                       const std::vector<std::string>& xs, const std::vector<std::string>& fes,
+                       const std::string& offset, const std::string& vcov_type,
+                       const std::vector<std::string>& clusters, bool drop_zero_fe,
+                       bool scale_x2, const std::string& weight_var, cecon::WeightKind weight_kind,
+                       bool emit_v, const std::string& d_out = std::string(),
+                       const std::string& d_name = std::string(),
+                       const cecon::TsMeta* ts = nullptr,
+                       const std::vector<char>* if_mask = nullptr);
+
 int cmd_fepois(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data"), y = opt(a, "--y"), xcsv = opt(a, "--x");
-    if (data_missing(data) || y.empty() || xcsv.empty()) {
-        std::fprintf(stderr, "usage: cobra fepois --data f.hbin --y COUNT[,C2,...] --x X1,X2 "
+    // --no-x: a model with no regressors (`ppmlhdfe y` / `ppmlhdfe y, absorb(f)`):
+    // the constant alone, or the absorbed effects alone with _cons recovered.
+    const bool no_x = has(a, "--no-x");
+    if (no_x && !xcsv.empty())
+        throw EngineError("bad_input", "fepois: --no-x and --x are mutually exclusive");
+    if (data_missing(data) || y.empty() || (xcsv.empty() && !no_x)) {
+        std::fprintf(stderr, "usage: cobra fepois --data f.hbin --y COUNT[,C2,...] --x X1,X2|--no-x "
                              "[--fe F] [--offset O] [--vcov iid|hc1|cluster|twoway] [--cluster C] "
-                             "[--weight W --wtype pw] [--keepif EXPR]\n"
+                             "[--weight W --wtype pw|fw|iw] [--keepif EXPR]\n"
                              "  --weight W --wtype pw  Stata pweight (P5): forces --vcov hc1/robust or\n"
-                             "                  cluster (Stata has no iid VCE under pweight); not valid\n"
-                             "                  with --fe (weighted absorption is not implemented).\n");
+                             "                  cluster (Stata has no iid VCE under pweight); with --fe\n"
+                             "                  the absorption is weighted by pw*mu (ppmlhdfe).\n"
+                             "  --wtype fw|iw   Stata fweight / iweight: the same weighted fit under\n"
+                             "                  any VCE; an fweight row counts w times (e(N) = Sum w).\n");
         return 2;
     }
-    data = maybe_keepif(data, opt(a, "--keepif"));
+    // --d-out PATH --d-name NAME: the --data frame plus ppmlhdfe's `d` (the sum of the
+    // absorbed effects net of _cons; 0 without --fe), missing off the fit's rows.
+    const std::string d_out = opt(a, "--d-out"), d_name = opt(a, "--d-name");
+    if (d_out.empty() != d_name.empty())
+        throw EngineError("bad_input", "fepois: --d-out and --d-name must be given together");
+    if (!d_out.empty() && !opt(a, "--keepif").empty())
+        throw EngineError("unsupported", "fepois: --d-out is not supported together with --keepif");
+    // BUG-1484: under --xtset/--tsset, --x/--y may carry L./F./D./S. tokens (`poisson
+    // cnt L.x1 x2 if t > 2`); route `if` through plan_keepif, as cmd_feols does, so
+    // they read the FULL series before the restriction applies.
+    const cecon::TsMeta tsm = parse_tsmeta(a);
+    const std::vector<std::string> ts_xs = split_csv(xcsv), ts_ys = split_csv(y);
+    KeepifPlan kp = plan_keepif(data, opt(a, "--keepif"), &tsm, {&ts_xs, &ts_ys});
+    data = kp.data;
+    const std::vector<char>* mask_p = kp.active ? &kp.mask : nullptr;
     bool drop_zero_fe = !has(a, "--keep-zero-fe");  // default: drop all-zero FE cells (ppmlhdfe)
     bool scale_x2 = (opt(a, "--scale") == "x2");    // glm quasi-Poisson dispersion-scaled SEs
     std::string vcov_type = opt(a, "--vcov", "iid");
-    // Stata pweight: only pweight is meaningful for `poisson`/`fepois` as an ML
-    // command (aw/iw are not valid Stata weight types there; fw would need
-    // integer-frequency semantics this engine doesn't implement for fepois), and
-    // pweight always forces a sandwich VCE — Stata has no iid pweight estimator.
+    // Stata pweight always forces a sandwich VCE — Stata has no iid pweight
+    // estimator. fweight and iweight (BUG-1538/1539) fit the same weighted
+    // likelihood under any VCE; an fweight's e(N) is Sum w (fepois.cpp, and
+    // run_fepois_emit_v's n_obs). Stata's `poisson` takes no aweight and
+    // `ppmlhdfe` no aweight or iweight (r(101), PIET's tokenizer answers those).
     std::string weight_var = opt(a, "--weight"), wtype = opt(a, "--wtype");
     cecon::WeightKind wkind = cecon::WeightKind::None;
     if (!weight_var.empty() || !wtype.empty()) {
         if (weight_var.empty())
             throw EngineError("bad_input", "fepois: --wtype requires --weight");
-        if (wtype != "pw" && wtype != "pweight")
-            throw EngineError("bad_input", "fepois: --wtype must be pw (only pweight is supported)");
-        wkind = cecon::WeightKind::Probability;
-        if (vcov_type == "iid")
+        if (wtype == "fw" || wtype == "fweight") wkind = cecon::WeightKind::Frequency;
+        else if (wtype == "iw" || wtype == "iweight") wkind = cecon::WeightKind::Importance;
+        else if (wtype == "pw" || wtype == "pweight") wkind = cecon::WeightKind::Probability;
+        else throw EngineError("bad_input", "fepois: --wtype must be pw, fw or iw");
+        if (wkind == cecon::WeightKind::Probability && vcov_type == "iid")
             throw EngineError("bad_input",
                 "fepois: [pweight=] requires --vcov hc1/robust or cluster; Stata has no "
                 "iid VCE under pweight");
-        if (!split_csv(opt(a, "--fe")).empty())
-            throw EngineError("unsupported",
-                "fepois: weights are not supported together with --fe "
-                "(weighted fixed-effect absorption is not implemented in this engine)");
     }
     std::vector<std::string> ys = split_csv(y);
+    // --emit-v: opt-in full e(V) of the fitted model (FU-859, see add_e_v). A batch has
+    // one V per outcome. Absorbed fits retain their recovered _cons covariance;
+    // multi-outcome batches still require a separate matrix per outcome.
+    const bool emit_v = has(a, "--emit-v");
+    if (emit_v && ys.size() > 1)
+        throw EngineError("unsupported",
+            "fepois: --emit-v is not supported with a multi-outcome --y batch");
+    if (!d_out.empty() && ys.size() > 1)
+        throw EngineError("unsupported", "fepois: --d-out is not supported with a multi-outcome --y batch");
     json out;
     if (ys.size() > 1) {
         // Mirrors feols_multi's weight rejection: the shared design across
@@ -381,17 +564,55 @@ int cmd_fepois(const std::vector<std::string>& a) {
             throw EngineError("unsupported",
                 "fepois: weights are not supported with a multi-outcome --y batch; "
                 "run one outcome per invocation");
+        // The batch has no time-series plumbing: plan_keepif's full-frame mask would be
+        // silently ignored there.
+        if (kp.active)
+            throw EngineError("unsupported",
+                "fepois: time-series operators with --keepif are not supported with a "
+                "multi-outcome --y batch; run one outcome per invocation");
         out = run_fepois_multi(data, ys, split_csv(xcsv), split_csv(opt(a, "--fe")),
                                opt(a, "--offset"), vcov_type,
                                split_csv(opt(a, "--cluster")), drop_zero_fe, scale_x2);
     } else {
-        out = run_fepois(data, y, split_csv(xcsv), split_csv(opt(a, "--fe")),
-                         opt(a, "--offset"), vcov_type,
-                         split_csv(opt(a, "--cluster")), drop_zero_fe, scale_x2,
-                         weight_var, wkind);
+        out = run_fepois_emit_v(data, y, split_csv(xcsv), split_csv(opt(a, "--fe")),
+                                opt(a, "--offset"), vcov_type,
+                                split_csv(opt(a, "--cluster")), drop_zero_fe, scale_x2,
+                                weight_var, wkind, emit_v, d_out, d_name, &tsm, mask_p);
     }
     emit(out, opt(a, "--out"));
     return 0;
+}
+
+// boottest's cluster rows run in ascending cluster-value order (the ado sorts
+// on the cluster variable before panelsetup); a Factor's codes run in first-
+// appearance order. Rank each code by its value: numbers numerically, strings
+// byte-wise. Used only for the Stata draw plan (StataWildDraws).
+static std::vector<int32_t> stata_cluster_rank(const Dataset& ds, const std::string& name,
+                                               const std::vector<int64_t>& keep, const Factor& f) {
+    const Column& c = ds.col(name);
+    std::vector<int64_t> rep(static_cast<size_t>(f.n_levels), -1);
+    for (size_t r = 0; r < f.codes.size() && r < keep.size(); ++r)
+        if (f.codes[r] >= 0 && rep[static_cast<size_t>(f.codes[r])] < 0)
+            rep[static_cast<size_t>(f.codes[r])] = keep[r];
+    std::vector<int32_t> order(static_cast<size_t>(f.n_levels));
+    for (int32_t g = 0; g < f.n_levels; ++g) order[static_cast<size_t>(g)] = g;
+    auto rowOf = [&](int32_t g) { return rep[static_cast<size_t>(g)]; };
+    if (c.dtype == DType::Factor) {
+        const int32_t* codes = c.codes();
+        std::stable_sort(order.begin(), order.end(), [&](int32_t x, int32_t y) {
+            const int32_t cx = codes[rowOf(x)], cy = codes[rowOf(y)];
+            const std::string& sx = cx < 0 ? std::string() : c.levels[static_cast<size_t>(cx)];
+            const std::string& sy = cy < 0 ? std::string() : c.levels[static_cast<size_t>(cy)];
+            return sx < sy;
+        });
+    } else {
+        const double* v = c.f64();
+        std::stable_sort(order.begin(), order.end(),
+                         [&](int32_t x, int32_t y) { return v[rowOf(x)] < v[rowOf(y)]; });
+    }
+    std::vector<int32_t> rank(static_cast<size_t>(f.n_levels));
+    for (int32_t q = 0; q < f.n_levels; ++q) rank[static_cast<size_t>(order[static_cast<size_t>(q)])] = q;
+    return rank;
 }
 
 int cmd_wildboot(const std::vector<std::string>& a) {
@@ -400,27 +621,118 @@ int cmd_wildboot(const std::vector<std::string>& a) {
     if (data_missing(data) || y.empty() || clcsv.empty()) {
         std::fprintf(stderr, "usage:\n"
             "  OLS: cobra wildboot --data f.hbin --y Y --x X1,X2 --param X1 --cluster C "
-            "[--fe F] [--null 0] [--reps 9999] [--seed 42] [--weights rademacher|webb]\n"
+            "[--fe F] [--keep-singletons] [--null 0] [--reps 9999] [--seed 42] "
+            "[--weights rademacher|webb|mammen|normal|gamma]\n"
             "  IV:  cobra wildboot --data f.hbin --y Y --x EXOG --endog D --instruments Z "
-            "--cluster C [--fe F] [--null 0] [--reps 9999] [--seed 42]\n");
+            "--cluster C [--fe F] [--keep-singletons] [--null 0] [--reps 9999] [--seed 42]\n");
         return 2;
     }
     double r = std::stod(opt(a, "--null", "0"));
     int reps = std::stoi(opt(a, "--reps", "9999"));
     if (reps < 1) { std::fprintf(stderr, "wildboot: --reps must be >= 1.\n"); return 2; }
     uint64_t seed = std::stoull(opt(a, "--seed", "42"));
-    BootWeights wt = (opt(a, "--weights") == "webb") ? BootWeights::Webb : BootWeights::Rademacher;
+    // --weights: boottest's weighttype() by its full name (BUG-1519); Rademacher when absent.
+    BootWeights wt = BootWeights::Rademacher;
+    if (const std::string ws = opt(a, "--weights"); !ws.empty() && !boot_weights_from_name(ws, wt))
+        throw EngineError("bad_input",
+                          "wildboot: --weights must be rademacher, webb, mammen, normal or gamma",
+                          "--weights");
+    // --keep-singletons: resample the fit's sample when that fit kept its
+    // singleton FE groups (areg, xtreg fe); default drop, as feols/iv.
+    const bool drop_singleton = !has(a, "--keep-singletons");
     const Dataset& ds = acquire_data(data);
+    // --rng-mt64 STATE: draw the Rademacher weights exactly as boottest does, from
+    // Stata's session stream at that state (StataWildDraws; PIET sends the state
+    // boottest's `set seed` leaves). The response reports the raw draws taken.
+    std::optional<StataWildDraws> stata_draws;
+    if (const std::string ms = opt(a, "--rng-mt64"); !ms.empty()) {
+        stata_draws.emplace();
+        if (!stata_draws->stream.restore(ms))
+            throw EngineError("bad_input", "wildboot: --rng-mt64 is not an mt64 state string");
+    }
+    const std::string first_cluster = split_csv(clcsv).empty() ? std::string() : split_csv(clcsv)[0];
 
     auto t0 = std::chrono::steady_clock::now();
     WildBootResult R;
-    int64_t n_obs = 0;
+    double n_obs = 0;
     std::vector<std::string> fv_warnings;  // BUG-112(8): md is branch-scoped, hoist the notes
     bool is_iv = !endog.empty();
-    if (is_iv) {
+    const std::string score_model = opt(a, "--model");
+    if (!score_model.empty()) {
+        if (is_iv || !opt(a, "--fe").empty() || has(a, "--no-intercept") ||
+            !opt(a, "--weight").empty() || !opt(a, "--wtype").empty() || split_csv(clcsv).size() != 1)
+            throw EngineError("unsupported", "ML score bootstrap requires one unweighted, unabsorbed, with-constant model");
+        GlmInputs g = load_glm(ds, "score bootstrap", y, split_csv(opt(a, "--x")), split_csv(clcsv));
+        const std::string param = opt(a, "--param");
+        auto it = std::find(g.names.begin(), g.names.end(), param);
+        if (it == g.names.end()) throw EngineError("bad_input", "score bootstrap: parameter is not in the fitted design");
+        if (stata_draws)
+            stata_draws->cluster_rank = stata_cluster_rank(ds, first_cluster, g.keep, g.cluster.at(0));
+        R = wild_score_bootstrap(g.X, g.n, g.k, g.y, g.cluster.at(0),
+                                static_cast<int>(it - g.names.begin()), param, score_model, r, reps, seed, wt,
+                                stata_draws ? &*stata_draws : nullptr);
+        n_obs = g.n;
+        fv_warnings = g.warnings;
+    } else if (has(a, "--wre") || (!is_iv && split_csv(clcsv).size() > 1)) {
+        // boottest's WRE after IV, and its multiway wild bootstrap-t after OLS:
+        // one direct-refit kernel (wild_restricted_efficient_bootstrap). No FE,
+        // no weights: the caller passes the model boottest builds (after
+        // ivreghdfe that is the unabsorbed, constant-free one).
+        if (!opt(a, "--fe").empty() || !opt(a, "--weight").empty() || !opt(a, "--wtype").empty())
+            throw EngineError("unsupported", "wildboot: the WRE / multiway bootstrap takes no fixed effects or weights");
+        const std::string param = opt(a, "--param");
+        if (param.empty()) throw EngineError("bad_input", "wildboot: --param is required");
+        WreSpec spec;
+        spec.null_beta = r;
+        spec.reps = reps;
+        spec.seed = seed;
+        spec.weights = wt;
+        spec.liml = has(a, "--liml");
+        spec.small = has(a, "--small");
+        spec.fe_dof_adj = std::stod(opt(a, "--fe-dof-adj", "0"));
+        if (is_iv) {
+            IvModelData md = build_iv_model(ds, y, split_csv(opt(a, "--x")), split_csv(endog),
+                                            split_csv(opt(a, "--instruments", opt(a, "--z"))), {},
+                                            split_csv(clcsv), nullptr, false, nullptr,
+                                            has(a, "--no-intercept"));
+            int j = -1;
+            for (int i = 0; i < md.kexog; ++i)
+                if (md.exog_names[static_cast<size_t>(i)] == param) j = i;
+            for (int m = 0; m < md.kendog; ++m)
+                if (md.endog_names[static_cast<size_t>(m)] == param) j = md.kexog + m;
+            if (j < 0) throw EngineError("bad_input", "wildboot: --param '" + param + "' is not a regressor");
+            spec.param_index = j;
+            n_obs = static_cast<double>(md.n);
+            fv_warnings = md.warnings;
+            R = wild_restricted_efficient_bootstrap(md.y, md.n, md.Xexog, md.kexog, md.exog_names,
+                                                    md.Xendog, md.kendog, md.endog_names, md.Zinst,
+                                                    md.kinst, md.cluster, spec);
+        } else {
+            ModelData md = build_model(ds, y, split_csv(opt(a, "--x")), {}, split_csv(clcsv), "",
+                                       false);
+            if (has(a, "--no-intercept") && !md.dm.xnames.empty() &&
+                md.dm.xnames.front() == "(intercept)") {
+                md.dm.X.erase(md.dm.X.begin(), md.dm.X.begin() + md.dm.n);
+                md.dm.xnames.erase(md.dm.xnames.begin());
+                --md.dm.k;
+            }
+            int j = -1;
+            for (int i = 0; i < md.dm.k; ++i)
+                if (md.dm.xnames[static_cast<size_t>(i)] == param) j = i;
+            if (j < 0) throw EngineError("bad_input", "wildboot: --param '" + param + "' is not a regressor");
+            spec.param_index = j;
+            n_obs = static_cast<double>(md.dm.n);
+            fv_warnings = md.warnings;
+            R = wild_restricted_efficient_bootstrap(md.dm.y, md.dm.n, md.dm.X, md.dm.k, md.dm.xnames,
+                                                    {}, 0, {}, {}, 0, md.cluster, spec);
+        }
+    } else if (is_iv) {
+        if (has(a, "--no-intercept") || !opt(a, "--weight").empty() || !opt(a, "--wtype").empty())
+            throw EngineError("unsupported", "wildboot: weighted/no-intercept IV bootstrap is not supported");
         IvModelData md = build_iv_model(ds, y, split_csv(opt(a, "--x")), split_csv(endog),
                                         split_csv(opt(a, "--instruments", opt(a, "--z"))),
-                                        split_csv(opt(a, "--fe")), split_csv(clcsv));
+                                        split_csv(opt(a, "--fe")), split_csv(clcsv), nullptr,
+                                        drop_singleton);
         n_obs = md.n;
         fv_warnings = md.warnings;
         R = wild_cluster_bootstrap_iv(md, r, reps, seed, 0, wt);
@@ -430,8 +742,27 @@ int cmd_wildboot(const std::vector<std::string>& a) {
             std::fprintf(stderr, "OLS wildboot needs --x and --param\n");
             return 2;
         }
+        const std::string weight = opt(a, "--weight"), wtype = opt(a, "--wtype");
+        WeightKind kind = WeightKind::None;
+        if (!weight.empty() || !wtype.empty()) {
+            if (weight.empty()) throw EngineError("bad_input", "wildboot: --wtype requires --weight");
+            if (wtype.empty() || wtype == "aw" || wtype == "aweight") kind = WeightKind::Analytic;
+            else if (wtype == "pw" || wtype == "pweight") kind = WeightKind::Probability;
+            else if (wtype == "fw" || wtype == "fweight") kind = WeightKind::Frequency;
+            else if (wtype == "iw" || wtype == "iweight") kind = WeightKind::Importance;
+            else throw EngineError("bad_input", "wildboot: unrecognized --wtype");
+        }
         ModelData md = build_model(ds, y, split_csv(xcsv), split_csv(opt(a, "--fe")),
-                                   split_csv(clcsv));
+                                   split_csv(clcsv), "", drop_singleton, nullptr, nullptr, weight, kind);
+        if (has(a, "--no-intercept")) {
+            if (!md.fe.empty()) throw EngineError("unsupported", "wildboot: --no-intercept with fixed effects is not supported");
+            if (!md.dm.xnames.empty() && md.dm.xnames.front() == "(intercept)") {
+                md.dm.X.erase(md.dm.X.begin(), md.dm.X.begin() + md.dm.n);
+                md.dm.xnames.erase(md.dm.xnames.begin());
+                --md.dm.k;
+                md.has_intercept = false;
+            }
+        }
         int j = -1;
         for (int i = 0; i < static_cast<int>(md.dm.xnames.size()); ++i)
             if (md.dm.xnames[i] == param) j = i;
@@ -440,8 +771,15 @@ int cmd_wildboot(const std::vector<std::string>& a) {
             return 2;
         }
         n_obs = md.dm.n;
+        if (kind == WeightKind::Frequency) {
+            n_obs = 0.0;
+            for (double w : md.weights) n_obs += w;
+        }
         fv_warnings = md.warnings;
-        R = wild_cluster_bootstrap(md, j, r, reps, seed, 0, wt);
+        if (stata_draws && !md.cluster.empty())
+            stata_draws->cluster_rank = stata_cluster_rank(ds, first_cluster, md.keep, md.cluster.at(0));
+        R = wild_cluster_bootstrap(md, j, r, reps, seed, 0, wt,
+                                   stata_draws && !md.cluster.empty() ? &*stata_draws : nullptr);
     }
     auto t1 = std::chrono::steady_clock::now();
 
@@ -462,6 +800,22 @@ int cmd_wildboot(const std::vector<std::string>& a) {
         {"seed", R.seed},
         {"time_ms", std::chrono::duration<double, std::milli>(t1 - t0).count()},
     };
+    if (!score_model.empty()) {
+        out["estimator"] = "wild_score_bootstrap";
+        out["z"] = R.t0;
+        out.erase("beta"); out.erase("se"); out.erase("t0");
+    }
+    if (stata_draws) out["rng_draws"] = stata_draws->taken;
+    if (std::isfinite(R.df_r)) {  // the direct-refit kernel (WRE / multiway)
+        out["estimator"] = is_iv ? "wild_restricted_efficient_bootstrap" : "wild_cluster_bootstrap_multiway";
+        out["df_r"] = R.df_r;
+        out["small"] = has(a, "--small");
+        if (is_iv) out["kappa"] = R.kappa;
+        if (!std::isfinite(R.t0)) out["t0"] = nullptr;
+        if (!std::isfinite(R.se)) out["se"] = nullptr;
+        if (!std::isfinite(R.p_symmetric)) out["p_symmetric"] = nullptr;
+        if (!std::isfinite(R.p_equaltail)) out["p_equaltail"] = nullptr;
+    }
     add_warnings(out, fv_warnings);  // BUG-112(8): absent-key when empty
     emit(out, opt(a, "--out"));
     return 0;
@@ -489,9 +843,20 @@ int cmd_liml(const std::vector<std::string>& a) {
     for (auto& s : endogs) { Yr.push_back(require_num(ds, "liml", s)); all.push_back(Yr.back()); }
     for (auto& s : exogs)  { Xr.push_back(require_num(ds, "liml", s)); all.push_back(Xr.back()); }
     for (auto& s : insts)  { Zr.push_back(require_num(ds, "liml", s)); all.push_back(Zr.back()); }
+    // --vcov iid (default) | robust/hc1 | cluster --cluster C.
+    const std::string vcov = opt(a, "--vcov", "iid"), clname = opt(a, "--cluster");
+    int vce = 0;
+    if (vcov == "robust" || vcov == "hc1") vce = 1;
+    else if (vcov == "cluster") vce = 2;
+    else if (vcov != "iid")
+        throw EngineError("unsupported", "liml: --vcov must be iid, robust/hc1 or cluster");
+    if (vce == 2 && (clname.empty() || split_csv(clname).size() != 1))
+        throw EngineError("unsupported", "liml: --vcov cluster takes exactly one --cluster variable");
+    const double* clraw = vce == 2 ? require_num(ds, "liml", clname) : nullptr;
+    if (clraw) all.push_back(clraw);
     auto keep = listwise_keep(all, n_raw);
     int64_t n = static_cast<int64_t>(keep.size());
-    if (n == 0) { std::fprintf(stderr, "liml: no rows after dropping missing.\n"); return 1; }
+    require_sample(n);  // BUG-1269: r(2000) "no observations" / r(2001) for one row
     auto gv = [&](const double* p2) { return gather_rows(p2, keep); };
     std::vector<double> yv = gv(yraw);
     std::vector<double> Y(static_cast<size_t>(n) * p), X1(static_cast<size_t>(n) * kx1), Z2(static_cast<size_t>(n) * m);
@@ -500,7 +865,20 @@ int cmd_liml(const std::vector<std::string>& a) {
     for (int64_t i = 0; i < n; ++i) X1[static_cast<int64_t>(kx1 - 1) * n + i] = 1.0;
     for (int c = 0; c < m; ++c) { auto col = gv(Zr[c]); std::copy(col.begin(), col.end(), Z2.data() + static_cast<int64_t>(c) * n); }
 
-    LimlResult r = liml_fit(yv, n, Y, p, X1, kx1, Z2, m, small, fuller);
+    std::vector<int32_t> clcodes;
+    int n_clusters = 0;
+    if (clraw) {
+        std::vector<double> cv = gv(clraw), u = cv;
+        std::sort(u.begin(), u.end());
+        u.erase(std::unique(u.begin(), u.end()), u.end());
+        clcodes.resize(cv.size());
+        for (size_t i = 0; i < cv.size(); ++i)
+            clcodes[i] = static_cast<int32_t>(std::lower_bound(u.begin(), u.end(), cv[i]) - u.begin());
+        n_clusters = static_cast<int>(u.size());
+        if (n_clusters < 2) throw EngineError("unsupported", "liml: --vcov cluster needs at least 2 clusters");
+    }
+    LimlResult r = liml_fit(yv, n, Y, p, X1, kx1, Z2, m, small, fuller, -1.0, vce,
+                            clraw ? &clcodes : nullptr, n_clusters);
     if (!r.ok) { std::fprintf(stderr, "liml: estimation failed (underidentified / singular?).\n"); return 1; }
     std::vector<std::string> names = endogs;
     for (auto& s : exogs) names.push_back(s);
@@ -517,6 +895,13 @@ int cmd_liml(const std::vector<std::string>& a) {
     json out = {{"estimator", fuller > 0 ? "fuller" : "liml"}, {"kappa", r.kappa},
                 {"fuller_alpha", fuller}, {"n_obs", r.n}, {"df_r", dof}, {"sigma2", r.sigma2},
                 {"small", small}, {"coefs", coefs}};
+    if (vce == 1) out["vcov_type"] = "hc1";
+    if (vce == 2) {
+        out["vcov_type"] = "cluster(" + clname + ")";
+        out["n_clusters"] = n_clusters;
+    }
+    // --emit-v (BUG-1196): the fit's full covariance, in the coefficients' order.
+    if (has(a, "--emit-v")) add_e_v(out, names, r.vcov);
     emit(out, opt(a, "--out"));
     return 0;
 }
@@ -559,7 +944,7 @@ int cmd_reg3(const std::vector<std::string>& a) {
     for (auto& v : instv) must.push_back(require_num(ds, "reg3", v));
     auto keep = listwise_keep(must, n_raw);
     int64_t n = static_cast<int64_t>(keep.size());
-    if (n == 0) { std::fprintf(stderr, "reg3: no rows after dropping missing.\n"); return 1; }
+    require_sample(n);  // BUG-1269: r(2000) "no observations" / r(2001) for one row (reg3 and sureg)
     auto getcol = [&](const std::string& v) { return gather_rows(require_num(ds, "reg3", v), keep); };
 
     std::vector<Reg3Eq> eqs(M);
@@ -592,8 +977,13 @@ int cmd_reg3(const std::vector<std::string>& a) {
         for (int c = 0; c < eqs[i].k; ++c) {
             int idx = r.koff[i] + c;
             double se = r.se[idx];
+            const double z = se > 0 ? r.beta[idx] / se : 0.0;
+            // Stata's reg3/sureg table is large-sample: z, P>|z| and the normal
+            // interval (no small option here).
             cj.push_back({{"name", eqs[i].names[c]}, {"b", r.beta[idx]}, {"se", se},
-                          {"t", se > 0 ? r.beta[idx] / se : 0.0}});
+                          {"t", z}, {"p", se > 0 ? z_twosided_pvalue(z) : 1.0},
+                          {"ci_lo", r.beta[idx] - 1.959963984540054 * se},
+                          {"ci_hi", r.beta[idx] + 1.959963984540054 * se}});
         }
         eqsj.push_back({{"depvar", deps[i]}, {"coefs", cj}});
     }
@@ -601,6 +991,17 @@ int cmd_reg3(const std::vector<std::string>& a) {
     for (int i = 0; i < M; ++i) { json row = json::array(); for (int j = 0; j < M; ++j) row.push_back(r.Sigma[static_cast<size_t>(i) * M + j]); sig.push_back(row); }
     json out = {{"estimator", "reg3"}, {"method", threesls ? "3sls" : "sure"}, {"n_obs", n},
                 {"n_equations", M}, {"equations", eqsj}, {"sigma", sig}};
+    // --emit-v: the stacked system covariance (K x K, cross-equation blocks
+    // included), named `depvar:coef` in e(b)'s order with the intercept spelled
+    // `_cons` -- Stata's reg3/sureg e(V) stripe (`y:x1 y:x2 y:_cons x3:x2 x3:_cons`).
+    if (has(a, "--emit-v")) {
+        std::vector<std::string> vn;
+        for (int i = 0; i < M; ++i)
+            for (int c = 0; c < eqs[i].k; ++c)
+                vn.push_back(deps[i] + ":" +
+                             (eqs[i].names[c] == "(intercept)" ? std::string("_cons") : eqs[i].names[c]));
+        add_e_v(out, vn, r.vcov, nullptr);
+    }
     emit(out, opt(a, "--out"));
     return 0;
 }

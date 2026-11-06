@@ -1,13 +1,19 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "common.h"
 #include "commands.h"
 
 #include "io/dta_reader.h"  // read_dta/DtaResult (import_dta, append, merge with a .dta `using`)
 #include "io/dta_writer.h"  // write_dta (export_dta — P1-A3 ARC 3 numeric writer)
 #include "data/datasignature.h"  // data_signature (P1-A3 reverse-oracle head)
+#include "core/ident.h"  // isIdentByte: a non-ASCII neighbour is not a word break
+#include "core/stata_pctile.h"  // --winsor cutoffs
 #include "core/eng_counters.h"  // WS-D2: merge_file_opens (S06 ARC-MRG)
 #include "core/verb_diag.h"  // COBRA_VERB_DIAG: joinby/merge/keepif phase timing (measurement-only)
+#include "data/frame_internal.h"  // frame_detail::round_to_store (round_column_to_store)
 
 #include <cstdlib>  // getenv (COBRA_MERGE_IO_DIAG)
+#include <fstream>  // cmd_setcol --ones-as reads its 0/1 values file
 #include <limits>  // cmd_append --type-clash force: numeric missing (BUG-550)
 #include <unordered_set>  // cmd_append --keepusing membership set (BUG-549)
 
@@ -26,7 +32,7 @@ namespace cli {
 // `kind` records: an expression (`--egen o=mean(x)`), a varlist (`--egen o=tag(a b)`;
 // seq() takes no input at all), or a row of columns (`--rowegen o=rowmean(a,b)`).
 
-// Aggregate-over-expression, optionally by(). Twelve spellings, eleven accumulators:
+// Aggregate-over-expression, optionally by(). Fourteen spellings, thirteen accumulators:
 // `sum` and `total` are Stata's two names for one of them.
 struct EgenExprSpec { const char* name; Frame::EgenFn fn; };
 const EgenExprSpec EGEN_EXPR[] = {
@@ -36,6 +42,9 @@ const EgenExprSpec EGEN_EXPR[] = {
     {"count", Frame::EgenFn::Count}, {"sd", Frame::EgenFn::Sd},
     {"rank", Frame::EgenFn::Rank}, {"pctile", Frame::EgenFn::Pctile},
     {"std", Frame::EgenFn::Std}, {"iqr", Frame::EgenFn::Iqr},
+    // BUG-1001: pc() (egen's pc) -- the percent (or, under `prop`, the proportion)
+    // of the group total. Oracle w2ap_egen_family eg_pc_*.
+    {"pc", Frame::EgenFn::Pc},
     // B4/W6. `var` is egenmore (SSC / corpus-bundled), NOT StataCorp — ACCEPTED-NAMED:
     // the third-party ado's spelling and semantics are the contract. See Frame::EgenFn
     // in src/data/frame.h for the reopening condition. rank's track/field/unique are
@@ -60,12 +69,14 @@ const EgenSpecialSpec EGEN_SPECIAL[] = {
     {"concat", "varlist"},
 };
 
-// Row functions across columns (--rowegen). Eight spellings, seven operations:
-// `rowtotal` and `rowsum` are two names for one of them.
+// Row functions across columns (--rowegen). Nine spellings, seven operations:
+// `rowtotal`, `rowsum` and `rsum` are three names for one of them (rsum is
+// rowtotal's Stata 8 name; BUG-1001).
 struct EgenRowSpec { const char* name; Frame::RowFn fn; };
 const EgenRowSpec EGEN_ROW[] = {
     {"rowmean", Frame::RowFn::Mean}, {"rowsd", Frame::RowFn::Sd},
     {"rowtotal", Frame::RowFn::Total}, {"rowsum", Frame::RowFn::Total},
+    {"rsum", Frame::RowFn::Total},
     {"rowmax", Frame::RowFn::Max}, {"rowmin", Frame::RowFn::Min},
     {"rowmiss", Frame::RowFn::Miss}, {"rownonmiss", Frame::RowFn::NonMiss},
 };
@@ -82,156 +93,28 @@ const std::vector<EgenFnInfo>& egen_function_table() {
     return T;
 }
 
-namespace {
-int egen_integer(const std::string& raw, const std::string& context) {
-    const std::string text = trimx(raw);
-    size_t start = !text.empty() && (text[0] == '+' || text[0] == '-') ? 1 : 0;
-    if (start == text.size() ||
-        !std::all_of(text.begin() + static_cast<std::ptrdiff_t>(start), text.end(),
-                     [](unsigned char c) { return std::isdigit(c); }))
-        throw EngineError("bad_input", context + ": integer required");
-    try {
-        const long long value = std::stoll(text);
-        if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max())
-            throw std::out_of_range("integer");
-        return static_cast<int>(value);
-    } catch (const std::exception&) {
-        throw EngineError("bad_input", context + ": integer out of range");
-    }
+// BUG-471 T1: the --store-type token of every verb that stores a numeric column
+// (eval, setcol, predict -- cmds_postest.cpp declares it). Absent = double, so a
+// caller that does not ask keeps its bytes.
+StoreType parse_store_type(const std::vector<std::string>& a, const char* verb) {
+    const std::string sv = opt(a, "--store-type");
+    if (sv == "float") return StoreType::Float;
+    if (sv == "byte") return StoreType::Byte;
+    if (sv == "int") return StoreType::Int;
+    if (sv == "long") return StoreType::Long;
+    if (!sv.empty() && sv != "double")
+        throw EngineError("bad_input", std::string(verb) +
+                                           ": --store-type expects byte|int|long|float|double");
+    return StoreType::Double;
 }
 
-// Parse the two restored functions' own option grammars, including quoted
-// punctuation and nested numlist ranges; never search for option substrings.
-std::map<std::string, std::string> restored_egen_options(const std::string& text,
-                                                       bool concat) {
-    const std::unordered_set<std::string> arguments = concat
-        ? std::unordered_set<std::string>{"punct", "format", "maxlength", "by"}
-        : std::unordered_set<std::string>{"at", "group", "by"};
-    const std::unordered_set<std::string> flags = concat
-        ? std::unordered_set<std::string>{"decode"}
-        : std::unordered_set<std::string>{"icodes", "label"};
-    std::map<std::string, std::string> result;
-    size_t pos = 0;
-    while (pos < text.size()) {
-        while (pos < text.size() && (std::isspace(static_cast<unsigned char>(text[pos])) || text[pos] == ',')) ++pos;
-        if (pos == text.size()) break;
-        const size_t nameStart = pos;
-        while (pos < text.size() && (std::isalnum(static_cast<unsigned char>(text[pos])) || text[pos] == '_')) ++pos;
-        if (pos == nameStart) throw EngineError("bad_input", "egen: malformed option suffix");
-        std::string name = text.substr(nameStart, pos - nameStart);
-        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
-        if (concat && name == "p") name = "punct";
-        if (!arguments.count(name) && !flags.count(name))
-            throw EngineError("bad_input", "egen " + std::string(concat ? "concat" : "cut") +
-                                          "(): option '" + name + "' is not allowed");
-        const size_t nameEnd = pos;
-        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
-        const bool hasArgument = pos < text.size() && text[pos] == '(';
-        if (!hasArgument) pos = nameEnd;
-        std::string body;
-        if (hasArgument) {
-            const size_t bodyStart = ++pos;
-            int depth = 1;
-            char quote = 0;
-            for (; pos < text.size() && depth != 0; ++pos) {
-                const char c = text[pos];
-                if (quote) { if (c == quote) quote = 0; }
-                else if (c == '\'' || c == '"') quote = c;
-                else if (c == '(') ++depth;
-                else if (c == ')') --depth;
-            }
-            if (depth != 0 || quote) throw EngineError("bad_input", "egen: unclosed option argument");
-            body = text.substr(bodyStart, pos - bodyStart - 1);
-        }
-        if (arguments.count(name) != static_cast<size_t>(hasArgument))
-            throw EngineError("bad_input", "egen: option '" + name + "' has invalid syntax");
-        if (!result.emplace(name, std::move(body)).second)
-            throw EngineError("bad_input", "egen: duplicate option '" + name + "'");
-        if (pos < text.size() && !std::isspace(static_cast<unsigned char>(text[pos])) && text[pos] != ',')
-            throw EngineError("bad_input", "egen: options must be separated by spaces");
-    }
-    return result;
+// BUG-924: the store boundary for a column built outside Frame's own writers
+// (setcol's payload, predict's fitted values): the ONE rule Frame::set_or_replace
+// applies (frame_detail::round_to_store), never a second one.
+void round_column_to_store(double* v, size_t n, StoreType st) {
+    if (st == StoreType::Double) return;
+    for (size_t i = 0; i < n; ++i) v[i] = frame_detail::round_to_store(v[i], st);
 }
-
-// Public numlist syntax: explicit finite numbers and from(step)to sequences.
-std::vector<double> cut_numlist(const std::string& text) {
-    std::vector<double> values;
-    size_t pos = 0;
-    auto skipSpace = [&] {
-        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
-    };
-    auto number = [&](int* decimalPlaces = nullptr) {
-        skipSpace();
-        const size_t numberStart = pos;
-        const char* first = text.c_str() + pos;
-        char* last = nullptr;
-        const long double value = std::strtold(first, &last);
-        if (last == first || !std::isfinite(value))
-            throw EngineError("bad_input", "egen cut(): at() requires finite numeric edges");
-        pos = static_cast<size_t>(last - text.c_str());
-        const std::string token = text.substr(numberStart, pos - numberStart);
-        for (unsigned char c : token)
-            if (!std::isdigit(c) && c != '+' && c != '-' && c != '.' && c != 'e' && c != 'E')
-                throw EngineError("bad_input", "egen cut(): invalid at() numeric token");
-        if (decimalPlaces != nullptr) {
-            const size_t exponentPos = token.find_first_of("eE");
-            const size_t decimalPos = token.find('.');
-            const int exponent = exponentPos == std::string::npos ? 0
-                : egen_integer(token.substr(exponentPos + 1), "egen cut() at() exponent");
-            if (exponent < -10000 || exponent > 10000)
-                throw EngineError("bad_input", "egen cut(): at() exponent is out of range");
-            const size_t mantissaEnd = exponentPos == std::string::npos ? token.size() : exponentPos;
-            *decimalPlaces = (decimalPos == std::string::npos ? 0
-                : static_cast<int>(mantissaEnd - decimalPos - 1)) - exponent;
-        }
-        return value;
-    };
-    auto append = [&](double value) {
-        if (values.size() == 1600)
-            throw EngineError("bad_input", "egen cut(): at() exceeds 1600 edges");
-        values.push_back(value);
-    };
-    while (true) {
-        skipSpace();
-        if (pos == text.size()) break;
-        int firstPlaces = 0, stepPlaces = 0;
-        const long double first = number(&firstPlaces);
-        const size_t afterNumber = pos;
-        skipSpace();
-        if (pos < text.size() && text[pos] == '(') {
-            ++pos;
-            const long double step = number(&stepPlaces);
-            skipSpace();
-            if (pos == text.size() || text[pos++] != ')')
-                throw EngineError("bad_input", "egen cut(): malformed at() range");
-            const long double end = number();
-            if (step <= 0.0 || end < first)
-                throw EngineError("bad_input", "egen cut(): at() ranges must increase with a positive step");
-            const long double span = (end - first) / step;
-            if (!std::isfinite(span) || span > 1599.0 + 1e-10)
-                throw EngineError("bad_input", "egen cut(): at() exceeds 1600 edges");
-            const size_t count = static_cast<size_t>(std::floor(span + 1e-12L * std::max(1.0L, span))) + 1;
-            const long double scale = std::pow(10.0L, std::max(firstPlaces, stepPlaces));
-            for (size_t k = 0; k < count; ++k) {
-                long double value = first + static_cast<long double>(k) * step;
-                // Keep decimal steps on their stated grid, so 0(.1)1 includes
-                // the same double .3 as the explicit edge .3 on every platform.
-                const long double scaled = value * scale;
-                if (scale > 0 && std::isfinite(scaled) && std::fabs(scaled) <= 0x1p53L)
-                    value = std::round(scaled) / scale;
-                append(static_cast<double>(value));
-            }
-            if (pos < text.size() && !std::isspace(static_cast<unsigned char>(text[pos])))
-                throw EngineError("bad_input", "egen cut(): malformed at() range suffix");
-        } else {
-            append(static_cast<double>(first));
-            if (pos < text.size() && pos == afterNumber)
-                throw EngineError("bad_input", "egen cut(): invalid at() numeric token");
-        }
-    }
-    return values;
-}
-}  // namespace
 
 // cobra eval — Stata-style data prep, applied in command-line order so dependent
 // transforms work (e.g. an egen that references a column made by an earlier bygen).
@@ -246,11 +129,11 @@ int cmd_eval(const std::vector<std::string>& a) {
             "    | --gen \"o=expr\" [--gen-strict, reject if o already exists] | --egen \"o=fn(expr), by(g..)\"\n"
             "        (fn over expr: max min mean median sum count sd rank std iqr | pctile(x),p(#))\n"
             "        (fn over varlist: tag(v..) group(v..)[,missing] | seq()[,by(g..)] — running 1..N)\n"
-            "        (fn over varlist: concat(v..)[,punct(s) format(%%fmt) decode maxlength(#)] — text result)\n"
-            "    | --rowegen \"o=rowfn(v1,v2,..)\" (rowmean rowsd rowtotal rowmax rowmin rowmiss rownonmiss)\n"
+            "        (fn over varlist: concat(v..)[,punct(s) format(%%fmt) maxlength(#)] — text result)\n"
+            "    | --rowegen \"o=rowfn(v1,v2,..)[,missing]\" (rowmean rowsd rowtotal/rsum rowmax rowmin rowmiss rownonmiss)\n"
             "    | --mkspline \"stub=var, cubic [, nknots(5)] [, knots(v1,v2,..)]\" (restricted cubic spline basis)\n"
             "    | --bygen \"o=expr, by(g..), sort(t..)\" | --winsor \"o=src,plo,phi\"\n"
-            "    | --xtile \"out=var, nq(k)|cutpoints(cvar)\" | --ipolate \"out=yvar xvar [, by(g..)] [, epolate]\"\n"
+            "    | --xtile \"out=var, nq(k) [w(wvar)]|cutpoints(cvar)\" | --ipolate \"out=yvar xvar [, by(g..)] [, epolate]\"\n"
             "    | --drop v | --keepif \"expr\"\n"
             "  --fweight W applies to every var in --summarize (Stata [fw=W]; integer weights only;\n"
             "    not combinable with --detail)\n"
@@ -261,6 +144,7 @@ int cmd_eval(const std::vector<std::string>& a) {
     const Dataset& ds = acquire_data(data);
     Frame fr = frame_from_acquired(ds);
     const int64_t n0 = fr.n_rows();
+    const int64_t overflow0 = fr.store_overflow();
     bool detail = has(a, "--detail");
     // BUG-112(1) engine-half: opt-in — a bare `--gen` stays create-or-replace (every
     // existing caller, including PIET's `replace` verb which ALSO issues `--gen`, is
@@ -272,41 +156,20 @@ int cmd_eval(const std::vector<std::string>& a) {
     // integrality/variance-divisor conventions (Frame::summarize's `analytic`). Passing
     // both is a contradiction, not a precedence question, so it is rejected.
     std::string aweight = opt(a, "--aweight");
-    if (!fweight.empty() && !aweight.empty())
-        throw EngineError("bad_input", "eval --summarize: --fweight and --aweight are mutually exclusive");
+    // [iw=]: Stata's importance weight -- N is the ROW count, sum_w/sum/mean are the
+    // weighted totals and Var = Sum w(x-m)^2/(Sum w - 1) (w2aj_qualifiers.log:826
+    // qf_sw_iw_*: N 12, sum_w 28.5); any real weight is legal.
+    std::string iweight = opt(a, "--iweight");
+    if ((!fweight.empty()) + (!aweight.empty()) + (!iweight.empty()) > 1)
+        throw EngineError("bad_input", "eval --summarize: --fweight, --aweight and --iweight are mutually exclusive");
     const bool analytic_w = !aweight.empty();
-    const std::string& sumw = analytic_w ? aweight : fweight;
+    const bool importance_w = !iweight.empty();
+    const std::string& sumw = analytic_w ? aweight : importance_w ? iweight : fweight;
     std::vector<std::string> summvars;
-    std::map<std::string, std::map<int, std::string>> valueLabels;
-    const std::string labelsText = opt(a, "--value-labels");
-    if (has(a, "--value-labels")) {
-        const json labels = json::parse(labelsText, nullptr, false);
-        if (!labels.is_object())
-            throw EngineError("bad_input", "eval: --value-labels must be an object of variable-to-label objects");
-        for (auto variable = labels.begin(); variable != labels.end(); ++variable) {
-            if (variable.key().empty() || !variable.value().is_object())
-                throw EngineError("bad_input", "eval: --value-labels entries require a variable name and label object");
-            auto& codes = valueLabels[variable.key()];
-            for (auto label = variable.value().begin(); label != variable.value().end(); ++label) {
-                if (!label.value().is_string())
-                    throw EngineError("bad_input", "eval: --value-labels label texts must be strings");
-                const int code = egen_integer(label.key(), "eval --value-labels code");
-                if (!codes.emplace(code, label.value().get<std::string>()).second)
-                    throw EngineError("bad_input", "eval: --value-labels contains duplicate numeric codes");
-            }
-        }
-    }
-    json egenValueLabels = json::object();
-    json egenStoreTypes = json::object();
 
     auto egen_fn = [](const std::string& f, Frame::EgenFn& o) -> bool {
         for (const EgenExprSpec& s : EGEN_EXPR) if (f == s.name) { o = s.fn; return true; }
         return false;
-    };
-    auto pct_field = [](const Frame::Summary& s, int p) -> double {
-        switch (p) { case 1: return s.p1; case 5: return s.p5; case 10: return s.p10;
-            case 25: return s.p25; case 50: return s.p50; case 75: return s.p75;
-            case 90: return s.p90; case 95: return s.p95; case 99: return s.p99; default: return 0; }
     };
 
     // ---- time-series context: a PRE-pass, deliberately not an ordered op --------
@@ -327,31 +190,73 @@ int cmd_eval(const std::vector<std::string>& a) {
     // makes the total run over rows the qualifier excluded. Read as context
     // (like --tsset) so argv order cannot matter.
     const std::string genMask = opt(a, "--gen-mask");
+    // BUG-841/842: Stata's `in a/b` as its own channel, so group() can number within
+    // the range while an `if` (even `_n>=a & _n<=b`) does not renumber; and
+    // --gen-replace, replace's rule that a row the qualifiers exclude keeps its value.
+    // Both are context for every --gen/--bygen of this invocation, like --gen-mask.
+    GenQualifier genQual;
+    {
+        const std::string gi = opt(a, "--gen-in");
+        if (!gi.empty()) {
+            const size_t slash = gi.find('/');
+            auto bound = [&](const std::string& t) -> int64_t {
+                const std::string u = trimx(t);
+                if (u.empty() || u.find_first_not_of("0123456789") != std::string::npos)
+                    throw EngineError("bad_input", "eval: --gen-in expects FIRST/LAST "
+                                                   "observation numbers, got '" + gi + "'");
+                return std::stoll(u);
+            };
+            if (slash == std::string::npos)
+                throw EngineError("bad_input", "eval: --gen-in expects FIRST/LAST "
+                                               "observation numbers, got '" + gi + "'");
+            genQual.in_first = bound(gi.substr(0, slash));
+            genQual.in_last = bound(gi.substr(slash + 1));
+            if (genQual.in_first < 1)
+                throw EngineError("bad_input", "eval: --gen-in's first observation must be "
+                                               "at least 1, got '" + gi + "'");
+        }
+        genQual.keep_unselected = has(a, "--gen-replace");
+    }
     // BUG-471 T1: the Stata storage type every --gen/--egen/--rowegen/--bygen output
     // of this invocation is stored as (Frame::set_or_replace rounds to it). Read once,
     // as context. Absent = double, so every existing caller's bytes are unchanged.
     // egen tag()/seq()/mode() ignore it (as their ados do); the replace-built egen results
     // refuse byte/int/long (Frame::row_egen, egen_by rank, egen_cut).
-    StoreType storeType = StoreType::Double;
-    {
-        const std::string sv = opt(a, "--store-type");
-        if (sv == "float") storeType = StoreType::Float;
-        else if (sv == "byte") storeType = StoreType::Byte;
-        else if (sv == "int") storeType = StoreType::Int;
-        else if (sv == "long") storeType = StoreType::Long;
-        else if (!sv.empty() && sv != "double")
-            throw EngineError("bad_input", "eval: --store-type expects byte|int|long|float|double");
-    }
+    const StoreType storeType = parse_store_type(a, "eval");
     // The tsset variable's display format, for tin()/twithin() literals.
     { const std::string tf = opt(a, "--tsfmt"); if (!tf.empty()) fr.set_ts_format(tf); }
     // B3(c): draw coordinates. `set seed` is remembered by the PIET session --
     // this process is a subprocess and remembers nothing -- so the seed and a
-    // per-call stream number ride the argv the way tsset does.
+    // per-call stream number ride the argv the way tsset does. They belong to
+    // this call: a Frame expression call spends them when it returns, and the
+    // guard drops them on every other way out, so a call that fails before any
+    // expression ran (the --xtset/--tsset pass below, a malformed --rng-mt64 or
+    // --gen) does not lend them to the next `cobra serve` request (BUG-1200).
+    struct RngCoordsGuard {
+        ~RngCoordsGuard() { cecon::clear_rng_coords(); }
+    } rng_coords_guard;
     {
         const std::string sd = opt(a, "--rng-seed"), st = opt(a, "--rng-stream");
         if (!sd.empty() || !st.empty())
             cecon::set_rng_coords(sd.empty() ? 123456789LL : std::stoll(sd),
                                   st.empty() ? 0LL : std::stoll(st));
+    }
+    // Stata's session stream (core/rng_mt64.h): PIET sends its c(rngstate)-format
+    // state, the draws come off it in evaluation order, and the response says how
+    // many raw draws were taken (`rng_draws`) so the session can skip past them.
+    // The guard turns the stream off on every exit, so a resident `cobra serve`
+    // never lends it to the next request.
+    struct Mt64CallGuard {
+        ~Mt64CallGuard() { (void)cecon::end_rng_mt64(); }
+    } mt64_guard;
+    bool mt64_on = false;
+    {
+        const std::string ms = opt(a, "--rng-mt64");
+        if (!ms.empty()) {
+            if (!cecon::begin_rng_mt64(ms))
+                throw EngineError("bad_input", "eval: --rng-mt64 is not an mt64 state string");
+            mt64_on = true;
+        }
     }
     for (size_t i = 0; i + 1 < a.size(); ++i) {
         if (a[i] == "--xtset") {
@@ -369,6 +274,8 @@ int cmd_eval(const std::vector<std::string>& a) {
     for (size_t i = 0; i + 1 < a.size(); ++i) {
         const std::string& f = a[i];
         const std::string v = a[i + 1];
+        const size_t at = i;
+        bool op = true;  // f is one of the ops below, and v its value
         if (f == "--xtset" || f == "--tsset" || f == "--tsdelta") {
             ++i;  // already applied by the ts pre-pass above — see its comment
         } else if (f == "--tsma") {
@@ -385,19 +292,15 @@ int cmd_eval(const std::vector<std::string>& a) {
         } else if (f == "--gen") {
             size_t eq = find_assign(v);
             if (eq == std::string::npos) { std::fprintf(stderr, "bad --gen '%s'\n", v.c_str()); return 2; }
-            fr.generate(trimx(v.substr(0, eq)), v.substr(eq + 1), genStrict, genMask, storeType); ++i;
+            fr.generate(trimx(v.substr(0, eq)), v.substr(eq + 1), genStrict, genMask, storeType,
+                        genQual); ++i;
         } else if (f == "--egen") {
             size_t eq = find_assign(v);
-            if (eq == std::string::npos)
-                throw EngineError("bad_input", "egen: expected output=function(arguments)");
             std::string outn = trimx(v.substr(0, eq)), rhs = trimx(v.substr(eq + 1));
             size_t fp = rhs.find('(');
-            if (fp == std::string::npos)
-                throw EngineError("bad_input", "egen: function arguments require parentheses");
             std::string fnm = trimx(rhs.substr(0, fp));
             int depth = 1; size_t p = fp + 1, st = p;
             for (; p < rhs.size() && depth > 0; ++p) { if (rhs[p] == '(') ++depth; else if (rhs[p] == ')') --depth; }
-            if (depth != 0) throw EngineError("bad_input", "egen: unclosed function arguments");
             std::string inner = rhs.substr(st, p - 1 - st);
             std::string opts = rhs.substr(p);  // tail after the inner ')': options like , by(..) p(..)
             std::vector<std::string> by = split_vars(paren_arg(opts, "by"));
@@ -415,9 +318,9 @@ int cmd_eval(const std::vector<std::string>& a) {
                 const std::string needle(w);
                 for (size_t p2 = hay.find(needle); p2 != std::string::npos;
                      p2 = hay.find(needle, p2 + 1)) {
-                    const bool lok = (p2 == 0) || !(std::isalnum(static_cast<unsigned char>(hay[p2 - 1])) || hay[p2 - 1] == '_');
+                    const bool lok = (p2 == 0) || !cecon::ident::isIdentByte(hay[p2 - 1]);
                     const size_t e = p2 + needle.size();
-                    const bool rok = (e >= hay.size()) || !(std::isalnum(static_cast<unsigned char>(hay[e])) || hay[e] == '_');
+                    const bool rok = (e >= hay.size()) || !cecon::ident::isIdentByte(hay[e]);
                     if (lok && rok) return true;
                 }
                 return false;
@@ -429,62 +332,77 @@ int cmd_eval(const std::vector<std::string>& a) {
                 mo.missing_as_value = has_word(opts, "missing");
                 std::string nm = paren_arg(opts, "nummode");
                 if (!nm.empty()) mo.nummode = std::stoi(trimx(nm));
-                // _gmode.ado:19 stores in the source's own type: --store-type does not reach it.
+                // egen mode stores in the source's own type: --store-type does not reach it.
                 fr.egen_mode(outn, inner, by, mo); ++i;
             } else if (fnm == "nvals") {
                 fr.egen_nvals(outn, split_vars(inner), by, has_word(opts, "missing"), storeType); ++i;
             } else if (fnm == "concat") {
-                const auto parsed = restored_egen_options(opts, true);
-                if (parsed.count("by"))
-                    throw EngineError("bad_input", "egen concat(): may not be combined with by");
+                // Stata refuses a `by` prefix on concat() with r(190), as it does
+                // for cut() (help egen: "may not be combined with by"; BUG-1106).
+                if (!by.empty())
+                    throw EngineError("bad_input",
+                        "egen concat(): may not be combined with by");
                 Frame::ConcatOpts co;
+                // punct("_") / format(%9.2f) arrive with their quotes when the caller
+                // wrote any; strip ONE matching pair, never trim the content itself —
+                // a separator of "  " is a legitimate two-space separator.
                 auto unquote = [](std::string s) {
-                    s = trimx(s);
                     if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"') ||
                                           (s.front() == '\'' && s.back() == '\'')))
                         s = s.substr(1, s.size() - 2);
                     return s;
                 };
-                if (auto option = parsed.find("punct"); option != parsed.end()) co.punct = unquote(option->second);
-                if (auto option = parsed.find("format"); option != parsed.end()) {
-                    co.format = trimx(unquote(option->second));
-                    if (co.format.empty()) throw EngineError("bad_input", "egen concat(): format() cannot be empty");
+                co.punct = unquote(paren_arg(opts, "punct"));
+                co.format = trimx(unquote(paren_arg(opts, "format")));
+                co.decode = has_word(opts, "decode");
+                // Only the long spelling is read. paren_arg does a plain substring
+                // find, so a bare `length(` probe would also match inside
+                // `maxlength(` (the mkspline knots/nknots hazard above) — concat has
+                // no `length()` option, so there is nothing to disambiguate and
+                // nothing that could be read twice.
+                std::string ml = trimx(paren_arg(opts, "maxlength"));
+                if (!ml.empty()) {
+                    // Stata accepts only an integer in [1, 32000]; anything else, a
+                    // non-integer included, is r(198) "invalid maxlength( )" (egen-six
+                    // k4; measured on StataBE) — so "12abc" must be rejected,
+                    // not silently read as 12.
+                    bool ok = true;
+                    for (size_t q = 0; q < ml.size(); ++q)
+                        if (!std::isdigit(static_cast<unsigned char>(ml[q])) &&
+                            !(q == 0 && (ml[q] == '-' || ml[q] == '+'))) ok = false;
+                    long parsed = 0;
+                    if (ok) { try { parsed = std::stol(ml); } catch (const std::exception&) { ok = false; } }
+                    if (!ok || parsed < 1 || parsed > 32000)
+                        throw EngineError("bad_input", "egen concat(): invalid maxlength( )");
+                    co.maxlength = static_cast<int>(parsed);
                 }
-                co.decode = parsed.count("decode") != 0;
-                co.valueLabels = valueLabels;
-                if (auto option = parsed.find("maxlength"); option != parsed.end()) {
-                    co.maxlength = egen_integer(option->second, "egen concat() maxlength()");
-                    if (co.maxlength < 1 || co.maxlength > 32000)
-                        throw EngineError("bad_input", "egen concat(): maxlength() must be between 1 and 32000");
-                }
+                // Text result: --store-type (a numeric storage type) does not reach it.
                 fr.egen_concat(outn, split_vars(inner), co); ++i;
             } else if (fnm == "cut") {
-                const auto parsed = restored_egen_options(opts, false);
-                if (parsed.count("by")) throw EngineError("bad_input", "egen cut(): may not be combined with by");
+                // Stata refuses a `by` prefix on cut() with r(190) — captured in
+                // egen-six as `c7_by_prefix` rc 190.
+                if (!by.empty())
+                    throw EngineError("bad_input", "egen cut(): may not be combined with by");
                 Frame::CutOpts co;
-                if (parsed.count("at") == parsed.count("group"))
-                    throw EngineError("bad_input", "egen cut(): specify exactly one of at() or group()");
-                if (auto option = parsed.find("at"); option != parsed.end()) {
-                    co.at = cut_numlist(option->second);
-                    if (co.at.empty()) throw EngineError("bad_input", "egen cut(): at() cannot be empty");
+                std::string at = paren_arg(opts, "at");
+                if (!at.empty()) {
+                    // Stata numlist accepts a `from(step)to` range — `at(0(.1)1)`. NOT
+                    // supported here on purpose: the egen-six capture shows Stata's own
+                    // answer for that form is the FLOAT-rounded bin (d = 0.29999999999
+                    // lands in [0.3,0.4), icode 3, not 2), and a double-precision
+                    // expansion of the range would silently disagree. Refuse until a
+                    // capture pins where the rounding happens.
+                    if (at.find('(') != std::string::npos)
+                        throw EngineError("bad_input",
+                            "egen cut(): at() numlist ranges like 0(.1)1 are not supported — "
+                            "list the edges explicitly");
+                    for (const auto& t : split_vars(at)) co.at.push_back(std::stod(t));
                 }
-                if (auto option = parsed.find("group"); option != parsed.end())
-                    co.group = egen_integer(option->second, "egen cut() group()");
-                co.icodes = parsed.count("icodes") != 0;
-                co.label = parsed.count("label") != 0;
-                std::map<int, std::string> labels;
-                StoreType storedType;
-                fr.egen_cut(outn, trimx(inner), co, storeType, &labels, &storedType);
-                const char* storedName = storedType == StoreType::Byte ? "byte"
-                    : storedType == StoreType::Int ? "int" : storedType == StoreType::Long ? "long"
-                    : storedType == StoreType::Float ? "float" : "double";
-                egenStoreTypes[outn] = storedName;
-                if (co.label) {
-                    json encoded = json::object();
-                    for (const auto& label : labels) encoded[std::to_string(label.first)] = label.second;
-                    egenValueLabels[outn] = std::move(encoded);
-                }
-                ++i;
+                std::string gp = paren_arg(opts, "group");
+                if (!gp.empty()) co.group = std::stoi(trimx(gp));
+                co.icodes = has_word(opts, "icodes");
+                co.label = has_word(opts, "label");
+                fr.egen_cut(outn, trimx(inner), co, storeType); ++i;
             } else if (varlist_egen && fnm == "tag") {
                 // _gtag.ado ignores the requested type: --store-type does not reach it.
                 fr.egen_tag(outn, split_vars(inner)); ++i;
@@ -505,7 +423,7 @@ int cmd_eval(const std::vector<std::string>& a) {
                 const double sq_from = num("from", "f", 1.0, nullptr);
                 const double sq_to = num("to", "t", 0.0, &has_to);
                 const double sq_block = num("block", "b", 1.0, nullptr);
-                // _gseq.ado ignores the requested type: --store-type does not reach it.
+                // Stata's seq() ignores the requested type: --store-type does not reach it.
                 fr.egen_seq(outn, by, sq_from, sq_to, has_to,
                             static_cast<int64_t>(sq_block)); ++i;
             } else if (varlist_egen) {
@@ -517,7 +435,7 @@ int cmd_eval(const std::vector<std::string>& a) {
                 if (!egen_fn(fnm, ef)) { std::fprintf(stderr, "--egen unknown fn '%s'\n", fnm.c_str()); return 2; }
                 // B4/W6: rank's three tie rules are OPTIONS, so they are resolved here
                 // rather than spelled as separate function names (Stata spells them
-                // `egen r = rank(x), track|field|unique`). Oracle private_oracle_b/_c.
+                // `egen r = rank(x), track|field|unique`). Oracle captures b and c.
                 if (ef == Frame::EgenFn::Rank) {
                     const bool trk = has_word(opts, "track"), fld = has_word(opts, "field"),
                                unq = has_word(opts, "unique");
@@ -533,7 +451,23 @@ int cmd_eval(const std::vector<std::string>& a) {
                     std::string ps = paren_arg(opts, "p");
                     if (!ps.empty()) pp = std::stod(trimx(ps));
                 }
-                fr.egen_by(outn, ef, inner, by, pp, storeType); ++i;
+                // BUG-1001: the options the ados read (see Frame::EgenOpts); each is
+                // read only for its own function, so `missing` on max() stays inert
+                // here exactly as before (PIET's per-function net refuses it).
+                Frame::EgenOpts eo;
+                if (ef == Frame::EgenFn::Sum) eo.missing = has_word(opts, "missing");
+                if (ef == Frame::EgenFn::Pc) eo.pc_prop = has_word(opts, "prop");
+                if (ef == Frame::EgenFn::Sum || ef == Frame::EgenFn::Mean)
+                    eo.data_order = has_word(opts, "dataorder");
+                if (ef == Frame::EgenFn::Std) {
+                    const std::string mv = trimx(paren_arg(opts, "mean"));
+                    const std::string sv = trimx(paren_arg(opts, "sd"));
+                    if (!mv.empty()) eo.std_mean = std::stod(mv);
+                    if (!sv.empty()) eo.std_sd = std::stod(sv);
+                    if (!(eo.std_sd > 0.0))
+                        throw EngineError("bad_input", "egen std(): sd() must be positive");
+                }
+                fr.egen_by(outn, ef, inner, by, pp, storeType, eo); ++i;
             }
         } else if (f == "--rowegen") {
             // egen row function across columns: out = rowfn(v1,v2,...)
@@ -545,8 +479,16 @@ int cmd_eval(const std::vector<std::string>& a) {
             std::vector<std::string> vars = split_vars(rhs.substr(fp + 1, rp - fp - 1));
             const EgenRowSpec* rs = nullptr;
             for (const EgenRowSpec& s : EGEN_ROW) if (fnm == s.name) { rs = &s; break; }
-            if (!rs) { std::fprintf(stderr, "--rowegen unknown fn '%s' (rowmean/rowsd/rowtotal/rowmax/rowmin/rowmiss/rownonmiss)\n", fnm.c_str()); return 2; }
-            fr.row_egen(outn, rs->fn, vars, storeType); ++i;
+            if (!rs) { std::fprintf(stderr, "--rowegen unknown fn '%s' (rowmean/rowsd/rowtotal/rsum/rowmax/rowmin/rowmiss/rownonmiss)\n", fnm.c_str()); return 2; }
+            // BUG-1001: `, missing` after the varlist -- rowtotal()/rsum()'s only
+            // option (help egen).
+            const std::string tail = rhs.substr(rp + 1);
+            const bool row_missing =
+                rs->fn == Frame::RowFn::Total && tail.find("missing") != std::string::npos;
+            // `, strok`: rownonmiss()'s only option (help egen).
+            const bool row_strok =
+                rs->fn == Frame::RowFn::NonMiss && tail.find("strok") != std::string::npos;
+            fr.row_egen(outn, rs->fn, vars, storeType, row_missing, row_strok); ++i;
         } else if (f == "--mkspline") {
             // classic mkspline ,cubic (RCS): out = stub; generates stub1..stub(nk-1)
             size_t eq = find_assign(v);
@@ -588,19 +530,34 @@ int cmd_eval(const std::vector<std::string>& a) {
             std::string expr = (cpos == std::string::npos) ? rhs : trimx(rhs.substr(0, cpos));
             std::string opts = (cpos == std::string::npos) ? "" : rhs.substr(cpos + 1);
             fr.bygen(outn, expr, split_vars(paren_arg(opts, "by")), split_vars(paren_arg(opts, "sort")),
-                     genMask, storeType); ++i;
+                     genMask, storeType, genQual); ++i;
         } else if (f == "--winsor") {
             size_t eq = find_assign(v);
             std::string outn = trimx(v.substr(0, eq));
             auto p = split_csv(v.substr(eq + 1));  // src, plo, phi
             if (p.size() != 3) { std::fprintf(stderr, "--winsor expects \"out=src,plo,phi\"\n"); return 2; }
-            Frame::Summary s = fr.summarize(p[0], true);
-            double lo = pct_field(s, std::stoi(p[1])), hi = pct_field(s, std::stoi(p[2]));
+            // Stata's _pctile at ANY cut (core/stata_pctile.h): the Summary
+            // fields hold nine percentiles, and the old lookup answered 0 for every
+            // other, so `winsor2 x, cuts(0 98)` set each value to 0 (AER 007's
+            // text_prev_24hr_w3; StataBE uni-oracle/wq.do).
+            double lo, hi;
+            {
+                const F64Reader r = fr.col(p[0]).f64.reader();
+                std::vector<double> vals;
+                vals.reserve(static_cast<std::size_t>(fr.n_rows()));
+                for (int64_t q = 0; q < fr.n_rows(); ++q) {
+                    const double x = r[static_cast<std::size_t>(q)];
+                    if (!std::isnan(x)) vals.push_back(x);
+                }
+                std::sort(vals.begin(), vals.end());
+                lo = cecon::stata_pctile_sorted(vals, std::stod(p[1]));
+                hi = cecon::stata_pctile_sorted(vals, std::stod(p[2]));
+            }
             char buf[256];
             std::snprintf(buf, sizeof buf,
                 "cond(missing(%s), ., cond(%s>%.17g, %.17g, cond(%s<%.17g, %.17g, %s)))",
                 p[0].c_str(), p[0].c_str(), hi, hi, p[0].c_str(), lo, lo, p[0].c_str());
-            fr.generate(outn, buf); ++i;
+            fr.generate(outn, buf, false, "", storeType); ++i;  // the source's type (winsor2 clonevar)
         } else if (f == "--xtile") {
             // xtile out = var, nq(k)
             size_t eq = find_assign(v);
@@ -618,7 +575,8 @@ int cmd_eval(const std::vector<std::string>& a) {
                 std::string nqs = paren_arg(opts, "nq");
                 if (nqs.empty()) nqs = paren_arg(opts, "nquantiles");
                 int nq = nqs.empty() ? 4 : std::stoi(trimx(nqs));
-                fr.xtile(outn, var, nq); ++i;
+                // BUG-1015: `w(wvar)` -- the [aw=]/[fw=] weight of the cutpoints.
+                fr.xtile(outn, var, nq, trimx(paren_arg(opts, "w"))); ++i;
             }
         } else if (f == "--ipolate") {
             // ipolate out = yvar xvar [, by(g..)] [, epolate]  (Stata `ipolate yvar xvar, gen() [epolate]`)
@@ -657,12 +615,22 @@ int cmd_eval(const std::vector<std::string>& a) {
             ++i;
         } else if (f == "--summarize") {
             for (const std::string& sv : split_csv(v)) summvars.push_back(sv); ++i;
+        } else {
+            op = false;
+        }
+        // BUG-1181: this scanner reads its ops without opt()/has(), so it marks
+        // them consumed itself; the E6 net (dispatch_guard) then refuses any other
+        // `--flag`, which it used to ignore -- `--store-type` sent to an engine
+        // that predates it stored doubles at rc 0.
+        if (op) {
+            mark_consumed(a, at);
+            mark_consumed(a, at + 1);
         }
     }
 
     json summ = json::object();
     for (const std::string& v : summvars) {
-        Frame::Summary s = fr.summarize(v, detail, sumw, analytic_w);
+        Frame::Summary s = fr.summarize(v, detail, sumw, analytic_w, nullptr, importance_w);
         json js = {{"N", s.n}, {"mean", s.mean}, {"sd", s.sd}, {"min", s.min}, {"max", s.max}};
         // BUG-344: r(sum)/r(sum_w) are posted by EVERY Stata summarize — plain, detail,
         // and meanonly alike — so they cannot be gated on `detail` (which is a display
@@ -683,11 +651,13 @@ int cmd_eval(const std::vector<std::string>& a) {
     // the session); one-shot keeps the exact old guarded write + "wrote" notice. The
     // n_rows/n_cols log below reads fr BEFORE any staging move, so it's unaffected.
     json log = {{"n_rows", fr.n_rows()}, {"n_rows_initial", n0}, {"n_cols", fr.n_cols()}};
+    // BUG-1123: the values this call's --store-type turned into missing (absent when
+    // none), so PIET's generate note can leave them out as Stata's does.
+    if (const int64_t k = fr.store_overflow() - overflow0; k > 0) log["store_overflow"] = k;
     if (!commit_frame(std::move(fr), out) && !out.empty())
         std::fprintf(stderr, "wrote %s\n", out.c_str());
     if (!summ.empty()) log["summarize"] = summ;
-    if (!egenValueLabels.empty()) log["egen_value_labels"] = std::move(egenValueLabels);
-    if (!egenStoreTypes.empty()) log["egen_store_types"] = std::move(egenStoreTypes);
+    if (mt64_on) log["rng_draws"] = cecon::end_rng_mt64();
     emit(log, "");
     return 0;
 }
@@ -719,6 +689,23 @@ int cmd_info(const std::string& path) {
 // a resident §26 session, which supplies the frame). Signing must not materialize a
 // borrowed column, which is why this hands `frame_from_acquired`'s Frame straight to
 // a const-only reader instead of copying anything out of it.
+// e(sample) T2 (internal note esample/SPEC.md §4.3): every column
+// PIET names with the `__piet_` prefix is PIET's own (today the one that persists
+// on the working frame is the estimation-sample mask `__piet_esample__`, which
+// PIET hides from its listings, piet::isHiddenColumn in
+// piet/native/include/piet/datastore.h; the rest are scratch). None is the
+// user's data, so the two verbs that describe or write the user's data drop them:
+// datasignature (Stata's signature never sees e(sample)) and export-dta (PIET's
+// save/saveold/tempfile path; Stata's `save` does not write the marker either --
+// w2_esample.log E14 reads e(sample) 0 after `use` of a saved copy). Kept here,
+// not in src/data/frame.h, because only these command verbs apply the rule.
+static void drop_piet_hidden_columns(Frame& fr) {
+    std::vector<std::string> hidden;
+    for (const auto& c : fr.columns())
+        if (c.name.rfind("__piet_", 0) == 0) hidden.push_back(c.name);
+    for (const auto& n : hidden) fr.drop(n);
+}
+
 int cmd_datasignature(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data");
     if (data_missing(data)) {
@@ -731,7 +718,35 @@ int cmd_datasignature(const std::vector<std::string>& a) {
     }
     const Dataset& ds = acquire_data(data);
     Frame fr = frame_from_acquired(ds);
-    std::printf("%s\n", data_signature(fr).c_str());
+    // --unordered [--types v1=byte,v2=str5,...] (BUG-1461): PIET's user-facing
+    // `datasignature` -- row order left out of the value plane and each named
+    // column's Stata storage type signed with it, as Stata's signature is.
+    SignatureOptions sopts;
+    sopts.unordered = has(a, "--unordered");
+    for (const auto& t : split_csv(opt(a, "--types"))) {
+        const std::string kv = trimx(t);
+        const std::size_t eq = kv.find('=');
+        if (eq != std::string::npos) sopts.types[kv.substr(0, eq)] = kv.substr(eq + 1);
+    }
+    // --vars v1,v2,... [--keepif EXPR]: the estimation-sample signature a fit posts
+    // as e(datasignature) (signestimationsample: `_datasignature varlist, esample
+    // nonames`), over the named columns in order -- repeats allowed -- and the rows
+    // EXPR keeps (PIET passes its e(sample) mask). Without --vars the verb is the
+    // whole-frame `datasignature` above, unchanged.
+    const std::string vars = opt(a, "--vars");
+    if (!vars.empty()) {
+        const std::string keepif = opt(a, "--keepif");
+        if (!keepif.empty()) fr.keep_if(keepif);
+        std::vector<std::string> names;
+        for (const auto& t : split_csv(vars)) {
+            std::string v = trimx(t);
+            if (!v.empty()) names.push_back(v);
+        }
+        std::printf("%s\n", data_signature_vars(fr, names, sopts).c_str());
+        return 0;
+    }
+    drop_piet_hidden_columns(fr);
+    std::printf("%s\n", data_signature(fr, sopts).c_str());
     return 0;
 }
 
@@ -988,7 +1003,9 @@ int cmd_joinby(const std::vector<std::string>& a) {
                              "  every master row, emits one row per using row sharing ALL key values (the\n"
                              "  full within-key Cartesian cross); a master row with zero using matches is\n"
                              "  DROPPED entirely. Factor keys match by LEVEL STRING, not per-file code.\n"
-                             "  A non-key column name present on both sides is bad_input.\n");
+                             "  A non-key column name present on both sides is bad_input.\n"
+                             "  [--unmatched none|master|using|both] [--merge-var NAME]: keep the\n"
+                             "  unmatched rows (codes 1/2) and add the 1/2/3 marker (joinby.ado).\n");
         return 2;
     }
     // COBRA_VERB_DIAG (measurement-only, see src/core/verb_diag.h): phase split of
@@ -1010,7 +1027,8 @@ int cmd_joinby(const std::vector<std::string>& a) {
 
     int64_t n_master = master.n_rows(), n_using = usingf.n_rows();
     const auto t_kernel0 = cecon::verb_diag_now(kVerbDiag);
-    Frame res = master.joinby(usingf, keys);
+    // joinby.ado's unmatched() (none|master|using|both) and its marker.
+    Frame res = master.joinby(usingf, keys, opt(a, "--unmatched"), opt(a, "--merge-var"));
     const double kernel_ms = cecon::verb_diag_ms(kVerbDiag, t_kernel0);
     int64_t nrows = res.n_rows();  // capture before the move into commit_frame
 
@@ -1161,7 +1179,10 @@ int cmd_contract(const std::vector<std::string>& a) {
 int cmd_merge(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data"), usingp = opt(a, "--using"), out = opt(a, "--out");
     std::string type = opt(a, "--type"), keyspec = opt(a, "--key");
-    if (data_missing(data) || usingp.empty() || out_missing(out) || type.empty() || keyspec.empty()) {
+    const bool stata_plan = has(a, "--stata-plan");
+    const bool sequential = stata_plan && has(a, "--sequential");
+    if (data_missing(data) || usingp.empty() || out_missing(out) || type.empty() ||
+        (keyspec.empty() && !sequential)) {
         std::fprintf(stderr, "usage: cobra merge --data master.hbin --using using.(hbin|dta|csv) "
                              "--type 1:1|m:1|1:m --key k1,k2\n"
                              "  [--keepusing v1,v2] [--nogenerate | --generate NAME]\n"
@@ -1170,10 +1191,14 @@ int cmd_merge(const std::vector<std::string>& a) {
                              "     where the master merely disagrees; the marker gains 4=missing updated\n"
                              "     and 5=nonmissing conflict, assigned per ROW over all overlapping vars)\n"
                              "  [--keep master|using|matched|all|1..5] [--assert match|master|using|all]\n"
-                             "  [--keepif EXPR] --out new.hbin\n");
+                             "  [--keepif EXPR] --out new.hbin\n"
+                             "  [--stata-plan [--sequential] [--sorted]]  (Stata's built-in _merge row\n"
+                             "     plan: key-sorted master, appended rows in using key order, using\n"
+                             "     values on using-only rows, exact keep/assert codes; --type m:m;\n"
+                             "     --sequential = merge 1:1 _n with no --key; --sorted = no re-sort)\n");
         return 2;
     }
-    if (type != "1:1" && type != "m:1" && type != "1:m")
+    if (type != "1:1" && type != "m:1" && type != "1:m" && !(stata_plan && type == "m:m"))
         throw EngineError("bad_input", "merge: --type must be 1:1, m:1, or 1:m");
 
     // WS-D2 / S06 ARC-MRG. The P2-PERF close NAMED merge as opening its files three
@@ -1216,7 +1241,10 @@ int cmd_merge(const std::vector<std::string>& a) {
 
     MergeOpts opts;
     opts.type = type;
-    opts.keylist = split_csv(keyspec);
+    opts.keylist = sequential ? std::vector<std::string>{} : split_csv(keyspec);
+    opts.stata_plan = stata_plan;
+    opts.sequential = sequential;
+    opts.presorted = stata_plan && has(a, "--sorted");
     opts.keepusing = split_csv(opt(a, "--keepusing"));
     opts.nogenerate = has(a, "--nogenerate");
     // `merge ..., update [replace]`. `--replace` alone is legal and means the same as
@@ -1464,8 +1492,12 @@ int cmd_encode(const std::vector<std::string>& a) {
     if (!commit_frame(std::move(fr), out))  // §26: stage into resident session, or write+notice one-shot
         std::fprintf(stderr, "encode: wrote %s (%s -> %s, %d levels)\n",
                     out.c_str(), var.c_str(), gen.c_str(), static_cast<int>(levels.size()));
+    // BUG-1372: substr() counts bytes, so a level can end inside a character; it
+    // travels escaped, as in the .hbin header, and PIET's runEncode turns it back.
+    std::vector<std::string> sent;
+    for (const auto& l : levels) sent.push_back(hbin_level_json_text(l));
     json result = {{"command", "encode"}, {"var", var}, {"gen", gen},
-                   {"n_levels", static_cast<int>(levels.size())}, {"levels", levels}};
+                   {"n_levels", static_cast<int>(levels.size())}, {"levels", sent}};
     emit(result, "");  // stdout, regardless of --out (which is the .hbin target here)
     return 0;
 }
@@ -1478,25 +1510,107 @@ int cmd_encode(const std::vector<std::string>& a) {
 // column/dictionary byte is preserved. --var existing + no --new = in-place replace
 // (dtype MAY change, e.g. factor->f64 = destring); --var new + --new = append at the
 // END; a mismatched NAME/--new combination is bad_input (Frame::setcol/read_csv_column
-// own every validation rule — see frame.h doc comments).
+// own every validation rule — see frame.h doc comments). --store-type T (f64 only)
+// stores every value as Stata's type T holds it (BUG-924: PIET's predict writes its
+// natively computed statistics here, float by default).
 int cmd_setcol(const std::vector<std::string>& a) {
     std::string data = opt(a, "--data"), var = opt(a, "--var"), values = opt(a, "--values"),
                dtype = opt(a, "--dtype"), out = opt(a, "--out");
     bool is_new = has(a, "--new");
     if (data_missing(data) || var.empty() || values.empty() || dtype.empty() || out_missing(out)) {
         std::fprintf(stderr, "usage: cobra setcol --data f.hbin --var NAME --values FILE.csv "
-                             "--dtype f64|factor [--new] [--keepif EXPR] --out new.hbin\n"
+                             "--dtype f64|factor [--new] [--ones-as V] [--store-type T] "
+                             "[--keepif EXPR] --out new.hbin\n"
                              "  FILE.csv: single column, ONE raw value per row, NO header; row count\n"
                              "  must equal the dataset's n_rows exactly. --new appends NAME as a\n"
                              "  brand-new column (NAME must not already exist); without --new, NAME is\n"
                              "  replaced in place (NAME must already exist; dtype may change, e.g.\n"
-                             "  factor->f64 = destring).\n");
+                             "  factor->f64 = destring). --ones-as V: FILE is a 0/1 indicator and\n"
+                             "  each 1 is stored as V (f64 only). --store-type byte|int|long|float|double\n"
+                             "  stores each value as that Stata type holds it (f64 only).\n");
         return 2;
     }
+    const StoreType storeType = parse_store_type(a, "setcol");
+    if (storeType != StoreType::Double && dtype != "f64")
+        throw EngineError("bad_input", "setcol: --store-type requires --dtype f64");
     data = maybe_keepif(data, opt(a, "--keepif"));
     const Dataset& ds = acquire_data(data);
     Frame fr = frame_from_acquired(ds);
-    FrameColumn newcol = Frame::read_csv_column(values, dtype, fr.n_rows());
+    // `--ones-as V` (e(sample) T2): the values file is the 0/1 indicator a fit
+    // wrote (`--esample-out`), and every 1 is stored as V -- PIET's per-install
+    // serial for the estimation-sample mask. Parsed here line by line ("0" or "1",
+    // nothing else, one per row): the general CSV reader paid a string per row,
+    // and PIET used to read and rewrite the whole file per fit first. Any other
+    // line is refused, so a file that is not that indicator is never stored.
+    FrameColumn newcol;
+    const std::string ones_as = opt(a, "--ones-as");
+    if (!ones_as.empty()) {
+        double v = 0.0;
+        try {
+            size_t used = 0;
+            v = std::stod(ones_as, &used);
+            if (used != ones_as.size()) throw std::invalid_argument(ones_as);
+        } catch (const std::exception&) {
+            throw EngineError("bad_input", "setcol: --ones-as must be a number (got '" + ones_as + "')");
+        }
+        if (dtype != "f64")
+            throw EngineError("bad_input", "setcol: --ones-as requires --dtype f64");
+        std::ifstream in(to_native_path(values), std::ios::binary | std::ios::ate);
+        if (!in) throw EngineError("data_io", "setcol: cannot open --values file: " + values, values);
+        const std::streamoff size = in.tellg();
+        std::string body(static_cast<size_t>(size > 0 ? size : 0), '\0');
+        in.seekg(0);
+        if (size > 0 && !in.read(&body[0], size))
+            throw EngineError("data_io", "setcol: cannot read --values file: " + values, values);
+        const int64_t n_rows = fr.n_rows();
+        std::vector<double> cells(static_cast<size_t>(n_rows), 0.0);
+        auto refuse = [&](int64_t row) {
+            throw EngineError("bad_input",
+                "setcol: --ones-as needs a 0/1 values file; row " + std::to_string(row) +
+                " is not 0 or 1", values);
+        };
+        if (body.size() == 2 * static_cast<size_t>(n_rows)) {
+            // The engine's own layout: exactly "0\n" or "1\n" per row.
+            for (int64_t i = 0; i < n_rows; ++i) {
+                const char c = body[2 * static_cast<size_t>(i)];
+                if ((c != '0' && c != '1') || body[2 * static_cast<size_t>(i) + 1] != '\n')
+                    refuse(i + 1);
+                if (c == '1') cells[static_cast<size_t>(i)] = v;
+            }
+        } else {
+            // Any other layout (CRLF, a missing final newline, a wrong row count).
+            int64_t row = 0;
+            size_t pos = 0;
+            while (pos < body.size()) {
+                size_t eol = body.find('\n', pos);
+                if (eol == std::string::npos) eol = body.size();
+                size_t len = eol - pos;
+                if (len > 0 && body[pos + len - 1] == '\r') --len;
+                ++row;
+                if (len != 1 || (body[pos] != '0' && body[pos] != '1')) refuse(row);
+                if (row > n_rows) break;
+                if (body[pos] == '1') cells[static_cast<size_t>(row - 1)] = v;
+                pos = eol + 1;
+            }
+            if (row != n_rows)
+                throw EngineError("bad_input", "setcol: --values has " + std::to_string(row) +
+                    " row(s), the dataset has " + std::to_string(n_rows) +
+                    " — row counts must match exactly", values);
+        }
+        newcol.is_factor = false;
+        newcol.f64 = std::move(cells);
+    } else {
+        newcol = Frame::read_csv_column(values, dtype, fr.n_rows());
+    }
+    if (storeType != StoreType::Double)
+        round_column_to_store(newcol.f64.data(), newcol.f64.size(), storeType);
+    // e(sample) T2: a hidden `__piet_*` column (see drop_piet_hidden_columns)
+    // is PIET's own, and PIET cannot see whether the working frame still carries
+    // one (the user-facing card hides it). `--new` on such a name REPLACES it, so
+    // installing the estimation-sample mask after every fit is one call whether
+    // or not an earlier fit's mask is still on the rows. User names keep the
+    // strict contract above.
+    if (is_new && var.rfind("__piet_", 0) == 0 && fr.has(var)) is_new = false;
     fr.setcol(var, std::move(newcol), is_new);
     if (!commit_frame(std::move(fr), out))  // §26: stage into resident session, or write+notice one-shot
         std::fprintf(stderr, "setcol: wrote %s (%s '%s', dtype %s)\n",
@@ -1508,7 +1622,7 @@ int cmd_setcol(const std::vector<std::string>& a) {
 int cmd_reshape(const std::vector<std::string>& a) {
     if (a.size() < 2) {
         std::fprintf(stderr, "usage: cobra reshape long|wide --data f.hbin --stubs s1,s2 --i id1,id2 --j year "
-                             "[--keepif EXPR] --out new.hbin\n");
+                             "[--keepif EXPR] [--stata [--string]] --out new.hbin\n");
         return 2;
     }
     std::string direction = a[1];
@@ -1524,9 +1638,18 @@ int cmd_reshape(const std::vector<std::string>& a) {
     const Dataset& ds = acquire_data(data);
     Frame fr = frame_from_acquired(ds);
 
+    // --stata: reshape.ado's own semantics (Frame::reshape_long_stata /
+    // reshape_wide_stata); --string: its `string` option (j holds text).
+    const bool stata = has(a, "--stata"), jstring = has(a, "--string");
+    // e(sample) T2: PIET's `__piet_*` columns are no Stata variable; reshape.ado
+    // would test them for constancy within i (w2_esample.log E9 `reshape wide y`
+    // rc 0), and the observations they marked do not survive a reshape anyway.
+    if (stata) drop_piet_hidden_columns(fr);
     Frame::ReshapeResult r;
-    if (direction == "long") r = fr.reshape_long(stubs, ivars, jvar);
-    else if (direction == "wide") r = fr.reshape_wide(stubs, ivars, jvar);
+    if (direction == "long") r = stata ? fr.reshape_long_stata(stubs, ivars, jvar, jstring)
+                                       : fr.reshape_long(stubs, ivars, jvar);
+    else if (direction == "wide") r = stata ? fr.reshape_wide_stata(stubs, ivars, jvar, jstring)
+                                            : fr.reshape_wide(stubs, ivars, jvar);
     else { std::fprintf(stderr, "reshape: direction must be 'long' or 'wide', got '%s'\n", direction.c_str()); return 2; }
 
     int64_t nrows = r.frame.n_rows();  // capture before the move into commit_frame
@@ -1604,22 +1727,28 @@ int cmd_import_dta(const std::vector<std::string>& a) {
 
     std::string meta_path = opt(a, "--out-meta");
     if (!meta_path.empty()) {
+        // BUG-1372: a label, value label, note or data label that is not UTF-8 (a
+        // byte substr() made it, or the file's own) travels escaped as a .hbin
+        // level does; PIET's applyDtaMeta and export-dta's --in-meta turn it back.
         json vars = json::array();
         for (const auto& vm : r.var_meta) {
-            vars.push_back({{"name", vm.name}, {"label", vm.label}, {"format", vm.format},
-                            {"stata_type", vm.stata_type}, {"value_label_name", vm.value_label_name}});
+            vars.push_back({{"name", vm.name}, {"label", hbin_level_json_text(vm.label)},
+                            {"format", vm.format}, {"stata_type", vm.stata_type},
+                            {"value_label_name", vm.value_label_name}});
         }
         json vlabs = json::object();
         for (const auto& vl : r.value_labels) {
             json m = json::object();
-            for (const auto& kv : vl.map) m[std::to_string(kv.first)] = kv.second;
+            for (const auto& kv : vl.map) m[std::to_string(kv.first)] = hbin_level_json_text(kv.second);
             vlabs[vl.name] = m;
         }
         json chars = json::array();
         for (const auto& ch : r.characteristics) {
-            chars.push_back({{"varname", ch.varname}, {"charname", ch.charname}, {"value", ch.value}});
+            chars.push_back({{"varname", ch.varname}, {"charname", ch.charname},
+                             {"value", hbin_level_json_text(ch.value)}});
         }
-        json meta = {{"format_version", r.format_version}, {"data_label", r.data_label},
+        json meta = {{"format_version", r.format_version},
+                     {"data_label", hbin_level_json_text(r.data_label)},
                     {"n_rows", r.frame.n_rows()}, {"variables", vars}, {"value_labels", vlabs},
                     {"characteristics", chars}};
         // "timestamp" (BUG-199): the source .dta's own <timestamp> header field,
@@ -1641,14 +1770,14 @@ int cmd_import_dta(const std::vector<std::string>& a) {
 // P1-A3-WRITER-NUMERIC + P1-A3-WRITER-STRINGS-IMPL — the write direction of
 // import-dta above: a Stata format-118 emitter (src/io/dta_writer.h carries the
 // layout, the type-narrowing invariant and the Q-rulings). Numeric types, str#
-// columns, variable labels, value labels and <characteristics>; strL is out of scope
-// (Q4) and an over-cap string is an honest EngineError, never a truncation.
+// columns, strL GSOs, variable labels, value labels and <characteristics>. Long
+// and binary strings use genuine strL records, never truncation.
 //
 // `--in-meta` is the symmetric counterpart of `import-dta --out-meta` and the ONLY
 // way a source file's declared Stata storage types can reach the writer: the Frame
 // carries f64/factor and nothing else, and the hbin header has no `stata_type` key,
 // so the declared types die at the hbin boundary one command earlier
-// (plans/P1-A3-WRITER-IMPL-brief.md §1). With the sidecar the round trip is a true
+// (internal note P1-A3-WRITER-IMPL-brief.md §1). With the sidecar the round trip is a true
 // type round trip; without it the writer scans and picks the narrowest LOSSLESS type,
 // which changes no value either way — the guard `(double)(float)v == v` is exactly
 // the condition under which `datasignature` is preserved, so gate ①
@@ -1675,14 +1804,14 @@ int cmd_export_dta(const std::vector<std::string>& a) {
             "  Writes Stata format 118, no Python dependency. Each numeric column is stored\n"
             "  in the narrowest type that holds every value LOSSLESSLY (byte/int/long/float\n"
             "  with the f32 round-trip guard, else double) — values never change. String\n"
-            "  columns are written as str# (width = the dictionary's longest UTF-8 value;\n"
-            "  over 2045 bytes is an error, not a truncation). --in-meta takes\n"
+            "  columns use str# or strL for long/binary values. --in-meta takes\n"
             "  `import-dta --out-meta` JSON back, so declared Stata types, display formats,\n"
             "  variable labels and value labels round-trip too.\n");
         return 2;
     }
     const Dataset& ds = acquire_data(in);
     Frame fr = frame_from_acquired(ds);
+    drop_piet_hidden_columns(fr);
 
     DtaWriteOptions wo;
     std::string meta_path = opt(a, "--in-meta");
@@ -1700,8 +1829,12 @@ int cmd_export_dta(const std::vector<std::string>& a) {
                          meta_path.c_str(), e.what());
             return 1;
         }
-        if (meta.contains("data_label") && meta["data_label"].is_string())
+        // BUG-1372: label text arrives escaped when it is not UTF-8 (import-dta's
+        // --out-meta and PIET's save write it so); each unescape is a no-op otherwise.
+        if (meta.contains("data_label") && meta["data_label"].is_string()) {
             wo.data_label = meta["data_label"].get<std::string>();
+            hbin_level_unescape(wo.data_label);
+        }
         // "timestamp" (BUG-199): symmetric with "data_label" above; absent key or
         // non-string value leaves wo.timestamp at its "" (Q8 byte-deterministic)
         // default, so an --in-meta from before this fix (or with no source
@@ -1717,8 +1850,10 @@ int cmd_export_dta(const std::vector<std::string>& a) {
                     m.format = v["format"].get<std::string>();
                 if (v.contains("stata_type") && v["stata_type"].is_string())
                     m.stata_type = v["stata_type"].get<std::string>();
-                if (v.contains("label") && v["label"].is_string())
+                if (v.contains("label") && v["label"].is_string()) {
                     m.label = v["label"].get<std::string>();
+                    hbin_level_unescape(m.label);
+                }
                 if (v.contains("value_label_name") && v["value_label_name"].is_string())
                     m.value_label_name = v["value_label_name"].get<std::string>();
                 wo.var_meta.push_back(std::move(m));
@@ -1734,7 +1869,9 @@ int cmd_export_dta(const std::vector<std::string>& a) {
                 for (auto e = it.value().begin(); e != it.value().end(); ++e) {
                     if (!e.value().is_string()) continue;
                     try {
-                        vl.map[std::stoll(e.key())] = e.value().get<std::string>();
+                        std::string& text = vl.map[std::stoll(e.key())];
+                        text = e.value().get<std::string>();
+                        hbin_level_unescape(text);
                     } catch (const std::exception&) {
                         std::fprintf(stderr,
                                      "export-dta: --in-meta value_labels['%s'] has non-numeric "
@@ -1757,8 +1894,10 @@ int cmd_export_dta(const std::vector<std::string>& a) {
                     c.varname = ch["varname"].get<std::string>();
                 if (ch.contains("charname") && ch["charname"].is_string())
                     c.charname = ch["charname"].get<std::string>();
-                if (ch.contains("value") && ch["value"].is_string())
+                if (ch.contains("value") && ch["value"].is_string()) {
                     c.value = ch["value"].get<std::string>();
+                    hbin_level_unescape(c.value);
+                }
                 if (c.varname.empty() || c.charname.empty()) continue;
                 wo.characteristics.push_back(std::move(c));
             }
@@ -1766,6 +1905,12 @@ int cmd_export_dta(const std::vector<std::string>& a) {
     }
 
     wo.strict_string_missing = has(a, "--strict-string-missing");
+    // --release 115|117|118 (default 118): `saveold`'s version() target.
+    const std::string rel = opt(a, "--release", "118");
+    if (rel == "115") wo.release = 115;
+    else if (rel == "117") wo.release = 117;
+    else if (rel == "118") wo.release = 118;
+    else throw EngineError("bad_input", "export-dta: --release must be 115, 117 or 118");
     write_dta(fr, out, wo);
     std::fprintf(stderr, "export-dta: %s -> %s  (format 118, %lld rows, %d cols%s)\n",
                  in.empty() ? "<resident>" : in.c_str(), out.c_str(),

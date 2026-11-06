@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "estimators/probit.h"
 
 #include <cmath>
@@ -10,8 +12,11 @@ namespace cecon {
 static inline double norm_cdf(double x) { return 0.5 * std::erfc(-x * 0.7071067811865476); }
 static inline double norm_pdf(double x) { return 0.3989422804014327 * std::exp(-0.5 * x * x); }
 
-ProbitResult probit_fit(const double* X, int64_t n, int k, const double* y, int maxit, double tol,
-                        const double* offset) {
+// The pre-FU-138 fit: Fisher-scoring IRLS from beta = 0 with the working weight
+// phi^2 / (Phi (1-Phi)) and response eta + (y-Phi)/phi. Kept for a NON-binary
+// y only (the logit_fit_irls twin; logit.cpp).
+static ProbitResult probit_fit_irls(const double* X, int64_t n, int k, const double* y, int maxit, double tol,
+                                    const double* offset) {
     ProbitResult r;
     r.k = k;
     std::vector<double> beta(k, 0.0), beta_prev(k, 0.0), eta(n), w(n), z(n), sw(n);
@@ -137,6 +142,7 @@ ProbitObservedInfo probit_observed_info(const ProbitResult& r, const double* X,
                                         const double* offset) {
     ProbitObservedInfo oi;
     oi.meat.assign(static_cast<size_t>(k) * k, 0.0);
+    oi.score.assign(static_cast<size_t>(n), 0.0);
     std::vector<double> obsI(static_cast<size_t>(k) * k, 0.0);
     const double INV_SQRT_2PI = 0.3989422804014327;
     for (int64_t i = 0; i < n; ++i) {
@@ -146,6 +152,7 @@ ProbitObservedInfo probit_observed_info(const ProbitResult& r, const double* X,
             eta += X[static_cast<int64_t>(c) * n + i] * r.beta[static_cast<size_t>(c)];
         double phi = INV_SQRT_2PI * std::exp(-0.5 * eta * eta);
         double sc = (y[static_cast<size_t>(i)] - Phi) * phi / (Phi * (1.0 - Phi));
+        oi.score[static_cast<size_t>(i)] = sc;
         double sc2 = sc * sc;
         double hw = sc * (sc + eta);   // observed-info weight lambda(lambda+eta)
         for (int c = 0; c < k; ++c) {
@@ -157,12 +164,70 @@ ProbitObservedInfo probit_observed_info(const ProbitResult& r, const double* X,
             }
         }
     }
+    // FU-210: a fit from the ml path carries the inverse of the Hessian its
+    // iteration used, which drops completely determined rows as Stata's does;
+    // that is the bread Stata reports (w2b_estim.log:762). The all-rows
+    // observed information above stays the fallback for a fit without it.
+    if (!r.bread_oim.empty()) {
+        oi.bread = r.bread_oim;
+        return oi;
+    }
     oi.bread = std::move(obsI);
     if (la::spd_inverse(oi.bread.data(), k) != 0) {
         oi.bread = r.V;
         oi.observed_spd = false;
     }
     return oi;
+}
+
+ProbitResult probit_fit_ml(const double* X, int64_t n, int k, const double* y,
+                           const MlMaxOptions& opt, const double* offset, bool has_constant,
+                           const double* weights) {
+    BinaryMlResult m = binary_ml_fit(BinaryLink::Probit, X, n, k, y, weights, offset, has_constant, opt);
+    ProbitResult r;
+    r.k = k;
+    r.separated_perfect = binary_predicts_perfectly(m.p, y, n);
+    // V: the Fisher bread at the ml beta (the retired IRLS fit's clamps).
+    std::vector<double> sw(static_cast<size_t>(n)), Xs(static_cast<size_t>(n) * k),
+        V(static_cast<size_t>(k) * k), eta(static_cast<size_t>(n));
+    la::mat_vec(X, n, k, m.beta.data(), eta.data());
+    for (int64_t i = 0; i < n; ++i) {
+        double e = std::max(-30.0, std::min(30.0, eta[i] + (offset ? offset[i] : 0.0)));
+        double Phi = std::min(1.0 - 1e-12, std::max(1e-12, norm_cdf(e)));
+        double phi = norm_pdf(e);
+        if (phi < 1e-12) phi = 1e-12;
+        double wi = (phi * phi) / (Phi * (1.0 - Phi));
+        if (wi < 1e-12) wi = 1e-12;
+        sw[i] = std::sqrt(weights ? weights[i] * wi : wi);
+    }
+    for (int c = 0; c < k; ++c) {
+        const double* xc = X + static_cast<size_t>(c) * n;
+        double* sc = Xs.data() + static_cast<size_t>(c) * n;
+        for (int64_t i = 0; i < n; ++i) sc[i] = xc[i] * sw[i];
+    }
+    la::xtx(Xs.data(), n, k, V.data());
+    la::spd_inverse(V.data(), k);
+    r.V = std::move(V);
+    r.beta = std::move(m.beta);
+    r.p = std::move(m.p);
+    r.bread_oim = std::move(m.bread);
+    r.iters = m.ic;
+    r.ic = m.ic;
+    r.converged = m.converged;
+    r.separated = m.singular;
+    r.ll = m.ll;
+    r.ilog = std::move(m.ilog);
+    r.n_cdf = m.n_cdf;
+    r.n_cds = m.n_cds;
+    return r;
+}
+
+ProbitResult probit_fit(const double* X, int64_t n, int k, const double* y, int maxit, double tol,
+                        const double* offset) {
+    if (!outcome_is_binary(y, n)) return probit_fit_irls(X, n, k, y, maxit, tol, offset);
+    MlMaxOptions opt;
+    opt.maxiter = maxit;
+    return probit_fit_ml(X, n, k, y, opt, offset, last_column_is_constant(X, n, k));
 }
 
 }  // namespace cecon

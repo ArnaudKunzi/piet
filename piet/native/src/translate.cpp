@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 #include "piet/translate.h"
 
 #include "data/ts_operators.h"  // BUG-370: cecon::is_ts_prefix — the engine's own
@@ -6,6 +8,8 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+
+#include "core/ident.h"  // the shared Unicode name rule (scanner byte tests)
 
 namespace piet::translate {
 
@@ -116,20 +120,20 @@ std::vector<TsTokenRef> extractTsTokens(const std::string& expr) {
       continue;
     }
     if (inStr) continue;
-    if (!(std::isalpha(static_cast<unsigned char>(expr[i])) || expr[i] == '_')) continue;
+    // core/ident.h: a byte >= 0x80 is a name byte, so `L.ملاحظات` is one run and
+    // `مL.x` is the tail of a name, not an operator chain.
+    if (!cecon::ident::isIdentStartByte(expr[i])) continue;
     if (i > 0) {
       char prev = expr[i - 1];
       // Mid-identifier (`totalL.x`) or right after a dot (the `y` of `L.y`) is
       // never the START of an operator chain.
-      if (std::isalnum(static_cast<unsigned char>(prev)) || prev == '_' || prev == '.') continue;
+      if (cecon::ident::isIdentByte(prev) || prev == '.') continue;
     }
     // Consume exactly what frame.cpp's parser consumes: the maximal [alnum_.] run.
     // That is what makes `L2.D.gdp` come back as ONE token rather than stopping at
     // the first dot, and it is why the prefix test below can be the engine's own.
     size_t j = i;
-    while (j < expr.size() && (std::isalnum(static_cast<unsigned char>(expr[j])) ||
-                               expr[j] == '_' || expr[j] == '.'))
-      ++j;
+    while (j < expr.size() && (cecon::ident::isIdentByte(expr[j]) || expr[j] == '.')) ++j;
     const std::string run = expr.substr(i, j - i);
     const size_t dot = run.rfind('.');
     if (dot != std::string::npos) {
@@ -188,7 +192,7 @@ bool exprHasTinToken(const std::string& expr) {
     else continue;
     if (i > 0) {
       const char p = expr[i - 1];
-      if (std::isalnum(static_cast<unsigned char>(p)) || p == '_' || p == '.') continue;
+      if (cecon::ident::isIdentByte(p) || p == '.') continue;  // core/ident.h
     }
     size_t j = i + len;
     while (j < expr.size() && (expr[j] == ' ' || expr[j] == '\t')) ++j;
@@ -206,14 +210,15 @@ bool exprHasDrawToken(const std::string& expr) {
     const char c = expr[i];
     if (quote) { if (c == quote) quote = 0; continue; }
     if (c == '"' || c == '\'') { quote = c; continue; }
-    if (c != 'r') continue;
     size_t len = 0;
     if (expr.compare(i, 11, "runiformint") == 0) len = 11;
     else if (expr.compare(i, 8, "runiform") == 0) len = 8;
+    else if (expr.compare(i, 7, "rnormal") == 0) len = 7;
+    else if (expr.compare(i, 7, "uniform") == 0) len = 7;
     else continue;
     if (i > 0) {
       const char p = expr[i - 1];
-      if (std::isalnum(static_cast<unsigned char>(p)) || p == '_' || p == '.') continue;
+      if (cecon::ident::isIdentByte(p) || p == '.') continue;  // core/ident.h
     }
     size_t j = i + len;
     while (j < expr.size() && (expr[j] == ' ' || expr[j] == '\t')) ++j;
@@ -227,11 +232,27 @@ std::vector<std::string> injectRngContextForExpr(const std::vector<std::string>&
                                                  SessionState& session) {
   if (!exprHasDrawToken(expr)) return argv;
   std::vector<std::string> out = argv;
-  out.push_back("--rng-seed");
-  out.push_back(std::to_string(session.seed.value_or(123456789LL)));
-  out.push_back("--rng-stream");
-  out.push_back(std::to_string(session.rngStream++));
+  out.push_back("--rng-mt64");
+  out.push_back(session.seed.stream().state_string());
+  ++session.rngStream;
   return out;
+}
+
+void absorbRngDraws(const nlohmann::json& engineResponse, SessionState& session) {
+  if (!engineResponse.is_object()) return;
+  auto it = engineResponse.find("rng_draws");
+  if (it == engineResponse.end() || !it->is_number_integer()) return;
+  const long long n = it->get<long long>();
+  if (n > 0) session.seed.stream().discard(static_cast<uint64_t>(n));
+}
+
+void carryStoreOverflow(const nlohmann::json& engineResponse, nlohmann::ordered_json& block) {
+  if (!engineResponse.is_object() || !block.is_object() ||
+      block.value("type", std::string()) != "data_mutation")
+    return;
+  auto it = engineResponse.find("store_overflow");
+  if (it != engineResponse.end() && it->is_number_integer() && it->get<long long>() > 0)
+    block["store_overflow"] = it->get<long long>();
 }
 
 std::vector<std::string> injectTsContextForExpr(const std::vector<std::string>& argv,

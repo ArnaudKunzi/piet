@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // AER scope 2, bundle K1 -- the four remaining small names in the twelve-paper
 // corpus, all of which rename or reorder variables and none of which the
 // registry could answer with an alias:

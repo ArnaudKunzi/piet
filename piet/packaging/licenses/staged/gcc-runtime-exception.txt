@@ -1,0 +1,11 @@
+STAGED PLACEHOLDER — NOT SHIPPED IN CURRENT (macOS) BUILDS
+Component : GCC runtime libraries (libgcc, libstdc++, libgfortran, libquadmath)
+License   : GPL-3.0 WITH GCC-exception-3.1 (GCC Runtime Library Exception)
+Activates : with static Linux/Windows builds produced by a GCC/MinGW toolchain.
+Invariant : the exception only covers builds made with an "Eligible Compilation
+            Process" — an unmodified GCC/MinGW toolchain with no proprietary
+            compiler plugins/codegen (WI-12a; hold this invariant and record the
+            toolchain in the build recipe).
+Action    : at the first such build, copy the verbatim GCC Runtime Library
+            Exception 3.1 text (from the toolchain's COPYING.RUNTIME) into a
+            top-level NN-gcc-runtime-exception.txt in piet/packaging/licenses/.

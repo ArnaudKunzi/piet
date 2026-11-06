@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — memory-mapped reader for the .hbin columnar format.
 // Zero-copy: columns are pointers into the mmap'd file. See tools/to_hbin.py
 // for the on-disk layout.
@@ -27,6 +29,22 @@ void cecon_ladder_probe_close();
 // both cobra and piet_native — which compiles this TU standalone — can link it).
 void cecon_coltouch_note(const std::string& name);
 void cecon_coltouch_generation(int64_t ncols);
+
+// A factor level travels in the .hbin header as a JSON string, and JSON text is
+// UTF-8, so a level that is not -- substr() and str# count bytes as Stata does, so
+// substr("José",1,4) is "Jos\xC3" -- could not be written at all: the save threw,
+// and the session lost its working data ("disk full or I/O error"). Such a level,
+// and any that begins with the marker byte \0, is written as \0 followed by its
+// bytes in hex, and the reader turns it back. Every other level is written as
+// itself, so a header without one is byte-for-byte what it was.
+bool hbin_level_needs_escape(const std::string& level);
+std::string hbin_level_escape(const std::string& level);
+void hbin_level_unescape(std::string& level);  // no-op unless it starts with \0
+// `text` as a JSON sidecar, reply or header key carries it: escaped as above when
+// it needs it, else itself. A column label in the .hbin header, a .dta label or
+// note in a sidecar and encode's levels travel this way, and hbin_level_unescape
+// turns each back.
+std::string hbin_level_json_text(const std::string& text);
 
 struct Column {
     std::string name;

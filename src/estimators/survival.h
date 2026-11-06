@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // cecon — survival analysis: `stset`, `stcox`, `streg, distribution(weibull)`.
 //
 // THE THREE VERBS AND HOW THEY CONNECT
@@ -14,7 +16,7 @@
 //          delayed-entry correction.
 //
 // Every formula below is pinned against StataBE 19.5 on the P7 pangram wave
-// (tests/kitchensink/pangram/waves/_oracle/p7_stata.log); the assertions live in
+// (internal capture p7_stata.log); the assertions live in
 // tests/unit/test_survival.cpp.
 #pragma once
 #include <cstdint>

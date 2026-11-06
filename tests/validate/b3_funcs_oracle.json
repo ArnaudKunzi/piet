@@ -1,0 +1,1964 @@
+{
+ "_": "StataBE answer key for AER scope-2 B3 expression functions. Generated from tests/validate/b3_funcs_oracle.do; the .log it was parsed from is deliberately untracked (.gitignore *.log), so THIS file is the pin. Regenerate: run the .do under StataBE batch, judge completion by the end-of-run marker the .do prints, then re-run the parser in the commit that introduced this file. Completion is judged by an end marker DISPLAYED at column 0: Stata echoes every source line with a leading '. ', so an unanchored grep matches the .do's own comment about the marker and calls a truncated run finished -- which it did once, which is why the rebuild now asserts the LAST emitted key came back.",
+ "oracle": "StataNow 19.5 BE (single-user), captured 2026-09-07 (rounds 1-6)",
+ "fields": {
+  "hex": "%21x of the stored double -- the authority",
+  "display": "%18.0g rendering, for humans only",
+  "rc": "Stata return code the expression produced",
+  "kind": "numeric | string | stata_error"
+ },
+ "adjudications": "internal note ONESHOT-AER-SCOPE2-PLAN-20260907.md section 7.7",
+ "records": {
+  "Clock.YMDhms": {
+   "kind": "numeric",
+   "hex": "+1.ba5ad0df98000X+028",
+   "display": "1899899183000",
+   "expr": "Clock(\"2020-03-15 13:45:56\",\"YMDhms\")"
+  },
+  "Cofd": {
+   "kind": "numeric",
+   "hex": "+1.ba57dcb578000X+028",
+   "display": "1899849627000",
+   "expr": "Cofd(td(15mar2020))"
+  },
+  "J.11": {
+   "kind": "numeric",
+   "hex": "+1.4000000000000X+002",
+   "display": "5"
+  },
+  "J.make": {
+   "rc": "0"
+  },
+  "J.scalar": {
+   "rc": "0"
+  },
+  "J.zero": {
+   "rc": "198"
+  },
+  "L.d": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "d(15mar2020)"
+  },
+  "L.h": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+006",
+   "display": "120",
+   "rc": "0",
+   "expr": "h(2020h1)"
+  },
+  "L.m": {
+   "kind": "numeric",
+   "hex": "+1.2d80000000000X+009",
+   "display": "603",
+   "rc": "0",
+   "expr": "m(2010m4)"
+  },
+  "L.q": {
+   "kind": "numeric",
+   "hex": "+1.7800000000000X+007",
+   "display": "188",
+   "rc": "0",
+   "expr": "q(2007q1)"
+  },
+  "L.tc.frac": {
+   "kind": "numeric",
+   "hex": "+1.4997fa0000000X+019",
+   "display": "43200500",
+   "rc": "0",
+   "expr": "tc(12:00:00.500)"
+  },
+  "L.tc.hm": {
+   "kind": "numeric",
+   "hex": "+1.4997000000000X+019",
+   "display": "43200000",
+   "rc": "0",
+   "expr": "tc(12:00)"
+  },
+  "L.td.mixed": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "td(15Mar2020)"
+  },
+  "L.td.upper": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "td(15MAR2020)"
+  },
+  "L.tm.upperM": {
+   "kind": "numeric",
+   "hex": "+1.6900000000000X+009",
+   "display": "722",
+   "rc": "0",
+   "expr": "tm(2020M3)"
+  },
+  "L.tq.upperQ": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+007",
+   "display": "240",
+   "rc": "0",
+   "expr": "tq(2020Q1)"
+  },
+  "L.w": {
+   "kind": "numeric",
+   "hex": "+1.8720000000000X+00b",
+   "display": "3129",
+   "rc": "0",
+   "expr": "w(2020w10)"
+  },
+  "L.y": {
+   "kind": "numeric",
+   "hex": "+1.f900000000000X+00a",
+   "display": "2020",
+   "rc": "0",
+   "expr": "y(2020)"
+  },
+  "bofd.nocal": {
+   "rc": "0",
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "expr": "bofd(\"nosuchcal\", td(15mar2020))"
+  },
+  "c.DMYhms": {
+   "kind": "numeric",
+   "hex": "+1.ba5ad07620000X+028",
+   "display": "1899899156000",
+   "rc": "0",
+   "expr": "clock(\"15mar2020 13:45:56\",\"DMYhms\")"
+  },
+  "c.YMDhm": {
+   "kind": "numeric",
+   "hex": "+1.ba5acf9b60000X+028",
+   "display": "1899899100000",
+   "rc": "0",
+   "expr": "clock(\"2020-03-15 13:45\",\"YMDhm\")"
+  },
+  "c.ampm": {
+   "kind": "numeric",
+   "hex": "+1.ba5acf9b60000X+028",
+   "display": "1899899100000",
+   "rc": "0",
+   "expr": "clock(\"2020-03-15 1:45 pm\",\"YMDhm\")"
+  },
+  "c.dateonly": {
+   "kind": "numeric",
+   "hex": "+1.ba57dc4c00000X+028",
+   "display": "1899849600000",
+   "rc": "0",
+   "expr": "clock(\"2020-03-15\",\"YMD\")"
+  },
+  "c.hms.only": {
+   "kind": "numeric",
+   "hex": "+1.7a15100000000X+019",
+   "display": "49556000",
+   "rc": "0",
+   "expr": "clock(\"13:45:56\",\"hms\")"
+  },
+  "c.skip": {
+   "kind": "numeric",
+   "hex": "+1.ba5acf9b60000X+028",
+   "display": "1899899100000",
+   "rc": "0",
+   "expr": "clock(\"x 2020-03-15 13:45\",\"#YMDhm\")"
+  },
+  "clock.DMYhms": {
+   "kind": "numeric",
+   "hex": "+1.ba5ad07620000X+028",
+   "display": "1899899156000",
+   "rc": "0",
+   "expr": "clock(\"15mar2020 13:45:56\",\"DMYhms\")"
+  },
+  "clock.MDYhm.top": {
+   "kind": "numeric",
+   "hex": "+1.ba5acf9b60000X+028",
+   "display": "1899899100000",
+   "rc": "0",
+   "expr": "clock(\"03/15/20 13:45\",\"MDYhm\",2050)"
+  },
+  "clock.MDYhms": {
+   "kind": "numeric",
+   "hex": "+1.ba5ad07620000X+028",
+   "display": "1899899156000",
+   "rc": "0",
+   "expr": "clock(\"03/15/2020 13:45:56\",\"MDYhms\")"
+  },
+  "clock.YMDhms": {
+   "kind": "numeric",
+   "hex": "+1.ba5ad07620000X+028",
+   "display": "1899899156000",
+   "expr": "clock(\"2020-03-15 13:45:56\",\"YMDhms\")"
+  },
+  "clock.bad": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "expr": "clock(\"zzz\",\"YMDhms\")"
+  },
+  "clock.badmask": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "clock(\"2020-03-15 13:45:56\",\"ZZZ\")"
+  },
+  "clock.frac": {
+   "kind": "numeric",
+   "hex": "+1.ba5ad07814000X+028",
+   "display": "1899899156500",
+   "rc": "0",
+   "expr": "clock(\"2020-03-15 13:45:56.500\",\"YMDhms\")"
+  },
+  "clock.hm.only": {
+   "kind": "numeric",
+   "hex": "+1.79a7b00000000X+019",
+   "display": "49500000",
+   "rc": "0",
+   "expr": "clock(\"13:45\",\"hm\")"
+  },
+  "clock.hm.top": {
+   "kind": "numeric",
+   "hex": "+1.79a7b00000000X+019",
+   "display": "49500000",
+   "rc": "0",
+   "expr": "clock(\"13:45\",\"hm\",2050)"
+  },
+  "clock.noms": {
+   "kind": "numeric",
+   "hex": "+1.ba5acf9b60000X+028",
+   "display": "1899899100000",
+   "expr": "clock(\"2020-03-15 13:45\",\"YMDhm\")"
+  },
+  "cofd": {
+   "kind": "numeric",
+   "hex": "+1.ba57dc4c00000X+028",
+   "display": "1899849600000",
+   "expr": "cofd(td(15mar2020))"
+  },
+  "colnumb.eq": {
+   "rc": "0"
+  },
+  "colnumb.eqfull": {
+   "rc": "0"
+  },
+  "d.syn": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "expr": "d(15mar2020)"
+  },
+  "daily.YMD": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "expr": "daily(\"2020-03-15\",\"YMD\")"
+  },
+  "date.19YMD": {
+   "kind": "numeric",
+   "hex": "-1.c640000000000X+00d",
+   "display": "-14536",
+   "rc": "0",
+   "expr": "date(\"20-03-15\",\"19YMD\")"
+  },
+  "date.20YMD": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "expr": "date(\"20-03-15\",\"20YMD\")"
+  },
+  "date.DMY": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "expr": "date(\"15mar2020\",\"DMY\")"
+  },
+  "date.DMY.notop": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "expr": "date(\"15/03/20\",\"DMY\")"
+  },
+  "date.DMY.top": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "expr": "date(\"15/03/20\",\"DMY\",2050)"
+  },
+  "date.MDY": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "expr": "date(\"03/15/2020\",\"MDY\")"
+  },
+  "date.YMD": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "expr": "date(\"2020-03-15\",\"YMD\")"
+  },
+  "date.bad": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "expr": "date(\"not a date\",\"YMD\")"
+  },
+  "date.badmask": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "date(\"2020-03-15\",\"ZZZ\")"
+  },
+  "date.empty": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "expr": "date(\"\",\"YMD\")"
+  },
+  "date.maskarity": {
+   "kind": "stata_error",
+   "stata_message": "invalid syntax",
+   "rc": "198",
+   "expr": "date(\"2020-03-15\")"
+  },
+  "date.month.name": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "date(\"March 15, 2020\",\"MDY\")"
+  },
+  "date.sep.none": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "date(\"20200315\",\"YMD\")"
+  },
+  "date.top.49": {
+   "kind": "numeric",
+   "hex": "+1.fd14000000000X+00e",
+   "display": "32581",
+   "rc": "0",
+   "expr": "date(\"15/03/49\",\"DMY\",2050)"
+  },
+  "date.top.51": {
+   "kind": "numeric",
+   "hex": "-1.91c0000000000X+00b",
+   "display": "-3214",
+   "rc": "0",
+   "expr": "date(\"15/03/51\",\"DMY\",2050)"
+  },
+  "date.top.60": {
+   "kind": "numeric",
+   "hex": "+1.2800000000000X+006",
+   "display": "74",
+   "rc": "0",
+   "expr": "date(\"15/03/60\",\"DMY\",2050)"
+  },
+  "date.ymd.time": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "date(\"2020-03-15 13:45\",\"YMD\")"
+  },
+  "days": {
+   "kind": "stata_error",
+   "stata_message": "unknown function days()",
+   "rc": "133",
+   "expr": "days(86400000)"
+  },
+  "dhms": {
+   "kind": "numeric",
+   "hex": "+1.ba5ad07620000X+028",
+   "display": "1899899156000",
+   "expr": "dhms(td(15mar2020),13,45,56)"
+  },
+  "dhms.frac": {
+   "kind": "numeric",
+   "hex": "+1.f400000000000X+008",
+   "display": "500",
+   "rc": "0",
+   "expr": "dhms(0,0,0,0.5)"
+  },
+  "dofC": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "expr": "dofC(tC(15mar2020 13:45:56))"
+  },
+  "dofb.nocal": {
+   "rc": "0",
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "expr": "dofb(1,\"nosuchcal\")"
+  },
+  "dofc": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "expr": "dofc(tc(15mar2020 13:45:56))"
+  },
+  "dofc.frac": {
+   "kind": "numeric",
+   "hex": "+0.0000000000000X-3ff",
+   "display": "0",
+   "rc": "0",
+   "expr": "dofc(500)"
+  },
+  "dofc.miss": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "dofc(.)"
+  },
+  "dofc.neg": {
+   "kind": "numeric",
+   "hex": "-1.0000000000000X+000",
+   "display": "-1",
+   "expr": "dofc(tc(31dec1959 23:00:00))"
+  },
+  "dofh": {
+   "kind": "numeric",
+   "hex": "+1.566c000000000X+00e",
+   "display": "21915",
+   "expr": "dofh(th(2020h1))"
+  },
+  "dofh.pre": {
+   "kind": "numeric",
+   "hex": "-1.7000000000000X+007",
+   "display": "-184",
+   "rc": "0",
+   "expr": "dofh(-1)"
+  },
+  "dofm": {
+   "kind": "numeric",
+   "hex": "+1.575c000000000X+00e",
+   "display": "21975",
+   "expr": "dofm(tm(2020m3))"
+  },
+  "dofm.miss": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "expr": "dofm(.)"
+  },
+  "dofm.pre": {
+   "kind": "numeric",
+   "hex": "-1.f000000000000X+004",
+   "display": "-31",
+   "rc": "0",
+   "expr": "dofm(-1)"
+  },
+  "dofm.var": {
+   "rc": "0"
+  },
+  "dofq": {
+   "kind": "numeric",
+   "hex": "+1.566c000000000X+00e",
+   "display": "21915",
+   "expr": "dofq(tq(2020q1))"
+  },
+  "dofq.240": {
+   "kind": "numeric",
+   "hex": "+1.566c000000000X+00e",
+   "display": "21915",
+   "rc": "0",
+   "expr": "dofq(240)"
+  },
+  "dofq.pre": {
+   "kind": "numeric",
+   "hex": "-1.7000000000000X+006",
+   "display": "-92",
+   "rc": "0",
+   "expr": "dofq(-1)"
+  },
+  "dofw": {
+   "kind": "numeric",
+   "hex": "+1.5768000000000X+00e",
+   "display": "21978",
+   "expr": "dofw(tw(2020w10))"
+  },
+  "dofw.pre": {
+   "kind": "numeric",
+   "hex": "-1.0000000000000X+003",
+   "display": "-8",
+   "rc": "0",
+   "expr": "dofw(-1)"
+  },
+  "dofy.1959": {
+   "kind": "numeric",
+   "hex": "-1.6d00000000000X+008",
+   "display": "-365",
+   "rc": "0",
+   "expr": "dofy(1959)"
+  },
+  "dofy.2020": {
+   "kind": "numeric",
+   "hex": "+1.566c000000000X+00e",
+   "display": "21915",
+   "rc": "0",
+   "expr": "dofy(2020)"
+  },
+  "dofy.miss": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "dofy(.)"
+  },
+  "dofy.via.ty": {
+   "kind": "stata_error",
+   "stata_message": "unknown function ty()",
+   "rc": "133",
+   "expr": "dofy(ty(2020))"
+  },
+  "h.syn": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+006",
+   "display": "120",
+   "expr": "h(2020h1)"
+  },
+  "halfyear.d": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+000",
+   "display": "1",
+   "rc": "0",
+   "expr": "halfyear(td(15mar2020))"
+  },
+  "halfyearly.YH": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+006",
+   "display": "120",
+   "expr": "halfyearly(\"2020-1\",\"YH\")"
+  },
+  "hh.miss": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "expr": "hh(.)"
+  },
+  "hh.of.timeonly": {
+   "kind": "numeric",
+   "hex": "+1.8000000000000X+003",
+   "display": "12",
+   "rc": "0",
+   "expr": "hh(tc(12:00))"
+  },
+  "hh.tc": {
+   "kind": "numeric",
+   "hex": "+1.a000000000000X+003",
+   "display": "13",
+   "expr": "hh(tc(15mar2020 13:45:56))"
+  },
+  "hhC.tC": {
+   "kind": "numeric",
+   "hex": "+1.a000000000000X+003",
+   "display": "13",
+   "expr": "hhC(tC(15mar2020 13:45:56))"
+  },
+  "hms": {
+   "kind": "numeric",
+   "hex": "+1.7a15100000000X+019",
+   "display": "49556000",
+   "expr": "hms(13,45,56)"
+  },
+  "hms.miss": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "hms(.,0,0)"
+  },
+  "hms.neg": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "hms(-1,0,0)"
+  },
+  "hms.ovf": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "expr": "hms(25,0,0)"
+  },
+  "hms.sec.ovf": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "hms(0,0,90)"
+  },
+  "hofd": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+006",
+   "display": "120",
+   "expr": "hofd(td(15mar2020))"
+  },
+  "hofd.pre": {
+   "kind": "numeric",
+   "hex": "-1.0000000000000X+000",
+   "display": "-1",
+   "rc": "0",
+   "expr": "hofd(td(31dec1959))"
+  },
+  "hours": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+000",
+   "display": "1",
+   "expr": "hours(3600000)"
+  },
+  "m.DMY.nosep": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "date(\"15032020\",\"DMY\")"
+  },
+  "m.DMY.upper": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "date(\"15MAR2020\",\"DMY\")"
+  },
+  "m.DMY.words": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "date(\"15 March 2020\",\"DMY\")"
+  },
+  "m.MDY.nosep": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "date(\"03152020\",\"MDY\")"
+  },
+  "m.Y.only": {
+   "kind": "numeric",
+   "hex": "+1.566c000000000X+00e",
+   "display": "21915",
+   "rc": "0",
+   "expr": "date(\"2020\",\"Y\")"
+  },
+  "m.YM.only": {
+   "kind": "numeric",
+   "hex": "+1.575c000000000X+00e",
+   "display": "21975",
+   "rc": "0",
+   "expr": "date(\"2020-03\",\"YM\")"
+  },
+  "m.YMD.7digit": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "date(\"2020315\",\"YMD\")"
+  },
+  "m.YMD.dot": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "date(\"2020.03.15\",\"YMD\")"
+  },
+  "m.YMD.nosep": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "date(\"20200315\",\"YMD\")"
+  },
+  "m.YMD.short": {
+   "kind": "numeric",
+   "hex": "+1.576c000000000X+00e",
+   "display": "21979",
+   "rc": "0",
+   "expr": "date(\"2020-3-5\",\"YMD\")"
+  },
+  "m.YMD.slash": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "date(\"2020/03/15\",\"YMD\")"
+  },
+  "m.YMD.ws": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "date(\"  2020-03-15  \",\"YMD\")"
+  },
+  "m.extra.token": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "date(\"2020-03-15-99\",\"YMD\")"
+  },
+  "m.invalid.feb29": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "date(\"29feb2021\",\"DMY\")"
+  },
+  "m.invalid.feb31": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "date(\"31feb2020\",\"DMY\")"
+  },
+  "m.lowermask": {
+   "rc": "0"
+  },
+  "m.mismatch": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "date(\"2020-03-15\",\"DMY\")"
+  },
+  "m.skiphead": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "date(\"junk 2020-03-15\",\"#YMD\")"
+  },
+  "m.skiptail": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "date(\"2020-03-15 junk\",\"YMD#\")"
+  },
+  "m.syn": {
+   "kind": "numeric",
+   "hex": "+1.6900000000000X+009",
+   "display": "722",
+   "expr": "m(2020m3)"
+  },
+  "mdy.bad": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "mdy(2,30,2020)"
+  },
+  "mdy.norm": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "rc": "0",
+   "expr": "mdy(3,15,2020)"
+  },
+  "minutes": {
+   "kind": "numeric",
+   "hex": "+1.8000000000000X+000",
+   "display": "1.5",
+   "expr": "minutes(90000)"
+  },
+  "mm.miss": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "expr": "mm(.)"
+  },
+  "mm.of.timeonly": {
+   "kind": "numeric",
+   "hex": "+0.0000000000000X-3ff",
+   "display": "0",
+   "rc": "0",
+   "expr": "mm(tc(12:00))"
+  },
+  "mm.tc": {
+   "kind": "numeric",
+   "hex": "+1.6800000000000X+005",
+   "display": "45",
+   "expr": "mm(tc(15mar2020 13:45:56))"
+  },
+  "mmC.tC": {
+   "kind": "numeric",
+   "hex": "+1.6800000000000X+005",
+   "display": "45",
+   "expr": "mmC(tC(15mar2020 13:45:56))"
+  },
+  "mofd": {
+   "kind": "numeric",
+   "hex": "+1.6900000000000X+009",
+   "display": "722",
+   "expr": "mofd(td(15mar2020))"
+  },
+  "mofd.frac": {
+   "kind": "numeric",
+   "hex": "+1.6900000000000X+009",
+   "display": "722",
+   "rc": "0",
+   "expr": "mofd(21989.7)"
+  },
+  "mofd.miss": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "expr": "mofd(.)"
+  },
+  "mofd.neg": {
+   "kind": "numeric",
+   "hex": "-1.0000000000000X+000",
+   "display": "-1",
+   "expr": "mofd(td(31dec1959))"
+  },
+  "monthly.M20Y": {
+   "kind": "numeric",
+   "hex": "+1.6900000000000X+009",
+   "display": "722",
+   "rc": "0",
+   "expr": "monthly(\"mar 20\",\"M20Y\")"
+  },
+  "monthly.MY": {
+   "kind": "numeric",
+   "hex": "+1.6900000000000X+009",
+   "display": "722",
+   "expr": "monthly(\"03-2020\",\"MY\")"
+  },
+  "monthly.MY.words": {
+   "kind": "numeric",
+   "hex": "+1.6900000000000X+009",
+   "display": "722",
+   "rc": "0",
+   "expr": "monthly(\"March 2020\",\"MY\")"
+  },
+  "monthly.YM": {
+   "kind": "numeric",
+   "hex": "+1.6900000000000X+009",
+   "display": "722",
+   "expr": "monthly(\"2020-03\",\"YM\")"
+  },
+  "monthly.bad": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "expr": "monthly(\"zzz\",\"YM\")"
+  },
+  "msofdays": {
+   "kind": "stata_error",
+   "stata_message": "unknown function msofdays()",
+   "rc": "133",
+   "expr": "msofdays(1)"
+  },
+  "msofhours": {
+   "kind": "numeric",
+   "hex": "+1.b774000000000X+015",
+   "display": "3600000",
+   "expr": "msofhours(1)"
+  },
+  "msofminutes": {
+   "kind": "numeric",
+   "hex": "+1.5f90000000000X+010",
+   "display": "90000",
+   "expr": "msofminutes(1.5)"
+  },
+  "msofseconds": {
+   "kind": "numeric",
+   "hex": "+1.5f90000000000X+010",
+   "display": "90000",
+   "expr": "msofseconds(90)"
+  },
+  "msofseconds.frac": {
+   "kind": "numeric",
+   "hex": "+1.f400000000000X+008",
+   "display": "500",
+   "rc": "0",
+   "expr": "msofseconds(0.5)"
+  },
+  "nara.Gutierrez": {
+   "kind": "string",
+   "value": "G362",
+   "rc": "0"
+  },
+  "nara.Jackson": {
+   "kind": "string",
+   "value": "J250",
+   "rc": "0"
+  },
+  "nara.Lee": {
+   "kind": "string",
+   "value": "L000",
+   "rc": "0"
+  },
+  "nara.Pfister": {
+   "kind": "string",
+   "value": "P236",
+   "rc": "0"
+  },
+  "nara.VanDeusen": {
+   "kind": "string",
+   "value": "V532",
+   "rc": "0"
+  },
+  "nara.digits": {
+   "kind": "string",
+   "value": "O165",
+   "rc": "0"
+  },
+  "nara.space": {
+   "kind": "string",
+   "value": "M235",
+   "rc": "0"
+  },
+  "nr.Ashcraft": {
+   "kind": "string",
+   "value": "A261",
+   "rc": "0"
+  },
+  "nr.Ashcroft": {
+   "kind": "string",
+   "value": "A261",
+   "rc": "0"
+  },
+  "nr.Bachman": {
+   "kind": "string",
+   "value": "B255",
+   "rc": "0"
+  },
+  "nr.Burroughs": {
+   "kind": "string",
+   "value": "B620",
+   "rc": "0"
+  },
+  "nr.DeLaRosa": {
+   "kind": "string",
+   "value": "D462",
+   "rc": "0"
+  },
+  "nr.Hochwald": {
+   "kind": "string",
+   "value": "H243",
+   "rc": "0"
+  },
+  "nr.Honeyman": {
+   "kind": "string",
+   "value": "H555",
+   "rc": "0"
+  },
+  "nr.Hubbard": {
+   "kind": "string",
+   "value": "H163",
+   "rc": "0"
+  },
+  "nr.Jackson": {
+   "kind": "string",
+   "value": "J250",
+   "rc": "0"
+  },
+  "nr.Lloyd": {
+   "kind": "string",
+   "value": "L300",
+   "rc": "0"
+  },
+  "nr.Lukasiewicz": {
+   "kind": "string",
+   "value": "L222",
+   "rc": "0"
+  },
+  "nr.McDonald": {
+   "kind": "string",
+   "value": "M235",
+   "rc": "0"
+  },
+  "nr.O'Brien": {
+   "kind": "string",
+   "value": "O165",
+   "rc": "0"
+  },
+  "nr.Pfister": {
+   "kind": "string",
+   "value": "P236",
+   "rc": "0"
+  },
+  "nr.Robert": {
+   "kind": "string",
+   "value": "R163",
+   "rc": "0"
+  },
+  "nr.Rupert": {
+   "kind": "string",
+   "value": "R163",
+   "rc": "0"
+  },
+  "nr.Sachs": {
+   "kind": "string",
+   "value": "S200",
+   "rc": "0"
+  },
+  "nr.Schwab": {
+   "kind": "string",
+   "value": "S100",
+   "rc": "0"
+  },
+  "nr.Schwartz": {
+   "kind": "string",
+   "value": "S632",
+   "rc": "0"
+  },
+  "nr.Tchaikovsky": {
+   "kind": "string",
+   "value": "T221",
+   "rc": "0"
+  },
+  "nr.Tymczak": {
+   "kind": "string",
+   "value": "T522",
+   "rc": "0"
+  },
+  "nr.Vandeusen": {
+   "kind": "string",
+   "value": "V532",
+   "rc": "0"
+  },
+  "nr.Wachob": {
+   "kind": "string",
+   "value": "W210",
+   "rc": "0"
+  },
+  "nr.Wachowski": {
+   "kind": "string",
+   "value": "W220",
+   "rc": "0"
+  },
+  "nr.Whitehead": {
+   "kind": "string",
+   "value": "W330",
+   "rc": "0"
+  },
+  "nr.Yamashita": {
+   "kind": "string",
+   "value": "Y523",
+   "rc": "0"
+  },
+  "nr.hw2": {
+   "kind": "string",
+   "value": "S632",
+   "rc": "0"
+  },
+  "nr.plain": {
+   "kind": "string",
+   "value": "S530",
+   "rc": "0"
+  },
+  "nullmat.bare": {
+   "kind": "stata_error",
+   "stata_message": "unknown function nullmat()",
+   "rc": "133"
+  },
+  "nullmat.exist": {
+   "rc": "0"
+  },
+  "nullmat.first": {
+   "rc": "0"
+  },
+  "p.h.compact": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+006",
+   "display": "120",
+   "rc": "0",
+   "expr": "halfyearly(\"2020h1\",\"YH\")"
+  },
+  "p.m.bad": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "monthly(\"2020-13\",\"YM\")"
+  },
+  "p.m.compact": {
+   "kind": "numeric",
+   "hex": "+1.6900000000000X+009",
+   "display": "722",
+   "rc": "0",
+   "expr": "monthly(\"2020m3\",\"YM\")"
+  },
+  "p.q.bad": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "quarterly(\"2020-5\",\"YQ\")"
+  },
+  "p.q.compact": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+007",
+   "display": "240",
+   "rc": "0",
+   "expr": "quarterly(\"2020q1\",\"YQ\")"
+  },
+  "p.q.upper": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+007",
+   "display": "240",
+   "rc": "0",
+   "expr": "quarterly(\"2020Q1\",\"YQ\")"
+  },
+  "p.w.compact": {
+   "kind": "numeric",
+   "hex": "+1.8720000000000X+00b",
+   "display": "3129",
+   "rc": "0",
+   "expr": "weekly(\"2020w10\",\"YW\")"
+  },
+  "q.syn": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+007",
+   "display": "240",
+   "expr": "q(2020q1)"
+  },
+  "qofd": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+007",
+   "display": "240",
+   "expr": "qofd(td(15mar2020))"
+  },
+  "qofd.neg": {
+   "kind": "numeric",
+   "hex": "-1.0000000000000X+000",
+   "display": "-1",
+   "expr": "qofd(td(31dec1959))"
+  },
+  "quarterly.YQ": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+007",
+   "display": "240",
+   "expr": "quarterly(\"2020-1\",\"YQ\")"
+  },
+  "quarterly.YQ.words": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+007",
+   "display": "240",
+   "rc": "0",
+   "expr": "quarterly(\"2020 1\",\"YQ\")"
+  },
+  "rng.u1": {
+   "kind": "numeric",
+   "hex": "+1.6e367c6f88882X-002",
+   "display": ".3576297228884259"
+  },
+  "rng.u2": {
+   "kind": "numeric",
+   "hex": "+1.9a0da12083fd2X-002",
+   "display": ".4004426170440613"
+  },
+  "rng.u3": {
+   "kind": "numeric",
+   "hex": "+1.60f6d9a1deaa1X-001",
+   "display": ".6893833170027684"
+  },
+  "rng.z1": {
+   "kind": "numeric",
+   "hex": "+1.1691446230bb4X-001",
+   "display": ".5440770501958156"
+  },
+  "rng.z2": {
+   "kind": "numeric",
+   "hex": "+1.aaf52469c3a40X-00a",
+   "display": ".0016287139391725"
+  },
+  "rng.z3": {
+   "kind": "numeric",
+   "hex": "+1.6e43e7486f754X-002",
+   "display": ".3576809061013269"
+  },
+  "runiform.range.det": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "runiform(3,3)"
+  },
+  "runiformint.det": {
+   "kind": "numeric",
+   "hex": "+1.4000000000000X+002",
+   "display": "5",
+   "expr": "runiformint(5,5)"
+  },
+  "runiformint.same": {
+   "kind": "numeric",
+   "hex": "+1.c000000000000X+002",
+   "display": "7",
+   "rc": "0",
+   "expr": "runiformint(7,7)"
+  },
+  "seconds": {
+   "kind": "numeric",
+   "hex": "+1.6800000000000X+006",
+   "display": "90",
+   "expr": "seconds(90000)"
+  },
+  "sit.mixws": {
+   "kind": "string",
+   "value": "a    b",
+   "rc": "0"
+  },
+  "sit.newline": {
+   "rc": "0"
+  },
+  "sl.mixed": {
+   "kind": "string",
+   "value": "mixed 12 ÀÉ",
+   "rc": "0"
+  },
+  "slt.only": {
+   "kind": "string",
+   "value": "",
+   "rc": "0"
+  },
+  "soundex": {
+   "kind": "string",
+   "value": "W252"
+  },
+  "soundex.Gutierrez": {
+   "kind": "string",
+   "value": "G362",
+   "rc": "0"
+  },
+  "soundex.Jackson": {
+   "kind": "string",
+   "value": "J250",
+   "rc": "0"
+  },
+  "soundex.Lee": {
+   "kind": "string",
+   "value": "L000",
+   "rc": "0"
+  },
+  "soundex.Pfister": {
+   "kind": "string",
+   "value": "P236",
+   "rc": "0"
+  },
+  "soundex.VanDeusen": {
+   "kind": "string",
+   "value": "V532",
+   "rc": "0"
+  },
+  "soundex_nara": {
+   "kind": "string",
+   "value": "W252"
+  },
+  "soundex_nara.2": {
+   "kind": "string",
+   "value": "T522"
+  },
+  "soundex_nara.3": {
+   "kind": "string",
+   "value": "A261"
+  },
+  "soundex_nara.empty": {
+   "kind": "string",
+   "value": ""
+  },
+  "ss.tc": {
+   "kind": "numeric",
+   "hex": "+1.c000000000000X+005",
+   "display": "56",
+   "expr": "ss(tc(15mar2020 13:45:56))"
+  },
+  "ssC.tC": {
+   "kind": "numeric",
+   "hex": "+1.c000000000000X+005",
+   "display": "56",
+   "expr": "ssC(tC(15mar2020 13:45:56))"
+  },
+  "stritrim": {
+   "kind": "string",
+   "value": "a b c"
+  },
+  "stritrim.empty": {
+   "kind": "string",
+   "value": "",
+   "rc": "0"
+  },
+  "stritrim.lead": {
+   "kind": "string",
+   "value": "  a b  ",
+   "rc": "0"
+  },
+  "stritrim.only": {
+   "kind": "string",
+   "value": "     ",
+   "rc": "0"
+  },
+  "stritrim.tabs": {
+   "kind": "string",
+   "value": "a               b"
+  },
+  "strlower": {
+   "kind": "string",
+   "value": "abc-def 12"
+  },
+  "strlower.accent": {
+   "kind": "string",
+   "value": "ÀÉÎ",
+   "rc": "0"
+  },
+  "strltrim": {
+   "kind": "string",
+   "value": "ab  "
+  },
+  "strltrim.tab": {
+   "kind": "string",
+   "value": "  x",
+   "rc": "0"
+  },
+  "strproper": {
+   "kind": "string",
+   "value": "Hello World"
+  },
+  "strrtrim": {
+   "kind": "string",
+   "value": "   ab"
+  },
+  "strtrim": {
+   "kind": "string",
+   "value": "ab"
+  },
+  "strupper": {
+   "kind": "string",
+   "value": "ABC-DEF 12"
+  },
+  "strupper.accent": {
+   "kind": "string",
+   "value": "àéî",
+   "rc": "0"
+  },
+  "su.mixed": {
+   "kind": "string",
+   "value": "MIXED 12 àé",
+   "rc": "0"
+  },
+  "sum.ifqual": {
+   "rc": "0"
+  },
+  "sum.last": {
+   "kind": "numeric",
+   "hex": "+1.bd89400000000X+012",
+   "display": "456229"
+  },
+  "sum.row1": {
+   "kind": "numeric",
+   "hex": "+1.0030000000000X+00c",
+   "display": "4099"
+  },
+  "sum.row5": {
+   "kind": "numeric",
+   "hex": "+1.8b28000000000X+00e",
+   "display": "25290"
+  },
+  "sum.string": {
+   "rc": "109"
+  },
+  "sum.total": {
+   "kind": "numeric",
+   "hex": "+1.bd89400000000X+012",
+   "display": "456229"
+  },
+  "sx.Ashcraft": {
+   "kind": "string",
+   "value": "A226",
+   "rc": "0"
+  },
+  "sx.Ashcroft": {
+   "kind": "string",
+   "value": "A226",
+   "rc": "0"
+  },
+  "sx.Bachman": {
+   "kind": "string",
+   "value": "B255",
+   "rc": "0"
+  },
+  "sx.Burroughs": {
+   "kind": "string",
+   "value": "B622",
+   "rc": "0"
+  },
+  "sx.DeLaRosa": {
+   "kind": "string",
+   "value": "D462",
+   "rc": "0"
+  },
+  "sx.Hochwald": {
+   "kind": "string",
+   "value": "H243",
+   "rc": "0"
+  },
+  "sx.Honeyman": {
+   "kind": "string",
+   "value": "H555",
+   "rc": "0"
+  },
+  "sx.Hubbard": {
+   "kind": "string",
+   "value": "H163",
+   "rc": "0"
+  },
+  "sx.Jackson": {
+   "kind": "string",
+   "value": "J250",
+   "rc": "0"
+  },
+  "sx.Lloyd": {
+   "kind": "string",
+   "value": "L300",
+   "rc": "0"
+  },
+  "sx.Lukasiewicz": {
+   "kind": "string",
+   "value": "L222",
+   "rc": "0"
+  },
+  "sx.McDonald": {
+   "kind": "string",
+   "value": "M235",
+   "rc": "0"
+  },
+  "sx.O'Brien": {
+   "kind": "string",
+   "value": "O165",
+   "rc": "0"
+  },
+  "sx.Pfister": {
+   "kind": "string",
+   "value": "P236",
+   "rc": "0"
+  },
+  "sx.Robert": {
+   "kind": "string",
+   "value": "R163",
+   "rc": "0"
+  },
+  "sx.Rupert": {
+   "kind": "string",
+   "value": "R163",
+   "rc": "0"
+  },
+  "sx.Sachs": {
+   "kind": "string",
+   "value": "S220",
+   "rc": "0"
+  },
+  "sx.Schwab": {
+   "kind": "string",
+   "value": "S100",
+   "rc": "0"
+  },
+  "sx.Schwartz": {
+   "kind": "string",
+   "value": "S632",
+   "rc": "0"
+  },
+  "sx.Tchaikovsky": {
+   "kind": "string",
+   "value": "T221",
+   "rc": "0"
+  },
+  "sx.Tymczak": {
+   "kind": "string",
+   "value": "T522",
+   "rc": "0"
+  },
+  "sx.Vandeusen": {
+   "kind": "string",
+   "value": "V532",
+   "rc": "0"
+  },
+  "sx.Wachob": {
+   "kind": "string",
+   "value": "W210",
+   "rc": "0"
+  },
+  "sx.Wachowski": {
+   "kind": "string",
+   "value": "W220",
+   "rc": "0"
+  },
+  "sx.Whitehead": {
+   "kind": "string",
+   "value": "W330",
+   "rc": "0"
+  },
+  "sx.Yamashita": {
+   "kind": "string",
+   "value": "Y523",
+   "rc": "0"
+  },
+  "sx.digits": {
+   "kind": "string",
+   "value": "",
+   "rc": "0"
+  },
+  "sx.empty": {
+   "kind": "string",
+   "value": "",
+   "rc": "0"
+  },
+  "sx.hw2": {
+   "kind": "string",
+   "value": "S632",
+   "rc": "0"
+  },
+  "sx.lower": {
+   "kind": "string",
+   "value": "W252",
+   "rc": "0"
+  },
+  "sx.plain": {
+   "kind": "string",
+   "value": "S530",
+   "rc": "0"
+  },
+  "t.1.0": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X-001",
+   "display": ".5",
+   "rc": "0",
+   "expr": "ttail(1,0)"
+  },
+  "t.100.3": {
+   "kind": "numeric",
+   "hex": "+1.beaea9e4ef16dX-00a",
+   "display": ".0017039576716647",
+   "rc": "0",
+   "expr": "ttail(100,3)"
+  },
+  "t.1000.196": {
+   "kind": "numeric",
+   "hex": "+1.9bd682a805bbdX-006",
+   "display": ".0251365924778744",
+   "rc": "0",
+   "expr": "ttail(1000,1.96)"
+  },
+  "t.2.10": {
+   "kind": "numeric",
+   "hex": "+1.42d86659a7ab5X-008",
+   "display": ".0049262285116628",
+   "rc": "0",
+   "expr": "ttail(2,10)"
+  },
+  "t.3.5": {
+   "kind": "numeric",
+   "hex": "+1.d83c5a81b1bc6X-004",
+   "display": ".1152919326224114",
+   "rc": "0",
+   "expr": "ttail(3,1.5)"
+  },
+  "t.5.0": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X-001",
+   "display": ".5",
+   "rc": "0",
+   "expr": "ttail(5,0)"
+  },
+  "t.frac.df": {
+   "kind": "numeric",
+   "hex": "+1.270ce9fe17ab2X-005",
+   "display": ".0360169000784841",
+   "rc": "0",
+   "expr": "ttail(10.5,2)"
+  },
+  "t.neg.df": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "ttail(-1,2)"
+  },
+  "tC.dt": {
+   "kind": "numeric",
+   "hex": "+1.ba5ad0df98000X+028",
+   "display": "1899899183000",
+   "expr": "tC(15mar2020 13:45:56)"
+  },
+  "tC.timeonly": {
+   "kind": "numeric",
+   "hex": "+1.4997000000000X+019",
+   "display": "43200000",
+   "rc": "0",
+   "expr": "tC(12:00)"
+  },
+  "tc.dt": {
+   "kind": "numeric",
+   "hex": "+1.ba5ad07620000X+028",
+   "display": "1899899156000",
+   "expr": "tc(15mar2020 13:45:56)"
+  },
+  "tc.hms": {
+   "kind": "numeric",
+   "hex": "+1.49d1980000000X+019",
+   "display": "43230000",
+   "rc": "0",
+   "expr": "tc(12:00:30)"
+  },
+  "tc.timeonly": {
+   "kind": "numeric",
+   "hex": "+1.4997000000000X+019",
+   "display": "43200000",
+   "rc": "0",
+   "expr": "tc(12:00)"
+  },
+  "tc.timeonly2": {
+   "kind": "numeric",
+   "hex": "+1.2064200000000X+019",
+   "display": "37800000",
+   "rc": "0",
+   "expr": "tc(10:30)"
+  },
+  "td.epoch": {
+   "kind": "numeric",
+   "hex": "+0.0000000000000X-3ff",
+   "display": "0",
+   "expr": "td(01jan1960)"
+  },
+  "td.mar2020": {
+   "kind": "numeric",
+   "hex": "+1.5794000000000X+00e",
+   "display": "21989",
+   "expr": "td(15mar2020)"
+  },
+  "td.pre": {
+   "kind": "numeric",
+   "hex": "-1.0000000000000X+000",
+   "display": "-1",
+   "expr": "td(31dec1959)"
+  },
+  "td.var": {
+   "rc": "198"
+  },
+  "th.2020h1": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+006",
+   "display": "120",
+   "expr": "th(2020h1)"
+  },
+  "tin": {
+   "rc": "0 n=4"
+  },
+  "tin.d": {
+   "rc": "0 n=4"
+  },
+  "tin.nots": {
+   "rc": "101"
+  },
+  "tin.q": {
+   "rc": "0 n=8"
+  },
+  "tin.qy": {
+   "rc": "198 n=8"
+  },
+  "tm.2020m3": {
+   "kind": "numeric",
+   "hex": "+1.6900000000000X+009",
+   "display": "722",
+   "expr": "tm(2020m3)"
+  },
+  "tm.epoch": {
+   "kind": "numeric",
+   "hex": "+0.0000000000000X-3ff",
+   "display": "0",
+   "expr": "tm(1960m1)"
+  },
+  "tm.neg": {
+   "kind": "numeric",
+   "hex": "-1.8000000000000X+003",
+   "display": "-12",
+   "rc": "0",
+   "expr": "tm(1959m1)"
+  },
+  "tm.pre": {
+   "kind": "numeric",
+   "hex": "-1.0000000000000X+000",
+   "display": "-1",
+   "expr": "tm(1959m12)"
+  },
+  "tq.2020q1": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+007",
+   "display": "240",
+   "expr": "tq(2020q1)"
+  },
+  "tq.epoch": {
+   "kind": "numeric",
+   "hex": "+0.0000000000000X-3ff",
+   "display": "0",
+   "expr": "tq(1960q1)"
+  },
+  "tq.neg": {
+   "kind": "numeric",
+   "hex": "-1.0000000000000X+002",
+   "display": "-4",
+   "rc": "0",
+   "expr": "tq(1959q1)"
+  },
+  "tq.pre": {
+   "kind": "numeric",
+   "hex": "-1.0000000000000X+000",
+   "display": "-1",
+   "expr": "tq(1959q4)"
+  },
+  "tq.var": {
+   "rc": "198"
+  },
+  "ttail": {
+   "kind": "numeric",
+   "hex": "+1.99b2498bd301bX-006",
+   "display": ".0250058859085557",
+   "expr": "ttail(10,2.228)"
+  },
+  "ttail.1": {
+   "kind": "numeric",
+   "hex": "+1.ffffffffffff8X-003",
+   "display": ".2499999999999998",
+   "rc": "0",
+   "expr": "ttail(1,1)"
+  },
+  "ttail.30": {
+   "kind": "numeric",
+   "hex": "+1.e621d9a50a891X-006",
+   "display": ".0296711564480253",
+   "rc": "0",
+   "expr": "ttail(30,1.96)"
+  },
+  "ttail.df0": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "ttail(0,1)"
+  },
+  "ttail.miss": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "ttail(10,.)"
+  },
+  "ttail.neg": {
+   "kind": "numeric",
+   "hex": "+1.f3326db3a167fX-001",
+   "display": ".9749941140914443",
+   "expr": "ttail(10,-2.228)"
+  },
+  "tw.2020w10": {
+   "kind": "numeric",
+   "hex": "+1.8720000000000X+00b",
+   "display": "3129",
+   "expr": "tw(2020w10)"
+  },
+  "twithin": {
+   "rc": "0 n=2"
+  },
+  "twithin.q": {
+   "rc": "0 n=6"
+  },
+  "ty.2020": {
+   "kind": "stata_error",
+   "stata_message": "unknown function ty()",
+   "rc": "133",
+   "expr": "ty(2020)"
+  },
+  "uf.3char": {
+   "kind": "string",
+   "value": "axb"
+  },
+  "uf.empty": {
+   "kind": "string",
+   "value": "",
+   "rc": "0"
+  },
+  "uf.empty.repl": {
+   "kind": "string",
+   "value": "ab"
+  },
+  "uf.longrepl": {
+   "kind": "string",
+   "value": "a?b",
+   "rc": "0"
+  },
+  "ustrfix.bad": {
+   "kind": "string",
+   "value": "ab�c"
+  },
+  "ustrfix.ok": {
+   "kind": "string",
+   "value": "abc"
+  },
+  "ustrfix.repl": {
+   "kind": "string",
+   "value": "ab?c"
+  },
+  "ustrfix.two": {
+   "kind": "string",
+   "value": "a��b",
+   "rc": "0"
+  },
+  "ustrlower.accent": {
+   "kind": "string",
+   "value": "àéî",
+   "rc": "0"
+  },
+  "w.syn": {
+   "kind": "numeric",
+   "hex": "+1.8720000000000X+00b",
+   "display": "3129",
+   "expr": "w(2020w10)"
+  },
+  "week.d": {
+   "kind": "numeric",
+   "hex": "+1.6000000000000X+003",
+   "display": "11",
+   "rc": "0",
+   "expr": "week(td(15mar2020))"
+  },
+  "weekly.YW": {
+   "kind": "numeric",
+   "hex": "+1.8720000000000X+00b",
+   "display": "3129",
+   "expr": "weekly(\"2020-10\",\"YW\")"
+  },
+  "wofd": {
+   "kind": "numeric",
+   "hex": "+1.8740000000000X+00b",
+   "display": "3130",
+   "expr": "wofd(td(15mar2020))"
+  },
+  "wofd.pre": {
+   "kind": "numeric",
+   "hex": "-1.0000000000000X+000",
+   "display": "-1",
+   "rc": "0",
+   "expr": "wofd(td(31dec1959))"
+  },
+  "y.syn": {
+   "kind": "numeric",
+   "hex": "+1.f900000000000X+00a",
+   "display": "2020",
+   "expr": "y(2020)"
+  },
+  "year.miss": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "year(.)"
+  },
+  "yearly.Y": {
+   "kind": "numeric",
+   "hex": "+1.f900000000000X+00a",
+   "display": "2020",
+   "expr": "yearly(\"2020\",\"Y\")"
+  },
+  "yh.2020.1": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+006",
+   "display": "120",
+   "rc": "0",
+   "expr": "yh(2020,1)"
+  },
+  "ym.1960.1": {
+   "kind": "numeric",
+   "hex": "+0.0000000000000X-3ff",
+   "display": "0",
+   "rc": "0",
+   "expr": "ym(1960,1)"
+  },
+  "ym.2020.3": {
+   "kind": "numeric",
+   "hex": "+1.6900000000000X+009",
+   "display": "722",
+   "rc": "0",
+   "expr": "ym(2020,3)"
+  },
+  "ym.miss": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "ym(.,3)"
+  },
+  "ym.ovf": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "ym(2020,13)"
+  },
+  "ym.zero": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "ym(2020,0)"
+  },
+  "yofd": {
+   "kind": "numeric",
+   "hex": "+1.f900000000000X+00a",
+   "display": "2020",
+   "expr": "yofd(td(15mar2020))"
+  },
+  "yofd.epoch": {
+   "kind": "numeric",
+   "hex": "+1.ea00000000000X+00a",
+   "display": "1960",
+   "rc": "0",
+   "expr": "yofd(0)"
+  },
+  "yofd.neg": {
+   "kind": "numeric",
+   "hex": "+1.e9c0000000000X+00a",
+   "display": "1959",
+   "expr": "yofd(td(31dec1959))"
+  },
+  "yq.2020.1": {
+   "kind": "numeric",
+   "hex": "+1.e000000000000X+007",
+   "display": "240",
+   "rc": "0",
+   "expr": "yq(2020,1)"
+  },
+  "yq.ovf": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "yq(2020,5)"
+  },
+  "yq.zero": {
+   "kind": "numeric",
+   "hex": "+1.0000000000000X+3ff",
+   "display": ".",
+   "rc": "0",
+   "expr": "yq(2020,0)"
+  },
+  "yw.2020.10": {
+   "kind": "numeric",
+   "hex": "+1.8720000000000X+00b",
+   "display": "3129",
+   "rc": "0",
+   "expr": "yw(2020,10)"
+  }
+ }
+}

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // PIET 2.0 native shell — entry point.
 //
 // Usage:
@@ -129,11 +131,14 @@ std::string readFileOrDie(const std::string& path) {
   return ss.str();
 }
 
-// Resolve dev files from the running executable, independent of the caller's
-// working directory and without embedding the builder's checkout path.
+// Resolves a path relative to this source file's known repo-tree location
+// (__FILE__ gives a build-time-stable anchor back to the repo without
+// hardcoding a machine path — works for any dev checkout location).
 std::string repoRelative(const std::string& suffix) {
-  auto root = piet::devTreeRoot();
-  return root ? *root + suffix : suffix;
+  std::string thisFile = __FILE__;  // .../piet/native/src/main.cpp
+  auto pos = thisFile.rfind("/piet/native/src/main.cpp");
+  std::string root = (pos == std::string::npos) ? "../.." : thisFile.substr(0, pos);
+  return root + suffix;
 }
 
 bool fileExists(const std::string& path) {
@@ -141,7 +146,7 @@ bool fileExists(const std::string& path) {
 }
 
 // M5 GA: resolves piet/frontend/index.html — bundled Resources/frontend/
-// FIRST when running from inside a packaged .app, dev-tree executable-relative
+// FIRST when running from inside a packaged .app, dev-tree __FILE__-relative
 // path otherwise. Mirrors resolveCobraBin()'s bundle-first order
 // (cobra_runner.cpp) so both halves of "what does a packaged .app load"
 // (the UI bundle, the engine binary) resolve the same way for the same
@@ -154,9 +159,10 @@ bool fileExists(const std::string& path) {
 // Resources/frontend/index.html is missing (a packaging-script regression —
 // see the Windows "resources\ runtime layer" canary bug this same
 // stabilization wave already fixed once for the cobra binary) must NOT
-// silently fall through to the dev-tree repoRelative() path: on a shipped
-// .app that checkout path will normally not exist — navigating a file:// URL
-// that resolves to nothing leaves a blank
+// silently fall through to the dev-tree repoRelative() path: that path is
+// derived from this SOURCE FILE's build-time __FILE__ location, which on a
+// shipped .app is some OTHER machine's checkout and essentially never
+// exists — navigating a file:// URL that resolves to nothing leaves a blank
 // window with no diagnostic (exactly the ERR_NAME_NOT_RESOLVED-shaped
 // failure mode). So: try the packaged path first; if that's not there, try
 // the dev-tree path as a best-effort fallback (covers running a freshly
@@ -297,9 +303,13 @@ void runDoInBackground(piet::Shell* shell, AppState* app, const std::string& seq
     // (set by this outer thread right before returning) tells it to stop
     // and push one FINAL snapshot.
     std::atomic<bool> runDone{false};
+    // The snapshot carries the running statement's text, which can hold a
+    // byte that is not UTF-8; a strict dump would throw on this bare thread
+    // and std::terminate the app, so it goes out as U+FFFD (BUG-1131).
     std::thread ticker([shell, app, &runDone]() {
       while (!runDone.load()) {
-        shell->postEvent(app->session.progressSnapshot().dump());
+        shell->postEvent(app->session.progressSnapshot().dump(
+            -1, ' ', false, nlohmann::ordered_json::error_handler_t::replace));
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
       }
     });
@@ -319,7 +329,7 @@ void runDoInBackground(piet::Shell* shell, AppState* app, const std::string& seq
       ev["kind"] = "block";
       ev["seq"] = streamedSeq++;
       ev["block"] = block;
-      shell->postEvent(ev.dump());
+      shell->postEvent(ev.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace));
     };
 
     // F6c tail-only return: move blocks[streamedCount:] — the UN-streamed
@@ -385,7 +395,8 @@ void runDoInBackground(piet::Shell* shell, AppState* app, const std::string& seq
     // calls progressFinish() internally before returning), so the last
     // pietEvents tick the frontend sees has running:false + the real
     // stopped_reason — never a stale "still running" snapshot.
-    shell->postEvent(app->session.progressSnapshot().dump());
+    shell->postEvent(app->session.progressSnapshot().dump(
+        -1, ' ', false, nlohmann::ordered_json::error_handler_t::replace));
 
     // Resolve the ORIGINAL bind() promise with the final {blocks,...}
     // payload. webview's resolve() is documented safe from any thread (it
@@ -396,7 +407,11 @@ void runDoInBackground(piet::Shell* shell, AppState* app, const std::string& seq
     // callback uses — routed here via a dedicated Shell::resolveInvoke()
     // (see shell.h/.cpp) so do/do_string can return asynchronously instead
     // of blocking the UI thread for a potentially long run.
-    shell->resolveInvoke(seq, true, out.dump());
+    // BUG-1372: a string function works on bytes, as Stata's do, so a block
+    // may carry a split UTF-8 sequence; it is sent as U+FFFD (what a terminal
+    // shows for Stata's own log byte) instead of failing the run.
+    shell->resolveInvoke(seq, true,
+                         out.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace));
     // BUG-391: LAST statement — nothing above may run after this store, because
     // reapFinished() joins (and thereby lets AppState/Shell teardown proceed)
     // the moment it sees the flag.
@@ -544,7 +559,10 @@ void bindAllRoutes(piet::Shell& shell, AppState& app) {
     nlohmann::ordered_json out;
     out["source"] = r.source;
     out["resolved_path"] = r.resolvedPath;
-    return piet::BridgeResult::success(out.dump());
+    // A do-file saved in Latin-1 still opens: its non-UTF-8 bytes show as
+    // U+FFFD instead of failing the route (BUG-1131).
+    return piet::BridgeResult::success(
+        out.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace));
   });
   shell.bindRoute("varlist", [&app](const std::string& body) {
     return piet::routes::varlist(app.session, body);
@@ -988,8 +1006,8 @@ void runDemoPage() {
 // session.cwd is seeded to the
 // INVOKING SHELL's own process cwd (below) so its relative paths (`use
 // "foo.dta"`, `cd`, tempfiles) resolve exactly as a real run would — a
-// kitchensink run invoked as `piet_native --do tests/kitchensink/debug_all.do`
-// from the repo root keeps resolving `use "synthetic_panel.csv"`-style relative
+// kitchensink run invoked as `piet_native --do debug_all.do`
+// from the repo root keeps resolving `use "fatalities.csv"`-style relative
 // paths against the repo root, not the .do file's own directory. Exit 0 iff
 // the file ran to completion with no stopped_at_reason, OR stopped on a
 // clean Stata `exit`/`exit, clear` (BUG-139 — `exit` halts via the same
@@ -1334,7 +1352,11 @@ int runDoFileHeadless(const std::string& filepath, const std::vector<std::string
     counters["error_blocks"] = piet::counters::errorBlocks();
     out["counters"] = counters;
   }
-  std::printf("%s\n", out.dump().c_str());
+  // BUG-1372: a split UTF-8 sequence from a byte-based string function is
+  // written as U+FFFD, as the GUI path sends it (runDoInBackground above); so
+  // is a byte that is not UTF-8 (`type` of a Latin-1 file, BUG-1131).
+  std::printf("%s\n",
+              out.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace).c_str());
   // BUG-124 (silent-death mode): with stdout redirected to a file on a FULL
   // disk, the buffered transcript is lost at exit-time flush and the run ends
   // exit 1 with an EMPTY stdout and no diagnostic anywhere (observed on the
@@ -1451,8 +1473,8 @@ int runDoFileHeadless(const std::string& filepath, const std::vector<std::string
 // (bundle-first resolution picks up Resources/frontend + Resources/cobra —
 // same order the product launch uses). Running the dev build binary smokes
 // the dev tree instead. The fixture dataset defaults to the SHIPPED sample
-// (bundled Resources/sample/synthetic_panel.csv, or the worktree's
-// piet/packaging/sample/synthetic_panel.csv for dev runs; override:
+// (bundled Resources/sample/fatalities.csv, or the worktree's
+// piet/packaging/sample/fatalities.csv for dev runs; override:
 // $PIET_UI_SMOKE_DATA).
 struct SmokeState {
   std::mutex m;
@@ -1528,7 +1550,7 @@ std::string smokeDriverJs(const std::string& dataPath, const std::string& doFixt
       //    false-positive on) its own harness. Any script that IS a DOM node
       //    beyond those two, or that carries a `src`, is content this driver
       //    did not ship.
-      // 2. Grammarly marker census: tests/kitchensink/BUGLOG.md BUG-197 /
+      // 2. Grammarly marker census: the internal bug ledger BUG-197 /
       //    piet/README.md's "Known issues" section confirm Grammarly Desktop
       //    as the one injector this fleet has actually caught mutating this
       //    DOM. Its confirmed markers (data-gramm*, the desktop-integration
@@ -2337,7 +2359,7 @@ std::string seedInjectionProbeJs() {
 
 int runUiSmoke() {
   // Fixture default (WI-4, 2.0.3): the SHIPPED sample dataset — bundled
-  // Resources/sample/synthetic_panel.csv when running from a packaged .app (the
+  // Resources/sample/fatalities.csv when running from a packaged .app (the
   // gate is then fully self-contained on any machine), else the same file in
   // the worktree (piet/packaging/sample/). $PIET_UI_SMOKE_DATA overrides.
   // env_utf8: a Korean %USERPROFILE%-rooted override arrives from narrow
@@ -2345,9 +2367,9 @@ int runUiSmoke() {
   std::string dataEnv = cecon::env_utf8("PIET_UI_SMOKE_DATA");
   std::string dataDefault;
   if (std::optional<std::string> resources = piet::bundleResourcesDir()) {
-    dataDefault = *resources + "/sample/synthetic_panel.csv";
+    dataDefault = *resources + "/sample/fatalities.csv";
   } else {
-    dataDefault = repoRelative("/piet/packaging/sample/synthetic_panel.csv");
+    dataDefault = repoRelative("/piet/packaging/sample/fatalities.csv");
   }
   std::string dataPath = !dataEnv.empty() ? dataEnv : dataDefault;
   std::string outEnv = cecon::env_utf8("PIET_UI_SMOKE_OUT");
@@ -2422,7 +2444,7 @@ int runUiSmoke() {
   // Measured non-fix: WKWebsiteDataStore governs persisted browsing state
   // (cookies/cache/IndexedDB/service workers). Grammarly Desktop — the one
   // injector this fleet has confirmed hitting this DOM (piet/README.md
-  // "Known issues"; tests/kitchensink/BUGLOG.md BUG-197) — attaches through
+  // "Known issues"; the internal bug ledger BUG-197) — attaches through
   // the macOS Accessibility API / a global input-event tap, neither of which
   // has any relationship to a WKWebView's data-store identity. Item 1 alone
   // is therefore not a fix for BUG-197's finding; it ships anyway as
@@ -2643,8 +2665,31 @@ int main(int argc, char** argv) {
   bool demo = false;
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--selftest") == 0) {
-      std::fprintf(stderr, "Public beta: run ctest --test-dir build and python3 tests/smoke.py.\n");
+      // R1 (selftest split): the suite lives in the sibling `piet_selftest`
+      // binary now — exec it so every script that says `piet_native --selftest`
+      // keeps working, dev tree and CI alike. The product binary itself no
+      // longer carries the 24k-line suite; a packaged .app that does not bundle
+      // piet_selftest gets an honest pointer instead of a silent no-op.
+#ifndef _WIN32
+      std::error_code selfEc;
+      std::filesystem::path self =
+          std::filesystem::weakly_canonical(std::filesystem::path(argv[0]), selfEc);
+      std::filesystem::path sib =
+          (selfEc || !self.has_parent_path()) ? std::filesystem::path("piet_selftest")
+                                              : self.parent_path() / "piet_selftest";
+      ::execl(sib.string().c_str(), "piet_selftest", static_cast<char*>(nullptr));
+      std::fprintf(stderr,
+                   "[piet_native] --selftest: could not exec %s (%s). The suite builds as the "
+                   "separate `piet_selftest` binary since the R1 split — build it with "
+                   "`cmake --build <builddir> --target piet_selftest` and run it directly.\n",
+                   sib.string().c_str(), std::strerror(errno));
       return 2;
+#else
+      std::fprintf(stderr,
+                   "[piet_native] --selftest: run the sibling piet_selftest.exe directly on "
+                   "Windows (R1 split).\n");
+      return 2;
+#endif
     }
     if (std::strcmp(argv[i], "--version") == 0) {
       // WP-2 single-version-source derivation point: prints the COMPILED
@@ -2702,7 +2747,7 @@ int main(int argc, char** argv) {
     // half, against a child that already exists and can be driven by hand.
     if (std::strcmp(argv[i], "--parallel-worker") == 0) {
       if (i + 1 >= argc) {
-        std::fprintf(stderr, "[piet_native] --parallel-worker requires a task-spec JSON path\n");
+        std::fprintf(stderr, "[piet_native] --parallel-worker requires a task-spec path\n");
         return 2;
       }
       return piet::parallel::runParallelWorker(argv[i + 1]);

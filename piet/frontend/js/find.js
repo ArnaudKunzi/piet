@@ -1,6 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // find.js — B11 ⌘F find bar (+ B12 replace in the do-file editor).
 //
-// Design law (UIUX-P8 §2/§3 `.find`, mockup: private-notes/plans/UIUX-P8-mockup-v3-pipboy.html):
+// Design law (UIUX-P8 §2/§3 `.find`, mockup: internal capture UIUX-P8-mockup-v3-pipboy.html):
 // summoned ONLY by Cmd/Ctrl+F (R1 — not persistent chrome; W1 — not a command
 // palette). Two surfaces, two behaviors:
 //   Results (#console-body)      → FIND-ONLY. The results log is immutable,

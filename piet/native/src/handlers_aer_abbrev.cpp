@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 M.K. Kim
 // winsor -- Nicholas J. Cox's winsor.ado (AER-SCOPE1 bundle A, 2026-09-03).
 //
 //     winsor VAR, gen(NEWVAR) p(#) | h(#) [highonly] [lowonly]
