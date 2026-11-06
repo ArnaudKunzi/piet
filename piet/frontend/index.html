@@ -506,6 +506,14 @@
           <span class="settings-hint">Provenance embeds a hash of your exact input data in each result (for reproducibility). Off by default to keep results lean; turn on before archiving results you'll need to reproduce.</span>
         </div>
 
+        <div class="settings-row">
+          <label for="set-follow-do-folder">Open do-files in their own folder</label>
+          <span class="settings-checkbox-wrap">
+            <input type="checkbox" id="set-follow-do-folder">
+          </span>
+          <span class="settings-hint">Opening a do-file moves the working directory to its folder, so relative paths find the files beside it, unless you have chosen a directory yourself with cd or a default working directory. Turn off to match Stata, which stays put. Applies to the next do-file you open.</span>
+        </div>
+
         <!-- WS-B (extcompat): the durable half of the first-run choice. The
              `set extcompat on|off` command moves the SESSION only, on purpose;
              this checkbox (and the first-run dialog) are the two places that

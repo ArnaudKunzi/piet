@@ -1197,6 +1197,9 @@ class SessionState {
   // frozen 1.x oracle defect. The 2.0 core no longer does this — `use`
   // leaves cwd untouched, matching real Stata.) ----------
   std::optional<std::string> cwd;  // unset -> caller falls back to getcwd()
+  // True once the user has picked the working directory: a `cd`, or a default
+  // working directory set in Settings. Opening a do-file then leaves it alone.
+  bool cwdChosenByUser = false;
 
   // -- log using/close (BUG-028, BS-006: real file-backed log) --------------
   // `log using FILE [, replace|append] [text]` really opens FILE now; every

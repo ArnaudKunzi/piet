@@ -63,6 +63,12 @@ struct Settings {
   // not yet consented. The frontend shows its consent dialog iff this is
   // empty; native never parses the value, it only round-trips it.
   std::string extcompatConsentAt;
+
+  // true -> opening a do-file in the app moves the working directory to its
+  // folder, unless the user has already chosen a directory (a `cd`, or a default
+  // working directory set above). false -> opening never moves it, as in Stata.
+  // Absent in every store written before this field existed, which reads as true.
+  bool followDoFileFolder = true;
 };
 
 // Detected hardware (SPEC II-1): read once per settings.get. RAM via
