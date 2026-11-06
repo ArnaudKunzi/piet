@@ -11,7 +11,8 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 90
+    # About 40 minutes more when the OpenBLAS cache misses.
+    timeout-minutes: 120
     defaults:
       run:
         shell: msys2 {0}
@@ -27,15 +28,21 @@ jobs:
           msystem: MINGW64
           update: false
           install: >-
+            make
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-gcc-fortran
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-openblas
             mingw-w64-x86_64-libiconv
             mingw-w64-x86_64-python
             rsync
             zip
+      # Only the finished library is kept. The key changes with the build script,
+      # which is where the OpenBLAS version and flags live.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build-openblas/install
+          key: openblas-${{ runner.os }}-${{ hashFiles('scripts/build-windows.sh') }}
       - name: Build and test the public source
         env:
           BUILD_JOBS: 4

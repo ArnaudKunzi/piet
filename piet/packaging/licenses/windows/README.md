@@ -53,8 +53,7 @@ WP-W6 (2026-07-08).
 | `30-mingw-winpthreads.txt` | MinGW-w64 winpthreads | Debian 12 `mingw-w64-x86-64-dev` 10.0.0-3 — verbatim from that package's `/usr/share/doc/mingw-w64-x86-64-dev/copyright` (winpthreads paragraphs) |
 | `40-libiconv-LGPL-2.1.txt` | GNU libiconv | MSYS2 `mingw-w64-x86_64-libiconv` 1.19.1-1 — verbatim from that package's `share/licenses/libiconv/COPYING.LIB` |
 
-The native build (`scripts/build-windows.sh`) takes all four components from
-MSYS2's MINGW64 packages instead of the Debian ones above: OpenBLAS 0.3.34 and
-GCC 16.2 at the time of writing. It also links libgomp, which is under the same
-GCC Runtime Library Exception as the other GCC runtime libraries. The license
-terms are unchanged across those versions.
+The native build (`scripts/build-windows.sh`) differs from the Debian lane above:
+it builds OpenBLAS 0.3.34 from its pinned source tarball, and takes the GCC runtime
+(GCC 16.2 at the time of writing), winpthreads and libiconv from MSYS2's MINGW64
+packages. The license terms are unchanged across those versions.

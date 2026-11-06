@@ -4,8 +4,8 @@
 # is the Windows counterpart of scripts/build-macos.sh.
 #
 # Run it from an MSYS2 MINGW64 shell, with:
-#   pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-gcc-fortran \
-#     mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-openblas \
+#   pacman -S --needed make mingw-w64-x86_64-gcc mingw-w64-x86_64-gcc-fortran \
+#     mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja \
 #     mingw-w64-x86_64-libiconv mingw-w64-x86_64-python
 #
 # Both executables link statically: the only DLLs they load are parts of Windows
@@ -40,8 +40,37 @@ gcc -O2 -D_FILE_OFFSET_BITS=64 -I"$compat" -c "$compat/mman.c" -o build-compat/m
 ar rcs build-compat/libmman_compat.a build-compat/mman.o
 mman_lib="$source_root/build-compat/libmman_compat.a"
 
-# Static BLAS/LAPACK and the runtimes it needs. MSYS2's libopenblas.a selects its
-# kernels for the running CPU at startup and is threaded with OpenMP.
+# BLAS/LAPACK, built here rather than taken from MSYS2's package. That package picks
+# its kernels for the running CPU at startup, so one .exe gives different numbers on
+# different machines: logit on a nearly separated sample takes 10 iterations with
+# Nehalem or SkylakeX kernels and 11 with Haswell, Sandybridge or Zen ones, moving
+# coefficients at 1e-8. A single fixed target gives every CPU the same answer, and
+# Nehalem's SSE4.2 is exactly the engine's x86-64-v2 floor. A pinned source also keeps
+# a package update from moving the numbers. Takes some minutes, once per build tree.
+openblas_version=0.3.34
+openblas_sha256=cd7e129868320cc2d033afa920e31202dfe0b8066a5b66661900ccc0f197dfed
+openblas_prefix=build-openblas/install
+if [ ! -f "$openblas_prefix/lib/libopenblas.a" ]; then
+  rm -rf build-openblas
+  mkdir -p build-openblas
+  tarball="build-openblas/OpenBLAS-$openblas_version.tar.gz"
+  # MSYS's own curl: MINGW64's cannot find its CA bundle in every install.
+  /usr/bin/curl -fsSL -o "$tarball" \
+    "https://github.com/OpenMathLib/OpenBLAS/releases/download/v$openblas_version/OpenBLAS-$openblas_version.tar.gz"
+  echo "$openblas_sha256  $tarball" | sha256sum -c -
+  tar -xzf "$tarball" -C build-openblas
+  # HAVE_SSE*: the same set docker/Dockerfile.windows asserts for this target.
+  openblas_flags="CC=gcc FC=gfortran HOSTCC=gcc BINARY=64 TARGET=NEHALEM NO_AVX512=1 \
+    HAVE_SSE3=1 HAVE_SSSE3=1 HAVE_SSE4_1=1 HAVE_SSE4_2=1 NO_SHARED=1 NUM_THREADS=64"
+  # shellcheck disable=SC2086  # the flags are meant to split
+  make -C "build-openblas/OpenBLAS-$openblas_version" -j"$jobs" $openblas_flags
+  # shellcheck disable=SC2086
+  make -C "build-openblas/OpenBLAS-$openblas_version" install "PREFIX=$(pwd)/$openblas_prefix" $openblas_flags
+fi
+openblas_lib="$source_root/$openblas_prefix/lib/libopenblas.a"
+openblas_include="$source_root/$openblas_prefix/include"
+
+# The Fortran runtime LAPACK needs, static.
 need_lib() {
   found=$(gcc -print-file-name="$1")
   if [ ! -f "$found" ]; then
@@ -50,8 +79,7 @@ need_lib() {
   fi
   printf '%s' "$found"
 }
-la_libs="$(need_lib libopenblas.a);$mman_lib;$(need_lib libgfortran.a);$(need_lib libgomp.a)"
-openblas_include=$(cygpath -m /mingw64/include/openblas)
+la_libs="$openblas_lib;$mman_lib;$(need_lib libgfortran.a)"
 # Newer GCC folds libquadmath into libgfortran, so it is optional here.
 quadmath=$(gcc -print-file-name=libquadmath.a)
 if [ -f "$quadmath" ]; then

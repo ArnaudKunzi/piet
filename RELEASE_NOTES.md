@@ -17,6 +17,11 @@ from any folder on a machine that already has WebView2, as Windows 11 does. Neit
 is code-signed, so SmartScreen warns on first launch: see the README's "Download
 for Windows".
 
+The Windows build gives the same numbers on every CPU. Its linear algebra uses one
+fixed set of OpenBLAS kernels (SSE4.2) rather than choosing by processor, because
+choosing changed results on nearly separated logit and probit samples at about 1e-8.
+The cost is speed on very large matrix work, compared with kernels tuned to a newer CPU.
+
 Known differences from the macOS build, both named rather than hidden:
 
 - `ustrregexra()` and `ustrregexm()` refuse a character above U+FFFF, such as an emoji,
