@@ -131,14 +131,15 @@ std::string readFileOrDie(const std::string& path) {
   return ss.str();
 }
 
-// Resolves a path relative to this source file's known repo-tree location
-// (__FILE__ gives a build-time-stable anchor back to the repo without
-// hardcoding a machine path — works for any dev checkout location).
+// Resolves a path relative to the development checkout this binary belongs
+// to (compile-time anchor when valid, else the executable's location, else
+// the cwd — see piet/bundle_paths.h).
 std::string repoRelative(const std::string& suffix) {
-  std::string thisFile = __FILE__;  // .../piet/native/src/main.cpp
-  auto pos = thisFile.rfind("/piet/native/src/main.cpp");
-  std::string root = (pos == std::string::npos) ? "../.." : thisFile.substr(0, pos);
-  return root + suffix;
+  // BUG-1939: __FILE__ is only the first candidate; a -ffile-prefix-map build
+  // makes it relative, and the executable's own location then has to anchor
+  // the tree (piet::devTreePath, shared with sysuse / c(sysdir_sample) /
+  // the notices route).
+  return piet::devTreePath(suffix);
 }
 
 bool fileExists(const std::string& path) {

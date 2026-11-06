@@ -2253,10 +2253,9 @@ std::string genExprText(const eval::ParsedCommand& parsed) {
 // piet::bundleResourcesDir()+"/sample/fatalities.csv", dev-tree
 // piet/packaging/sample/fatalities.csv otherwise (see main.cpp:957-968).
 // This mirrors that exact resolution order rather than inventing a second
-// convention. main.cpp is out of this workstream's file manifest, so the
-// existence check and the dev-tree __FILE__-relative anchor (main.cpp's own
-// repoRelative(), main.cpp:212-217) are duplicated locally here — small,
-// single-purpose, not worth a shared header for two call sites.
+// convention; the dev-tree anchor itself is shared (piet/bundle_paths.h,
+// devTreePath) since BUG-1939 showed that a per-site __FILE__ anchor breaks
+// identically at every site under -ffile-prefix-map.
 bool fileExistsLocal(const std::string& path) {
   if (path.empty()) return false;
   std::ifstream f(cecon::to_native_path(path));
@@ -2264,10 +2263,9 @@ bool fileExistsLocal(const std::string& path) {
 }
 
 std::string devTreeSampleFatalitiesCsv() {
-  std::string thisFile = __FILE__;  // .../piet/native/src/dispatcher.cpp
-  auto pos = thisFile.rfind("/piet/native/src/dispatcher.cpp");
-  std::string root = (pos == std::string::npos) ? "../.." : thisFile.substr(0, pos);
-  return root + "/piet/packaging/sample/fatalities.csv";
+  // BUG-1939: resolved through piet::devTreePath (executable-relative with the
+  // compile-time anchor only as a first candidate), not through __FILE__ alone.
+  return piet::devTreePath("/piet/packaging/sample/fatalities.csv");
 }
 
 // bysort.py's needs_bygen: `_n` or `_N` as a whole identifier token anywhere

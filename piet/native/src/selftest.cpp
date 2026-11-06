@@ -24182,6 +24182,14 @@ void testBUG155PredictOnlyRequestedColumn() {
 
   piet::SessionState session(workdir);
   (void)piet::dispatch("sysuse fatalities, clear", session);
+  if (!session.hasData()) {
+    // BUG-1939: with no rows the sentinel read below walked off an empty
+    // column (segfault in a public clone whose sysuse could not find the
+    // sample); a setup miss is a declared skip, never a crash.
+    skip("BUG-155 (all legs)", "`sysuse fatalities` setup returned no data");
+    fs::remove_all(workdir, ec);
+    return;
+  }
 
   // Arm 1 (THE RED ARM — this is the pre-fix defect verbatim): a user variable
   // that happens to be called `resid` must survive `predict <name>, xb`. Pre-fix,
@@ -24195,7 +24203,7 @@ void testBUG155PredictOnlyRequestedColumn() {
   bool sentinelIntact = false;
   if (ds != nullptr && ds->has("resid")) {
     const double* vals = ds->col("resid").f64();
-    sentinelIntact = vals != nullptr && vals[0] == 99999.0;
+    sentinelIntact = vals != nullptr && ds->nRows() > 0 && vals[0] == 99999.0;
   }
   check(sentinelIntact,
         "BUG-155: a pre-existing user variable named `resid` is NOT overwritten by "
@@ -24217,6 +24225,44 @@ void testBUG155PredictOnlyRequestedColumn() {
         "BUG-155: `predict, resid` appends only the named residual column (no stray `xb`)");
 
   fs::remove_all(workdir, ec);
+}
+
+// BUG-1939: every dev-tree path (sysuse sample, frontend index.html,
+// c(sysdir_sample), the notices route) was anchored on __FILE__ alone. A build
+// with -ffile-prefix-map — the public build script — makes __FILE__ relative,
+// so each anchor fell back to "../.." against the cwd and `sysuse fatalities`
+// answered "file not found" in a public clone (and BUG-155's arm then crashed
+// on the empty column). The shared resolver must find the tree from the
+// executable's own location, with no __FILE__ involved.
+void testBUG1939DevTreeRootResolution() {
+  std::printf("[selftest] --- BUG-1939 dev-tree root resolves from the executable, not __FILE__ ---\n");
+  if (piet::bundleResourcesDir().has_value()) {
+    skip("BUG-1939 (all legs)", "running from inside a packaged bundle; the dev tree does not apply");
+    return;
+  }
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  std::optional<std::string> exe = piet::executablePath();
+  check(exe.has_value(), "BUG-1939: executablePath() resolves for a dev-tree binary");
+  std::optional<std::string> fromExe;
+  if (exe.has_value()) {
+    auto sep = exe->find_last_of("/\\");
+    if (sep != std::string::npos) fromExe = piet::devTreeRootFrom(exe->substr(0, sep));
+  }
+  check(fromExe.has_value(),
+        "BUG-1939: the checkout root is found by walking up from the executable's directory "
+        "(no __FILE__ in that path) -- the arm that a -ffile-prefix-map build failed");
+  check(fromExe.has_value() &&
+            fs::is_regular_file(cecon::to_native_path(*fromExe + "/piet/packaging/sample/fatalities.csv"), ec),
+        "BUG-1939: ...and that root holds piet/packaging/sample/fatalities.csv");
+  std::optional<std::string> root = piet::devTreeRoot();
+  check(root.has_value() &&
+            fs::is_regular_file(cecon::to_native_path(*root + "/piet/frontend/index.html"), ec),
+        "BUG-1939: devTreeRoot() (the production resolver) reaches piet/frontend/index.html");
+  check(piet::devTreePath("/piet/packaging/sample") == (root.has_value() ? *root : std::string("../..")) + "/piet/packaging/sample",
+        "BUG-1939: devTreePath() is root + suffix (the \"../..\" guess only when nothing resolves)");
+  check(!piet::devTreeRootFrom("/").has_value(),
+        "BUG-1939: a start point with no checkout above it resolves to nothing, not to a guess");
 }
 
 void testBS005FormatDisplayLayer() {
@@ -40400,6 +40446,7 @@ int runSelftest() {
   // P2 wave: BUG-155 — `predict, xb` appended an unrequested second column and
   // silently overwrote a user variable named `resid` (RED cert arm 1).
   testBUG155PredictOnlyRequestedColumn();
+  testBUG1939DevTreeRootResolution();
   testBS005FormatDisplayLayer();
   // BETA campaign Phase B (B-log cluster): `log using`/`log close` real
   // file write (BUG-028/BS-006).

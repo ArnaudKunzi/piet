@@ -811,10 +811,9 @@ BridgeResult legalNotices(const std::string& /*body*/) {
 
   // Dev run: concatenate the checked-in manifest (same NN-*.txt glob +
   // lexical order the packager uses).
-  std::string root = std::string(__FILE__);
-  auto pos = root.rfind("/piet/native/src/routes.cpp");
-  if (pos != std::string::npos) {
-    std::string licensesDir = root.substr(0, pos) + "/piet/packaging/licenses";
+  // BUG-1939: the dev tree is found from the executable, not from __FILE__.
+  if (std::optional<std::string> root = devTreeRoot()) {
+    std::string licensesDir = *root + "/piet/packaging/licenses";
     std::vector<std::string> parts;
     if (DIR* d = opendir(licensesDir.c_str())) {
       while (dirent* e = readdir(d)) {

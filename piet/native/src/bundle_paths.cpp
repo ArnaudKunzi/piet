@@ -5,6 +5,8 @@
 
 #include <climits>
 #include <cstdlib>
+#include <filesystem>
+#include <system_error>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -95,6 +97,62 @@ std::optional<std::string> bundleResourcesDir() {
   std::string contentsDir = dir.substr(0, dir.size() - std::string("/MacOS").size());
   return contentsDir + "/Resources";
 #endif
+}
+
+namespace {
+
+bool looksLikeDevTree(const std::filesystem::path& root) {
+  std::error_code ec;
+  return std::filesystem::is_regular_file(root / "piet" / "native" / "CMakeLists.txt", ec) &&
+         std::filesystem::is_directory(root / "piet" / "packaging" / "sample", ec);
+}
+
+}  // namespace
+
+std::optional<std::string> devTreeRootFrom(const std::string& startDir) {
+  if (startDir.empty()) return std::nullopt;
+  std::error_code ec;
+  std::filesystem::path dir = std::filesystem::absolute(cecon::to_native_path(startDir), ec);
+  if (ec) return std::nullopt;
+  dir = dir.lexically_normal();
+  for (int depth = 0; depth <= 8; ++depth) {
+    if (looksLikeDevTree(dir)) return dir.u8string();
+    std::filesystem::path parent = dir.parent_path();
+    if (parent.empty() || parent == dir) break;
+    dir = parent;
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> devTreeRoot() {
+  // 1. compile-time anchor — only trusted when it is absolute and still there
+  std::string thisFile = __FILE__;  // .../piet/native/src/bundle_paths.cpp when built in place
+  auto pos = thisFile.rfind("/piet/native/src/bundle_paths.cpp");
+  if (pos != std::string::npos && pos > 0 &&
+      (thisFile[0] == '/' || (thisFile.size() > 2 && thisFile[1] == ':'))) {
+    std::string root = thisFile.substr(0, pos);
+    if (looksLikeDevTree(cecon::to_native_path(root))) return root;
+  }
+  // 2. the executable's own location (piet/native/build/piet_native, or any
+  //    build directory under the checkout)
+  if (std::optional<std::string> exe = executablePath()) {
+    auto lastSep = exe->find_last_of("/\\");
+    if (lastSep != std::string::npos) {
+      if (auto root = devTreeRootFrom(exe->substr(0, lastSep))) return root;
+    }
+  }
+  // 3. the current working directory
+  std::error_code ec;
+  std::filesystem::path cwd = std::filesystem::current_path(ec);
+  if (!ec) {
+    if (auto root = devTreeRootFrom(cwd.u8string())) return root;
+  }
+  return std::nullopt;
+}
+
+std::string devTreePath(const std::string& suffix) {
+  if (std::optional<std::string> root = devTreeRoot()) return *root + suffix;
+  return "../.." + suffix;
 }
 
 }  // namespace piet

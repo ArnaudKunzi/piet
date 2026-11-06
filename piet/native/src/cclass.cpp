@@ -26,18 +26,15 @@ namespace {
 // c(sysdir_sample): the directory holding the bundled sample datasets.
 // Resolution order mirrors `sysuse` exactly (dispatcher.cpp's path helpers,
 // themselves mirroring main.cpp's runUiSmoke): bundle Resources/sample first,
-// dev-tree piet/packaging/sample otherwise. Duplicated rather than shared for
-// the same manifest reason dispatcher.cpp documents at its own copy.
+// dev-tree piet/packaging/sample otherwise (piet::devTreePath, shared since
+// BUG-1939).
 std::string sampleDataDir() {
   if (auto res = bundleResourcesDir()) {
     std::string dir = *res + "/sample";
     std::error_code ec;
     if (std::filesystem::is_directory(cecon::to_native_path(dir), ec)) return dir;
   }
-  std::string thisFile = __FILE__;  // .../piet/native/src/cclass.cpp
-  auto pos = thisFile.rfind("/piet/native/src/cclass.cpp");
-  std::string root = (pos == std::string::npos) ? "../.." : thisFile.substr(0, pos);
-  return root + "/piet/packaging/sample";
+  return devTreePath("/piet/packaging/sample");  // BUG-1939: shared, executable-relative anchor
 }
 
 std::string detectOs() {

@@ -83,12 +83,16 @@ def main():
         folder = Path(d)
         (folder / "fatalities.csv").write_bytes(SAMPLE.read_bytes())
         reg = f"regress {DEPVAR} {' '.join(REGRESSORS)}"
-        lists = run(["import delimited fatalities.csv, clear", "summarize", reg,
+        # `sysuse fatalities` is the bundled-sample path the app resolves on its own
+        # (from the executable's location in a dev tree): it broke silently under the
+        # -ffile-prefix-map build this script uses, so it is pinned here first.
+        lists = run(["sysuse fatalities, clear", "count",
+                     "import delimited fatalities.csv, clear", "summarize", reg,
                      "save roundtrip.dta, replace", "clear", "use roundtrip.dta", reg], folder)
-        assert len(lists) == 7, f"expected 7 block lists, got {len(lists)}"
+        assert len(lists) == 9, f"expected 9 block lists, got {len(lists)}"
         for i, blocks in enumerate(lists):
             assert not errors(blocks), f"command {i} produced an error: {errors(blocks)}"
-        first, again = estimation(lists[2]), estimation(lists[6])
+        first, again = estimation(lists[4]), estimation(lists[8])
         assert first["coeftable"] == again["coeftable"], "reloaded .dta changed the fit"
         n, beta = reference_ols()
         assert first["n_obs"] == n, f"N {first['n_obs']} != {n}"

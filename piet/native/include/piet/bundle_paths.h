@@ -45,6 +45,27 @@ std::optional<std::string> executablePath();
 // path, non-macOS platform).
 std::optional<std::string> bundleResourcesDir();
 
+// The development checkout this binary belongs to (the directory that holds
+// piet/native/CMakeLists.txt and piet/packaging/sample/), when running
+// unbundled. Resolution order:
+//   1. the compile-time anchor (__FILE__ of bundle_paths.cpp) when it is an
+//      absolute path that still exists — the plain in-place build;
+//   2. upward from the executable's own directory (piet/native/build/ sits
+//      three levels under the root; any depth up to eight is accepted);
+//   3. upward from the current working directory.
+// Step 1 alone was the whole rule until 2026-11-06 (BUG-1939): a build with
+// -ffile-prefix-map (the public build script, any reproducible build) makes
+// __FILE__ relative, every __FILE__-anchored site then resolved to "../.."
+// relative to the cwd, and `sysuse fatalities` / the frontend index.html /
+// c(sysdir_sample) / the legal notices all went missing in a public clone.
+std::optional<std::string> devTreeRoot();
+// The search of steps 2/3 alone, from a given start directory (exposed so the
+// selftest can prove the resolution does not depend on __FILE__).
+std::optional<std::string> devTreeRootFrom(const std::string& startDir);
+// devTreeRoot() + suffix; when no root is found, falls back to the historical
+// "../.." + suffix so callers keep their pre-existing failure behaviour.
+std::string devTreePath(const std::string& suffix);
+
 }  // namespace piet
 
 #endif  // PIET_NATIVE_BUNDLE_PATHS_H
