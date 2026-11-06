@@ -15,7 +15,7 @@ layer (`generate`/`egen`/`merge`/`joinby`/`reshape`/`collapse` …). Heavy linea
 algebra goes through the platform BLAS (Apple **Accelerate** on macOS — the AMX
 path on Apple Silicon); the engine never reimplements BLAS.
 
-PIET is aimed at students, instructors, and researchers who want familiar
+**PIET** (Parser, Interpreter & Econometric Tools) is aimed at students, instructors, and researchers who want familiar
 syntax without a paid license. It is **not** a copy, port, or clone of Stata,
 and contains no Stata source code, manual text, or other StataCorp-authored
 material (see *Relationship to Stata* below).
