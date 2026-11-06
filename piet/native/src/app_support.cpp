@@ -22,6 +22,7 @@
 #include "io/win_compat.h"
 #include "piet/handlers.h"  // resolveUserPath
 #include "piet/session_state.h"
+#include "piet/settings.h"
 
 namespace piet {
 
@@ -134,13 +135,17 @@ FileReadResult readDoFileForBridge(const SessionState& session, const std::strin
 
 // Opening a do-file in the app makes its folder the working directory, so a
 // relative `use "data.dta"` in it finds the data beside it instead of looking in
-// the seeded Documents folder. Goes through `cd`'s own handler so every consumer
-// of the working directory (the business-calendar search path included) moves
-// with it. Returns the new directory, or "" when nothing moved. Only the app's
-// open gestures call this: a typed `do FILE` keeps the working directory, as
-// Stata's does and as scripts that chain do-files by relative path rely on.
+// the seeded Documents folder. It defers to the user: a directory they chose (a
+// `cd`, or a default working directory in Settings) stays, so a project that
+// runs `code/a.do` from its root behaves as in Stata, and Settings can turn the
+// behaviour off outright. Goes through `cd`'s own handler so every consumer of
+// the working directory (the business-calendar search path included) moves with
+// it. Returns the new directory, or "" when nothing moved. Only the app's open
+// gestures call this: a typed `do FILE` keeps the working directory, as Stata's
+// does and as scripts that chain do-files by relative path rely on.
 std::string followDoFileDirectory(SessionState& session, const std::string& resolvedDoFile) {
   namespace fs = std::filesystem;
+  if (session.cwdChosenByUser || !settings::load().followDoFileFolder) return std::string();
   const fs::path dir = cecon::to_native_path(resolvedDoFile).parent_path();
   if (dir.empty()) return std::string();
   std::error_code ec;

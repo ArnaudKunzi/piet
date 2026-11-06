@@ -11763,7 +11763,9 @@ nlohmann::ordered_json dispatchImpl(const std::string& rawCmdTyped, SessionState
     // latent rather than live — but it is the same unguarded shape, one
     // registry edit away from the crash the `use` arm actually took.
     std::string dirArg = rawArgsAfterCmd(parsed.raw);
-    blocks.push_back(ojson(handlers::runCd(dirArg, session)));
+    ojson cdBlock = ojson(handlers::runCd(dirArg, session));
+    if (cdBlock.value("type", std::string()) == "echo") session.cwdChosenByUser = true;
+    blocks.push_back(std::move(cdBlock));
     return blocks;
   }
 

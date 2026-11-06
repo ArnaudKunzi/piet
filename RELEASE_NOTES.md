@@ -3,13 +3,15 @@
 The app reports PIET `A.0.2`, the engine CoBrA `1.0.2`; contracts unchanged at
 1.26.0 / 2.10.0. Corresponding source: this repository at tag `A.0.2`.
 
-**New on every platform: a do-file's folder becomes the working directory when you
-open it.** Choosing a do-file with Run .do or Open do-file, dropping one on the
-window, or reopening one from Recent now moves the working directory to that file's
-folder, and the Results pane says so. A relative `use "mydata.dta"` in the do-file
-finds the data beside it, where before it looked in Documents. A `cd` you type
-afterwards stands, because the move happens only when a file is opened. A `do FILE`
-you type or call from a script leaves the working directory alone, as in Stata.
+**New on every platform: do-files open in their own folder, unless you chose a
+directory yourself.** PIET still starts in Documents. Choosing a do-file with Run .do
+or Open do-file, dropping one on the window, or reopening one from Recent now moves
+the working directory to that file's folder, and the Results pane says so, so a
+relative `use "mydata.dta"` finds the data beside the do-file. Once you have run `cd`,
+or if you set a default working directory in Settings, opening a do-file leaves the
+directory alone, so a project that runs `code/analysis.do` from its root behaves as
+in Stata. A `do FILE` you type or call from a script never moves it. To match Stata
+fully, turn off **Open do-files in their own folder** in Settings.
 
 **New: Windows 10/11 x64.** `PIET-A.0.2-setup.exe` installs the app and, if the machine
 needs it, Microsoft's WebView2 Runtime. `PIET-A.0.2-windows-x64-portable.zip` runs

@@ -159,6 +159,8 @@ Settings load() {
         s.extcompat = j["extcompat"].get<bool>();
       if (j.contains("extcompat_consent_at") && j["extcompat_consent_at"].is_string())
         s.extcompatConsentAt = j["extcompat_consent_at"].get<std::string>();
+      if (j.contains("follow_do_file_folder") && j["follow_do_file_folder"].is_boolean())
+        s.followDoFileFolder = j["follow_do_file_folder"].get<bool>();
     }
   } catch (const nlohmann::json::exception&) {
     // Malformed file -> defaults (never throw into a launch/route path).
@@ -181,6 +183,7 @@ bool save(const Settings& s) {
   j["ui_state"] = s.uiState;                      // N2 (P8.1-W2)
   j["extcompat"] = s.extcompat;                    // WS-B
   j["extcompat_consent_at"] = s.extcompatConsentAt;  // WS-B
+  j["follow_do_file_folder"] = s.followDoFileFolder;
   std::ofstream f(settingsNative(path), std::ios::binary | std::ios::trunc);
   if (!f) return false;
   f << j.dump(2) << "\n";
@@ -361,6 +364,7 @@ nlohmann::ordered_json toGetJson(const Settings& s, const SysInfo& sys,
   j["extcompat"] = s.extcompat;
   j["extcompat_consent_at"] = s.extcompatConsentAt;
   j["consent_required"] = s.extcompatConsentAt.empty() && !testIsolationActive();
+  j["follow_do_file_folder"] = s.followDoFileFolder;
   // WS-B step 6: the boot-time pack scan. settings.get is the one call the
   // frontend already makes at boot (hydrateUiState), so the enumeration rides
   // it rather than inventing a route for a directory listing. Enumerate-only:
@@ -429,6 +433,8 @@ BridgeResult settingsSet(const std::string& body) {
         s.extcompat = j["extcompat"].get<bool>();
       if (j.contains("extcompat_consent_at") && j["extcompat_consent_at"].is_string())
         s.extcompatConsentAt = j["extcompat_consent_at"].get<std::string>();
+      if (j.contains("follow_do_file_folder") && j["follow_do_file_folder"].is_boolean())
+        s.followDoFileFolder = j["follow_do_file_folder"].get<bool>();
     }
   } catch (const nlohmann::json::exception& e) {
     nlohmann::ordered_json err;

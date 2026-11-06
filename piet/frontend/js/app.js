@@ -1237,11 +1237,11 @@ async function onOpenFile(knownPath) {
 // ─── Run .do ─────────────────────────────────────────────────────────────────
 
 /**
- * Opening a do-file moves the working directory to its folder, so its relative
- * `use "data.dta"` finds the data beside it. A working directory that changes
- * under the user must not change silently, so the move is announced. Nothing is
- * printed when the file was already in the working directory. A later `cd` by the
- * user stands: the move happens when a file is opened, never when it is run.
+ * Opening a do-file can move the working directory to its folder, so its relative
+ * `use "data.dta"` finds the data beside it. The kernel decides: not after a `cd`,
+ * not with a default working directory set, not with the setting off. A working
+ * directory that changes under the user must not change silently, so a move is
+ * announced; `dir` is empty when nothing moved.
  */
 function noteWorkingDirectory(dir) {
   if (dir) appendBlock({ type: 'note', text: `Working directory is now ${dir} (the do-file's folder)` });
@@ -2553,6 +2553,10 @@ async function populateSettings() {
   const ext = document.getElementById('set-extcompat');
   if (ext) ext.checked = !s || s.extcompat !== false;
 
+  // Default TRUE on the same reasoning: an absent field means it is on.
+  const followDo = document.getElementById('set-follow-do-folder');
+  if (followDo) followDo.checked = !s || s.follow_do_file_folder !== false;
+
   const fsSel = document.getElementById('set-fontsize');
   if (fsSel) fsSel.value = localStorage.getItem('piet-font-size') || 'medium';
   const pa = document.getElementById('set-paste-autorun');
@@ -2579,6 +2583,7 @@ async function applySettings() {
     // it to the dispatch gate's cache, so it takes effect on the next command
     // rather than at the next launch.
     extcompat: !!document.getElementById('set-extcompat')?.checked,
+    follow_do_file_folder: !!document.getElementById('set-follow-do-folder')?.checked,
   };
   try {
     await client.setSettings(partial);

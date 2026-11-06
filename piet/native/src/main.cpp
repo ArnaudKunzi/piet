@@ -931,6 +931,7 @@ void runRealFrontend() {
     std::error_code seedEc;
     if (std::filesystem::is_directory(cecon::to_native_path(cfg.defaultWorkingDir), seedEc)) {
       seedCwd = cfg.defaultWorkingDir;
+      app.session.cwdChosenByUser = true;
     }
   }
   app.session.cwd = seedCwd;
@@ -1859,8 +1860,8 @@ std::string smokeDriverJs(const std::string& dataPath, const std::string& doFixt
       }).then(function () {
         // 6b. OPENING A DO-FILE MOVES THE WORKING DIRECTORY TO ITS FOLDER, through
         // the real product path: a file_dropped push -> routeDroppedFile ->
-        // onOpenDoFile. The folder name is Hangul, and a typed `do FILE` must NOT
-        // move the directory.
+        // onOpenDoFile. The folder name is Hangul. It must NOT move with the
+        // setting off, after a `cd`, or for a typed `do FILE`.
         var pwd = function () {
           return window.pietNative.request('command', { cmd: 'display c(pwd)' }).then(function (r) {
             var b = ((r && r.blocks) || []).find(function (x) { return x && typeof x.text === 'string' && x.type !== 'echo'; });
@@ -1870,22 +1871,32 @@ std::string smokeDriverJs(const std::string& dataPath, const std::string& doFixt
         };
         var folder = 'do 폴더', before;
         var endsInFolder = function (p) { return String(p).replace(/[\\/]+$/, '').slice(-folder.length) === folder; };
+        var moveNotes = function () {
+          return (document.getElementById('console-body')?.textContent || '').split('Working directory is now').length - 1;
+        };
+        // One drop, finished when the editor holds the file again. The wait first:
+        // the previous step releases the busy lock just after its work completes.
+        var dropDoFile = function () {
+          document.getElementById('doedit-text').value = '';
+          return new Promise(function (resolve) { setTimeout(resolve, 500); }).then(function () {
+            return window.pietNative.request('smoke.drop_do_file', {});
+          }).then(function () {
+            return waitFor('dropped do-file loaded into the editor', function () {
+              return document.getElementById('doedit-text').value.indexOf('ui smoke sibling') >= 0;
+            }, STEP_TIMEOUT_MS);
+          });
+        };
         return pwd().then(function (p) {
           before = p;
           if (endsInFolder(before)) throw new Error('fixture error: already in the do-file folder');
-          // The run in step 6 releases the busy lock just after its block renders.
-          return new Promise(function (resolve) { setTimeout(resolve, 500); });
-        }).then(function () {
-          return window.pietNative.request('smoke.drop_do_file', {});
-        }).then(function () {
-          return waitFor('dropped do-file loaded into the editor', function () {
-            return document.getElementById('doedit-text')?.value.indexOf('ui smoke sibling') >= 0;
-          }, STEP_TIMEOUT_MS);
-        }).then(function () {
-          return waitFor('the console names the new working directory', function () {
-            var t = document.getElementById('console-body')?.textContent || '';
-            return t.indexOf('Working directory') >= 0 && t.indexOf(folder) >= 0;
-          }, STEP_TIMEOUT_MS);
+          return window.pietNative.request('settings.set', { follow_do_file_folder: false });
+        }).then(dropDoFile).then(pwd).then(function (p) {
+          if (p !== before || moveNotes() !== 0) throw new Error('the setting is off, but opening moved to ' + p);
+          return window.pietNative.request('settings.set', { follow_do_file_folder: true });
+        }).then(dropDoFile).then(function () {
+          if (moveNotes() !== 1 || (document.getElementById('console-body')?.textContent || '').indexOf(folder) < 0) {
+            throw new Error('the console did not name the new working directory');
+          }
         }).then(pwd).then(function (p) {
           if (!endsInFolder(p)) throw new Error('c(pwd) did not follow the do-file: ' + p);
           // A relative path now resolves beside the do-file, the reported problem.
@@ -1898,13 +1909,15 @@ std::string smokeDriverJs(const std::string& dataPath, const std::string& doFixt
             return r.resolved_path;
           });
         }).then(function (siblingPath) {
-          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-          return window.pietNative.request('command', { cmd: 'cd "' + before + '"' }).then(function () {
+          // A directory the user chose outranks the do-file's folder.
+          return window.pietNative.request('command', { cmd: 'cd "' + before + '"' }).then(dropDoFile).then(pwd).then(function (p) {
+            if (p !== before || moveNotes() !== 1) throw new Error('opening overrode the user\'s cd, now at ' + p);
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
             return window.pietNative.request('command', { cmd: 'do "' + siblingPath + '"' });
           });
         }).then(pwd).then(function (p) {
           if (p !== before) throw new Error('a typed do FILE moved the working directory to ' + p);
-          report(false, true, 'do_file_folder_cwd', 'drop -> editor -> cwd follows, relative path resolves; typed do FILE leaves cwd alone');
+          report(false, true, 'do_file_folder_cwd', 'setting off stays; on follows and relative path resolves; a cd stands; typed do FILE stays');
         });
       }).then(function () {
         // 7. OVERLAY EXCLUSIVITY (design decision 5 / A2-05): opening one
