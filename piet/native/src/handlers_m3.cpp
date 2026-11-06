@@ -5792,7 +5792,11 @@ std::string signatureStamp(const std::string& epochSeconds) {
     return epochSeconds;
   }
   std::tm tm{};
+#ifdef _WIN32
+  localtime_s(&tm, &t);
+#else
   localtime_r(&t, &tm);
+#endif
   static const char* kMon[] = {"jan", "feb", "mar", "apr", "may", "jun",
                                "jul", "aug", "sep", "oct", "nov", "dec"};
   char buf[32];
@@ -6922,7 +6926,7 @@ ojson runCd(const std::string& dirArgIn, SessionState& session) {
     if (!home.empty()) dirArg = home + dirArg.substr(1);
   }
   namespace fs = std::filesystem;
-  fs::path p(dirArg);
+  fs::path p = cecon::to_native_path(dirArg);
   if (p.is_relative()) {
     std::string base = session.cwd.has_value() && !session.cwd->empty() ? *session.cwd
                         : fs::current_path().u8string();

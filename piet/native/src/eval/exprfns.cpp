@@ -1731,9 +1731,12 @@ PyValue fnRegexr(const std::vector<PyValue>& args) {
 // refused a few byte-sensitive constructs and let the rest through byte-wise
 // (`ustrregexra("éé","é+","x")` gave "xx": the `+` applied to é's last byte
 // only); the refusal itself surfaced as r(198) "invalid syntax". Now subject,
-// pattern and replacement are decoded to UTF-32 (wchar_t is 32 bits on every
-// platform this builds for; static_assert below) and matched with
-// std::wregex, so `.`, quantifiers and bracket classes see whole code points.
+// pattern and replacement are decoded to one wchar_t per code point and matched
+// with std::wregex, so `.`, quantifiers and bracket classes see whole code points.
+// wchar_t is 32 bits except on Windows, where it is 16: every code point through
+// U+FFFF (Hangul included) still fits in one unit there and matches identically.
+// Above U+FFFF a code point would need a surrogate pair, and `.` or `+` would then
+// apply to half a character, so Windows refuses those by name (beyondWchar below).
 // Measured in StataBE 19.5 (piet-macro-layer-functions probe uregex.log):
 // ustrregexra("é",".","x") = "x" and ustrregexra("café","caf","tea") = "teaé".
 //
@@ -1756,11 +1759,24 @@ PyValue fnRegexr(const std::vector<PyValue>& args) {
 //  * a replacement holding `\` or a `$` not followed by a digit (ICU and
 //    ECMAScript read those differently);
 //  * a pattern std::wregex cannot compile, or a subject/pattern/replacement
-//    that is not valid UTF-8.
+//    that is not valid UTF-8;
+//  * on Windows only, a code point above U+FFFF in any argument (see above).
 // The subject is never echoed back as if the replacement had run.
-static_assert(sizeof(wchar_t) == 4, "ustrregexra decodes to UTF-32 in wchar_t");
 
 void appendUtf8(std::string& out, unsigned cp);  // defined with ustrunescape below
+
+// True when `s` holds a code point one wchar_t cannot carry. Call it on input
+// decodeUtf8Strict accepted: a lead byte of 0xF0 or above then always starts a
+// four-byte sequence, which is exactly a code point above U+FFFF.
+static bool beyondWchar(const std::string& s) {
+  if (sizeof(wchar_t) >= 4) return false;
+  for (const char c : s) {
+    if (static_cast<unsigned char>(c) >= 0xF0) return true;
+  }
+  return false;
+}
+static const char* const kBeyondWcharRefusal =
+    "a character above U+FFFF, which this Windows build cannot match as one code point";
 
 static bool decodeUtf8Strict(const std::string& s, std::wstring& out) {
   out.clear();
@@ -1859,6 +1875,10 @@ PyValue fnUstrregexra(const std::vector<PyValue>& args) {
       !decodeUtf8Strict(pythonStr(args[2]), wr)) {
     refuseUstrregexra("an argument that is not valid UTF-8");
   }
+  if (beyondWchar(pythonStr(args[0])) || beyondWchar(pythonStr(args[1])) ||
+      beyondWchar(pythonStr(args[2]))) {
+    refuseUstrregexra(kBeyondWcharRefusal);
+  }
   bool caseInsensitive = false;
   if (args.size() == 4) {
     auto ci = pythonFloat(args[3]);
@@ -1896,6 +1916,9 @@ PyValue fnUstrregexm(const std::vector<PyValue>& args) {
   std::wstring ws, wp;
   if (!decodeUtf8Strict(pythonStr(args[0]), ws) || !decodeUtf8Strict(pythonStr(args[1]), wp)) {
     refuseUstrregex("ustrregexm", "an argument that is not valid UTF-8");
+  }
+  if (beyondWchar(pythonStr(args[0])) || beyondWchar(pythonStr(args[1]))) {
+    refuseUstrregex("ustrregexm", kBeyondWcharRefusal);
   }
   bool caseInsensitive = false;
   if (args.size() == 3) {

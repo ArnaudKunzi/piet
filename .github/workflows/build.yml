@@ -18,3 +18,5 @@ jobs:
         env:
           BUILD_JOBS: 3
         run: sh scripts/build-macos.sh
+      - name: Run the real app
+        run: python3 tests/ui_smoke.py

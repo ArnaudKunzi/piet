@@ -28,6 +28,7 @@
 
 #include "data/frame.h"
 #include "data/missing.h"
+#include "io/win_compat.h"  // native_temp_path: /tmp on POSIX, %TEMP% on Windows
 #include "io/dta_reader.h"
 #include "io/dta_writer.h"
 
@@ -61,7 +62,7 @@ static void check_kinds(const Frame& f, const std::string& tag) {
 }
 
 int test_dta_missing_roundtrip_main() {
-    const std::string path = "/tmp/cecon_missing_roundtrip.dta";
+    const std::string path = cecon::native_temp_path("cecon_missing_roundtrip.dta");
 
     Frame fr;
     fr.set_n_rows_hint(29);  // 2 finite + 27 missing kinds
@@ -124,7 +125,7 @@ int test_dta_missing_roundtrip_main() {
     // column the claim (and hence the emitted <sortlist>) must be GONE, because a
     // stale claim would be a false "Sorted by:" in real Stata.
     {
-        const std::string sp = "/tmp/cecon_sortclaim_roundtrip.dta";
+        const std::string sp = cecon::native_temp_path("cecon_sortclaim_roundtrip.dta");
         Frame sf;
         sf.set_n_rows_hint(4);
         sf.append_f64_column("a", {1, 1, 2, 2});
@@ -148,7 +149,7 @@ int test_dta_missing_roundtrip_main() {
     // Native save now emits genuine DTA tempfiles; long strings and embedded
     // binary NULs must therefore survive the actual persistence plane.
     {
-        const std::string lp = "/tmp/cecon_strl_roundtrip.dta";
+        const std::string lp = cecon::native_temp_path("cecon_strl_roundtrip.dta");
         const std::vector<std::string> values = {"", std::string(2045, 'a'),
             std::string(2046, 'b'), std::string(2100, 'c'), std::string("a\0b", 3),
             std::string("\0ab", 3), std::string("ab\0", 3), std::string(2046, 'b')};

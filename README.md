@@ -27,8 +27,7 @@ A ready-built app for Apple Silicon Macs is attached to each release on the
 containing `PIET.app` (the interface, the CoBrA engine, the sample dataset,
 the licence and the third-party notices), with its SHA-256 beside it. Drag
 `PIET.app` to Applications. Requirements: macOS 13.3 or newer, Apple Silicon
-(arm64); Intel Macs and Windows/Linux are not built yet (the Windows port is
-in progress from the `docker/` recipes).
+(arm64); Intel Macs and Linux are not built yet.
 
 **About the security warning on first launch.** The app is signed only with
 an ad-hoc signature and is **not notarized**: notarization needs an Apple
@@ -50,6 +49,29 @@ this source tree in about ten minutes (`sh scripts/build-macos.sh`, then
 `sh scripts/package-macos-dmg.sh` makes the same `.dmg`), and every release
 page states the exact source commit it was built from. The corresponding
 source for every binary is this repository at the release's tag.
+
+## Download for Windows
+
+Each release from A.0.2 on carries two downloads for 64-bit Windows 10 or 11, on
+any CPU from about 2009 onward (SSE4.2), with a SHA-256 beside each:
+
+- **`PIET-<version>-setup.exe`** installs PIET, adds a Start menu entry, copies
+  the demo kit to `Documents\PIET`, and installs Microsoft's WebView2 Runtime if
+  the machine needs it. It asks for administrator rights.
+- **`PIET-<version>-windows-x64-portable.zip`** needs no installation: unzip it
+  anywhere and run `PIET.exe`. It needs the WebView2 Runtime already present,
+  which Windows 11 includes; without it, PIET says where to get it.
+
+**About the security warning on first launch.** The downloads are not code-signed:
+a signing certificate costs money the project does not have. Windows SmartScreen
+may therefore say it "prevented an unrecognized app from starting". This reports
+the missing signature, not a finding about the app. To continue, click **More
+info**, then **Run anyway**. To build it yourself instead, see *Build* below.
+
+Two behaviours differ from the macOS build, and `RELEASE_NOTES.md` gives the
+reason for each: `ustrregexra()` and `ustrregexm()` refuse characters above U+FFFF
+such as emoji, and `sdid, vce(bootstrap)` standard errors can differ in about the
+fourth significant digit.
 
 ## Developer's note
 
@@ -241,13 +263,21 @@ render; the SVG graphs land in the working directory.
 
 ## Build
 
-Requires CMake ≥ 3.20 and a C++17 compiler. Currently macOS-first (Accelerate);
-Windows and Linux ports are in progress (`docker/` holds the cross-build recipes).
+Requires CMake ≥ 3.20 and a C++17 compiler. macOS uses Accelerate and Windows uses
+OpenBLAS; a Linux port is in progress (`docker/` holds the cross-build recipes).
 
 The one-command path, which is also what the CI workflow runs:
 
 ```sh
 sh scripts/build-macos.sh      # builds both executables, runs ctest and the public smoke test
+```
+
+On Windows, from an [MSYS2](https://www.msys2.org/) MINGW64 shell, with the packages
+named at the top of the script:
+
+```sh
+sh scripts/build-windows.sh    # the same, with both executables linked statically
+bash scripts/package-windows.sh   # the portable zip, and the installer if Inno Setup is present
 ```
 
 Step by step:
@@ -267,7 +297,8 @@ and `cmake -S piet/native -B piet/native/build -DCMAKE_BUILD_TYPE=Release`.
 
 **Tests from a fresh clone.** `ctest` (the engine's unit tests) and
 `tests/public_smoke.py` (import → regress → save → reload through the app, checked
-against an independent OLS) run self-contained; `scripts/build-macos.sh` runs both.
+against an independent OLS) run self-contained; both build scripts run both.
+`tests/ui_smoke.py` runs the app's real-window journey and needs a desktop session.
 `piet_native --selftest` is the maintainers' suite: most of its arms read private
 oracle fixtures (Stata captures and datasets the repo deliberately does not ship),
 so in a clone it reports those arms as failed or skipped rather than passing.

@@ -48,6 +48,7 @@
 //       otherwise-valid invocation, while every real flag (including one
 //       only read inside a conditional branch, e.g. --cluster under --vcov
 //       cluster) keeps working unchanged.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -817,7 +818,12 @@ struct Run {
     std::string err;
 };
 
-Run cobra(const std::string& args, const std::string& tag) {
+Run cobra(const std::string& args, const std::string& raw_tag) {
+    // Tags carry log references like "R_pw (:274, :403)", and a colon is not legal in
+    // a Windows file name. There the shell redirection fails and leaves a file cut off
+    // at the colon, ending in a space, which remove_all below then retries forever.
+    std::string tag = raw_tag;
+    std::replace(tag.begin(), tag.end(), ':', '_');
     const fs::path outp = g_dir / (tag + ".json"), errp = g_dir / (tag + ".err");
     std::error_code ec;
     fs::remove(outp, ec);
@@ -897,7 +903,11 @@ static void test_postest_refit_cli() {
     using namespace postest_cli;
     std::printf("post-estimation refit under the fit's weight / dof convention (CLI):\n");
     const char* env = std::getenv("COBRA_BIN");
+#if defined(_WIN32)
+    g_cobra = env ? std::string(env) : (fs::current_path() / "cobra.exe").string();
+#else
     g_cobra = env ? std::string(env) : (fs::current_path() / "cobra").string();
+#endif
     if (!fs::exists(g_cobra)) {
         check(false, "cobra binary not found at " + g_cobra + " (run from the build directory or "
                      "set COBRA_BIN)");
@@ -1174,7 +1184,11 @@ static void test_fepois_ts_cli() {
     using namespace postest_cli;
     std::printf("fepois with time-series operators under --xtset (CLI):\n");
     const char* env = std::getenv("COBRA_BIN");
+#if defined(_WIN32)
+    g_cobra = env ? std::string(env) : (fs::current_path() / "cobra.exe").string();
+#else
     g_cobra = env ? std::string(env) : (fs::current_path() / "cobra").string();
+#endif
     if (!fs::exists(g_cobra)) {
         check(false, "cobra binary not found at " + g_cobra);
         return;

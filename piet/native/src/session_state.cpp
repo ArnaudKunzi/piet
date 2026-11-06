@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 M.K. Kim
 #include "piet/session_state.h"
+#ifndef _WIN32
 #include <execinfo.h>
 #include <dlfcn.h>
+#endif
 #include "io/win_compat.h"  // cecon::to_native_path (BUG-050 wide open)
 
 #include <algorithm>
@@ -2548,6 +2550,7 @@ void SessionState::ensureMaterializedHead(const char* c4Site) {
       // in-process with dladdr: an offline atos guesses the ASLR slide and names
       // the wrong function (measured, RAMDIET-CENSUS section 7.1).
       std::string chain;
+#ifndef _WIN32  // no backtrace/dladdr there; this diagnostic just leaves the caller blank
       if (residentDirty_) {
         void* bt[10];
         const int n = ::backtrace(bt, 10);
@@ -2557,6 +2560,7 @@ void SessionState::ensureMaterializedHead(const char* c4Site) {
           chain += (chain.empty() ? "" : "<") + std::string(sym);
         }
       }
+#endif
       std::fprintf(f, "MATERIALIZE\t%s\t%s\t%s\n", residentDirty_ ? "flush" : "clean",
                    c4Site ? c4Site : "?", chain.c_str());
       std::fclose(f);

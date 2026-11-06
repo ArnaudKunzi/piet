@@ -1,5 +1,10 @@
 # Cross-compile piet_native for Windows x64 (MinGW-w64, Debian 12 base).
 #
+# NOT the path Windows releases are built from: that is scripts/build-windows.sh,
+# natively under MSYS2. This recipe has not been re-run since the port landed; its
+# blocker list below is history, and it installs no iconv, which piet/native now
+# requires.
+#
 # WP-W6 (Porting Op) — Windows toolchain/packaging lane. This recipe attempts
 # the WIN32 build/link of piet_native against whatever piet/native/ sources
 # are checked out. It is written to run TODAY (against main's piet/native,

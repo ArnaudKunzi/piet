@@ -28,14 +28,13 @@ order for a Windows `THIRD_PARTY_NOTICES.txt` is:
                                       libstdc++/libgfortran/libquadmath)
 ./30-mingw-winpthreads.txt          (Windows-only: posix threading model —
                                       winpthreads backs <pthread.h>/std::thread)
+./40-libiconv-LGPL-2.1.txt          (Windows-only: piet_native.exe links libiconv
+                                      statically for import delimited's encoding())
 ../30-DATA-SOURCES.txt              (shared: Fatalities sample dataset)
 ```
 
-A future Windows packaging/assembly script (the WP-W6 analogue of
-`package_native_app.sh` — not yet written; see
-`piet/packaging/piet_setup.iss`'s header comment) should concatenate exactly
-this shared-plus-windows set, mirroring the mac script's lexical-order
-`NN-*.txt` concatenation but scoped to `../*.txt` + `./*.txt`.
+`../stage_native_windows.sh` concatenates this shared-plus-windows set: every
+`../NN-*.txt` in lexical order, then every `./NN-*.txt`.
 
 **Coordinate before generalizing the shared generator.** If Conductor wants
 one shared, platform-aware `THIRD_PARTY_NOTICES.txt` generator instead of two
@@ -52,3 +51,10 @@ WP-W6 (2026-07-08).
 | `10-openblas-BSD-3.txt` | OpenBLAS | `v0.3.28` tag (`docker/Dockerfile.windows`'s `OPENBLAS_TAG`) — LICENSE fetched from the tagged source tree |
 | `20-gcc-runtime-exception.txt` | GCC runtime libs (libgcc/libstdc++/libgfortran/libquadmath) | Debian 12 `gcc-mingw-w64-base` 12.2.0-14+deb12u1+25.2+b1 (posix variant) — verbatim from that package's `/usr/share/doc/gcc-mingw-w64-base/copyright` |
 | `30-mingw-winpthreads.txt` | MinGW-w64 winpthreads | Debian 12 `mingw-w64-x86-64-dev` 10.0.0-3 — verbatim from that package's `/usr/share/doc/mingw-w64-x86-64-dev/copyright` (winpthreads paragraphs) |
+| `40-libiconv-LGPL-2.1.txt` | GNU libiconv | MSYS2 `mingw-w64-x86_64-libiconv` 1.19.1-1 — verbatim from that package's `share/licenses/libiconv/COPYING.LIB` |
+
+The native build (`scripts/build-windows.sh`) takes all four components from
+MSYS2's MINGW64 packages instead of the Debian ones above: OpenBLAS 0.3.34 and
+GCC 16.2 at the time of writing. It also links libgomp, which is under the same
+GCC Runtime Library Exception as the other GCC runtime libraries. The license
+terms are unchanged across those versions.
