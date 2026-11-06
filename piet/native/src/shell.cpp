@@ -232,9 +232,18 @@ Shell::Shell(bool debug) : impl_(new Impl(debug)) {
   // created top-level WebView2 HWND as well so the same icon appears in the
   // title bar, Alt-Tab switcher, and taskbar.
   // window() is null when the WebView2 runtime is missing (the engine's
-  // constructor bails early); there is no window to brand in that case.
+  // constructor bails early). The installer normally provides the runtime, but
+  // the portable zip cannot, and carrying on from here crashes with no message.
   HWND hwnd = static_cast<HWND>(impl_->view.window());
-  if (!hwnd) return;
+  if (!hwnd) {
+    MessageBoxW(nullptr,
+                L"PIET needs the Microsoft Edge WebView2 Runtime, and it could not be "
+                L"started on this PC.\n\nInstall the Evergreen runtime from "
+                L"https://developer.microsoft.com/microsoft-edge/webview2/ and open PIET "
+                L"again.",
+                L"PIET", MB_OK | MB_ICONERROR);
+    ExitProcess(1);
+  }
   HINSTANCE module = GetModuleHandleW(nullptr);
   // NOT named `small`/`large`: <rpcndr.h> (reached via objbase.h) #defines
   // `small` to `char`, which would silently mangle a variable of that name.

@@ -1237,6 +1237,17 @@ async function onOpenFile(knownPath) {
 // ─── Run .do ─────────────────────────────────────────────────────────────────
 
 /**
+ * Opening a do-file moves the working directory to its folder, so its relative
+ * `use "data.dta"` finds the data beside it. A working directory that changes
+ * under the user must not change silently, so the move is announced. Nothing is
+ * printed when the file was already in the working directory. A later `cd` by the
+ * user stands: the move happens when a file is opened, never when it is run.
+ */
+function noteWorkingDirectory(dir) {
+  if (dir) appendBlock({ type: 'note', text: `Working directory is now ${dir} (the do-file's folder)` });
+}
+
+/**
  * BUG-045 (SPEC III-6 label honesty): a control's label is a contract — "Run
  * .do" must run. Picking a .do file loads its source into the Do-file Editor
  * AND runs it immediately via the SAME buffer-run path runDoEditor() uses
@@ -1258,7 +1269,8 @@ async function onRunDo() {
   try {
     filepath = await client.pickFile('do');
     if (!filepath) { document.getElementById('cmd-input')?.focus(); return; }   // user cancelled — no error
-    const { source, resolved_path } = await client.readDoFile(filepath);
+    const { source, resolved_path, cwd_changed } = await client.readDoFile(filepath, { followCwd: true });
+    noteWorkingDirectory(cwd_changed);
     setDoEditorText(source);
     setDoEditorPath(resolved_path);
     trackRecentFile(resolved_path || filepath, 'do');   // B3 — reopening from
@@ -1334,7 +1346,8 @@ async function onOpenDoFile(knownPath) {
       filepath = await client.pickFile('do');
       if (!filepath) { document.getElementById('cmd-input')?.focus(); return; }   // user cancelled — no error
     }
-    const { source, resolved_path } = await client.readDoFile(filepath);
+    const { source, resolved_path, cwd_changed } = await client.readDoFile(filepath, { followCwd: true });
+    noteWorkingDirectory(cwd_changed);
     setDoEditorText(source);
     setDoEditorPath(resolved_path);
     openDoEditor();   // foreground; focuses #doedit-text itself — don't refocus cmd-input below

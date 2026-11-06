@@ -56,6 +56,12 @@ namespace {
 
 namespace fs = std::filesystem;
 
+#ifdef _WIN32
+// Same shims as selftest.cpp: the Windows CRT has no setenv/unsetenv.
+int setenv(const char* name, const char* value, int) { return _putenv_s(name, value); }
+int unsetenv(const char* name) { return _putenv_s(name, ""); }
+#endif
+
 struct LineResult {
   std::string rc = "0";
   std::string msg;

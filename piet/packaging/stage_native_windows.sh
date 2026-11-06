@@ -15,6 +15,9 @@
 # Compiler) still needs to run on Windows (or under Wine), since Inno itself
 # has no macOS/Linux build.
 #
+# scripts/package-windows.sh is the usual way in: it sets the two inputs below
+# from a native scripts/build-windows.sh build and calls this script.
+#
 # Usage (from the repo root, after both Docker cross-builds have produced
 # their exports):
 #   piet/packaging/stage_native_windows.sh [OUTPUT_DIR]
@@ -147,8 +150,11 @@ cp "${DEMO_KIT_SRC}/fatalities.csv"     "${OUTPUT_DIR}/demo/"
 cp "${DEMO_KIT_SRC}/pangram_tour.do"    "${OUTPUT_DIR}/demo/"
 # Inno Setup runs under Wine in the cross-build lane. Its file enumerator can
 # mojibake a UTF-8 source filename and abort with "Invalid name", so retain the
-# Korean guide bytes under an ASCII packaging name.
-cp "${DEMO_KIT_SRC}/사용법.md"           "${OUTPUT_DIR}/demo/PANGRAM_GUIDE_KO.md"
+# Korean guide bytes under an ASCII packaging name. The public source tree does
+# not carry this guide, so a clone staging without it is not an error.
+if [[ -f "${DEMO_KIT_SRC}/사용법.md" ]]; then
+  cp "${DEMO_KIT_SRC}/사용법.md"         "${OUTPUT_DIR}/demo/PANGRAM_GUIDE_KO.md"
+fi
 
 # ── Third-party notices — shared parts + Windows-only activated parts ─────
 # (see piet/packaging/licenses/windows/README.md for why these two lists are
@@ -172,8 +178,8 @@ cp "${NOTICES_OUT}" "${OUTPUT_DIR}/THIRD_PARTY_NOTICES.txt"
   || { echo "FATAL: THIRD_PARTY_NOTICES.txt missing/empty in the assembled bundle at ${NOTICES_OUT}" >&2; exit 1; }
 grep -q "StataCorp LLC" "${NOTICES_OUT}" \
   || { echo "FATAL: StataCorp non-affiliation disclaimer absent from ${NOTICES_OUT}" >&2; exit 1; }
-grep -q "OpenBLAS" "${NOTICES_OUT}" && grep -q "GCC RUNTIME LIBRARY EXCEPTION" "${NOTICES_OUT}" && grep -q "winpthreads" "${NOTICES_OUT}" \
-  || { echo "FATAL: expected Windows-only component notices (OpenBLAS/GCC-runtime/winpthreads) absent from ${NOTICES_OUT}" >&2; exit 1; }
+grep -q "OpenBLAS" "${NOTICES_OUT}" && grep -q "GCC RUNTIME LIBRARY EXCEPTION" "${NOTICES_OUT}" && grep -q "winpthreads" "${NOTICES_OUT}" && grep -q "GNU libiconv" "${NOTICES_OUT}" \
+  || { echo "FATAL: expected Windows-only component notices (OpenBLAS/GCC-runtime/winpthreads/libiconv) absent from ${NOTICES_OUT}" >&2; exit 1; }
 
 # ── Runtime-layout assert — the bundle_paths.cpp WP-W5 contract ───────────
 # Everything piet_native resolves through bundleResourcesDir() must exist

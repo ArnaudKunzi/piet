@@ -1,0 +1,80 @@
+name: Windows build and self-test
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # release.yml calls this for a tag, then attaches what it uploads.
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    # About 40 minutes more when the OpenBLAS cache misses.
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Keep line endings as committed
+        shell: pwsh
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-gcc-fortran
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-libiconv
+            mingw-w64-x86_64-python
+            rsync
+            zip
+      # Only the finished library is kept. The key changes with the build script,
+      # which is where the OpenBLAS version and flags live.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build-openblas/install
+          key: openblas-${{ runner.os }}-${{ hashFiles('scripts/build-windows.sh') }}
+      - name: Build and test the public source
+        env:
+          BUILD_JOBS: 4
+          PYTHONUTF8: 1
+        run: sh scripts/build-windows.sh
+      - name: Install Inno Setup
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download is-7_1_1 --repo jrsoftware/issrc --pattern 'innosetup-7.1.1-x64.exe' --dir "$env:RUNNER_TEMP"
+          $setup = Join-Path $env:RUNNER_TEMP 'innosetup-7.1.1-x64.exe'
+          if ((Get-AuthenticodeSignature $setup).Status -ne 'Valid') { throw 'Inno Setup installer is not validly signed' }
+          $dir = Join-Path $env:RUNNER_TEMP 'inno'
+          Start-Process -Wait -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER',"/DIR=`"$dir`"",'/NOICONS'
+          "ISCC=$dir\ISCC.exe" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Package the zip and the installer
+        run: bash scripts/package-windows.sh
+      - name: Run the real app from the packaged folder
+        env:
+          PYTHONUTF8: 1
+        run: python tests/ui_smoke.py dist/windows-amd64-piet/PIET-windows/PIET.exe
+      - name: Checksums
+        run: |
+          cd dist/windows-amd64-piet
+          for file in PIET-*-setup.exe PIET-*-portable.zip; do sha256sum "$file" > "$file.sha256"; done
+          cat ./*.sha256
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: piet-windows-x64
+          if-no-files-found: error
+          path: |
+            dist/windows-amd64-piet/PIET-*-setup.exe
+            dist/windows-amd64-piet/PIET-*-portable.zip
+            dist/windows-amd64-piet/*.sha256

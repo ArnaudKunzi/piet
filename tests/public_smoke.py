@@ -7,8 +7,8 @@ reload, regress again. The regression is checked against an independent
 normal-equations solve written here, and the reloaded run must reproduce the
 first one exactly. Nothing here needs Stata, private fixtures or a network.
 
-Usage (from the repository root, after scripts/build-macos.sh built both
-executables):  python3 tests/public_smoke.py
+Usage (from the repository root, after scripts/build-macos.sh or
+scripts/build-windows.sh built both executables):  python3 tests/public_smoke.py
 Environment: PIET_BIN / COBRA_BIN override the binary locations.
 """
 import csv
@@ -20,8 +20,9 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ENGINE = Path(os.environ.get("COBRA_BIN", ROOT / "build" / "cobra"))
-APP = Path(os.environ.get("PIET_BIN", ROOT / "piet" / "native" / "build" / "piet_native"))
+EXE = ".exe" if os.name == "nt" else ""
+ENGINE = Path(os.environ.get("COBRA_BIN", ROOT / "build" / f"cobra{EXE}"))
+APP = Path(os.environ.get("PIET_BIN", ROOT / "piet" / "native" / "build" / f"piet_native{EXE}"))
 SAMPLE = ROOT / "demos" / "fatalities" / "fatalities.csv"
 DEPVAR, REGRESSORS = "fatal", ["beertax", "unemp"]
 
@@ -29,7 +30,7 @@ DEPVAR, REGRESSORS = "fatal", ["beertax", "unemp"]
 def run(cmds, folder):
     env = dict(os.environ, COBRA_BIN=str(ENGINE), PIET_SETTINGS_FILE=str(folder / "settings.json"))
     req = {"kind": "dispatch", "cmds": cmds, "workdir": str(folder), "cwd": str(folder)}
-    p = subprocess.run([str(APP), "--run-block"], input=json.dumps(req), text=True,
+    p = subprocess.run([str(APP), "--run-block"], input=json.dumps(req), text=True, encoding="utf-8",
                        capture_output=True, env=env, timeout=180)
     if p.returncode:
         raise AssertionError(f"piet_native exit {p.returncode}: {p.stderr[-2000:]} {p.stdout[-2000:]}")
@@ -75,6 +76,38 @@ def reference_ols():
     return len(rows), solve(xtx, xty)
 
 
+def text_of(blocks):
+    """Every string a command's blocks carry, for matching what it printed."""
+    return json.dumps(blocks, ensure_ascii=False)
+
+
+def unicode_checks():
+    """Non-ASCII working folders and text. A narrow API on Windows decodes a UTF-8 path
+    through the active code page and never finds the file, and regex matching there has
+    only 16 bits per character, so both are pinned on every platform."""
+    with tempfile.TemporaryDirectory(prefix="piet-public-smoke-") as d:
+        folder = Path(d) / "한글 폴더"
+        folder.mkdir()
+        (folder / "fatalities.csv").write_bytes(SAMPLE.read_bytes())
+        reg = f"regress {DEPVAR} {' '.join(REGRESSORS)}"
+        lists = run(["import delimited fatalities.csv, clear", reg, "save 저장.dta, replace",
+                     "clear", "use 저장.dta", reg,
+                     'display ustrregexra("한글자", ".", "x")',
+                     'display ustrregexra("a😀", "a", "x")'], folder)
+        for i, blocks in enumerate(lists[:7]):
+            assert not errors(blocks), f"command {i} failed in a Hangul folder: {errors(blocks)}"
+        assert (folder / "저장.dta").is_file(), "save did not write the Hangul file name"
+        assert estimation(lists[1])["coeftable"] == estimation(lists[5])["coeftable"], \
+            "a .dta under a Hangul path changed the fit"
+        assert "xxx" in text_of(lists[6]), f"`.` must match whole Hangul characters: {lists[6]}"
+        emoji = lists[7]
+        if os.name == "nt":
+            # One wchar_t cannot hold it there, so this is refused rather than half-matched.
+            assert errors(emoji) and "U+FFFF" in text_of(emoji), f"expected the refusal: {emoji}"
+        else:
+            assert not errors(emoji) and "x😀" in text_of(emoji), f"expected x😀: {emoji}"
+
+
 def main():
     assert ENGINE.is_file(), f"engine not built: {ENGINE}"
     assert APP.is_file(), f"app not built: {APP}"
@@ -102,8 +135,9 @@ def main():
             assert name in got, f"coefficient {name} missing from {sorted(got)}"
             tol = 1e-8 * max(1.0, abs(ref))
             assert abs(got[name] - ref) <= tol, f"{name}: {got[name]!r} vs reference {ref!r}"
+    unicode_checks()
     print(f"public smoke: OK (N={n}, {len(names)} coefficients match an independent OLS to 1e-8, "
-          f".dta roundtrip reproduces the fit)")
+          f".dta roundtrip reproduces the fit, Hangul paths and text work)")
 
 
 if __name__ == "__main__":

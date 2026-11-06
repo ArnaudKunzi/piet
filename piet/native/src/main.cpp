@@ -113,6 +113,7 @@ struct FileReadResult {
   std::string resolvedPath;
 };
 FileReadResult readDoFileForBridge(const SessionState& session, const std::string& rawPath);
+std::string followDoFileDirectory(SessionState& session, const std::string& resolvedDoFile);
 const char* scratchOwnerMarkerName();
 void writeScratchOwnerMarker(const std::string& dir);
 int reapDeadScratch(const std::string& base);
@@ -530,9 +531,10 @@ void bindAllRoutes(piet::Shell& shell, AppState& app) {
   // (item 2 of this wave) so a relative path follows the seeded
   // session.cwd exactly like `use`/`do` would. App-shell facility, not a
   // Boundary-B kernel endpoint — same classification family as
-  // dialog.open/legal.notices (it only reads session.cwd, never mutates
-  // SessionState, and has no directory-listing or write affordance). The
-  // resolve+validate+read logic lives in piet::readDoFileForBridge() (just
+  // dialog.open/legal.notices (it has no directory-listing or write affordance,
+  // and only reads session.cwd unless the caller asks for {follow_cwd:true}, the
+  // app's "opened this do-file" gesture; the reply then names the new directory
+  // in cwd_changed if it moved). The resolve+validate+read logic lives in piet::readDoFileForBridge() (just
   // above bindAllRoutes) so selftest.cpp can exercise it directly; this
   // lambda is thin JSON-in/JSON-out wiring, same shape as dialog.open.
   shell.bindRoute("file.read", [&app](const std::string& body) -> piet::BridgeResult {
@@ -544,12 +546,14 @@ void bindAllRoutes(piet::Shell& shell, AppState& app) {
     };
 
     std::string rawPath;
+    bool followCwd = false;
     try {
       auto j = nlohmann::json::parse(body);
       if (!j.is_object() || !j.contains("path") || !j["path"].is_string()) {
         return badRequest("file.read: body must be {\"path\": string}");
       }
       rawPath = j["path"].get<std::string>();
+      followCwd = j.value("follow_cwd", false);
     } catch (const nlohmann::json::exception& e) {
       return badRequest(std::string("file.read: invalid JSON body: ") + e.what());
     }
@@ -560,6 +564,10 @@ void bindAllRoutes(piet::Shell& shell, AppState& app) {
     nlohmann::ordered_json out;
     out["source"] = r.source;
     out["resolved_path"] = r.resolvedPath;
+    if (followCwd) {
+      const std::string moved = piet::followDoFileDirectory(app.session, r.resolvedPath);
+      if (!moved.empty()) out["cwd_changed"] = moved;
+    }
     // A do-file saved in Latin-1 still opens: its non-UTF-8 bytes show as
     // U+FFFD instead of failing the route (BUG-1131).
     return piet::BridgeResult::success(
@@ -1849,6 +1857,56 @@ std::string smokeDriverJs(const std::string& dataPath, const std::string& doFixt
           report(false, true, 'editor_first_run', 'file.read -> editor -> doedit-run -> describe block rendered');
         });
       }).then(function () {
+        // 6b. OPENING A DO-FILE MOVES THE WORKING DIRECTORY TO ITS FOLDER, through
+        // the real product path: a file_dropped push -> routeDroppedFile ->
+        // onOpenDoFile. The folder name is Hangul, and a typed `do FILE` must NOT
+        // move the directory.
+        var pwd = function () {
+          return window.pietNative.request('command', { cmd: 'display c(pwd)' }).then(function (r) {
+            var b = ((r && r.blocks) || []).find(function (x) { return x && typeof x.text === 'string' && x.type !== 'echo'; });
+            if (!b) throw new Error('display c(pwd) printed nothing: ' + JSON.stringify(r));
+            return b.text.trim();
+          });
+        };
+        var folder = 'do 폴더', before;
+        var endsInFolder = function (p) { return String(p).replace(/[\\/]+$/, '').slice(-folder.length) === folder; };
+        return pwd().then(function (p) {
+          before = p;
+          if (endsInFolder(before)) throw new Error('fixture error: already in the do-file folder');
+          // The run in step 6 releases the busy lock just after its block renders.
+          return new Promise(function (resolve) { setTimeout(resolve, 500); });
+        }).then(function () {
+          return window.pietNative.request('smoke.drop_do_file', {});
+        }).then(function () {
+          return waitFor('dropped do-file loaded into the editor', function () {
+            return document.getElementById('doedit-text')?.value.indexOf('ui smoke sibling') >= 0;
+          }, STEP_TIMEOUT_MS);
+        }).then(function () {
+          return waitFor('the console names the new working directory', function () {
+            var t = document.getElementById('console-body')?.textContent || '';
+            return t.indexOf('Working directory') >= 0 && t.indexOf(folder) >= 0;
+          }, STEP_TIMEOUT_MS);
+        }).then(pwd).then(function (p) {
+          if (!endsInFolder(p)) throw new Error('c(pwd) did not follow the do-file: ' + p);
+          // A relative path now resolves beside the do-file, the reported problem.
+          return window.pietNative.request('file.read', { path: 'smoke_sibling.do' });
+        }).then(function (r) {
+          if (!r || r.source.indexOf('ui smoke sibling') < 0) throw new Error('relative path missed the sibling');
+          // Opening it again from its own folder moves nothing and says nothing.
+          return window.pietNative.request('file.read', { path: r.resolved_path, follow_cwd: true }).then(function (again) {
+            if (again.cwd_changed) throw new Error('reopened in place but reported a move: ' + again.cwd_changed);
+            return r.resolved_path;
+          });
+        }).then(function (siblingPath) {
+          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+          return window.pietNative.request('command', { cmd: 'cd "' + before + '"' }).then(function () {
+            return window.pietNative.request('command', { cmd: 'do "' + siblingPath + '"' });
+          });
+        }).then(pwd).then(function (p) {
+          if (p !== before) throw new Error('a typed do FILE moved the working directory to ' + p);
+          report(false, true, 'do_file_folder_cwd', 'drop -> editor -> cwd follows, relative path resolves; typed do FILE leaves cwd alone');
+        });
+      }).then(function () {
         // 7. OVERLAY EXCLUSIVITY (design decision 5 / A2-05): opening one
         // console-overlay via its toolbar anchor must close any other.
         var graphicsAnchor = document.querySelector('[data-action="graphics"]');
@@ -2429,6 +2487,17 @@ int runUiSmoke() {
   // name so file.read (which only serves .do) can verify it.
   std::string saveTargetPath = workdir + "/ui_smoke_save_roundtrip.do";
 
+  // do_file_folder_cwd target: a do-file in a folder of its own, Hangul-named
+  // ("do 폴더", spelled as its UTF-8 bytes).
+  const std::string siblingDir = workdir + "/do \xED\x8F\xB4\xEB\x8D\x94";
+  const std::string siblingDoPath = siblingDir + "/smoke_sibling.do";
+  {
+    std::error_code siblingEc;
+    std::filesystem::create_directories(cecon::to_native_path(siblingDir), siblingEc);
+    std::ofstream siblingFile(cecon::to_native_path(siblingDoPath));
+    siblingFile << "* ui smoke sibling\n";
+  }
+
   // --- BUG-197: hermetic-verdict regime -------------------------------------
   // Two independent layers, and the report below names both so a future
   // reader of one log line knows which regime judged that run:
@@ -2505,6 +2574,16 @@ int runUiSmoke() {
       }
     }
     if (isFinal) smoke.cv.notify_all();
+    return piet::BridgeResult::success(R"({"ok":true})");
+  });
+
+  // Test-mode only, like smoke.report: pushes the same event the native drop
+  // handler does (shell.cpp's installFileDropHandler), which page script cannot.
+  shell.bindRoute("smoke.drop_do_file", [&shell, siblingDoPath](const std::string&) -> piet::BridgeResult {
+    nlohmann::ordered_json ev;
+    ev["kind"] = "file_dropped";
+    ev["path"] = siblingDoPath;
+    shell.postEvent(ev.dump());
     return piet::BridgeResult::success(R"({"ok":true})");
   });
 

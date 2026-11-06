@@ -105,7 +105,11 @@ std::string resolveCobraBin() {
       const std::string selfDir = exe->substr(0, slash);
       // piet/native/build/piet_native -> ../../../build/cobra (repo-root build),
       // and a co-located cobra for a flat install.
+#ifdef _WIN32
+      const char* rel[] = {"/../../../build/cobra.exe", "/../../../../build/cobra.exe", "/cobra.exe"};
+#else
       const char* rel[] = {"/../../../build/cobra", "/../../../../build/cobra", "/cobra"};
+#endif
       for (const char* r : rel) {
         const std::string cand = selfDir + r;
         if (fileExists(cand)) return cand;

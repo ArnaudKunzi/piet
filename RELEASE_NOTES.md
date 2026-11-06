@@ -1,3 +1,52 @@
+# PIET A.0.2 / CoBrA 1.0.2 — first Windows build; do-files open in their own folder
+
+The app reports PIET `A.0.2`, the engine CoBrA `1.0.2`; contracts unchanged at
+1.26.0 / 2.10.0. Corresponding source: this repository at tag `A.0.2`.
+
+**New on every platform: a do-file's folder becomes the working directory when you
+open it.** Choosing a do-file with Run .do or Open do-file, dropping one on the
+window, or reopening one from Recent now moves the working directory to that file's
+folder, and the Results pane says so. A relative `use "mydata.dta"` in the do-file
+finds the data beside it, where before it looked in Documents. A `cd` you type
+afterwards stands, because the move happens only when a file is opened. A `do FILE`
+you type or call from a script leaves the working directory alone, as in Stata.
+
+**New: Windows 10/11 x64.** `PIET-A.0.2-setup.exe` installs the app and, if the machine
+needs it, Microsoft's WebView2 Runtime. `PIET-A.0.2-windows-x64-portable.zip` runs
+from any folder on a machine that already has WebView2, as Windows 11 does. Neither
+is code-signed, so SmartScreen warns on first launch: see the README's "Download
+for Windows".
+
+The Windows build gives the same numbers on every CPU. Its linear algebra uses one
+fixed set of OpenBLAS kernels (SSE4.2) rather than choosing by processor, because
+choosing changed results on nearly separated logit and probit samples at about 1e-8.
+The cost is speed on very large matrix work, compared with kernels tuned to a newer CPU.
+
+Known differences from the macOS build, both named rather than hidden:
+
+- `ustrregexra()` and `ustrregexm()` refuse a character above U+FFFF, such as an emoji,
+  with r(199). Windows matches text in 16-bit units, so `.` would otherwise match half
+  of such a character. Hangul and all other text through U+FFFF behave as on macOS.
+- `sdid, vce(bootstrap)` standard errors can differ from the macOS build's in about the
+  fourth significant digit for the same seed; the point estimate does not. A few
+  resampled panels are near-degenerate, which makes those replicates sensitive to
+  whether the CPU fuses `a*b + c` into one rounding step. The macOS build does and the
+  Windows build, which targets CPUs without that instruction, does not.
+
+Also fixed: a built tree on Windows now finds its own engine, and the engine's
+x86-64 baseline is now applied on native Windows builds.
+
+**Checks on this tree:** engine unit tests and `tests/public_smoke.py` (now including
+Hangul folder and file names) on both macOS and Windows in GitHub Actions, where the
+same 45 of 112 engine tests are skipped on both for lack of private fixtures; the
+app's real-window `--ui-smoke` journey on both, now covering the do-file folder
+behaviour through the drop path.
+
+**Build provenance:** `.github/workflows/release.yml` built every download from the
+commit at this tag: `scripts/build-macos.sh` with `scripts/package-macos-dmg.sh`, and
+`scripts/build-windows.sh` with `scripts/package-windows.sh`. Verify downloads with the
+attached `.sha256` files.
+
 # PIET A.0.1 / CoBrA 1.0.1 — patch stamp of 2026-11-06 (tag `A.0.1`)
 
 Patch cut of the official line: the same tree as the 2026-11-06 macOS build

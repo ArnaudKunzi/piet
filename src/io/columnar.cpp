@@ -3,7 +3,9 @@
 #include "io/columnar.h"
 #include <set>
 #include <map>
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include "data/frame.h"  // RAMDIET A: shared read census
 #include "core/error.h"
 #include "io/win_compat.h"  // native_open/native_fd_size: wide (_wopen) on Windows for non-ASCII paths (BUG-050)
@@ -774,8 +776,14 @@ void cecon_ladder_probe_close() {
         // Symbolize IN-PROCESS: an offline atos guesses the ASLR slide and names the
         // wrong function (measured, RAMDIET §7.1).
         for (const auto& kv : g_f64_sites) {
+#ifdef _WIN32
+            // No dladdr on Windows; this probe is a diagnostic, so the raw name
+            // is just left unresolved.
+            const char* sym = "?";
+#else
             Dl_info info{};
             const char* sym = (dladdr(kv.first, &info) && info.dli_sname) ? info.dli_sname : "?";
+#endif
             std::fprintf(f, "f64site calls=%lld cols=%zu %s\n",
                          static_cast<long long>(kv.second), g_f64_cols[kv.first].size(), sym);
         }

@@ -554,16 +554,24 @@ int runParallelWorker(const std::string& specPath) {
   std::filesystem::create_directories(workdir, ec);
 
   // §3.5: the parent owns the total core budget; the child just obeys it.
+  // (This path is the spawned worker on every platform; Windows has no setenv.)
+  const auto setWorkerEnv = [](const char* name, const std::string& value) {
+#ifdef _WIN32
+    ::_putenv_s(name, value.c_str());
+#else
+    ::setenv(name, value.c_str(), 1);
+#endif
+  };
   if (spec.contains("engine_threads") && spec["engine_threads"].is_number_integer()) {
     int nt = spec["engine_threads"].get<int>();
     if (nt >= 1) {
-      ::setenv("CECON_NUM_THREADS", std::to_string(nt).c_str(), 1);
-      ::setenv("VECLIB_MAXIMUM_THREADS", std::to_string(nt).c_str(), 1);
+      setWorkerEnv("CECON_NUM_THREADS", std::to_string(nt));
+      setWorkerEnv("VECLIB_MAXIMUM_THREADS", std::to_string(nt));
     }
   }
   if (spec.contains("engine_memory_mb") && spec["engine_memory_mb"].is_number_integer()) {
     const int64_t mb = spec["engine_memory_mb"].get<int64_t>();
-    if (mb >= 1) ::setenv("CECON_MEMORY_BUDGET_MB", std::to_string(mb).c_str(), 1);
+    if (mb >= 1) setWorkerEnv("CECON_MEMORY_BUDGET_MB", std::to_string(mb));
   }
 
   SessionState session(workdir);

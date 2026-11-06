@@ -145,7 +145,17 @@ int test_sdid_main() {
         SdidResult R = run(P, cfg);
         ok(R.ok, "B: factor-structure staggered panel estimates");
         near(R.att, 1.4591054059, 1e-8, "B: ATT regression pin");
+        // The SE has one pin per floating-point regime, not a wider tolerance. A few
+        // resampled panels here are near-degenerate, so whether `a*b + c` rounds once
+        // (FMA) or twice moves those replicates by up to 3e-4 and the SE in its fourth
+        // significant digit; the point estimate above does not move. Targets without
+        // FMA (the x86-64-v2 Windows floor) never fuse, and GCC and clang agree on them
+        // bit for bit, so that value is compiler-independent.
+#if defined(__x86_64__) && !defined(__FMA__)
+        near(R.se, 0.0599451776, 1e-8, "B: bootstrap SE regression pin (no FMA)");
+#else
         near(R.se, 0.0599426696, 1e-8, "B: bootstrap SE regression pin");
+#endif
         near(R.t, R.att / R.se, 1e-12, "B: t == att/se");
         near(R.ci_hi - R.ci_lo, 2.0 * 1.959963984540054 * R.se, 1e-12,
              "B: 95% CI width == 2 z se (large-sample, as Stata's sdid prints)");

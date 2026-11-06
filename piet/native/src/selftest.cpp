@@ -113,6 +113,11 @@ static std::string selftestValidateDir() {
 }
 
 #ifdef _WIN32
+// <windows.h> defines the 16-bit-era keywords `near` and `far` as empty macros,
+// which turns the `auto near = ...` helpers below into a syntax error.
+#undef near
+#undef far
+
 // MinGW/MSVC do not provide the POSIX setenv()/unsetenv() helpers used by
 // several escape-hatch self-tests below. Keep those tests enabled on Windows
 // and preserve setenv(overwrite=0) semantics instead of compiling them out —
