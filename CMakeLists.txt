@@ -130,7 +130,7 @@ target_link_libraries(cecon_core PUBLIC ${CECON_LA_LIBS} Threads::Threads)
 
 add_executable(cobra apps/cecon_cli.cpp apps/cmds/common.cpp apps/cmds/options_table.cpp apps/cmds/cmds_linear.cpp apps/cmds/cmds_panel.cpp apps/cmds/cmds_mle.cpp apps/cmds/cmds_postest.cpp apps/cmds/cmds_diag.cpp apps/cmds/cmds_ts.cpp apps/cmds/cmds_summary.cpp apps/cmds/cmds_data.cpp apps/cmds/cmds_survey.cpp apps/cmds/cmds_oglm.cpp apps/cmds/cmds_mlogit.cpp apps/cmds/cmds_zicount.cpp apps/cmds/cmds_ivml.cpp apps/cmds/cmds_mixedlm.cpp apps/cmds/cmds_survival.cpp apps/cmds/cmds_varmodel.cpp apps/cmds/cmds_xtabond.cpp apps/cmds/cmds_nlgmm.cpp apps/cmds/cmds_miimpute.cpp apps/cmds/cmds_rd.cpp apps/cmds/cmds_eventstudy.cpp apps/cmds/cmds_sdid.cpp apps/cmds/cmds_binscatter.cpp apps/cmds/cmds_aer_estim.cpp apps/cmds/cmds_oaxaca.cpp apps/cmds/cmds_nnmatch.cpp)
 target_link_libraries(cobra PRIVATE cecon_core)
-target_compile_definitions(cobra PRIVATE COBRA_VERSION="1.0.0")
+target_compile_definitions(cobra PRIVATE COBRA_VERSION="1.0.1")
 
 enable_testing()
 find_package(Python3 COMPONENTS Interpreter QUIET)

@@ -126,7 +126,7 @@ Survey) and produces 30 tables and 5 figures; along the way it exercises
 | Command blocks executed | about 40,000 (`Master.do` plus every nested do-file) |
 | Result files written | 114 of 114 (tables, figures, cleaned datasets) |
 | Error blocks | 0 (the three errors the package itself swallows with `capture` are its own `which <package>` probes) |
-| Wall time, PIET A.0.0 / CoBrA 1.0.0 | 7.2 minutes on an Apple M1 (8 GB RAM, macOS 26.6), single process |
+| Wall time, PIET A.0.1 / CoBrA 1.0.1 | 7.2 minutes on an Apple M1 (8 GB RAM, macOS 26.6), single process |
 
 **Against the reference run.** The same package was run in Stata/BE 19.5 on
 the same machine and compared cell by cell (`.tex` tables) and value by value
@@ -152,7 +152,7 @@ work in progress and are not claimed.
 
 ## Speed
 
-What is known today, measured rather than promised (PIET A.0.0 / CoBrA 1.0.0,
+What is known today, measured rather than promised (PIET A.0.1 / CoBrA 1.0.1,
 Apple M1, 8 GB RAM, macOS 26.6, release build):
 
 | Workload | Wall time |

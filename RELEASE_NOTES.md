@@ -1,3 +1,16 @@
+# PIET A.0.1 / CoBrA 1.0.1 — patch stamp of 2026-11-06 (tag `A.0.1`)
+
+Patch cut of the official line: the same tree as the 2026-11-06 macOS build
+below, now carrying the version strings that identify it (the app reports
+PIET `A.0.1`, the engine CoBrA `1.0.1`; contracts unchanged at 1.26.0 / 2.10.0).
+What changed since A.0.0 / 1.0.0: BUG-1939 (dev-tree paths resolve from the
+executable; `sysuse` and the frontend were lost under a `-ffile-prefix-map`
+build), BUG-1940 (`hausman` when V_b-V_B is not positive definite answered
+chi2 ~ 1e16 or refused; now Stata's generalized-inverse rule with its note),
+adoption declarations and SPDX headers across the tree, the demo tour
+corrections, and the public packaging scripts. The `.dmg` on the release page
+is rebuilt from this tag. Corresponding source: this repository at tag `A.0.1`.
+
 # PIET A.0.0 / CoBrA 1.0.0 — macOS build of 2026-11-06 (tag `A.0.0-public-20261106`)
 
 First downloadable build from the public tree: `PIET-A.0.0-20261106-macos-arm64.dmg`
